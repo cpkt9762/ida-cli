@@ -2073,919 +2073,1618 @@ mod tests {
     use super::{dispatch_rpc, mock::MockWorker};
     use crate::error::ToolError;
     use crate::router::protocol::RpcRequest;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
-    #[test]
-    fn test_parse_address_value_hex_string() {
-        let v = json!("0x5e8");
-        let result = parse_address_value(&v);
-        assert_eq!(result, Some(0x5e8));
+    async fn run_dispatch(method: &str, params: Value) -> Vec<(String, Value)> {
+        let mock = MockWorker::new();
+        let req = RpcRequest::new("1", method, params);
+        dispatch_rpc(&req, &mock).await.unwrap();
+        let calls = mock.calls.lock().unwrap().clone();
+        calls
     }
 
-    #[test]
-    fn test_parse_address_value_decimal_string() {
-        let v = json!("1512");
-        let result = parse_address_value(&v);
-        assert_eq!(result, Some(1512));
-    }
-
-    #[test]
-    fn test_parse_address_value_number() {
-        let v = json!(0x5e8u64);
-        let result = parse_address_value(&v);
-        assert_eq!(result, Some(0x5e8));
-    }
-
-    #[test]
-    fn test_parse_address_value_invalid() {
-        let v = json!("invalid");
-        let result = parse_address_value(&v);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_parse_address_value_null() {
-        let v = json!(null);
-        let result = parse_address_value(&v);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_parse_pattern_array() {
-        let patterns_json = json!(["FD 7B", "90 90"]);
-        let patterns: Vec<String> = if let Some(arr) = patterns_json.as_array() {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        } else {
-            vec![]
-        };
-        assert_eq!(patterns, vec!["FD 7B", "90 90"]);
-    }
-
-    #[test]
-    fn test_parse_pattern_string() {
-        let patterns_json = json!("FD 7B");
-        let patterns: Vec<String> = if let Some(s) = patterns_json.as_str() {
-            vec![s.to_string()]
-        } else {
-            vec![]
-        };
-        assert_eq!(patterns, vec!["FD 7B"]);
-    }
-
-    #[test]
-    fn test_parse_pattern_json_array_string() {
-        let patterns_json = json!(r#"["FD 7B", "90 90"]"#);
-        let patterns: Vec<String> = if let Some(s) = patterns_json.as_str() {
-            if s.trim().starts_with('[') {
-                if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(s) {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                } else {
-                    vec![s.to_string()]
-                }
-            } else {
-                vec![s.to_string()]
+    macro_rules! parse_address_case {
+        ($name:ident, $input:tt, $expected:expr) => {
+            #[test]
+            fn $name() {
+                assert_eq!(parse_address_value(&json!($input)), $expected);
             }
-        } else {
-            vec![]
         };
-        assert_eq!(patterns, vec!["FD 7B", "90 90"]);
     }
 
-    #[test]
-    fn test_parse_insn_patterns_string() {
-        let patterns_json = json!("bl");
-        let patterns: Vec<String> = if let Some(s) = patterns_json.as_str() {
-            if s.trim().starts_with('[') {
-                if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(s) {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                } else {
-                    vec![s.to_string()]
-                }
-            } else {
-                vec![s.to_string()]
+    macro_rules! single_call_test {
+        ($name:ident, $method:expr, $params:expr, $recorded:expr, $key:expr, $expected:expr) => {
+            #[tokio::test]
+            async fn $name() {
+                let calls = run_dispatch($method, $params).await;
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].0, $recorded);
+                assert_eq!(calls[0].1[$key], $expected);
             }
-        } else {
-            vec![]
         };
-        assert_eq!(patterns, vec!["bl"]);
     }
 
-    #[test]
-    fn test_parse_insn_patterns_array() {
-        let patterns_json = json!(["bl", "mov"]);
-        let patterns: Vec<String> = if let Some(arr) = patterns_json.as_array() {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        } else {
-            vec![]
-        };
-        assert_eq!(patterns, vec!["bl", "mov"]);
-    }
+    // -- parse_address_value --
+    parse_address_case!(test_parse_address_hex_lowercase, "0x1000", Some(0x1000));
+    parse_address_case!(
+        test_parse_address_hex_uppercase_prefix,
+        "0X1000",
+        Some(0x1000)
+    );
+    parse_address_case!(test_parse_address_hex_mixed_digits, "0xAbCd", Some(0xabcd));
+    parse_address_case!(test_parse_address_decimal_string, "4096", Some(4096));
+    parse_address_case!(test_parse_address_decimal_with_space, " 4096 ", Some(4096));
+    parse_address_case!(test_parse_address_zero_string, "0", Some(0));
+    parse_address_case!(test_parse_address_zero_hex, "0x0", Some(0));
+    parse_address_case!(test_parse_address_u64_number, 12345u64, Some(12345));
+    parse_address_case!(test_parse_address_u32_number, 99u32, Some(99));
+    parse_address_case!(
+        test_parse_address_large_hex,
+        "0xffffffffffffffff",
+        Some(u64::MAX)
+    );
+    parse_address_case!(test_parse_address_invalid_text, "hello", None);
+    parse_address_case!(test_parse_address_invalid_hex, "0xxyz", None);
+    parse_address_case!(test_parse_address_empty_string, "", None);
+    parse_address_case!(test_parse_address_minus_number, "-1", None);
+    parse_address_case!(test_parse_address_float_text, "3.14", None);
+    parse_address_case!(test_parse_address_bool_true, true, None);
+    parse_address_case!(test_parse_address_bool_false, false, None);
+    parse_address_case!(test_parse_address_null, null, None);
+    parse_address_case!(test_parse_address_array, ["0x10"], None);
+    parse_address_case!(test_parse_address_object, {"address": "0x10"}, None);
+    parse_address_case!(test_parse_address_space_only, "   ", None);
+    parse_address_case!(test_parse_address_leading_zero_decimal, "00042", Some(42));
+    parse_address_case!(test_parse_address_hex_with_spaces, " 0x2a ", Some(42));
+    parse_address_case!(
+        test_parse_address_decimal_max_u32,
+        "4294967295",
+        Some(4294967295)
+    );
+    parse_address_case!(
+        test_parse_address_decimal_max_i32,
+        "2147483647",
+        Some(2147483647)
+    );
+    parse_address_case!(test_parse_address_hex_one, "0x1", Some(1));
+    parse_address_case!(test_parse_address_hex_f, "0xf", Some(15));
+    parse_address_case!(
+        test_parse_address_hex_deadbeef,
+        "0xdeadbeef",
+        Some(0xdeadbeef)
+    );
+    parse_address_case!(test_parse_address_decimal_small, "7", Some(7));
+    parse_address_case!(test_parse_address_decimal_big, "987654321", Some(987654321));
+    parse_address_case!(test_parse_address_non_numeric_suffix, "12abc", None);
+    parse_address_case!(test_parse_address_non_numeric_prefix, "abc12", None);
+    parse_address_case!(test_parse_address_hex_prefix_only, "0x", None);
+    parse_address_case!(test_parse_address_hex_prefix_only_upper, "0X", None);
+    parse_address_case!(test_parse_address_plus_sign, "+42", Some(42));
+    parse_address_case!(test_parse_address_tabs, "\t0x20\t", Some(32));
 
+    // -- Database management --
+    single_call_test!(
+        test_dispatch_open,
+        "open",
+        json!({"path": "/tmp/a.bin", "load_debug_info": true}),
+        "open",
+        "path",
+        json!("/tmp/a.bin")
+    );
+    single_call_test!(
+        test_dispatch_close,
+        "close",
+        json!({}),
+        "close",
+        "__dummy__",
+        json!(null)
+    );
+    single_call_test!(
+        test_dispatch_shutdown,
+        "shutdown",
+        json!({}),
+        "shutdown",
+        "__dummy__",
+        json!(null)
+    );
+    single_call_test!(
+        test_dispatch_load_debug_info,
+        "load_debug_info",
+        json!({"path": "/tmp/symbols.dSYM", "verbose": true}),
+        "load_debug_info",
+        "verbose",
+        json!(true)
+    );
+    single_call_test!(
+        test_dispatch_get_analysis_status,
+        "get_analysis_status",
+        json!({}),
+        "analysis_status",
+        "__dummy__",
+        json!(null)
+    );
+    single_call_test!(
+        test_dispatch_get_analysis_status_via_old_alias,
+        "analysis_status",
+        json!({}),
+        "analysis_status",
+        "__dummy__",
+        json!(null)
+    );
+    single_call_test!(
+        test_dispatch_get_database_info,
+        "get_database_info",
+        json!({}),
+        "idb_meta",
+        "__dummy__",
+        json!(null)
+    );
+    single_call_test!(
+        test_dispatch_get_database_info_via_old_alias,
+        "idb_meta",
+        json!({}),
+        "idb_meta",
+        "__dummy__",
+        json!(null)
+    );
+
+    // -- Functions --
+    single_call_test!(
+        test_dispatch_list_functions,
+        "list_functions",
+        json!({"offset": 3, "limit": 5, "filter": "sub_", "timeout_secs": 9}),
+        "list_functions",
+        "offset",
+        json!(3)
+    );
+    single_call_test!(
+        test_dispatch_list_functions_via_old_alias,
+        "list_funcs",
+        json!({"offset": 3}),
+        "list_functions",
+        "offset",
+        json!(3)
+    );
+    single_call_test!(
+        test_dispatch_get_function_by_name,
+        "get_function_by_name",
+        json!({"name": "entry"}),
+        "resolve_function",
+        "name",
+        json!("entry")
+    );
+    single_call_test!(
+        test_dispatch_get_function_by_name_via_old_alias,
+        "resolve_function",
+        json!({"name": "entry"}),
+        "resolve_function",
+        "name",
+        json!("entry")
+    );
+    single_call_test!(
+        test_dispatch_get_function_prototype,
+        "get_function_prototype",
+        json!({"address": "0x4010"}),
+        "get_function_prototype",
+        "addr",
+        json!(0x4010u64)
+    );
+    single_call_test!(
+        test_dispatch_get_function_prototype_by_name,
+        "get_function_prototype",
+        json!({"name": "foo"}),
+        "get_function_prototype",
+        "name",
+        json!("foo")
+    );
+    single_call_test!(
+        test_dispatch_get_function_at_address,
+        "get_function_at_address",
+        json!({"address": "0x5000", "offset": 7}),
+        "function_at",
+        "addr",
+        json!(0x5000u64)
+    );
+    single_call_test!(
+        test_dispatch_get_function_at_address_via_old_alias,
+        "function_at",
+        json!({"target_name": "foo", "offset": 2}),
+        "function_at",
+        "name",
+        json!("foo")
+    );
+    single_call_test!(
+        test_dispatch_batch_lookup_functions,
+        "batch_lookup_functions",
+        json!({"queries": ["a", "b"]}),
+        "lookup_funcs",
+        "queries",
+        json!(["a", "b"])
+    );
+    single_call_test!(
+        test_dispatch_batch_lookup_functions_via_old_alias,
+        "lookup_funcs",
+        json!({"queries": ["entry"]}),
+        "lookup_funcs",
+        "queries",
+        json!(["entry"])
+    );
+    single_call_test!(
+        test_dispatch_export_functions,
+        "export_functions",
+        json!({"offset": 10, "limit": 11}),
+        "export_funcs",
+        "limit",
+        json!(11)
+    );
+    single_call_test!(
+        test_dispatch_export_functions_via_old_alias,
+        "export_funcs",
+        json!({"offset": 1, "limit": 2}),
+        "export_funcs",
+        "offset",
+        json!(1)
+    );
+
+    // -- Disassembly / Decompilation --
+    single_call_test!(
+        test_dispatch_disassemble,
+        "disassemble",
+        json!({"address": "0x1000", "count": 5}),
+        "disasm",
+        "count",
+        json!(5)
+    );
+    single_call_test!(
+        test_dispatch_disassemble_via_old_alias,
+        "disasm",
+        json!({"address": "0x1000", "count": 5}),
+        "disasm",
+        "addr",
+        json!(0x1000u64)
+    );
     #[tokio::test]
-    async fn test_dispatch_get_bytes_hex_string_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "read_bytes", json!({"addr": "0x5e8", "size": 16}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls[0].0, "get_bytes");
-        assert_eq!(calls[0].1["addr"], 0x5e8u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_get_bytes_decimal_string_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "read_bytes", json!({"addr": "1512", "size": 8}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls[0].0, "get_bytes");
-        assert_eq!(calls[0].1["addr"], 1512u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_get_bytes_numeric_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "read_bytes", json!({"addr": 0x5e8u64, "size": 4}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls[0].0, "get_bytes");
-        assert_eq!(calls[0].1["addr"], 0x5e8u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_find_bytes_single_string_pattern() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "search_bytes", json!({"pattern": "FD 7B"}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "find_bytes");
-        assert_eq!(calls[0].1["pattern"], "FD 7B");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_find_bytes_array_pattern() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "search_bytes", json!({"pattern": ["FD 7B", "90 90"]}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
+    async fn test_dispatch_disassemble_multiple_addresses() {
+        let calls = run_dispatch(
+            "disassemble",
+            json!({"address": ["0x1000", "0x1008"], "count": 3}),
+        )
+        .await;
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, "find_bytes");
-        assert_eq!(calls[0].1["pattern"], "FD 7B");
-        assert_eq!(calls[1].0, "find_bytes");
-        assert_eq!(calls[1].1["pattern"], "90 90");
+        assert_eq!(calls[0].0, "disasm");
+        assert_eq!(calls[1].0, "disasm");
+        assert_eq!(calls[0].1["addr"], json!(0x1000u64));
+        assert_eq!(calls[1].1["addr"], json!(0x1008u64));
     }
-
+    single_call_test!(
+        test_dispatch_disassemble_function,
+        "disassemble_function",
+        json!({"name": "sub_main", "count": 9}),
+        "disasm_by_name",
+        "name",
+        json!("sub_main")
+    );
+    single_call_test!(
+        test_dispatch_disassemble_function_via_old_alias,
+        "disasm_by_name",
+        json!({"name": "sub_main", "count": 9}),
+        "disasm_by_name",
+        "count",
+        json!(9)
+    );
+    single_call_test!(
+        test_dispatch_disassemble_function_at,
+        "disassemble_function_at",
+        json!({"address": "0x7000", "count": 4}),
+        "disasm_function_at",
+        "addr",
+        json!(0x7000u64)
+    );
+    single_call_test!(
+        test_dispatch_disassemble_function_at_via_old_alias,
+        "disasm_function_at",
+        json!({"target_name": "sub_a", "count": 4}),
+        "disasm_function_at",
+        "name",
+        json!("sub_a")
+    );
+    single_call_test!(
+        test_dispatch_decompile_function,
+        "decompile_function",
+        json!({"address": "0x8000"}),
+        "decompile",
+        "addr",
+        json!(0x8000u64)
+    );
+    single_call_test!(
+        test_dispatch_decompile_function_via_old_alias,
+        "decompile",
+        json!({"address": "0x8000"}),
+        "decompile",
+        "addr",
+        json!(0x8000u64)
+    );
     #[tokio::test]
-    async fn test_dispatch_find_bytes_json_array_string_pattern() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "search_bytes", json!({"pattern": r#"["FD 7B"]"#}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "find_bytes");
-        assert_eq!(calls[0].1["pattern"], "FD 7B");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_find_insns_single_string_pattern() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "search_instructions", json!({"patterns": "bl"}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "find_insns");
-        assert_eq!(calls[0].1["patterns"], json!(["bl"]));
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_find_insns_array_pattern() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "search_instructions",
-            json!({"patterns": ["bl", "mov"]}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "find_insns");
-        assert_eq!(calls[0].1["patterns"], json!(["bl", "mov"]));
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_find_insns_json_array_string() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "search_instructions", json!({"patterns": r#"["bl"]"#}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "find_insns");
-        assert_eq!(calls[0].1["patterns"], json!(["bl"]));
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_decompile_hex_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "decompile_function", json!({"address": "0x100015a98"}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "decompile");
-        assert_eq!(calls[0].1["addr"], 0x100015a98u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_decompile_numeric_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "decompile_function", json!({"address": 4096u64}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "decompile");
-        assert_eq!(calls[0].1["addr"], 4096u64);
-    }
-
-    /// Regression test: decompile with array of hex-string addresses
-    /// Bug: before fix, passing ["0x100000328", "0x100000340"] was parsed as 0x0
-    /// because parse_address_value() on a JSON array returns None → unwrap_or(0).
-    /// Current code uses parse_address_values() which handles arrays correctly.
-    #[tokio::test]
-    async fn test_dispatch_decompile_array_hex_addresses() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "decompile_function",
-            json!({"address": ["0x100000328", "0x100000340"]}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        // Both addresses must be dispatched (not collapsed to 0x0)
+    async fn test_dispatch_decompile_function_multiple_addresses() {
+        let calls = run_dispatch("decompile_function", json!({"address": ["0x1", "0x2"]})).await;
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "decompile");
-        assert_eq!(calls[0].1["addr"], 0x100000328u64);
         assert_eq!(calls[1].0, "decompile");
-        assert_eq!(calls[1].1["addr"], 0x100000340u64);
     }
+    single_call_test!(
+        test_dispatch_get_pseudocode_at,
+        "get_pseudocode_at",
+        json!({"address": "0x9000"}),
+        "pseudocode_at",
+        "addr",
+        json!(0x9000u64)
+    );
+    single_call_test!(
+        test_dispatch_get_pseudocode_at_via_old_alias,
+        "pseudocode_at",
+        json!({"address": "0x9000", "end_address": "0x9010"}),
+        "pseudocode_at",
+        "end_addr",
+        json!(0x9010u64)
+    );
 
+    // -- Segments / Strings --
+    single_call_test!(
+        test_dispatch_list_segments,
+        "list_segments",
+        json!({}),
+        "segments",
+        "__dummy__",
+        json!(null)
+    );
+    single_call_test!(
+        test_dispatch_list_segments_via_old_alias,
+        "segments",
+        json!({}),
+        "segments",
+        "__dummy__",
+        json!(null)
+    );
+    single_call_test!(
+        test_dispatch_list_strings_without_query,
+        "list_strings",
+        json!({"offset": 2, "limit": 3}),
+        "strings",
+        "offset",
+        json!(2)
+    );
+    single_call_test!(
+        test_dispatch_list_strings_via_old_alias,
+        "strings",
+        json!({"offset": 4, "limit": 8}),
+        "strings",
+        "limit",
+        json!(8)
+    );
+    single_call_test!(
+        test_dispatch_list_strings_with_query,
+        "list_strings",
+        json!({"query": "malloc", "limit": 7}),
+        "find_string",
+        "query",
+        json!("malloc")
+    );
+    single_call_test!(
+        test_dispatch_list_strings_with_query_via_find_string_alias,
+        "find_string",
+        json!({"query": "malloc", "exact": true}),
+        "find_string",
+        "exact",
+        json!(true)
+    );
+    single_call_test!(
+        test_dispatch_list_strings_with_query_via_analyze_strings_alias,
+        "analyze_strings",
+        json!({"query": "malloc", "offset": 1}),
+        "find_string",
+        "query",
+        json!("malloc")
+    );
+    single_call_test!(
+        test_dispatch_get_xrefs_to_string,
+        "get_xrefs_to_string",
+        json!({"query": "str", "limit": 11}),
+        "xrefs_to_string",
+        "limit",
+        json!(11)
+    );
+    single_call_test!(
+        test_dispatch_get_xrefs_to_string_via_old_alias,
+        "xrefs_to_string",
+        json!({"query": "str", "max_xrefs": 5}),
+        "xrefs_to_string",
+        "max_xrefs",
+        json!(5)
+    );
+
+    // -- Types --
+    single_call_test!(
+        test_dispatch_list_local_types,
+        "list_local_types",
+        json!({"offset": 2, "limit": 12, "filter": "my_"}),
+        "local_types",
+        "filter",
+        json!("my_")
+    );
+    single_call_test!(
+        test_dispatch_list_local_types_via_old_alias,
+        "local_types",
+        json!({"offset": 2, "limit": 12}),
+        "local_types",
+        "offset",
+        json!(2)
+    );
+    single_call_test!(
+        test_dispatch_declare_c_type,
+        "declare_c_type",
+        json!({"decl": "typedef int T;", "replace": true}),
+        "declare_type",
+        "decl",
+        json!("typedef int T;")
+    );
+    single_call_test!(
+        test_dispatch_declare_c_type_via_old_alias,
+        "declare_type",
+        json!({"decl": "typedef int T2;", "replace": false}),
+        "declare_type",
+        "replace",
+        json!(false)
+    );
+    single_call_test!(
+        test_dispatch_apply_type,
+        "apply_type",
+        json!({"address": "0xa000", "decl": "int"}),
+        "apply_types",
+        "addr",
+        json!(0xa000u64)
+    );
+    single_call_test!(
+        test_dispatch_apply_type_via_old_alias,
+        "apply_types",
+        json!({"target_name": "glob", "decl": "char*"}),
+        "apply_types",
+        "name",
+        json!("glob")
+    );
+    single_call_test!(
+        test_dispatch_infer_type,
+        "infer_type",
+        json!({"address": "0xb000"}),
+        "infer_types",
+        "addr",
+        json!(0xb000u64)
+    );
+    single_call_test!(
+        test_dispatch_infer_type_via_old_alias,
+        "infer_types",
+        json!({"target_name": "g_var"}),
+        "infer_types",
+        "name",
+        json!("g_var")
+    );
+    single_call_test!(
+        test_dispatch_set_function_prototype,
+        "set_function_prototype",
+        json!({"address": "0xc000", "prototype": "int f(void);"}),
+        "set_function_prototype",
+        "prototype",
+        json!("int f(void);")
+    );
+    single_call_test!(
+        test_dispatch_set_function_prototype_by_name,
+        "set_function_prototype",
+        json!({"name": "f", "prototype": "void f(int);"}),
+        "set_function_prototype",
+        "name",
+        json!("f")
+    );
+    single_call_test!(
+        test_dispatch_rename_stack_variable,
+        "rename_stack_variable",
+        json!({"func_address": "0xd000", "name": "v1", "new_name": "arg1"}),
+        "rename_stack_variable",
+        "old_name",
+        json!("v1")
+    );
+    single_call_test!(
+        test_dispatch_rename_stack_variable_by_name,
+        "rename_stack_variable",
+        json!({"func_name": "foo", "name": "v2", "new_name": "len"}),
+        "rename_stack_variable",
+        "func_name",
+        json!("foo")
+    );
+    single_call_test!(
+        test_dispatch_set_stack_variable_type,
+        "set_stack_variable_type",
+        json!({"func_address": "0xd100", "name": "v1", "type_decl": "size_t"}),
+        "set_stack_variable_type",
+        "var_name",
+        json!("v1")
+    );
+    single_call_test!(
+        test_dispatch_set_stack_variable_type_by_name,
+        "set_stack_variable_type",
+        json!({"func_name": "foo", "name": "v3", "type_decl": "char*"}),
+        "set_stack_variable_type",
+        "func_name",
+        json!("foo")
+    );
+    single_call_test!(
+        test_dispatch_list_enums,
+        "list_enums",
+        json!({"filter": "E_", "offset": 1, "limit": 2}),
+        "list_enums",
+        "filter",
+        json!("E_")
+    );
+    single_call_test!(
+        test_dispatch_create_enum,
+        "create_enum",
+        json!({"decl": "enum E { A=1 };", "replace": true}),
+        "create_enum",
+        "replace",
+        json!(true)
+    );
+
+    // -- Address / Stack / Struct / Xref --
+    single_call_test!(
+        test_dispatch_get_address_info,
+        "get_address_info",
+        json!({"address": "0xe000", "offset": 4}),
+        "addr_info",
+        "addr",
+        json!(0xe000u64)
+    );
+    single_call_test!(
+        test_dispatch_get_address_info_via_old_alias,
+        "addr_info",
+        json!({"target_name": "foo", "offset": 4}),
+        "addr_info",
+        "name",
+        json!("foo")
+    );
+    single_call_test!(
+        test_dispatch_create_stack_variable,
+        "create_stack_variable",
+        json!({"address": "0xf000", "offset": -16, "decl": "int x;"}),
+        "declare_stack",
+        "offset",
+        json!(-16)
+    );
+    single_call_test!(
+        test_dispatch_create_stack_variable_via_old_alias,
+        "declare_stack",
+        json!({"target_name": "foo", "offset": -8, "decl": "char c;"}),
+        "declare_stack",
+        "name",
+        json!("foo")
+    );
+    single_call_test!(
+        test_dispatch_delete_stack_variable,
+        "delete_stack_variable",
+        json!({"address": "0xf010", "offset": -16}),
+        "delete_stack",
+        "addr",
+        json!(0xf010u64)
+    );
+    single_call_test!(
+        test_dispatch_delete_stack_variable_via_old_alias,
+        "delete_stack",
+        json!({"target_name": "foo", "offset": -8}),
+        "delete_stack",
+        "name",
+        json!("foo")
+    );
+    single_call_test!(
+        test_dispatch_get_stack_frame,
+        "get_stack_frame",
+        json!({"address": "0x11000"}),
+        "stack_frame",
+        "addr",
+        json!(0x11000u64)
+    );
+    single_call_test!(
+        test_dispatch_get_stack_frame_via_old_alias,
+        "stack_frame",
+        json!({"address": "0x11000"}),
+        "stack_frame",
+        "addr",
+        json!(0x11000u64)
+    );
+    single_call_test!(
+        test_dispatch_list_structs,
+        "list_structs",
+        json!({"offset": 1, "limit": 10}),
+        "structs",
+        "limit",
+        json!(10)
+    );
+    single_call_test!(
+        test_dispatch_list_structs_via_old_alias,
+        "structs",
+        json!({"offset": 2, "limit": 3}),
+        "structs",
+        "offset",
+        json!(2)
+    );
+    single_call_test!(
+        test_dispatch_get_struct_info,
+        "get_struct_info",
+        json!({"name": "MyStruct"}),
+        "struct_info",
+        "name",
+        json!("MyStruct")
+    );
+    single_call_test!(
+        test_dispatch_get_struct_info_via_old_alias,
+        "struct_info",
+        json!({"ordinal": 3}),
+        "struct_info",
+        "ordinal",
+        json!(3)
+    );
+    single_call_test!(
+        test_dispatch_read_struct_at_address,
+        "read_struct_at_address",
+        json!({"address": "0x12000", "name": "MyStruct"}),
+        "read_struct",
+        "addr",
+        json!(0x12000u64)
+    );
+    single_call_test!(
+        test_dispatch_read_struct_at_address_via_old_alias,
+        "read_struct",
+        json!({"address": "0x12010", "ordinal": 2}),
+        "read_struct",
+        "ordinal",
+        json!(2)
+    );
+    single_call_test!(
+        test_dispatch_get_xrefs_to,
+        "get_xrefs_to",
+        json!({"address": "0x13000"}),
+        "xrefs_to",
+        "addr",
+        json!(0x13000u64)
+    );
+    single_call_test!(
+        test_dispatch_get_xrefs_to_via_old_alias,
+        "xrefs_to",
+        json!({"address": "0x13000"}),
+        "xrefs_to",
+        "addr",
+        json!(0x13000u64)
+    );
+    single_call_test!(
+        test_dispatch_get_xrefs_from,
+        "get_xrefs_from",
+        json!({"address": "0x13010"}),
+        "xrefs_from",
+        "addr",
+        json!(0x13010u64)
+    );
+    single_call_test!(
+        test_dispatch_get_xrefs_from_via_old_alias,
+        "xrefs_from",
+        json!({"address": "0x13010"}),
+        "xrefs_from",
+        "addr",
+        json!(0x13010u64)
+    );
+    single_call_test!(
+        test_dispatch_get_xrefs_to_struct_field,
+        "get_xrefs_to_struct_field",
+        json!({"name": "MyStruct", "member_name": "field", "limit": 50}),
+        "xrefs_to_field",
+        "member_name",
+        json!("field")
+    );
+    single_call_test!(
+        test_dispatch_get_xrefs_to_struct_field_via_old_alias,
+        "xrefs_to_field",
+        json!({"ordinal": 1, "member_index": 2}),
+        "xrefs_to_field",
+        "member_index",
+        json!(2)
+    );
+
+    // -- Imports / Exports / Entry --
+    single_call_test!(
+        test_dispatch_list_imports,
+        "list_imports",
+        json!({"offset": 5, "limit": 6}),
+        "imports",
+        "offset",
+        json!(5)
+    );
+    single_call_test!(
+        test_dispatch_list_imports_via_old_alias,
+        "imports",
+        json!({"offset": 1, "limit": 2}),
+        "imports",
+        "limit",
+        json!(2)
+    );
+    single_call_test!(
+        test_dispatch_list_exports,
+        "list_exports",
+        json!({"offset": 7, "limit": 8}),
+        "exports",
+        "limit",
+        json!(8)
+    );
+    single_call_test!(
+        test_dispatch_list_exports_via_old_alias,
+        "exports",
+        json!({"offset": 7, "limit": 8}),
+        "exports",
+        "offset",
+        json!(7)
+    );
+    // -- Memory --
+    single_call_test!(
+        test_dispatch_read_bytes,
+        "read_bytes",
+        json!({"address": "0x14000", "size": 16}),
+        "get_bytes",
+        "addr",
+        json!(0x14000u64)
+    );
+    single_call_test!(
+        test_dispatch_read_bytes_via_old_alias,
+        "get_bytes",
+        json!({"address": "0x14000", "size": 8}),
+        "get_bytes",
+        "size",
+        json!(8)
+    );
+    single_call_test!(
+        test_dispatch_read_string,
+        "read_string",
+        json!({"address": "0x14100", "max_len": 32}),
+        "get_string",
+        "max_len",
+        json!(32)
+    );
+    single_call_test!(
+        test_dispatch_read_string_via_old_alias,
+        "get_string",
+        json!({"address": "0x14100", "max_len": 12}),
+        "get_string",
+        "addr",
+        json!(0x14100u64)
+    );
+    single_call_test!(
+        test_dispatch_read_global_variable,
+        "read_global_variable",
+        json!({"query": "gCounter"}),
+        "get_global_value",
+        "query",
+        json!("gCounter")
+    );
+    single_call_test!(
+        test_dispatch_read_global_variable_via_old_alias,
+        "get_global_value",
+        json!({"query": "gCounter"}),
+        "get_global_value",
+        "query",
+        json!("gCounter")
+    );
+    single_call_test!(
+        test_dispatch_read_int,
+        "read_int",
+        json!({"address": "0x15000", "size": 8}),
+        "read_int",
+        "size",
+        json!(8)
+    );
+
+    // -- Annotations / Rename --
+    single_call_test!(
+        test_dispatch_set_comment,
+        "set_comment",
+        json!({"address": "0x16000", "comment": "note"}),
+        "set_comments",
+        "comment",
+        json!("note")
+    );
+    single_call_test!(
+        test_dispatch_set_comment_via_old_alias,
+        "set_comments",
+        json!({"target_name": "foo", "comment": "note"}),
+        "set_comments",
+        "name",
+        json!("foo")
+    );
+    single_call_test!(
+        test_dispatch_set_function_comment,
+        "set_function_comment",
+        json!({"address": "0x16010", "comment": "fn note"}),
+        "set_function_comment",
+        "comment",
+        json!("fn note")
+    );
+    single_call_test!(
+        test_dispatch_rename_symbol,
+        "rename_symbol",
+        json!({"address": "0x17000", "name": "new_name"}),
+        "rename",
+        "new_name",
+        json!("new_name")
+    );
+    single_call_test!(
+        test_dispatch_rename_symbol_via_old_alias,
+        "rename",
+        json!({"current_name": "old", "name": "new"}),
+        "rename",
+        "current_name",
+        json!("old")
+    );
+    single_call_test!(
+        test_dispatch_batch_rename,
+        "batch_rename",
+        json!({"renames": [{"address": "0x1000", "new_name": "a"}]}),
+        "batch_rename",
+        "entries",
+        json!([[0x1000u64, null, "a"]])
+    );
+    single_call_test!(
+        test_dispatch_rename_local_variable,
+        "rename_local_variable",
+        json!({"func_address": "0x18000", "lvar_name": "v1", "new_name": "idx"}),
+        "rename_lvar",
+        "new_name",
+        json!("idx")
+    );
+    single_call_test!(
+        test_dispatch_rename_local_variable_via_old_alias,
+        "rename_lvar",
+        json!({"func_address": "0x18000", "lvar_name": "v1", "new_name": "idx"}),
+        "rename_lvar",
+        "func_addr",
+        json!(0x18000u64)
+    );
+    single_call_test!(
+        test_dispatch_set_local_variable_type,
+        "set_local_variable_type",
+        json!({"func_address": "0x18010", "lvar_name": "v2", "type_str": "u32"}),
+        "set_lvar_type",
+        "type_str",
+        json!("u32")
+    );
+    single_call_test!(
+        test_dispatch_set_local_variable_type_via_old_alias,
+        "set_lvar_type",
+        json!({"func_address": "0x18010", "lvar_name": "v2", "type_str": "u32"}),
+        "set_lvar_type",
+        "func_addr",
+        json!(0x18010u64)
+    );
+    single_call_test!(
+        test_dispatch_set_decompiler_comment,
+        "set_decompiler_comment",
+        json!({"func_address": "0x18020", "address": "0x18024", "comment": "c"}),
+        "set_decompiler_comment",
+        "itp",
+        json!(69)
+    );
+
+    // -- Patching --
+    single_call_test!(
+        test_dispatch_patch_bytes,
+        "patch_bytes",
+        json!({"address": "0x19000", "bytes": [144, 145]}),
+        "patch_bytes",
+        "bytes",
+        json!([144, 145])
+    );
+    single_call_test!(
+        test_dispatch_patch_bytes_via_old_alias,
+        "patch",
+        json!({"address": "0x19000", "bytes": "90 91"}),
+        "patch_bytes",
+        "addr",
+        json!(0x19000u64)
+    );
+    single_call_test!(
+        test_dispatch_patch_assembly,
+        "patch_assembly",
+        json!({"address": "0x19010", "line": "nop"}),
+        "patch_asm",
+        "line",
+        json!("nop")
+    );
+    single_call_test!(
+        test_dispatch_patch_assembly_via_old_alias,
+        "patch_asm",
+        json!({"address": "0x19010", "line": "ret"}),
+        "patch_asm",
+        "line",
+        json!("ret")
+    );
+
+    // -- Control / Call flow --
+    single_call_test!(
+        test_dispatch_get_basic_blocks,
+        "get_basic_blocks",
+        json!({"address": "0x1a000"}),
+        "basic_blocks",
+        "addr",
+        json!(0x1a000u64)
+    );
+    single_call_test!(
+        test_dispatch_get_basic_blocks_via_old_alias,
+        "basic_blocks",
+        json!({"address": "0x1a000"}),
+        "basic_blocks",
+        "addr",
+        json!(0x1a000u64)
+    );
+    single_call_test!(
+        test_dispatch_get_callees,
+        "get_callees",
+        json!({"address": "0x1a010"}),
+        "callees",
+        "addr",
+        json!(0x1a010u64)
+    );
+    single_call_test!(
+        test_dispatch_get_callees_via_old_alias,
+        "callees",
+        json!({"address": "0x1a010"}),
+        "callees",
+        "addr",
+        json!(0x1a010u64)
+    );
+    single_call_test!(
+        test_dispatch_get_callers,
+        "get_callers",
+        json!({"address": "0x1a020"}),
+        "callers",
+        "addr",
+        json!(0x1a020u64)
+    );
+    single_call_test!(
+        test_dispatch_get_callers_via_old_alias,
+        "callers",
+        json!({"address": "0x1a020"}),
+        "callers",
+        "addr",
+        json!(0x1a020u64)
+    );
+    single_call_test!(
+        test_dispatch_build_callgraph,
+        "build_callgraph",
+        json!({"roots": ["0x1a030"], "max_depth": 3, "max_nodes": 7}),
+        "callgraph",
+        "max_depth",
+        json!(3)
+    );
+    single_call_test!(
+        test_dispatch_build_callgraph_via_old_alias,
+        "callgraph",
+        json!({"roots": "0x1a030", "max_depth": 2}),
+        "callgraph",
+        "addr",
+        json!(0x1a030u64)
+    );
+    single_call_test!(
+        test_dispatch_find_control_flow_paths,
+        "find_control_flow_paths",
+        json!({"start": "0x1a040", "end": "0x1a050", "max_paths": 2}),
+        "find_paths",
+        "max_paths",
+        json!(2)
+    );
+    single_call_test!(
+        test_dispatch_find_control_flow_paths_via_old_alias,
+        "find_paths",
+        json!({"start": "0x1a040", "end": "0x1a050", "max_depth": 4}),
+        "find_paths",
+        "max_depth",
+        json!(4)
+    );
+    single_call_test!(
+        test_dispatch_build_xref_matrix,
+        "build_xref_matrix",
+        json!({"addrs": ["0x1a060", "0x1a070"]}),
+        "xref_matrix",
+        "addrs",
+        json!([0x1a060u64, 0x1a070u64])
+    );
+    single_call_test!(
+        test_dispatch_build_xref_matrix_via_old_alias,
+        "xref_matrix",
+        json!({"addrs": ["0x1a080"]}),
+        "xref_matrix",
+        "addrs",
+        json!([0x1a080u64])
+    );
+
+    // -- Globals / Analysis / Search / Script --
+    single_call_test!(
+        test_dispatch_list_globals,
+        "list_globals",
+        json!({"query": "g_", "limit": 20}),
+        "list_globals",
+        "limit",
+        json!(20)
+    );
+    single_call_test!(
+        test_dispatch_run_auto_analysis,
+        "run_auto_analysis",
+        json!({"timeout_secs": 10}),
+        "analyze_funcs",
+        "timeout_secs",
+        json!(10)
+    );
+    single_call_test!(
+        test_dispatch_run_auto_analysis_via_old_alias,
+        "analyze_funcs",
+        json!({"timeout_secs": 3}),
+        "analyze_funcs",
+        "timeout_secs",
+        json!(3)
+    );
+    single_call_test!(
+        test_dispatch_search_bytes_single_pattern,
+        "search_bytes",
+        json!({"patterns": "FD 7B", "limit": 11}),
+        "find_bytes",
+        "pattern",
+        json!("FD 7B")
+    );
+    single_call_test!(
+        test_dispatch_search_bytes_via_old_alias,
+        "find_bytes",
+        json!({"patterns": "AA BB"}),
+        "find_bytes",
+        "pattern",
+        json!("AA BB")
+    );
     #[tokio::test]
-    async fn test_dispatch_xrefs_to_hex_address() {
+    async fn test_dispatch_search_bytes_multiple_patterns() {
+        let calls = run_dispatch("search_bytes", json!({"patterns": ["11 22", "33 44"]})).await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "find_bytes");
+        assert_eq!(calls[1].0, "find_bytes");
+    }
+    #[tokio::test]
+    async fn test_dispatch_search_bytes_empty_patterns() {
         let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "get_xrefs_to", json!({"address": "0x1000"}));
+        let req = RpcRequest::new("1", "search_bytes", json!({"patterns": null}));
+        let v = dispatch_rpc(&req, &mock).await.unwrap();
+        assert_eq!(v, json!({"matches": [], "count": 0}));
+        assert!(mock.calls.lock().unwrap().is_empty());
+    }
+    single_call_test!(
+        test_dispatch_search_text,
+        "search_text",
+        json!({"text": "malloc", "max_results": 9}),
+        "search_text",
+        "text",
+        json!("malloc")
+    );
+    single_call_test!(
+        test_dispatch_search_text_via_old_alias,
+        "search",
+        json!({"text": "free", "max_results": 5}),
+        "search_text",
+        "max_results",
+        json!(5)
+    );
+    single_call_test!(
+        test_dispatch_search_imm,
+        "search_imm",
+        json!({"imm": 123, "max_results": 4}),
+        "search_imm",
+        "imm",
+        json!(123)
+    );
+    single_call_test!(
+        test_dispatch_search_instructions,
+        "search_instructions",
+        json!({"patterns": ["bl", "ret"]}),
+        "find_insns",
+        "patterns",
+        json!(["bl", "ret"])
+    );
+    single_call_test!(
+        test_dispatch_search_instructions_via_old_alias,
+        "find_insns",
+        json!({"patterns": "mov"}),
+        "find_insns",
+        "patterns",
+        json!(["mov"])
+    );
+    single_call_test!(
+        test_dispatch_search_instruction_operands,
+        "search_instruction_operands",
+        json!({"patterns": ["x0"]}),
+        "find_insn_operands",
+        "patterns",
+        json!(["x0"])
+    );
+    single_call_test!(
+        test_dispatch_search_instruction_operands_via_old_alias,
+        "find_insn_operands",
+        json!({"patterns": "x1"}),
+        "find_insn_operands",
+        "patterns",
+        json!(["x1"])
+    );
+    single_call_test!(
+        test_dispatch_run_script,
+        "run_script",
+        json!({"code": "print('ok')", "timeout_secs": 6}),
+        "run_script",
+        "code",
+        json!("print('ok')")
+    );
 
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
+    // -- Compound tools --
+    #[tokio::test]
+    async fn test_dispatch_batch_decompile() {
+        let calls = run_dispatch(
+            "batch_decompile",
+            json!({"addresses": ["0x2000", "0x2008"]}),
+        )
+        .await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "decompile");
+        assert_eq!(calls[1].0, "decompile");
+    }
+    #[tokio::test]
+    async fn test_dispatch_batch_decompile_single_item() {
+        let calls = run_dispatch("batch_decompile", json!({"addresses": "0x2000"})).await;
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "xrefs_to");
-        assert_eq!(calls[0].1["addr"], 0x1000u64);
+        assert_eq!(calls[0].0, "decompile");
+    }
+    #[tokio::test]
+    async fn test_dispatch_search_pseudocode() {
+        let calls = run_dispatch(
+            "search_pseudocode",
+            json!({"pattern": "malloc", "limit": 5}),
+        )
+        .await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "list_functions");
+    }
+    #[tokio::test]
+    async fn test_dispatch_scan_memory_table() {
+        let calls = run_dispatch(
+            "scan_memory_table",
+            json!({"base_address": "0x3000", "stride": 8, "count": 3}),
+        )
+        .await;
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0, "get_bytes");
+        assert_eq!(calls[2].1["addr"], json!(0x3010u64));
+    }
+    #[tokio::test]
+    async fn test_dispatch_scan_memory_table_via_old_alias() {
+        let calls = run_dispatch("table_scan", json!({"base_address": "0x3100", "count": 2})).await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "get_bytes");
+    }
+    #[tokio::test]
+    async fn test_dispatch_diff_pseudocode() {
+        let calls = run_dispatch(
+            "diff_pseudocode",
+            json!({"addr1": "0x4000", "addr2": "0x4010"}),
+        )
+        .await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "decompile");
+        assert_eq!(calls[1].0, "decompile");
+    }
+    #[tokio::test]
+    async fn test_dispatch_diff_pseudocode_via_old_alias() {
+        let calls = run_dispatch(
+            "diff_functions",
+            json!({"addr1": "0x5000", "addr2": "0x5010"}),
+        )
+        .await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "decompile");
+        assert_eq!(calls[1].0, "decompile");
     }
 
+    // -- Alias extra coverage --
+    single_call_test!(
+        test_dispatch_alias_list_strings_find_string,
+        "find_string",
+        json!({"query": "x"}),
+        "find_string",
+        "query",
+        json!("x")
+    );
+    single_call_test!(
+        test_dispatch_alias_list_strings_strings,
+        "strings",
+        json!({}),
+        "strings",
+        "offset",
+        json!(0)
+    );
+    single_call_test!(
+        test_dispatch_alias_export_funcs,
+        "export_funcs",
+        json!({}),
+        "export_funcs",
+        "limit",
+        json!(100)
+    );
+    single_call_test!(
+        test_dispatch_alias_lookup_funcs,
+        "lookup_funcs",
+        json!({"queries": ["q"]}),
+        "lookup_funcs",
+        "queries",
+        json!(["q"])
+    );
+    single_call_test!(
+        test_dispatch_alias_function_at,
+        "function_at",
+        json!({"address": "0x10"}),
+        "function_at",
+        "addr",
+        json!(0x10u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_disasm,
+        "disasm",
+        json!({"address": "0x10"}),
+        "disasm",
+        "addr",
+        json!(0x10u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_disasm_by_name,
+        "disasm_by_name",
+        json!({"name": "f"}),
+        "disasm_by_name",
+        "name",
+        json!("f")
+    );
+    single_call_test!(
+        test_dispatch_alias_disasm_function_at,
+        "disasm_function_at",
+        json!({"address": "0x10"}),
+        "disasm_function_at",
+        "addr",
+        json!(0x10u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_decompile,
+        "decompile",
+        json!({"address": "0x10"}),
+        "decompile",
+        "addr",
+        json!(0x10u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_pseudocode_at,
+        "pseudocode_at",
+        json!({"address": "0x10"}),
+        "pseudocode_at",
+        "addr",
+        json!(0x10u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_xrefs_to_string,
+        "xrefs_to_string",
+        json!({"query": "q"}),
+        "xrefs_to_string",
+        "query",
+        json!("q")
+    );
+    single_call_test!(
+        test_dispatch_alias_local_types,
+        "local_types",
+        json!({}),
+        "local_types",
+        "limit",
+        json!(100)
+    );
+    single_call_test!(
+        test_dispatch_alias_declare_type,
+        "declare_type",
+        json!({"decl": "int x;"}),
+        "declare_type",
+        "decl",
+        json!("int x;")
+    );
+    single_call_test!(
+        test_dispatch_alias_apply_types,
+        "apply_types",
+        json!({"address": "0x22"}),
+        "apply_types",
+        "addr",
+        json!(0x22u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_infer_types,
+        "infer_types",
+        json!({"address": "0x23"}),
+        "infer_types",
+        "addr",
+        json!(0x23u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_addr_info,
+        "addr_info",
+        json!({"address": "0x24"}),
+        "addr_info",
+        "addr",
+        json!(0x24u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_declare_stack,
+        "declare_stack",
+        json!({"address": "0x25", "offset": -4, "decl": "int x;"}),
+        "declare_stack",
+        "addr",
+        json!(0x25u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_delete_stack,
+        "delete_stack",
+        json!({"address": "0x26"}),
+        "delete_stack",
+        "addr",
+        json!(0x26u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_stack_frame,
+        "stack_frame",
+        json!({"address": "0x27"}),
+        "stack_frame",
+        "addr",
+        json!(0x27u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_structs,
+        "structs",
+        json!({}),
+        "structs",
+        "offset",
+        json!(0)
+    );
+    single_call_test!(
+        test_dispatch_alias_struct_info,
+        "struct_info",
+        json!({"name": "S"}),
+        "struct_info",
+        "name",
+        json!("S")
+    );
+    single_call_test!(
+        test_dispatch_alias_read_struct,
+        "read_struct",
+        json!({"address": "0x28", "name": "S"}),
+        "read_struct",
+        "addr",
+        json!(0x28u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_xrefs_to,
+        "xrefs_to",
+        json!({"address": "0x29"}),
+        "xrefs_to",
+        "addr",
+        json!(0x29u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_xrefs_from,
+        "xrefs_from",
+        json!({"address": "0x30"}),
+        "xrefs_from",
+        "addr",
+        json!(0x30u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_xrefs_to_field,
+        "xrefs_to_field",
+        json!({"name": "S"}),
+        "xrefs_to_field",
+        "name",
+        json!("S")
+    );
+    single_call_test!(
+        test_dispatch_alias_imports,
+        "imports",
+        json!({}),
+        "imports",
+        "limit",
+        json!(100)
+    );
+    single_call_test!(
+        test_dispatch_alias_exports,
+        "exports",
+        json!({}),
+        "exports",
+        "limit",
+        json!(100)
+    );
+    single_call_test!(
+        test_dispatch_alias_get_bytes,
+        "get_bytes",
+        json!({"address": "0x31"}),
+        "get_bytes",
+        "addr",
+        json!(0x31u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_get_string,
+        "get_string",
+        json!({"address": "0x32"}),
+        "get_string",
+        "addr",
+        json!(0x32u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_get_global_value,
+        "get_global_value",
+        json!({"query": "g"}),
+        "get_global_value",
+        "query",
+        json!("g")
+    );
+    single_call_test!(
+        test_dispatch_alias_set_comments,
+        "set_comments",
+        json!({"address": "0x33", "comment": "c"}),
+        "set_comments",
+        "addr",
+        json!(0x33u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_rename,
+        "rename",
+        json!({"address": "0x34", "name": "n"}),
+        "rename",
+        "addr",
+        json!(0x34u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_rename_lvar,
+        "rename_lvar",
+        json!({"func_address": "0x35", "lvar_name": "v", "new_name": "n"}),
+        "rename_lvar",
+        "func_addr",
+        json!(0x35u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_set_lvar_type,
+        "set_lvar_type",
+        json!({"func_address": "0x36", "lvar_name": "v", "type_str": "i32"}),
+        "set_lvar_type",
+        "func_addr",
+        json!(0x36u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_patch,
+        "patch",
+        json!({"address": "0x37", "bytes": [1]}),
+        "patch_bytes",
+        "addr",
+        json!(0x37u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_patch_asm,
+        "patch_asm",
+        json!({"address": "0x38", "line": "nop"}),
+        "patch_asm",
+        "addr",
+        json!(0x38u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_basic_blocks,
+        "basic_blocks",
+        json!({"address": "0x39"}),
+        "basic_blocks",
+        "addr",
+        json!(0x39u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_callees,
+        "callees",
+        json!({"address": "0x40"}),
+        "callees",
+        "addr",
+        json!(0x40u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_callers,
+        "callers",
+        json!({"address": "0x41"}),
+        "callers",
+        "addr",
+        json!(0x41u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_callgraph,
+        "callgraph",
+        json!({"roots": ["0x42"]}),
+        "callgraph",
+        "addr",
+        json!(0x42u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_find_paths,
+        "find_paths",
+        json!({"start": "0x43", "end": "0x44"}),
+        "find_paths",
+        "start",
+        json!(0x43u64)
+    );
+    single_call_test!(
+        test_dispatch_alias_xref_matrix,
+        "xref_matrix",
+        json!({"addrs": ["0x45"]}),
+        "xref_matrix",
+        "addrs",
+        json!([0x45u64])
+    );
+    single_call_test!(
+        test_dispatch_alias_analyze_funcs,
+        "analyze_funcs",
+        json!({}),
+        "analyze_funcs",
+        "timeout_secs",
+        json!(null)
+    );
+    single_call_test!(
+        test_dispatch_alias_find_bytes,
+        "find_bytes",
+        json!({"patterns": "aa"}),
+        "find_bytes",
+        "pattern",
+        json!("aa")
+    );
+    single_call_test!(
+        test_dispatch_alias_search_text,
+        "search",
+        json!({"text": "aa"}),
+        "search_text",
+        "text",
+        json!("aa")
+    );
+    single_call_test!(
+        test_dispatch_alias_find_insns,
+        "find_insns",
+        json!({"patterns": "aa"}),
+        "find_insns",
+        "patterns",
+        json!(["aa"])
+    );
+    single_call_test!(
+        test_dispatch_alias_find_insn_operands,
+        "find_insn_operands",
+        json!({"patterns": "aa"}),
+        "find_insn_operands",
+        "patterns",
+        json!(["aa"])
+    );
+
+    // -- Unknown --
     #[tokio::test]
     async fn test_dispatch_unknown_method_returns_error() {
         let mock = MockWorker::new();
         let req = RpcRequest::new("1", "nonexistent_tool", json!({}));
-
         let err = dispatch_rpc(&req, &mock).await.unwrap_err();
-
         match err {
             ToolError::InvalidToolName(msg) => {
-                assert!(msg.contains("Unknown method: nonexistent_tool"))
+                assert!(msg.contains("Unknown method: nonexistent_tool"));
             }
             other => panic!("expected InvalidToolName, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_alias_resolution() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "disasm", json!({"address": "0x1000", "count": 5}));
-
-        let result = dispatch_rpc(&req, &mock).await;
-        assert!(
-            result.is_ok(),
-            "Old alias 'disasm' should dispatch correctly"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_find_bytes_empty_pattern_returns_empty() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "search_bytes", json!({"pattern": null}));
-
-        let result = dispatch_rpc(&req, &mock).await.unwrap();
-
-        assert_eq!(result, json!({"matches": [], "count": 0}));
-        let calls = mock.calls.lock().unwrap();
-        assert!(calls.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_get_bytes_default_size() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "read_bytes", json!({"addr": "0x1000"}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "get_bytes");
-        assert_eq!(calls[0].1["addr"], 0x1000u64);
-        assert_eq!(calls[0].1["size"], 16);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_batch_decompile_array_addresses() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "batch_decompile",
-            json!({"addresses": ["0x1000", "0x2000"]}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, "decompile");
-        assert_eq!(calls[0].1["addr"], 0x1000u64);
-        assert_eq!(calls[1].0, "decompile");
-        assert_eq!(calls[1].1["addr"], 0x2000u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_batch_decompile_single_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "batch_decompile", json!({"addresses": "0x3000"}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "decompile");
-        assert_eq!(calls[0].1["addr"], 0x3000u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_batch_decompile_json_array_string_addresses() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "batch_decompile",
-            json!({"addresses": r#"["0x4000","0x5000"]"#}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, "decompile");
-        assert_eq!(calls[0].1["addr"], 0x4000u64);
-        assert_eq!(calls[1].0, "decompile");
-        assert_eq!(calls[1].1["addr"], 0x5000u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_search_pseudocode_pattern() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "search_pseudocode", json!({"pattern": "malloc"}));
-
-        let result = dispatch_rpc(&req, &mock).await.unwrap();
-
-        assert_eq!(result["pattern"], "malloc");
-        assert_eq!(result["matches"], json!([]));
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "list_functions");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_search_pseudocode_default_limit() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "search_pseudocode", json!({"pattern": "foo"}));
-
-        let result = dispatch_rpc(&req, &mock).await.unwrap();
-
-        assert_eq!(result["total_searched"], 0);
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "list_functions");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_search_pseudocode_timeout_secs() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "search_pseudocode",
-            json!({"pattern": "bar", "timeout_secs": 7u64}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "list_functions");
-        assert_eq!(calls[0].1["timeout_secs"], 7u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_table_scan_hex_base_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "table_scan",
-            json!({"base_address": "0x1000", "count": 1}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "get_bytes");
-        assert_eq!(calls[0].1["addr"], 0x1000u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_table_scan_default_stride_count() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "scan_memory_table", json!({"base_address": 0x2000u64}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 16);
-        assert_eq!(calls[0].0, "get_bytes");
-        assert_eq!(calls[0].1["addr"], 0x2000u64);
-        assert_eq!(calls[1].1["addr"], 0x2008u64);
-        assert_eq!(calls[0].1["size"], 8);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_diff_functions_hex_addresses() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "diff_functions",
-            json!({"addr1": "0x1000", "addr2": "0x2000"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, "decompile");
-        assert_eq!(calls[0].1["addr"], 0x1000u64);
-        assert_eq!(calls[1].0, "decompile");
-        assert_eq!(calls[1].1["addr"], 0x2000u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_diff_functions_numeric_addresses() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "diff_functions",
-            json!({"addr1": 4096u64, "addr2": 8192u64}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, "decompile");
-        assert_eq!(calls[0].1["addr"], 4096u64);
-        assert_eq!(calls[1].0, "decompile");
-        assert_eq!(calls[1].1["addr"], 8192u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_rename_by_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "rename",
-            json!({"address": "0x1000", "name": "my_func"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "rename");
-        assert_eq!(calls[0].1["addr"], 0x1000u64);
-        assert_eq!(calls[0].1["new_name"], "my_func");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_rename_by_current_name() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "rename",
-            json!({"current_name": "old_func", "name": "new_func"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "rename");
-        assert_eq!(calls[0].1["current_name"], "old_func");
-        assert_eq!(calls[0].1["new_name"], "new_func");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_set_comments_by_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "set_comments",
-            json!({"address": "0x2000", "comment": "hello"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "set_comments");
-        assert_eq!(calls[0].1["addr"], 0x2000u64);
-        assert_eq!(calls[0].1["comment"], "hello");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_set_comments_by_target_name() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "set_comments",
-            json!({"target_name": "my_func", "comment": "world"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "set_comments");
-        assert_eq!(calls[0].1["name"], "my_func");
-        assert_eq!(calls[0].1["comment"], "world");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_patch_bytes_hex_string() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "patch_bytes",
-            json!({"address": "0x3000", "bytes": "90 90 90"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "patch_bytes");
-        assert_eq!(calls[0].1["addr"], 0x3000u64);
-        assert_eq!(calls[0].1["bytes"], json!([0x90u8, 0x90u8, 0x90u8]));
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_patch_bytes_array() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "patch_bytes",
-            json!({"address": 0x3000u64, "bytes": [144, 144]}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "patch_bytes");
-        assert_eq!(calls[0].1["addr"], 0x3000u64);
-        assert_eq!(calls[0].1["bytes"], json!([144u8, 144u8]));
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_patch_asm_by_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "patch_asm",
-            json!({"address": "0x4000", "line": "nop"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "patch_asm");
-        assert_eq!(calls[0].1["addr"], 0x4000u64);
-        assert_eq!(calls[0].1["line"], "nop");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_declare_type() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "declare_type",
-            json!({"decl": "typedef int MyInt;", "replace": true}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "declare_type");
-        assert_eq!(calls[0].1["decl"], "typedef int MyInt;");
-        assert_eq!(calls[0].1["replace"], true);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_apply_types_by_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "apply_types",
-            json!({"address": "0x5000", "decl": "void foo(void);"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "apply_types");
-        assert_eq!(calls[0].1["addr"], 0x5000u64);
-        assert_eq!(calls[0].1["decl"], "void foo(void);");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_infer_types_by_address() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "infer_type", json!({"address": "0x6000"}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "infer_types");
-        assert_eq!(calls[0].1["addr"], 0x6000u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_declare_stack() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "declare_stack",
-            json!({"address": "0x7000", "offset": -8i64, "decl": "int* p;"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "declare_stack");
-        assert_eq!(calls[0].1["addr"], 0x7000u64);
-        assert_eq!(calls[0].1["offset"], -8i64);
-        assert_eq!(calls[0].1["decl"], "int* p;");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_delete_stack() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "delete_stack",
-            json!({"address": "0x7000", "offset": -8i64}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "delete_stack");
-        assert_eq!(calls[0].1["addr"], 0x7000u64);
-        assert_eq!(calls[0].1["offset"], -8i64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_basic_blocks() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "get_basic_blocks", json!({"address": "0x1000"}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "basic_blocks");
-        assert_eq!(calls[0].1["addr"], 0x1000u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_callers() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "get_callers", json!({"address": "0x1000"}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "callers");
-        assert_eq!(calls[0].1["addr"], 0x1000u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_callees() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new("1", "get_callees", json!({"address": "0x1000"}));
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "callees");
-        assert_eq!(calls[0].1["addr"], 0x1000u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_callgraph() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "callgraph",
-            json!({"roots": ["0x1000"], "max_depth": 3, "max_nodes": 64}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "callgraph");
-        assert_eq!(calls[0].1["addr"], 0x1000u64);
-        assert_eq!(calls[0].1["max_depth"], 3u64);
-        assert_eq!(calls[0].1["max_nodes"], 64u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_find_paths() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "find_paths",
-            json!({"start": "0x1000", "end": "0x2000"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "find_paths");
-        assert_eq!(calls[0].1["start"], 0x1000u64);
-        assert_eq!(calls[0].1["end"], 0x2000u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_list_globals() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "list_globals",
-            json!({"query": "some_global", "limit": 50}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "list_globals");
-        assert_eq!(calls[0].1["query"], "some_global");
-        assert_eq!(calls[0].1["limit"], 50u64);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_find_insn_operands() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "search_instruction_operands",
-            json!({"patterns": "rax"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "find_insn_operands");
-        assert_eq!(calls[0].1["patterns"], json!(["rax"]));
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_rename_lvar() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "rename_lvar",
-            json!({"func_address": "0x1000", "lvar_name": "v1", "new_name": "counter"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "rename_lvar");
-        assert_eq!(calls[0].1["func_addr"], 0x1000u64);
-        assert_eq!(calls[0].1["lvar_name"], "v1");
-        assert_eq!(calls[0].1["new_name"], "counter");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_set_lvar_type() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "set_lvar_type",
-            json!({"func_address": "0x2000", "lvar_name": "v1", "type_str": "unsigned int"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "set_lvar_type");
-        assert_eq!(calls[0].1["func_addr"], 0x2000u64);
-        assert_eq!(calls[0].1["lvar_name"], "v1");
-        assert_eq!(calls[0].1["type_str"], "unsigned int");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_set_decompiler_comment() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "set_decompiler_comment",
-            json!({"func_address": "0x3000", "address": "0x3010", "comment": "loop start"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "set_decompiler_comment");
-        assert_eq!(calls[0].1["func_addr"], 0x3000u64);
-        assert_eq!(calls[0].1["addr"], 0x3010u64);
-        assert_eq!(calls[0].1["itp"], 69); // default ITP_SEMI
-        assert_eq!(calls[0].1["comment"], "loop start");
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_set_decompiler_comment_custom_itp() {
-        let mock = MockWorker::new();
-        let req = RpcRequest::new(
-            "1",
-            "set_decompiler_comment",
-            json!({"func_address": "0x3000", "address": "0x3010", "itp": 74, "comment": "block"}),
-        );
-
-        dispatch_rpc(&req, &mock).await.unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "set_decompiler_comment");
-        assert_eq!(calls[0].1["itp"], 74); // ITP_BLOCK1
-        assert_eq!(calls[0].1["comment"], "block");
     }
 }
