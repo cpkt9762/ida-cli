@@ -1246,3 +1246,23 @@ pub struct DscAddDylibRequest {
     )]
     pub timeout_secs: Option<u64>,
 }
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Default)]
+pub struct DscAddRegionRequest {
+    #[schemars(
+        description = "Optional database handle for multi-IDB routing. If omitted, uses the active database."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_handle: Option<String>,
+    #[schemars(
+        description = "Exactly one region address to load from the currently open DSC database (string/number). \
+        Accepts hex (e.g. '0x180116000') or decimal."
+    )]
+    #[serde(alias = "ea", alias = "addr")]
+    pub address: Value,
+    #[schemars(
+        description = "Execution timeout in seconds (default: 300, max: 600). \
+        Use this for loading data/GOT/stub regions on-demand from DSC."
+    )]
+    pub timeout_secs: Option<u64>,
+}

@@ -4362,7 +4362,8 @@ impl IdaMcpServer {
         Uses the dscu plugin to incrementally add one module at a time. \
         Runs ObjC type analysis on the newly loaded module but skips \
         full auto-analysis to keep the operation fast. \
-        Example: after open_dsc loaded libobjc, use this to add Foundation."
+        Example: after open_dsc loaded libobjc, use this to add Foundation. \
+        If auto-analysis is not ready afterward, call analyze_funcs before relying on xrefs/decompile."
     )]
     #[instrument(skip(self), fields(module = %req.module))]
     async fn dsc_add_dylib(
@@ -4370,20 +4371,6 @@ impl IdaMcpServer {
         Parameters(req): Parameters<DscAddDylibRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: dsc_add_dylib");
-        if let ServerMode::Router(ref router) = self.mode {
-            let module = req.module.trim().to_string();
-            let script = crate::dsc::dsc_add_dylib_script(&module);
-            let timeout = Some(req.timeout_secs.unwrap_or(300).min(600));
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "run_script",
-                    json!({"code": script, "timeout_secs": timeout}),
-                )
-                .await;
-        }
-
         let module = req.module.trim().to_string();
         if module.is_empty() {
             return Ok(ToolError::InvalidParams("module must not be empty".into()).to_tool_result());
@@ -4404,6 +4391,17 @@ impl IdaMcpServer {
         let timeout = Some(req.timeout_secs.unwrap_or(300).min(600));
         let script = crate::dsc::dsc_add_dylib_script(&module);
 
+        if let ServerMode::Router(ref router) = self.mode {
+            return self
+                .route_or_err(
+                    router,
+                    req.db_handle.as_deref(),
+                    "run_script",
+                    json!({"code": script, "timeout_secs": timeout}),
+                )
+                .await;
+        }
+
         match self.worker.run_script(&script, timeout).await {
             Ok(result) => {
                 if !run_script_succeeded(&result) {
@@ -4412,12 +4410,30 @@ impl IdaMcpServer {
                     return Ok(ToolError::IdaError(message).to_tool_result());
                 }
                 let stdout = run_script_field(&result, "stdout").unwrap_or_default();
+                let analysis_status = match self.worker.analysis_status().await {
+                    Ok(status) => Some(status),
+                    Err(err) => {
+                        warn!(module = %module, error = %err, "failed to fetch analysis_status after dsc_add_dylib");
+                        None
+                    }
+                };
+                let analysis_ready = analysis_status.as_ref().map(|s| s.auto_is_ok);
+                let next_steps = dsc_analysis_next_steps(
+                    analysis_ready,
+                    "Proceed with xrefs/decompile/list_functions for the newly loaded module.",
+                );
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&json!({
                         "success": true,
                         "module": module,
-                        "message": format!("Successfully loaded {module} into the database"),
+                        "message": format!(
+                            "Successfully loaded {module} into the database. \
+                             Lightweight ObjC analysis ran; full auto-analysis was not forced."
+                        ),
                         "stdout": stdout,
+                        "analysis_status": analysis_status,
+                        "analysis_ready": analysis_ready,
+                        "next_steps": next_steps,
                     }))
                     .unwrap_or_default(),
                 )]))
@@ -4425,6 +4441,110 @@ impl IdaMcpServer {
             Err(ToolError::Timeout(secs)) => {
                 let message = run_script_timeout_message(secs, &script);
                 warn!(module = %module, timeout_secs = secs, "dsc_add_dylib timed out");
+                Ok(ToolError::IdaError(message).to_tool_result())
+            }
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Load an additional DSC memory region by address into an already-open \
+        DSC database. Uses dscu region mode to load data/GOT/stub areas on-demand. \
+        Accepts exactly one address per call. \
+        Requires a database previously opened via open_dsc. \
+        This does not force full auto-analysis; after loading, call analysis_status \
+        and run analyze_funcs if auto_is_ok=false before relying on xrefs/decompile."
+    )]
+    #[instrument(skip(self), fields(address = ?req.address))]
+    async fn dsc_add_region(
+        &self,
+        Parameters(req): Parameters<DscAddRegionRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: dsc_add_region");
+
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(v) => v,
+            Err(ToolError::InvalidAddress(addr)) => {
+                return Ok(
+                    ToolError::InvalidParams(format!("Invalid address: {addr}")).to_tool_result()
+                )
+            }
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        if addrs.len() != 1 {
+            return Ok(
+                ToolError::InvalidParams("address must contain exactly one value".into())
+                    .to_tool_result(),
+            );
+        }
+        let ea = addrs[0];
+        let ea_hex = format!("0x{ea:x}");
+        let timeout = Some(req.timeout_secs.unwrap_or(300).min(600));
+        let script = crate::dsc::dsc_add_region_script(ea);
+
+        if let ServerMode::Router(ref router) = self.mode {
+            return self
+                .route_or_err(
+                    router,
+                    req.db_handle.as_deref(),
+                    "run_script",
+                    json!({"code": script, "timeout_secs": timeout}),
+                )
+                .await;
+        }
+
+        match self.worker.run_script(&script, timeout).await {
+            Ok(result) => {
+                if !run_script_succeeded(&result) {
+                    let message = run_script_failure_message(&result);
+                    warn!(
+                        address = %ea_hex,
+                        error = %message,
+                        "dsc_add_region failed"
+                    );
+                    return Ok(ToolError::IdaError(message).to_tool_result());
+                }
+                let stdout = run_script_field(&result, "stdout").unwrap_or_default();
+                let analysis_status = match self.worker.analysis_status().await {
+                    Ok(status) => Some(status),
+                    Err(err) => {
+                        warn!(
+                            address = %ea_hex,
+                            error = %err,
+                            "failed to fetch analysis_status after dsc_add_region"
+                        );
+                        None
+                    }
+                };
+                let analysis_ready = analysis_status.as_ref().map(|s| s.auto_is_ok);
+                let next_steps = dsc_analysis_next_steps(
+                    analysis_ready,
+                    "Proceed with xrefs/decompile/list_functions for symbols near this region.",
+                );
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&json!({
+                        "success": true,
+                        "address": ea_hex,
+                        "address_value": ea,
+                        "message": format!(
+                            "Successfully loaded DSC region at 0x{ea:x}. \
+                             Full auto-analysis was not forced."
+                        ),
+                        "stdout": stdout,
+                        "analysis_status": analysis_status,
+                        "analysis_ready": analysis_ready,
+                        "next_steps": next_steps,
+                    }))
+                    .unwrap_or_default(),
+                )]))
+            }
+            Err(ToolError::Timeout(secs)) => {
+                let message = run_script_timeout_message(secs, &script);
+                warn!(
+                    address = %ea_hex,
+                    timeout_secs = secs,
+                    "dsc_add_region timed out"
+                );
                 Ok(ToolError::IdaError(message).to_tool_result())
             }
             Err(e) => Ok(e.to_tool_result()),
@@ -4674,6 +4794,21 @@ fn run_script_timeout_message(timeout_secs: u64, code: &str) -> String {
     )
 }
 
+fn dsc_analysis_next_steps(
+    analysis_ready: Option<bool>,
+    ready_message: &'static str,
+) -> Vec<String> {
+    if analysis_ready == Some(true) {
+        vec![ready_message.to_string()]
+    } else {
+        vec![
+            "Call analysis_status to check auto-analysis progress.".to_string(),
+            "If auto_is_ok is false, run analyze_funcs and wait for completion before xrefs/decompile."
+                .to_string(),
+        ]
+    }
+}
+
 async fn get_int_values(
     worker: &IdaWorker,
     address: Value,
@@ -4759,6 +4894,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "open_dsc" => Some(schema::<OpenDscRequest>()),
         "open_sbpf" => Some(schema::<OpenSbpfRequest>()),
         "dsc_add_dylib" => Some(schema::<DscAddDylibRequest>()),
+        "dsc_add_region" => Some(schema::<DscAddRegionRequest>()),
         "close_idb" => Some(schema::<CloseIdbRequest>()),
         "load_debug_info" => Some(schema::<LoadDebugInfoRequest>()),
         "get_analysis_status" => Some(schema::<EmptyParams>()),
@@ -4864,7 +5000,7 @@ fn task_state_to_mcp(state: &task::TaskState) -> rmcp::model::Task {
         status,
         status_message: Some(state.message.clone()),
         created_at: state.created_at_iso.clone(),
-        last_updated_at: Some(state.created_at_iso.clone()),
+        last_updated_at: Some(state.updated_at_iso.clone()),
         ttl: Some(task::TASK_RETENTION_TTL_MS),
         poll_interval: Some(5000),
     }

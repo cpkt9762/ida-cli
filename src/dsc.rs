@@ -190,35 +190,89 @@ print(\"[ida-mcp] DSC module loading complete\")
     script
 }
 
+/// Python helper that wraps `load_and_run_plugin` with error checking.
+///
+/// Raises `RuntimeError` when the plugin returns `None`, `False`, or a
+/// negative integer, preventing silent failures in DSC loading scripts.
+fn run_plugin_checked_python() -> &'static str {
+    r#"
+def run_plugin_checked(name, arg, context, strict_nonzero=False):
+    def plugin_failed():
+        raise RuntimeError(f"{name} plugin failed during {context} (return={rc!r})")
+
+    rc = load_and_run_plugin(name, arg)
+    if rc is None:
+        plugin_failed()
+    if strict_nonzero and (rc is False or (isinstance(rc, int) and rc <= 0)):
+        plugin_failed()
+    if isinstance(rc, int) and rc < 0:
+        plugin_failed()
+    return rc
+"#
+}
+
 /// Build an IDAPython script that incrementally loads a single dylib
 /// into an already-open DSC database via the dscu plugin.
 ///
 /// Unlike [`dsc_load_script`], this script intentionally omits the
 /// global `auto_mark_range(0, BADADDR, AU_FINAL)` + `auto_wait()` pass
 /// so that incremental adds stay fast and avoid multi-minute timeouts.
+/// Uses `run_plugin_checked` to surface dscu/objc plugin failures as
+/// `RuntimeError` rather than silently succeeding.
 pub fn dsc_add_dylib_script(module: &str) -> String {
     let escaped = escape_python_string(module);
+    let run_plugin_checked = run_plugin_checked_python();
     format!(
         "\
 import idaapi
 from idc import *
 
+{run_plugin_checked}
+
 def dscu_load_module(module):
     node = idaapi.netnode()
     node.create(\"$ dscu\")
     node.supset(2, module)
-    load_and_run_plugin(\"dscu\", 1)
+    run_plugin_checked(\"dscu\", 1, f\"loading module {{module}}\", True)
 
 print(\"[ida-mcp] loading additional dylib: {escaped}\")
 dscu_load_module(\"{escaped}\")
 
 # ObjC type analysis (lightweight, no full auto-analysis)
 print(\"[ida-mcp] analyzing objc types\")
-load_and_run_plugin(\"objc\", 1)
+run_plugin_checked(\"objc\", 1, \"objc type analysis\", False)
 print(\"[ida-mcp] analyzing NSConcreteGlobalBlock objects\")
-load_and_run_plugin(\"objc\", 4)
+run_plugin_checked(\"objc\", 4, \"objc global block analysis\", False)
 
 print(\"[ida-mcp] dsc_add_dylib complete for: {escaped}\")
+"
+    )
+}
+
+/// Build an IDAPython script that incrementally loads a single address
+/// region from an already-open DSC database via the dscu plugin.
+///
+/// This is useful for loading data/GOT/stub regions on-demand when an
+/// analysis session needs additional non-code areas from the dyld cache.
+pub fn dsc_add_region_script(ea: u64) -> String {
+    let ea_hex = format!("0x{ea:x}");
+    let run_plugin_checked = run_plugin_checked_python();
+    format!(
+        "\
+import idaapi
+from idc import *
+
+{run_plugin_checked}
+
+def dscu_load_region(ea):
+    node = idaapi.netnode()
+    node.create(\"$ dscu\")
+    node.altset(3, ea)
+    run_plugin_checked(\"dscu\", 2, \"loading region {ea_hex}\", True)
+
+print(\"[ida-mcp] loading DSC region: {ea_hex}\")
+dscu_load_region({ea})
+print(\"[ida-mcp] dsc_add_region complete for: {ea_hex}\")
 "
     )
 }
@@ -226,7 +280,8 @@ print(\"[ida-mcp] dsc_add_dylib complete for: {escaped}\")
 #[cfg(test)]
 mod tests {
     use crate::dsc::{
-        dsc_add_dylib_script, dsc_file_type, dsc_load_script, escape_python_string, idat_dsc_args,
+        dsc_add_dylib_script, dsc_add_region_script, dsc_file_type, dsc_load_script,
+        escape_python_string, idat_dsc_args,
     };
     use std::path::Path;
 
@@ -327,7 +382,12 @@ mod tests {
     fn add_dylib_script_content() {
         let script = dsc_add_dylib_script("/usr/lib/libSystem.B.dylib");
         assert!(script.contains("dscu_load_module(\"/usr/lib/libSystem.B.dylib\")"));
-        assert!(script.contains("load_and_run_plugin(\"objc\", 1)"));
+        assert!(script.contains("def run_plugin_checked(name, arg, context, strict_nonzero=False)"));
+        assert!(script.contains("run_plugin_checked(\"dscu\", 1"));
+        assert!(script.contains("loading module {module}\", True)"));
+        assert!(script.contains("raise RuntimeError"));
+        assert!(script.contains("run_plugin_checked(\"objc\", 1"));
+        assert!(script.contains("run_plugin_checked(\"objc\", 4"));
         assert!(script.contains("dsc_add_dylib complete"));
     }
 
@@ -350,7 +410,6 @@ mod tests {
         let script = dsc_add_dylib_script(malicious);
         let escaped = escape_python_string(malicious);
         assert!(script.contains(&escaped));
-        // No unescaped quotes
         for (i, ch) in escaped.char_indices() {
             if ch == '"' {
                 assert!(
@@ -359,5 +418,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn add_region_script_content() {
+        let script = dsc_add_region_script(0x180116000);
+        assert!(script.contains("def dscu_load_region(ea)"));
+        assert!(script.contains("node.altset(3, ea)"));
+        assert!(script.contains("run_plugin_checked(\"dscu\", 2"));
+        assert!(script.contains("loading region 0x180116000"));
+        assert!(script.contains("dscu_load_region(6443589632)"));
+        assert!(script.contains("dsc_add_region complete for: 0x180116000"));
     }
 }
