@@ -186,12 +186,9 @@ fn main() -> anyhow::Result<()> {
         use std::sync::Mutex;
 
         const LOG_PATH: &str = "/tmp/ida-mcp.log";
-        let stderr_layer = fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("ida_mcp=info")),
-            );
+        let stderr_layer = fmt::layer().with_writer(std::io::stderr).with_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("ida_mcp=info")),
+        );
 
         match OpenOptions::new().create(true).append(true).open(LOG_PATH) {
             Ok(log_file) => {
@@ -212,14 +209,16 @@ fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 eprintln!("[ida-mcp] warn: cannot open log file {LOG_PATH}: {e}");
-                tracing_subscriber::registry()
-                    .with(stderr_layer)
-                    .init();
+                tracing_subscriber::registry().with(stderr_layer).init();
             }
         }
     }
 
-    info!(pid = std::process::id(), version = env!("CARGO_PKG_VERSION"), "=== ida-mcp started ===");
+    info!(
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        "=== ida-mcp started ==="
+    );
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Serve(ServeArgs::default())) {
         Command::Serve(args) => run_server(args),
@@ -514,6 +513,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 sse_retry: None,
                 stateful_mode: !args.stateless,
                 cancellation_token: cancel_for_config,
+                json_response: args.json_response,
             };
 
             let service = StreamableHttpService::new(
@@ -842,4 +842,3 @@ fn disasm_at(db: &IDB, addr: Address, count: usize) -> anyhow::Result<String> {
 
     Ok(lines.join("\n"))
 }
-

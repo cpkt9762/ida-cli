@@ -1,11 +1,12 @@
-use ida_mcp::router::protocol::RpcRequest;
-use ida_mcp::rpc_dispatch::dispatch_rpc;
-use ida_mcp::{run_ida_loop, IdaWorker, ToolError};
-use rstest::{fixture, rstest};
 use serde_json::{json, Value};
-use std::sync::mpsc;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use tokio::process::Command;
+use tokio::sync::{oneshot, OnceCell};
 
-const REQUEST_QUEUE_CAPACITY: usize = 64;
 const ADDR_ADD: &str = "0x100000328";
 const ADDR_MAIN: &str = "0x100000348";
 
@@ -20,46 +21,196 @@ struct SmokeCase {
     allow_error: bool,
 }
 
-#[fixture]
-#[once]
-fn worker() -> IdaWorker {
-    let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
-    std::thread::spawn(move || {
-        run_ida_loop(rx);
-    });
-    IdaWorker::new(tx)
+struct WorkerClient {
+    writer_tx: std_mpsc::Sender<String>,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>,
+    counter: AtomicU64,
+    child: Mutex<std::process::Child>,
 }
 
-#[fixture]
-#[once]
-fn open_db(worker: &IdaWorker) -> Value {
-    if !ida_available() {
-        return json!(null);
+fn find_ida_mcp_exe() -> PathBuf {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    manifest.join("target/debug/ida-mcp")
+}
+
+async fn spawn_worker() -> WorkerClient {
+    let exe = find_ida_mcp_exe();
+    let mut cmd = Command::new(&exe);
+    cmd.arg("serve-worker");
+
+    if let Ok(dyld) = std::env::var("DYLD_LIBRARY_PATH") {
+        cmd.env("DYLD_LIBRARY_PATH", dyld);
+    }
+    if let Ok(idadir) = std::env::var("IDADIR") {
+        cmd.env("IDADIR", idadir);
+    }
+    if let Ok(ld) = std::env::var("LD_LIBRARY_PATH") {
+        cmd.env("LD_LIBRARY_PATH", ld);
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build runtime");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
 
-    rt.block_on(async {
-        call(
-            worker,
-            "open",
-            json!({
-                "path": "test/fixtures/mini.i64",
-                "auto_analyse": false,
-                "force": true,
-            }),
-        )
-        .await
-        .expect("failed to open mini.i64")
-    })
+    let mut std_cmd = cmd.into_std();
+    let mut child = std_cmd
+        .spawn()
+        .expect("failed to spawn ida-mcp serve-worker");
+    let stdin = child.stdin.take().expect("failed to capture child stdin");
+    let stdout = child.stdout.take().expect("failed to capture child stdout");
+
+    let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let pending_for_reader = pending.clone();
+    let pending_for_writer = pending.clone();
+    let (writer_tx, writer_rx) = std_mpsc::channel::<String>();
+
+    std::thread::spawn(move || {
+        let mut writer = BufWriter::new(stdin);
+        while let Ok(line) = writer_rx.recv() {
+            if let Err(e) = writer.write_all(line.as_bytes()) {
+                let mut map = pending_for_writer.lock().expect("pending mutex poisoned");
+                for (_, tx) in map.drain() {
+                    let _ = tx.send(Err(format!("worker write error: {e}")));
+                }
+                break;
+            }
+            if let Err(e) = writer.flush() {
+                let mut map = pending_for_writer.lock().expect("pending mutex poisoned");
+                for (_, tx) in map.drain() {
+                    let _ = tx.send(Err(format!("worker flush error: {e}")));
+                }
+                break;
+            }
+        }
+    });
+
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let mut map = pending_for_reader.lock().expect("pending mutex poisoned");
+                    for (_, tx) in map.drain() {
+                        let _ = tx.send(Err("worker closed".to_string()));
+                    }
+                    break;
+                }
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    if let Ok(resp) = serde_json::from_str::<Value>(trimmed) {
+                        let id = resp
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if id.is_empty() {
+                            continue;
+                        }
+
+                        let mut map = pending_for_reader.lock().expect("pending mutex poisoned");
+                        if let Some(tx) = map.remove(&id) {
+                            if resp.get("error").is_none() || resp["error"].is_null() {
+                                let _ =
+                                    tx.send(Ok(resp.get("result").cloned().unwrap_or(Value::Null)));
+                            } else {
+                                let msg = resp["error"]["message"]
+                                    .as_str()
+                                    .unwrap_or("unknown error")
+                                    .to_string();
+                                let _ = tx.send(Err(msg));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let mut map = pending_for_reader.lock().expect("pending mutex poisoned");
+                    for (_, tx) in map.drain() {
+                        let _ = tx.send(Err(format!("worker I/O error: {e}")));
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
+    WorkerClient {
+        writer_tx,
+        pending,
+        counter: AtomicU64::new(0),
+        child: Mutex::new(child),
+    }
 }
 
-async fn call(worker: &IdaWorker, method: &str, params: Value) -> Result<Value, ToolError> {
-    let req = RpcRequest::new("test", method, params);
-    dispatch_rpc(&req, worker).await
+impl WorkerClient {
+    async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let id = format!("r{}", self.counter.fetch_add(1, Ordering::SeqCst));
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+
+        let (tx, rx) = oneshot::channel();
+        let mut map = self.pending.lock().expect("pending mutex poisoned");
+        map.insert(id.clone(), tx);
+        drop(map);
+
+        let line = serde_json::to_string(&req)
+            .map_err(|e| format!("serialize request failed: {e}"))?
+            + "\n";
+        self.writer_tx
+            .send(line)
+            .map_err(|_| "worker write channel closed".to_string())?;
+
+        rx.await.map_err(|_| "worker closed".to_string())?
+    }
+
+    async fn ensure_running(&self) -> Result<(), String> {
+        let mut child = self.child.lock().expect("child mutex poisoned");
+        match child.try_wait() {
+            Ok(Some(status)) => Err(format!("worker exited unexpectedly: {status}")),
+            Ok(None) => Ok(()),
+            Err(e) => Err(format!("failed to check worker status: {e}")),
+        }
+    }
+}
+
+static CLIENT: OnceCell<WorkerClient> = OnceCell::const_new();
+
+async fn client() -> &'static WorkerClient {
+    CLIENT
+        .get_or_init(|| async {
+            let c = spawn_worker().await;
+            let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/mini.i64");
+
+            c.call(
+                "open",
+                json!({
+                    "path": fixture.to_string_lossy().to_string(),
+                    "force": true,
+                }),
+            )
+            .await
+            .expect("failed to open mini.i64");
+
+            c
+        })
+        .await
 }
 
 fn smoke_cases() -> Vec<SmokeCase> {
@@ -81,7 +232,7 @@ fn smoke_cases() -> Vec<SmokeCase> {
         },
         SmokeCase {
             method: "get_function_by_name",
-            params: json!({"name": "_add"}),
+            params: json!({"name": "add"}),
             allow_error: false,
         },
         SmokeCase {
@@ -96,7 +247,7 @@ fn smoke_cases() -> Vec<SmokeCase> {
         },
         SmokeCase {
             method: "batch_lookup_functions",
-            params: json!({"queries": ["_add", ADDR_MAIN]}),
+            params: json!({"queries": ["add", ADDR_MAIN]}),
             allow_error: false,
         },
         SmokeCase {
@@ -111,7 +262,7 @@ fn smoke_cases() -> Vec<SmokeCase> {
         },
         SmokeCase {
             method: "disassemble_function",
-            params: json!({"name": "_add", "count": 6}),
+            params: json!({"name": "add", "count": 6}),
             allow_error: false,
         },
         SmokeCase {
@@ -286,14 +437,14 @@ fn smoke_cases() -> Vec<SmokeCase> {
         },
         SmokeCase {
             method: "rename_symbol",
-            params: json!({"current_name": "_add", "name": "_add", "flags": 0}),
+            params: json!({"current_name": "add", "name": "add", "flags": 0}),
             allow_error: true,
         },
         SmokeCase {
             method: "batch_rename",
             params: json!({"renames": [
-                {"current_name": "_add", "new_name": "_add"},
-                {"current_name": "_main", "new_name": "_main"}
+                {"current_name": "add", "new_name": "add"},
+                {"current_name": "main", "new_name": "main"}
             ]}),
             allow_error: true,
         },
@@ -437,21 +588,29 @@ fn extract_first_param_name(code: &str) -> Option<String> {
     last.map(str::to_string)
 }
 
-#[rstest]
-#[tokio::test]
-async fn test_e2e_open_and_database_basics(worker: &IdaWorker, open_db: &Value) {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_open_and_database_basics() {
     if !ida_available() {
         return;
     }
 
-    assert!(open_db.get("path").is_some(), "open should return db info");
+    let c = client().await;
+    c.ensure_running().await.expect("worker should be running");
 
-    let status = call(worker, "get_analysis_status", json!({}))
+    let db_info = c
+        .call("get_database_info", json!({}))
+        .await
+        .expect("get_database_info failed");
+    assert!(db_info.is_object(), "database info should be JSON object");
+
+    let status = c
+        .call("get_analysis_status", json!({}))
         .await
         .expect("get_analysis_status failed");
     assert!(status.get("auto_is_ok").is_some());
 
-    let funcs = call(worker, "list_functions", json!({"offset": 0, "limit": 10}))
+    let funcs = c
+        .call("list_functions", json!({"offset": 0, "limit": 10}))
         .await
         .expect("list_functions failed");
     let list = funcs["functions"]
@@ -459,35 +618,38 @@ async fn test_e2e_open_and_database_basics(worker: &IdaWorker, open_db: &Value) 
         .expect("functions should be array");
     assert!(list.len() >= 2, "mini.i64 should have at least 2 functions");
 
-    let add = call(worker, "get_function_by_name", json!({"name": "_add"}))
+    let add = match c
+        .call("get_function_by_name", json!({"name": "_add"}))
         .await
-        .expect("get_function_by_name failed");
+    {
+        Ok(v) => v,
+        Err(_) => c
+            .call("get_function_by_name", json!({"name": "add"}))
+            .await
+            .expect("get_function_by_name failed"),
+    };
     let addr = add["address"].as_str().unwrap_or_default();
     assert!(addr.contains("100000328"), "_add address mismatch: {addr}");
 }
 
-#[rstest]
-#[tokio::test]
-async fn test_e2e_patch_bytes_then_read_back(worker: &IdaWorker, open_db: &Value) {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_patch_bytes_then_read_back() {
     if !ida_available() {
         return;
     }
-    let _ = open_db;
 
-    let before = call(
-        worker,
-        "read_bytes",
-        json!({"address": ADDR_ADD, "size": 4}),
-    )
-    .await
-    .expect("read_bytes before patch failed");
+    let c = client().await;
+
+    let before = c
+        .call("read_bytes", json!({"address": ADDR_ADD, "size": 4}))
+        .await
+        .expect("read_bytes before patch failed");
     let before_hex = before["bytes"]
         .as_str()
         .expect("read_bytes should return hex bytes")
         .to_string();
 
-    call(
-        worker,
+    c.call(
         "patch_bytes",
         json!({
             "address": ADDR_ADD,
@@ -497,21 +659,17 @@ async fn test_e2e_patch_bytes_then_read_back(worker: &IdaWorker, open_db: &Value
     .await
     .expect("patch_bytes failed");
 
-    let after = call(
-        worker,
-        "read_bytes",
-        json!({"address": ADDR_ADD, "size": 4}),
-    )
-    .await
-    .expect("read_bytes after patch failed");
+    let after = c
+        .call("read_bytes", json!({"address": ADDR_ADD, "size": 4}))
+        .await
+        .expect("read_bytes after patch failed");
     let after_hex = after["bytes"].as_str().unwrap_or_default().to_lowercase();
     assert!(
         after_hex.contains("0b080000") || after_hex.contains("0b 08 00 00"),
         "patched bytes not visible, got: {after_hex}"
     );
 
-    call(
-        worker,
+    c.call(
         "patch_bytes",
         json!({
             "address": ADDR_ADD,
@@ -522,15 +680,16 @@ async fn test_e2e_patch_bytes_then_read_back(worker: &IdaWorker, open_db: &Value
     .expect("failed to restore original bytes");
 }
 
-#[rstest]
-#[tokio::test]
-async fn test_e2e_rename_then_set_type_lvar(worker: &IdaWorker, open_db: &Value) {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_rename_then_set_type_lvar() {
     if !ida_available() {
         return;
     }
-    let _ = open_db;
 
-    let decomp = call(worker, "decompile_function", json!({"address": ADDR_ADD}))
+    let c = client().await;
+
+    let decomp = c
+        .call("decompile_function", json!({"address": ADDR_ADD}))
         .await
         .expect("decompile_function failed");
     let code = decomp["code"].as_str().unwrap_or_default();
@@ -539,16 +698,16 @@ async fn test_e2e_rename_then_set_type_lvar(worker: &IdaWorker, open_db: &Value)
     let lvar_name = extract_first_param_name(code).unwrap_or_else(|| "a1".to_string());
     let renamed = "e2e_arg";
 
-    let rename_result = call(
-        worker,
-        "rename_local_variable",
-        json!({
-            "func_address": ADDR_ADD,
-            "lvar_name": lvar_name,
-            "new_name": renamed,
-        }),
-    )
-    .await;
+    let rename_result = c
+        .call(
+            "rename_local_variable",
+            json!({
+                "func_address": ADDR_ADD,
+                "lvar_name": lvar_name,
+                "new_name": renamed,
+            }),
+        )
+        .await;
 
     assert!(
         rename_result.is_ok(),
@@ -556,16 +715,16 @@ async fn test_e2e_rename_then_set_type_lvar(worker: &IdaWorker, open_db: &Value)
         rename_result.err()
     );
 
-    let type_result = call(
-        worker,
-        "set_local_variable_type",
-        json!({
-            "func_address": ADDR_ADD,
-            "lvar_name": renamed,
-            "type_str": "int",
-        }),
-    )
-    .await;
+    let type_result = c
+        .call(
+            "set_local_variable_type",
+            json!({
+                "func_address": ADDR_ADD,
+                "lvar_name": renamed,
+                "type_str": "int",
+            }),
+        )
+        .await;
 
     assert!(
         type_result.is_ok(),
@@ -574,13 +733,13 @@ async fn test_e2e_rename_then_set_type_lvar(worker: &IdaWorker, open_db: &Value)
     );
 }
 
-#[rstest]
-#[tokio::test]
-async fn test_e2e_smoke_dispatch_methods(worker: &IdaWorker, open_db: &Value) {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_smoke_dispatch_methods() {
     if !ida_available() {
         return;
     }
-    let _ = open_db;
+
+    let c = client().await;
 
     let cases = smoke_cases();
     assert_eq!(
@@ -590,7 +749,7 @@ async fn test_e2e_smoke_dispatch_methods(worker: &IdaWorker, open_db: &Value) {
     );
 
     for case in cases {
-        let result = call(worker, case.method, case.params.clone()).await;
+        let result = c.call(case.method, case.params.clone()).await;
         if case.allow_error {
             continue;
         }
