@@ -507,7 +507,7 @@ pub async fn dispatch_rpc<W: WorkerDispatch>(
             let r = worker.exports(offset, limit).await?;
             Ok(serde_json::to_value(r).unwrap_or(json!([])))
         }
-        "entrypoints" => {
+        "list_entry_points" => {
             let r = worker.entrypoints().await?;
             Ok(serde_json::to_value(r).unwrap_or(json!([])))
         }

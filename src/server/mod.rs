@@ -3995,7 +3995,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Analyze functions (not supported)")]
-    async fn analyze_funcs(
+    async fn run_auto_analysis(
         &self,
         Parameters(req): Parameters<AnalyzeFuncsRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -4559,7 +4559,7 @@ impl IdaMcpServer {
         Use the task_id returned by open_dsc."
     )]
     #[instrument(skip(self), fields(task_id = %req.task_id))]
-    async fn task_status(
+    async fn get_task_status(
         &self,
         Parameters(req): Parameters<TaskStatusRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -5000,7 +5000,7 @@ fn task_state_to_mcp(state: &task::TaskState) -> rmcp::model::Task {
         status,
         status_message: Some(state.message.clone()),
         created_at: state.created_at_iso.clone(),
-        last_updated_at: Some(state.updated_at_iso.clone()),
+        last_updated_at: state.updated_at_iso.clone(),
         ttl: Some(task::TASK_RETENTION_TTL_MS),
         poll_interval: Some(5000),
     }
@@ -5112,15 +5112,16 @@ impl ServerHandler for IdaMcpServer {
         &self,
         request: GetTaskInfoParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetTaskInfoResult, McpError> {
+    ) -> Result<GetTaskResult, McpError> {
         let state = self.task_registry.get(&request.task_id).ok_or_else(|| {
             McpError::invalid_params(
                 "Unknown task_id",
                 Some(json!({ "task_id": request.task_id })),
             )
         })?;
-        Ok(GetTaskInfoResult {
-            task: Some(task_state_to_mcp(&state)),
+        Ok(GetTaskResult {
+            meta: None,
+            task: task_state_to_mcp(&state),
         })
     }
 
@@ -5128,14 +5129,12 @@ impl ServerHandler for IdaMcpServer {
         &self,
         request: GetTaskResultParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<TaskResult, McpError> {
+    ) -> Result<GetTaskPayloadResult, McpError> {
         let state = self.task_registry.get(&request.task_id);
         match state {
-            Some(s) if s.status == task::TaskStatus::Completed => Ok(TaskResult {
-                content_type: "application/json".to_string(),
-                value: task_payload_result_value(s.result),
-                summary: None,
-            }),
+            Some(s) if s.status == task::TaskStatus::Completed => {
+                Ok(GetTaskPayloadResult(task_payload_result_value(s.result)))
+            }
             Some(s) if s.status == task::TaskStatus::Failed => {
                 Err(McpError::internal_error(s.message, None))
             }
@@ -5157,9 +5156,16 @@ impl ServerHandler for IdaMcpServer {
         &self,
         request: CancelTaskParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<(), McpError> {
+    ) -> Result<CancelTaskResult, McpError> {
         if self.task_registry.cancel(&request.task_id) {
-            Ok(())
+            let state = self
+                .task_registry
+                .get(&request.task_id)
+                .ok_or_else(|| McpError::internal_error("Task disappeared after cancel", None))?;
+            Ok(CancelTaskResult {
+                meta: None,
+                task: task_state_to_mcp(&state),
+            })
         } else {
             Err(McpError::invalid_params(
                 "Task not found or not running",
@@ -5301,7 +5307,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         &self,
         request: GetTaskInfoParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<GetTaskInfoResult, McpError> {
+    ) -> Result<GetTaskResult, McpError> {
         self.0.get_task_info(request, ctx).await
     }
 
@@ -5309,7 +5315,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         &self,
         request: GetTaskResultParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<TaskResult, McpError> {
+    ) -> Result<GetTaskPayloadResult, McpError> {
         self.0.get_task_result(request, ctx).await
     }
 
@@ -5317,7 +5323,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         &self,
         request: CancelTaskParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<(), McpError> {
+    ) -> Result<CancelTaskResult, McpError> {
         self.0.cancel_task(request, ctx).await
     }
 }
