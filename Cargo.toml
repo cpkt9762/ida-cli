@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 idalib = { path = "3rd-github/idalib/idalib" }
-rmcp = { version = "0.15", features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { path = "3rd-github/rust-sdk/crates/rmcp", features = ["server", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal", "process", "io-util", "time"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
@@ -39,6 +39,9 @@ tower-service = "0.3"
 
 [build-dependencies]
 idalib-build = { path = "3rd-github/idalib/idalib-build" }
+
+[dev-dependencies]
+rstest = "0.25"
 
 [[bin]]
 name = "multi_idb_probe"

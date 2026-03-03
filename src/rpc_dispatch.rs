@@ -2105,10 +2105,11 @@ pub mod mock {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_address_value;
     use super::{dispatch_rpc, mock::MockWorker};
+    use super::{parse_address_value, parse_patch_bytes};
     use crate::error::ToolError;
     use crate::router::protocol::RpcRequest;
+    use rstest::rstest;
     use serde_json::{json, Value};
 
     async fn run_dispatch(method: &str, params: Value) -> Vec<(String, Value)> {
@@ -3722,5 +3723,672 @@ mod tests {
             }
             other => panic!("expected InvalidToolName, got {other:?}"),
         }
+    }
+
+    async fn run_dispatch_result(
+        method: &str,
+        params: Value,
+    ) -> Result<Vec<(String, Value)>, ToolError> {
+        let mock = MockWorker::new();
+        let req = RpcRequest::new("1", method, params);
+        dispatch_rpc(&req, &mock).await?;
+        let calls = mock.calls.lock().unwrap().clone();
+        Ok(calls)
+    }
+
+    fn assert_single_full_call(
+        method: &str,
+        expected_worker_method: &str,
+        expected_payload: Value,
+        calls: &[(String, Value)],
+    ) {
+        assert_eq!(calls.len(), 1, "expected one call for method {method}");
+        assert_eq!(
+            calls[0].0, expected_worker_method,
+            "worker method mismatch for {method}"
+        );
+        assert_eq!(
+            calls[0].1, expected_payload,
+            "payload mismatch for {method}"
+        );
+    }
+
+    #[rstest]
+    #[case::space_separated(json!("90 91"), vec![0x90, 0x91])]
+    #[case::continuous_hex(json!("9091"), vec![0x90, 0x91])]
+    #[case::with_0x_prefix(json!("0x90 0x91"), vec![0x90, 0x91])]
+    #[case::comma_separated(json!("90,91"), vec![0x90, 0x91])]
+    #[case::colon_separated(json!("90:91"), vec![0x90, 0x91])]
+    #[case::dash_separated(json!("90-91"), vec![0x90, 0x91])]
+    #[case::underscore_separated(json!("90_91"), vec![0x90, 0x91])]
+    #[case::mixed_separators(json!("0x90, 91:AB"), vec![0x90, 0x91, 0xAB])]
+    #[case::single_byte(json!("FF"), vec![0xFF])]
+    #[case::four_bytes_continuous(json!("0b080000"), vec![0x0b, 0x08, 0x00, 0x00])]
+    #[case::long_continuous(json!("deadbeef"), vec![0xDE, 0xAD, 0xBE, 0xEF])]
+    #[case::json_array(json!([144, 145]), vec![0x90, 0x91])]
+    fn test_parse_patch_bytes_valid(#[case] input: Value, #[case] expected: Vec<u8>) {
+        let parsed = parse_patch_bytes(&input).unwrap();
+        assert_eq!(parsed, expected);
+    }
+
+    #[rstest]
+    #[case::empty_string(json!(""))]
+    #[case::odd_length(json!("ABC"))]
+    #[case::invalid_char(json!("GG"))]
+    #[case::empty_array(json!([]))]
+    #[case::wrong_type(json!({"bytes": "90"}))]
+    fn test_parse_patch_bytes_invalid(#[case] input: Value) {
+        assert!(parse_patch_bytes(&input).is_err());
+    }
+
+    #[rstest]
+    #[case::open(
+        "open",
+        json!({
+            "path": "/tmp/test.i64",
+            "load_debug_info": true,
+            "debug_info_path": "/tmp/symbols.pdb",
+            "debug_info_verbose": true,
+            "force": true,
+            "file_type": "ELF",
+            "auto_analyse": true,
+            "extra_args": ["-A", "-Sscript.py"],
+        }),
+        "open",
+        json!({
+            "path": "/tmp/test.i64",
+            "load_debug_info": true,
+            "debug_info_path": "/tmp/symbols.pdb",
+            "debug_info_verbose": true,
+            "force": true,
+            "file_type": "ELF",
+            "auto_analyse": true,
+            "extra_args": ["-A", "-Sscript.py"],
+        })
+    )]
+    #[case::close("close", json!({}), "close", json!({}))]
+    #[case::shutdown("shutdown", json!({}), "shutdown", json!({}))]
+    #[case::load_debug_info(
+        "load_debug_info",
+        json!({"path": "/tmp/dsym", "verbose": true}),
+        "load_debug_info",
+        json!({"path": "/tmp/dsym", "verbose": true})
+    )]
+    #[case::get_analysis_status("get_analysis_status", json!({}), "analysis_status", json!({}))]
+    #[case::list_functions(
+        "list_functions",
+        json!({"offset": 10, "limit": 50, "filter": "sub_", "timeout_secs": 30}),
+        "list_functions",
+        json!({"offset": 10, "limit": 50, "filter": "sub_", "timeout_secs": 30})
+    )]
+    #[case::get_function_by_name(
+        "get_function_by_name",
+        json!({"name": "entry"}),
+        "resolve_function",
+        json!({"name": "entry"})
+    )]
+    #[case::get_function_prototype(
+        "get_function_prototype",
+        json!({"address": "0x4010", "name": "foo"}),
+        "get_function_prototype",
+        json!({"addr": 0x4010u64, "name": "foo"})
+    )]
+    #[case::get_function_at_address(
+        "get_function_at_address",
+        json!({"address": "0x5000", "target_name": "entry", "offset": 7}),
+        "function_at",
+        json!({"addr": 0x5000u64, "name": "entry", "offset": 7})
+    )]
+    #[case::batch_lookup_functions(
+        "batch_lookup_functions",
+        json!({"queries": ["a", "b", "c"]}),
+        "lookup_funcs",
+        json!({"queries": ["a", "b", "c"]})
+    )]
+    #[case::export_functions(
+        "export_functions",
+        json!({"offset": 10, "limit": 11}),
+        "export_funcs",
+        json!({"offset": 10, "limit": 11})
+    )]
+    #[case::disassemble(
+        "disassemble",
+        json!({"address": "0x1000", "count": 5}),
+        "disasm",
+        json!({"addr": 0x1000u64, "count": 5})
+    )]
+    #[case::disassemble_function(
+        "disassemble_function",
+        json!({"name": "sub_main", "count": 9}),
+        "disasm_by_name",
+        json!({"name": "sub_main", "count": 9})
+    )]
+    #[case::disassemble_function_at(
+        "disassemble_function_at",
+        json!({"address": "0x7000", "target_name": "sub_a", "offset": 3, "count": 4}),
+        "disasm_function_at",
+        json!({"addr": 0x7000u64, "name": "sub_a", "offset": 3, "count": 4})
+    )]
+    #[case::decompile_function(
+        "decompile_function",
+        json!({"address": "0x8000"}),
+        "decompile",
+        json!({"addr": 0x8000u64})
+    )]
+    #[case::get_pseudocode_at(
+        "get_pseudocode_at",
+        json!({"address": "0x9000", "end_address": "0x9010"}),
+        "pseudocode_at",
+        json!({"addr": 0x9000u64, "end_addr": 0x9010u64})
+    )]
+    #[case::list_segments("list_segments", json!({}), "segments", json!({}))]
+    #[case::list_strings(
+        "list_strings",
+        json!({"query": "malloc", "exact": true, "case_insensitive": false, "offset": 2, "limit": 7, "timeout_secs": 9}),
+        "find_string",
+        json!({"query": "malloc", "exact": true, "case_insensitive": false, "offset": 2, "limit": 7, "timeout_secs": 9})
+    )]
+    #[case::get_xrefs_to_string(
+        "get_xrefs_to_string",
+        json!({"query": "str", "exact": true, "case_insensitive": false, "offset": 1, "limit": 11, "max_xrefs": 5, "timeout_secs": 4}),
+        "xrefs_to_string",
+        json!({"query": "str", "exact": true, "case_insensitive": false, "offset": 1, "limit": 11, "max_xrefs": 5, "timeout_secs": 4})
+    )]
+    #[case::list_local_types(
+        "list_local_types",
+        json!({"offset": 2, "limit": 12, "filter": "my_", "timeout_secs": 8}),
+        "local_types",
+        json!({"offset": 2, "limit": 12, "filter": "my_", "timeout_secs": 8})
+    )]
+    #[case::declare_c_type(
+        "declare_c_type",
+        json!({"decl": "typedef int T;", "relaxed": true, "replace": true, "multi": true}),
+        "declare_type",
+        json!({"decl": "typedef int T;", "relaxed": true, "replace": true, "multi": true})
+    )]
+    #[case::apply_type(
+        "apply_type",
+        json!({
+            "address": "0xa000",
+            "target_name": "glob",
+            "offset": 16,
+            "stack_offset": -8,
+            "stack_name": "v1",
+            "decl": "int",
+            "type_name": "int",
+            "relaxed": true,
+            "delay": true,
+            "strict": true,
+        }),
+        "apply_types",
+        json!({
+            "addr": 0xa000u64,
+            "name": "glob",
+            "offset": 16,
+            "stack_offset": -8,
+            "stack_name": "v1",
+            "decl": "int",
+            "type_name": "int",
+            "relaxed": true,
+            "delay": true,
+            "strict": true,
+        })
+    )]
+    #[case::infer_type(
+        "infer_type",
+        json!({"address": "0xb000", "target_name": "g_var", "offset": 3}),
+        "infer_types",
+        json!({"addr": 0xb000u64, "name": "g_var", "offset": 3})
+    )]
+    #[case::set_function_prototype(
+        "set_function_prototype",
+        json!({"address": "0xc000", "name": "f", "prototype": "int f(void);"}),
+        "set_function_prototype",
+        json!({"addr": 0xc000u64, "name": "f", "prototype": "int f(void);"})
+    )]
+    #[case::rename_stack_variable(
+        "rename_stack_variable",
+        json!({"func_address": "0xd000", "func_name": "foo", "name": "v1", "new_name": "arg1"}),
+        "rename_stack_variable",
+        json!({"func_addr": 0xd000u64, "func_name": "foo", "old_name": "v1", "new_name": "arg1"})
+    )]
+    #[case::set_stack_variable_type(
+        "set_stack_variable_type",
+        json!({"func_address": "0xd100", "func_name": "foo", "name": "v1", "type_decl": "size_t"}),
+        "set_stack_variable_type",
+        json!({"func_addr": 0xd100u64, "func_name": "foo", "var_name": "v1", "type_decl": "size_t"})
+    )]
+    #[case::list_enums(
+        "list_enums",
+        json!({"filter": "E_", "offset": 1, "limit": 2}),
+        "list_enums",
+        json!({"filter": "E_", "offset": 1, "limit": 2})
+    )]
+    #[case::create_enum(
+        "create_enum",
+        json!({"decl": "enum E { A=1 };", "replace": true}),
+        "create_enum",
+        json!({"decl": "enum E { A=1 };", "replace": true})
+    )]
+    #[case::get_address_info(
+        "get_address_info",
+        json!({"address": "0xe000", "target_name": "foo", "offset": 4}),
+        "addr_info",
+        json!({"addr": 0xe000u64, "name": "foo", "offset": 4})
+    )]
+    #[case::create_stack_variable(
+        "create_stack_variable",
+        json!({"address": "0xf000", "target_name": "foo", "offset": -16, "var_name": "var_a", "decl": "int x;", "relaxed": true}),
+        "declare_stack",
+        json!({"addr": 0xf000u64, "name": "foo", "offset": -16, "var_name": "var_a", "decl": "int x;", "relaxed": true})
+    )]
+    #[case::delete_stack_variable(
+        "delete_stack_variable",
+        json!({"address": "0xf010", "target_name": "foo", "offset": -8, "var_name": "v2"}),
+        "delete_stack",
+        json!({"addr": 0xf010u64, "name": "foo", "offset": -8, "var_name": "v2"})
+    )]
+    #[case::get_stack_frame(
+        "get_stack_frame",
+        json!({"address": "0x11000"}),
+        "stack_frame",
+        json!({"addr": 0x11000u64})
+    )]
+    #[case::list_structs(
+        "list_structs",
+        json!({"offset": 1, "limit": 10, "filter": "S", "timeout_secs": 6}),
+        "structs",
+        json!({"offset": 1, "limit": 10, "filter": "S", "timeout_secs": 6})
+    )]
+    #[case::get_struct_info(
+        "get_struct_info",
+        json!({"ordinal": 3, "name": "MyStruct"}),
+        "struct_info",
+        json!({"ordinal": 3, "name": "MyStruct"})
+    )]
+    #[case::read_struct_at_address(
+        "read_struct_at_address",
+        json!({"address": "0x12000", "ordinal": 2, "name": "MyStruct"}),
+        "read_struct",
+        json!({"addr": 0x12000u64, "ordinal": 2, "name": "MyStruct"})
+    )]
+    #[case::get_xrefs_to(
+        "get_xrefs_to",
+        json!({"address": "0x13000"}),
+        "xrefs_to",
+        json!({"addr": 0x13000u64})
+    )]
+    #[case::get_xrefs_from(
+        "get_xrefs_from",
+        json!({"address": "0x13010"}),
+        "xrefs_from",
+        json!({"addr": 0x13010u64})
+    )]
+    #[case::get_xrefs_to_struct_field(
+        "get_xrefs_to_struct_field",
+        json!({"ordinal": 1, "name": "MyStruct", "member_index": 2, "member_name": "field", "limit": 50}),
+        "xrefs_to_field",
+        json!({"ordinal": 1, "name": "MyStruct", "member_index": 2, "member_name": "field", "limit": 50})
+    )]
+    #[case::list_imports(
+        "list_imports",
+        json!({"offset": 5, "limit": 6}),
+        "imports",
+        json!({"offset": 5, "limit": 6})
+    )]
+    #[case::list_exports(
+        "list_exports",
+        json!({"offset": 7, "limit": 8}),
+        "exports",
+        json!({"offset": 7, "limit": 8})
+    )]
+    #[case::list_entry_points("list_entry_points", json!({}), "entrypoints", json!({}))]
+    #[case::read_bytes(
+        "read_bytes",
+        json!({"address": "0x14000", "target_name": "buf", "offset": 2, "size": 16}),
+        "get_bytes",
+        json!({"addr": 0x14000u64, "name": "buf", "offset": 2, "size": 16})
+    )]
+    #[case::read_int(
+        "read_int",
+        json!({"address": "0x15000", "size": 8}),
+        "read_int",
+        json!({"addr": 0x15000u64, "size": 8})
+    )]
+    #[case::read_string(
+        "read_string",
+        json!({"address": "0x15100", "max_len": 32}),
+        "get_string",
+        json!({"addr": 0x15100u64, "max_len": 32})
+    )]
+    #[case::read_global_variable(
+        "read_global_variable",
+        json!({"query": "gCounter"}),
+        "get_global_value",
+        json!({"query": "gCounter"})
+    )]
+    #[case::set_comment(
+        "set_comment",
+        json!({"address": "0x16000", "target_name": "foo", "offset": 1, "comment": "note", "repeatable": true}),
+        "set_comments",
+        json!({"addr": 0x16000u64, "name": "foo", "offset": 1, "comment": "note", "repeatable": true})
+    )]
+    #[case::set_function_comment(
+        "set_function_comment",
+        json!({"address": "0x16010", "name": "f", "comment": "fn note", "repeatable": true}),
+        "set_function_comment",
+        json!({"addr": 0x16010u64, "name": "f", "comment": "fn note", "repeatable": true})
+    )]
+    #[case::rename_symbol(
+        "rename_symbol",
+        json!({"address": "0x17000", "current_name": "old", "name": "new_name", "flags": 3}),
+        "rename",
+        json!({"addr": 0x17000u64, "current_name": "old", "new_name": "new_name", "flags": 3})
+    )]
+    #[case::batch_rename(
+        "batch_rename",
+        json!({"renames": [
+            {"address": "0x1000", "current_name": "a", "new_name": "a1"},
+            {"current_name": "b", "new_name": "b1"}
+        ]}),
+        "batch_rename",
+        json!({"entries": [[0x1000u64, "a", "a1"], [null, "b", "b1"]]})
+    )]
+    #[case::rename_local_variable(
+        "rename_local_variable",
+        json!({"func_address": "0x18000", "lvar_name": "v1", "new_name": "idx"}),
+        "rename_lvar",
+        json!({"func_addr": 0x18000u64, "lvar_name": "v1", "new_name": "idx"})
+    )]
+    #[case::set_local_variable_type(
+        "set_local_variable_type",
+        json!({"func_address": "0x18010", "lvar_name": "v2", "type_str": "u32"}),
+        "set_lvar_type",
+        json!({"func_addr": 0x18010u64, "lvar_name": "v2", "type_str": "u32"})
+    )]
+    #[case::set_decompiler_comment(
+        "set_decompiler_comment",
+        json!({"func_address": "0x18020", "address": "0x18024", "itp": 2, "comment": "c"}),
+        "set_decompiler_comment",
+        json!({"func_addr": 0x18020u64, "addr": 0x18024u64, "itp": 2, "comment": "c"})
+    )]
+    #[case::patch_bytes(
+        "patch_bytes",
+        json!({"address": "0x19000", "target_name": "p", "offset": 4, "bytes": "0x90,91:AB"}),
+        "patch_bytes",
+        json!({"addr": 0x19000u64, "name": "p", "offset": 4, "bytes": [0x90u8, 0x91u8, 0xABu8]})
+    )]
+    #[case::patch_assembly(
+        "patch_assembly",
+        json!({"address": "0x19010", "target_name": "p", "offset": 2, "line": "nop"}),
+        "patch_asm",
+        json!({"addr": 0x19010u64, "name": "p", "offset": 2, "line": "nop"})
+    )]
+    #[case::get_basic_blocks(
+        "get_basic_blocks",
+        json!({"address": "0x1a000"}),
+        "basic_blocks",
+        json!({"addr": 0x1a000u64})
+    )]
+    #[case::get_callees(
+        "get_callees",
+        json!({"address": "0x1a010"}),
+        "callees",
+        json!({"addr": 0x1a010u64})
+    )]
+    #[case::get_callers(
+        "get_callers",
+        json!({"address": "0x1a020"}),
+        "callers",
+        json!({"addr": 0x1a020u64})
+    )]
+    #[case::build_callgraph(
+        "build_callgraph",
+        json!({"roots": ["0x1a030"], "max_depth": 3, "max_nodes": 7}),
+        "callgraph",
+        json!({"addr": 0x1a030u64, "max_depth": 3, "max_nodes": 7})
+    )]
+    #[case::find_control_flow_paths(
+        "find_control_flow_paths",
+        json!({"start": "0x1a040", "end": "0x1a050", "max_paths": 2, "max_depth": 4}),
+        "find_paths",
+        json!({"start": 0x1a040u64, "end": 0x1a050u64, "max_paths": 2, "max_depth": 4})
+    )]
+    #[case::build_xref_matrix(
+        "build_xref_matrix",
+        json!({"addrs": ["0x1a060", "0x1a070"]}),
+        "xref_matrix",
+        json!({"addrs": [0x1a060u64, 0x1a070u64]})
+    )]
+    #[case::get_database_info("get_database_info", json!({}), "idb_meta", json!({}))]
+    #[case::list_globals(
+        "list_globals",
+        json!({"query": "g_", "offset": 1, "limit": 20, "timeout_secs": 5}),
+        "list_globals",
+        json!({"query": "g_", "offset": 1, "limit": 20, "timeout_secs": 5})
+    )]
+    #[case::run_auto_analysis(
+        "run_auto_analysis",
+        json!({"timeout_secs": 10}),
+        "analyze_funcs",
+        json!({"timeout_secs": 10})
+    )]
+    #[case::search_bytes(
+        "search_bytes",
+        json!({"patterns": "FD 7B", "limit": 11, "timeout_secs": 12}),
+        "find_bytes",
+        json!({"pattern": "FD 7B", "max_results": 11, "timeout_secs": 12})
+    )]
+    #[case::search_text(
+        "search_text",
+        json!({"text": "malloc", "max_results": 9, "timeout_secs": 1}),
+        "search_text",
+        json!({"text": "malloc", "max_results": 9, "timeout_secs": 1})
+    )]
+    #[case::search_imm(
+        "search_imm",
+        json!({"imm": 123, "max_results": 4, "timeout_secs": 2}),
+        "search_imm",
+        json!({"imm": 123, "max_results": 4, "timeout_secs": 2})
+    )]
+    #[case::search_instructions(
+        "search_instructions",
+        json!({"patterns": ["bl", "ret"], "limit": 6, "case_insensitive": false, "timeout_secs": 3}),
+        "find_insns",
+        json!({"patterns": ["bl", "ret"], "max_results": 6, "case_insensitive": false, "timeout_secs": 3})
+    )]
+    #[case::search_instruction_operands(
+        "search_instruction_operands",
+        json!({"patterns": ["x0"], "limit": 7, "case_insensitive": false, "timeout_secs": 4}),
+        "find_insn_operands",
+        json!({"patterns": ["x0"], "max_results": 7, "case_insensitive": false, "timeout_secs": 4})
+    )]
+    #[case::run_script(
+        "run_script",
+        json!({"code": "print('ok')", "timeout_secs": 6}),
+        "run_script",
+        json!({"code": "print('ok')", "timeout_secs": 6})
+    )]
+    #[case::search_pseudocode(
+        "search_pseudocode",
+        json!({"pattern": "malloc", "limit": 5, "timeout_secs": 77}),
+        "list_functions",
+        json!({"offset": 0, "limit": 10000, "filter": null, "timeout_secs": 77})
+    )]
+    #[tokio::test]
+    async fn test_dispatch_full_params_single_call(
+        #[case] method: &str,
+        #[case] params: Value,
+        #[case] expected_worker_method: &str,
+        #[case] expected_payload: Value,
+    ) {
+        let calls = run_dispatch_result(method, params).await.unwrap();
+        assert_single_full_call(method, expected_worker_method, expected_payload, &calls);
+    }
+
+    #[rstest]
+    #[case::batch_decompile(
+        "batch_decompile",
+        json!({"addresses": ["0x2000", "0x2008"]}),
+        vec![
+            ("decompile", json!({"addr": 0x2000u64})),
+            ("decompile", json!({"addr": 0x2008u64})),
+        ]
+    )]
+    #[case::scan_memory_table(
+        "scan_memory_table",
+        json!({"base_address": "0x3000", "stride": 8, "count": 3}),
+        vec![
+            ("get_bytes", json!({"addr": 0x3000u64, "name": null, "offset": 0, "size": 8})),
+            ("get_bytes", json!({"addr": 0x3008u64, "name": null, "offset": 0, "size": 8})),
+            ("get_bytes", json!({"addr": 0x3010u64, "name": null, "offset": 0, "size": 8})),
+        ]
+    )]
+    #[case::diff_pseudocode(
+        "diff_pseudocode",
+        json!({"addr1": "0x4000", "addr2": "0x4010"}),
+        vec![
+            ("decompile", json!({"addr": 0x4000u64})),
+            ("decompile", json!({"addr": 0x4010u64})),
+        ]
+    )]
+    #[tokio::test]
+    async fn test_dispatch_full_params_multi_call(
+        #[case] method: &str,
+        #[case] params: Value,
+        #[case] expected_calls: Vec<(&str, Value)>,
+    ) {
+        let calls = run_dispatch_result(method, params).await.unwrap();
+        assert_eq!(
+            calls.len(),
+            expected_calls.len(),
+            "call count mismatch for {method}"
+        );
+        for (idx, (expected_name, expected_payload)) in expected_calls.iter().enumerate() {
+            assert_eq!(
+                calls[idx].0, *expected_name,
+                "call[{idx}] method mismatch for {method}"
+            );
+            assert_eq!(
+                calls[idx].1, *expected_payload,
+                "call[{idx}] payload mismatch for {method}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::space_separated(json!({"address": "0x1000", "bytes": "90 91"}), vec![0x90u8, 0x91])]
+    #[case::continuous_hex(json!({"address": "0x1000", "bytes": "9091"}), vec![0x90, 0x91])]
+    #[case::with_0x_prefix(json!({"address": "0x1000", "bytes": "0x90 0x91"}), vec![0x90, 0x91])]
+    #[case::four_bytes_no_space(json!({"address": "0x1000", "bytes": "0b080000"}), vec![0x0b, 0x08, 0x00, 0x00])]
+    #[case::json_array(json!({"address": "0x1000", "bytes": [0x90, 0x91]}), vec![0x90, 0x91])]
+    #[tokio::test]
+    async fn test_patch_bytes_data_integrity(
+        #[case] params: Value,
+        #[case] expected_bytes: Vec<u8>,
+    ) {
+        let calls = run_dispatch_result("patch_bytes", params).await.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "patch_bytes");
+        let recorded_bytes: Vec<u8> = calls[0].1["bytes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u8)
+            .collect();
+        assert_eq!(recorded_bytes, expected_bytes);
+    }
+
+    #[rstest]
+    #[case::list_functions_defaults(
+        "list_functions",
+        json!({}),
+        "list_functions",
+        json!({"offset": 0, "limit": 100, "filter": null, "timeout_secs": null})
+    )]
+    #[case::disassemble_default_count(
+        "disassemble",
+        json!({"address": "0x1000"}),
+        "disasm",
+        json!({"addr": 0x1000u64, "count": 10})
+    )]
+    #[case::disassemble_function_at_defaults(
+        "disassemble_function_at",
+        json!({"address": "0x7000"}),
+        "disasm_function_at",
+        json!({"addr": 0x7000u64, "name": null, "offset": 0, "count": 200})
+    )]
+    #[case::list_strings_defaults(
+        "list_strings",
+        json!({}),
+        "strings",
+        json!({"offset": 0, "limit": 100, "filter": null, "timeout_secs": null})
+    )]
+    #[case::declare_c_type_defaults(
+        "declare_c_type",
+        json!({"decl": "int x;"}),
+        "declare_type",
+        json!({"decl": "int x;", "relaxed": false, "replace": false, "multi": false})
+    )]
+    #[case::read_bytes_defaults(
+        "read_bytes",
+        json!({"address": "0x14000"}),
+        "get_bytes",
+        json!({"addr": 0x14000u64, "name": null, "offset": 0, "size": 16})
+    )]
+    #[case::read_int_defaults(
+        "read_int",
+        json!({"address": "0x15000"}),
+        "read_int",
+        json!({"addr": 0x15000u64, "size": 4})
+    )]
+    #[case::read_string_defaults(
+        "read_string",
+        json!({"address": "0x15100"}),
+        "get_string",
+        json!({"addr": 0x15100u64, "max_len": 1024})
+    )]
+    #[case::set_decompiler_comment_default_itp(
+        "set_decompiler_comment",
+        json!({"func_address": "0x18020", "address": "0x18024", "comment": "c"}),
+        "set_decompiler_comment",
+        json!({"func_addr": 0x18020u64, "addr": 0x18024u64, "itp": 69, "comment": "c"})
+    )]
+    #[case::build_callgraph_defaults(
+        "build_callgraph",
+        json!({"roots": "0x1a030"}),
+        "callgraph",
+        json!({"addr": 0x1a030u64, "max_depth": 5, "max_nodes": 100})
+    )]
+    #[case::search_instructions_defaults(
+        "search_instructions",
+        json!({"patterns": "mov"}),
+        "find_insns",
+        json!({"patterns": ["mov"], "max_results": 100, "case_insensitive": true, "timeout_secs": null})
+    )]
+    #[tokio::test]
+    async fn test_dispatch_default_params(
+        #[case] method: &str,
+        #[case] params: Value,
+        #[case] expected_worker_method: &str,
+        #[case] expected_payload: Value,
+    ) {
+        let calls = run_dispatch_result(method, params).await.unwrap();
+        assert_single_full_call(method, expected_worker_method, expected_payload, &calls);
+    }
+
+    #[rstest]
+    #[case::patch_bytes_empty("patch_bytes", json!({"address": "0x1000", "bytes": ""}))]
+    #[case::patch_bytes_invalid_hex("patch_bytes", json!({"address": "0x1000", "bytes": "GG"}))]
+    #[case::patch_bytes_odd_hex("patch_bytes", json!({"address": "0x1000", "bytes": "ABC"}))]
+    #[case::unknown_method("nonexistent", json!({}))]
+    #[case::missing_required_name("get_function_by_name", json!({}))]
+    #[case::invalid_param_type("list_functions", json!({"offset": "bad"}))]
+    #[case::scan_memory_table_missing_base("scan_memory_table", json!({"count": 2}))]
+    #[tokio::test]
+    async fn test_dispatch_errors(#[case] method: &str, #[case] params: Value) {
+        let mock = MockWorker::new();
+        let req = RpcRequest::new("1", method, params);
+        assert!(dispatch_rpc(&req, &mock).await.is_err());
     }
 }
