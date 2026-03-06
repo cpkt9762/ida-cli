@@ -1226,6 +1226,12 @@ pub struct OpenSbpfRequest {
     pub sbpf2host_path: Option<String>,
     #[schemars(description = "Pass --dump-ir to sbpf2host to also emit LLVM IR (default: false)")]
     pub dump_ir: Option<bool>,
+    #[schemars(
+        description = "Skip automatic import of sbpf_runtime.h types (SbpfContext, etc). \
+        Default: false (types are imported automatically on first open)."
+    )]
+    #[serde(default)]
+    pub skip_runtime_types: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
