@@ -8,9 +8,12 @@ DSTATE_SUSP = -1
 DSTATE_NOTASK = 0
 DSTATE_RUN = 1
 
-WFNE_SUSP = 0x0001
-WFNE_SILENT = 0x0004
-WFNE_CONT = 0x0008
+WFNE_ANY = 1
+WFNE_SUSP = 2
+WFNE_SILENT = 4
+WFNE_CONT = 8
+WFNE_NOWAIT = 16
+WFNE_USEC = 32
 
 def safe_hex(v):
     if v is None:
@@ -63,6 +66,56 @@ pub fn parse_debug_output(result: &Value) -> Result<Value, ToolError> {
 
 pub fn build_script(body: &str) -> String {
     format!("{}\n{}", HEADLESS_PREAMBLE, body)
+}
+
+/// Auto-detect the platform-appropriate IDA remote debug server binary.
+///
+/// Returns the absolute path to `mac_server_arm` (macOS ARM64),
+/// `mac_server` (macOS x86_64), `linux_server64` (Linux), or `None` if
+/// no debug server is found.  The caller passes this to script generators
+/// so the generated Python can spawn the server on demand.
+pub fn find_debug_server_path() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let candidates: &[&str] = if cfg!(target_arch = "aarch64") {
+            &[
+                "/Applications/IDA Professional 9.3.app/Contents/MacOS/dbgsrv/mac_server_arm",
+                "/Applications/IDA Professional 9.2.app/Contents/MacOS/dbgsrv/mac_server_arm",
+                "/Applications/IDA Home 9.3.app/Contents/MacOS/dbgsrv/mac_server_arm",
+                "/Applications/IDA Essential 9.3.app/Contents/MacOS/dbgsrv/mac_server_arm",
+            ]
+        } else {
+            &[
+                "/Applications/IDA Professional 9.3.app/Contents/MacOS/dbgsrv/mac_server",
+                "/Applications/IDA Professional 9.2.app/Contents/MacOS/dbgsrv/mac_server",
+                "/Applications/IDA Home 9.3.app/Contents/MacOS/dbgsrv/mac_server",
+                "/Applications/IDA Essential 9.3.app/Contents/MacOS/dbgsrv/mac_server",
+            ]
+        };
+        for p in candidates {
+            if std::path::Path::new(p).exists() {
+                return Some(p.to_string());
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let bases = ["/opt/idapro-9.3", "/opt/idapro-9.2"];
+        for base in &bases {
+            let p = format!("{}/dbgsrv/linux_server64", base);
+            if std::path::Path::new(&p).exists() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }
 
 pub mod breakpoint;

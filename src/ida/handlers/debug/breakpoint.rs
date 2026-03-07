@@ -11,7 +11,7 @@ pub fn generate_add_breakpoint_script(
         Some(cond) => format!(
             r#"
 if ok:
-    bpt = ida_idd.bpt_t()
+    bpt = ida_dbg.bpt_t()
     if ida_dbg.get_bpt({address}, bpt):
         bpt.condition = "{cond}"
         ida_dbg.update_bpt(bpt)
@@ -68,7 +68,7 @@ pub fn generate_list_breakpoints_script() -> String {
     let body = r#"
 bpts = []
 for i in range(ida_dbg.get_bpt_qty()):
-    bpt = ida_idd.bpt_t()
+    bpt = ida_dbg.bpt_t()
     if ida_dbg.getn_bpt(i, bpt):
         bpts.append({
             "address": safe_hex(bpt.ea),

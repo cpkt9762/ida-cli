@@ -552,15 +552,39 @@ impl IdaMcpServer {
         tool_name: &str,
         script: &str,
         timeout_secs: u64,
-        route_args: Value,
+        _route_args: Value,
     ) -> Result<CallToolResult, McpError> {
+        let outer_timeout = timeout_secs + 5;
         if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(router, db_handle, tool_name, route_args)
-                .await;
+            // Enforce db_handle when multiple IDBs are open
+            if db_handle.is_none() {
+                let count = router.worker_count().await;
+                if count > 1 {
+                    return Ok(ToolError::InvalidParams(
+                        "db_handle is required when multiple databases are open. \
+                         Provide the db_handle returned by open_idb."
+                            .to_string(),
+                    )
+                    .to_tool_result());
+                }
+            }
+
+            let params = json!({"code": script, "timeout_secs": outer_timeout});
+            return match router.route_request(db_handle, "run_script", params).await {
+                Ok(result) => match crate::ida::handlers::debug::parse_debug_output(&result) {
+                    Ok(data) => Ok(CallToolResult::success(vec![Content::text(
+                        serde_json::to_string_pretty(&data).unwrap_or_default(),
+                    )])),
+                    Err(e) => {
+                        warn!(tool = tool_name, error = %e, "debug script parse failed (routed)");
+                        Ok(e.to_tool_result())
+                    }
+                },
+                Err(e) => Ok(e.to_tool_result()),
+            };
         }
 
-        match self.worker.run_script(script, Some(timeout_secs)).await {
+        match self.worker.run_script(script, Some(outer_timeout)).await {
             Ok(result) => match crate::ida::handlers::debug::parse_debug_output(&result) {
                 Ok(data) => Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&data).unwrap_or_default(),
@@ -806,10 +830,13 @@ impl IdaMcpServer {
         }
 
         let input = crate::expand_path(&req.path);
-        let output_dir = req.output_dir.as_deref().map(std::path::Path::new);
+        let resolved_dir = crate::sbpf::resolve_output_dir(
+            &input,
+            req.output_dir.as_deref().map(std::path::Path::new),
+        );
+        let output_dir = Some(resolved_dir.as_path());
         let dump_ir = req.dump_ir.unwrap_or(false);
 
-        // Compute the expected dylib output path (e.g. program.dylib on macOS).
         let dylib_path = crate::sbpf::sbpf2host_output_path(&input, output_dir);
         let dylib_str = dylib_path.display().to_string();
 
@@ -4838,8 +4865,12 @@ impl IdaMcpServer {
         let timeout = req.timeout_secs.unwrap_or(30).min(600);
         let name = req.debugger_name.as_deref().unwrap_or("mac");
         let is_remote = req.is_remote.unwrap_or(false);
-        let script =
-            crate::ida::handlers::debug::process::generate_load_debugger_script(name, is_remote);
+        let dbgsrv = crate::ida::handlers::debug::find_debug_server_path();
+        let script = crate::ida::handlers::debug::process::generate_load_debugger_script(
+            name,
+            is_remote,
+            dbgsrv.as_deref(),
+        );
         self.run_debug_script(
             req.db_handle.as_deref(),
             "dbg_load_debugger",
@@ -4860,11 +4891,13 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: dbg_start_process");
         let timeout = req.timeout_secs.unwrap_or(60).min(600);
+        let dbgsrv = crate::ida::handlers::debug::find_debug_server_path();
         let script = crate::ida::handlers::debug::process::generate_start_process_script(
             req.path.as_deref(),
             req.args.as_deref(),
             req.start_dir.as_deref(),
             timeout,
+            dbgsrv.as_deref(),
         );
         self.run_debug_script(
             req.db_handle.as_deref(),
@@ -4884,8 +4917,12 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: dbg_attach_process");
         let timeout = req.timeout_secs.unwrap_or(30).min(600);
-        let script =
-            crate::ida::handlers::debug::process::generate_attach_process_script(req.pid, timeout);
+        let dbgsrv = crate::ida::handlers::debug::find_debug_server_path();
+        let script = crate::ida::handlers::debug::process::generate_attach_process_script(
+            req.pid,
+            timeout,
+            dbgsrv.as_deref(),
+        );
         self.run_debug_script(
             req.db_handle.as_deref(),
             "dbg_attach_process",

@@ -7,7 +7,16 @@ pub fn generate_get_registers_script(register_names: Option<&[String]>) -> Strin
             let names_py: Vec<String> = names.iter().map(|n| format!("\"{}\"", n)).collect();
             format!("names = [{}]", names_py.join(", "))
         }
-        _ => "import ida_idp\nnames = list(ida_idp.ph_get_regnames())".to_string(),
+        _ => r#"import ida_idp
+_raw = list(ida_idp.ph_get_regnames())
+names = []
+_seen = set()
+for _n in _raw:
+    rv = ida_idd.regval_t()
+    if ida_dbg.get_reg_val(_n, rv) and _n not in _seen:
+        names.append(_n)
+        _seen.add(_n)"#
+            .to_string(),
     };
     let body = format!(
         r#"
@@ -18,7 +27,7 @@ else:
     regs = {{}}
     {filter_code}
     for name in names:
-        rv = ida_dbg.regval_t()
+        rv = ida_idd.regval_t()
         if ida_dbg.get_reg_val(name, rv):
             regs[name] = safe_hex(rv.ival)
     ip = safe_hex(ida_dbg.get_ip_val())
@@ -38,7 +47,7 @@ state = ida_dbg.get_process_state()
 if state != -1:
     make_result(False, error=f"Cannot set register: state={{state}}, need DSTATE_SUSP(-1)")
 else:
-    rv = ida_dbg.regval_t()
+    rv = ida_idd.regval_t()
     rv.ival = {value}
     ok = ida_dbg.set_reg_val("{register_name}", rv)
     make_result(ok, {{"register": "{register_name}", "value": safe_hex({value}), "set_ok": ok}})
@@ -58,8 +67,9 @@ state = ida_dbg.get_process_state()
 if state != -1:
     make_result(False, error=f"Cannot read memory: state={{state}}, need DSTATE_SUSP(-1)")
 else:
+    import idc as _idc
     size = min({clamped}, 4096)
-    data = ida_dbg.read_dbg_memory({address}, size)
+    data = _idc.read_dbg_memory({address}, size)
     if data is not None and len(data) > 0:
         hex_str = data.hex()
         ascii_str = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
@@ -87,10 +97,10 @@ state = ida_dbg.get_process_state()
 if state != -1:
     make_result(False, error=f"Cannot write memory: state={{state}}, need DSTATE_SUSP(-1)")
 else:
+    import idc as _idc
     data_bytes = bytes.fromhex("{clean_hex}")
-    written = ida_dbg.write_dbg_memory({address}, data_bytes)
-    ok = written == len(data_bytes)
-    make_result(ok, {{"address": safe_hex({address}), "bytes_written": written, "ok": ok}})
+    ok = _idc.write_dbg_memory({address}, data_bytes)
+    make_result(bool(ok), {{"address": safe_hex({address}), "bytes_written": len(data_bytes) if ok else 0, "ok": bool(ok)}})
 "#,
         clean_hex = clean_hex,
         address = address,
@@ -104,17 +114,20 @@ pub fn generate_get_memory_info_script() -> String {
 import idaapi
 ranges = idaapi.meminfo_vec_t()
 n = ida_dbg.get_dbg_memory_info(ranges)
-regions = []
-for i in range(n):
-    r = ranges[i]
-    regions.append({
-        "start": safe_hex(r.start_ea),
-        "end": safe_hex(r.end_ea),
-        "name": str(r.name) if r.name else "",
-        "sclass": str(r.sclass) if hasattr(r, "sclass") else "",
-        "perm": int(r.perm) if hasattr(r, "perm") else 0,
-    })
-make_result(True, {"regions": regions, "count": len(regions)})
+if n < 0:
+    make_result(False, error=f"get_dbg_memory_info failed (code={n}). This debug server may not support memory region enumeration.")
+else:
+    regions = []
+    for i in range(n):
+        r = ranges[i]
+        regions.append({
+            "start": safe_hex(r.start_ea),
+            "end": safe_hex(r.end_ea),
+            "name": str(r.name) if r.name else "",
+            "sclass": str(r.sclass) if hasattr(r, "sclass") else "",
+            "perm": int(r.perm) if hasattr(r, "perm") else 0,
+        })
+    make_result(True, {"regions": regions, "count": len(regions)})
 "#;
     super::build_script(body)
 }

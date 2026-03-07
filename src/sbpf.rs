@@ -71,6 +71,52 @@ pub fn find_sbpf2host() -> Result<PathBuf, ToolError> {
     ))
 }
 
+// ── Output directory resolution ───────────────────────────────────────────
+
+/// Check whether a directory is writable by probing with a temp file.
+///
+/// More reliable than inspecting `metadata().permissions()` on Unix, which
+/// only checks owner bits and ignores ACLs / mount flags / sandboxing.
+fn is_dir_writable(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(format!(".sbpf2host_probe_{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Resolve the effective output directory for `sbpf2host` products.
+///
+/// - If `output_dir` is explicitly provided, returns it as-is (respecting
+///   the caller's choice, even if the directory might not be writable).
+/// - Otherwise, uses the input file's parent directory — **unless** that
+///   directory is not writable (common when the MCP server runs in a
+///   sandbox with a read-only CWD), in which case falls back to
+///   [`std::env::temp_dir()`].
+pub fn resolve_output_dir(input: &Path, output_dir: Option<&Path>) -> PathBuf {
+    if let Some(dir) = output_dir {
+        return dir.to_path_buf();
+    }
+    let parent = input.parent().unwrap_or(Path::new("."));
+    if is_dir_writable(parent) {
+        parent.to_path_buf()
+    } else {
+        let tmp = std::env::temp_dir();
+        tracing::warn!(
+            input_dir = %parent.display(),
+            fallback = %tmp.display(),
+            "Input directory is not writable; falling back to temp dir for sbpf2host output"
+        );
+        tmp
+    }
+}
+
 // ── Output path helpers ───────────────────────────────────────────────────
 
 /// Compute the output `.dylib` / `.so` path for a given sBPF input.
@@ -152,12 +198,18 @@ pub fn run_sbpf2host(
         "Running sbpf2host AOT compilation"
     );
 
+    // Canonicalize input so it stays valid after we change the working dir.
+    let abs_input = std::fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
+    let working_dir = dylib_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+
     let mut cmd = Command::new(&sbpf2host);
-    // --dylib-output expects the path WITHOUT extension; sbpf2host appends
-    // the platform extension (.dylib / .so) itself.
     let dylib_stem = dylib_path.with_extension("");
-    cmd.arg(input)
-        .arg(format!("--dylib-output={}", dylib_stem.display()));
+    cmd.arg(&abs_input)
+        .arg(format!("--dylib-output={}", dylib_stem.display()))
+        .current_dir(&working_dir);
 
     if dump_ir {
         cmd.arg("--dump-ir");
@@ -253,5 +305,28 @@ mod tests {
         assert!(dsym.to_str().unwrap().contains(".dSYM"));
         assert!(dsym.to_str().unwrap().contains("DWARF"));
         assert!(dsym.to_str().unwrap().ends_with("program.dylib"));
+    }
+
+    #[test]
+    fn resolve_output_dir_explicit() {
+        let input = Path::new("/some/program.so");
+        let dir = Path::new("/explicit/dir");
+        assert_eq!(
+            resolve_output_dir(input, Some(dir)),
+            Path::new("/explicit/dir")
+        );
+    }
+
+    #[test]
+    fn resolve_output_dir_writable_parent() {
+        let tmp = std::env::temp_dir();
+        let input = tmp.join("program.so");
+        assert_eq!(resolve_output_dir(&input, None), tmp);
+    }
+
+    #[test]
+    fn resolve_output_dir_readonly_fallback() {
+        let input = Path::new("/nonexistent_sbpf2host_test_dir/program.so");
+        assert_eq!(resolve_output_dir(input, None), std::env::temp_dir());
     }
 }
