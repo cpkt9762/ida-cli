@@ -5,20 +5,47 @@
 const DBGSRV_HELPERS: &str = r#"
 import subprocess as _sp, socket as _sock, time as _time
 
+def _wait_port(port, timeout=3.0):
+    """Block until mac_server_arm is accepting TCP connections."""
+    _deadline = _time.monotonic() + timeout
+    while _time.monotonic() < _deadline:
+        try:
+            _cs = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            _cs.settimeout(0.5)
+            _cs.connect(('127.0.0.1', port))
+            _cs.close()
+            return True
+        except OSError:
+            try:
+                _cs.close()
+            except Exception:
+                pass
+            _time.sleep(0.1)
+    return False
+
 def _ensure_dbgsrv(srv_path):
     if hasattr(idaapi, '_mcp_dbgsrv'):
         _info = idaapi._mcp_dbgsrv
         if _info['proc'].poll() is None:
-            return _info['port']
+            if _wait_port(_info['port'], timeout=1.0):
+                return _info['port']
+            # Server process alive but not listening — restart
+            try:
+                _info['proc'].kill()
+            except Exception:
+                pass
     _s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
     _s.bind(('127.0.0.1', 0))
     _port = _s.getsockname()[1]
     _s.close()
-    _proc = _sp.Popen([srv_path, '-p', str(_port), '-t'],
+    _proc = _sp.Popen([srv_path, '-p', str(_port), '-t', '--on-broken-connection-keep-session'],
                       stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-    _time.sleep(0.5)
-    if _proc.poll() is not None:
-        raise RuntimeError(f"Debug server exited immediately (code={_proc.returncode})")
+    if not _wait_port(_port, timeout=5.0):
+        rc = _proc.poll()
+        if rc is not None:
+            raise RuntimeError(f"Debug server exited immediately (code={rc})")
+        _proc.kill()
+        raise RuntimeError(f"Debug server not listening on port {_port} after 5s")
     idaapi._mcp_dbgsrv = {'proc': _proc, 'port': _port}
     return _port
 
@@ -212,14 +239,19 @@ if state != 0:
     _os.kill(_child_pid, 9)
     make_result(False, error=f"Cannot attach: process state is {{state}}, need DSTATE_NOTASK(0)")
 else:
-    ret = ida_dbg.attach_process(_child_pid, -1)
+    ret = -1
+    for _attempt in range(3):
+        ret = ida_dbg.attach_process(_child_pid, -1)
+        if ret == 1:
+            break
+        _time.sleep(0.5 * (_attempt + 1))
     if ret == 1:
         code = ida_dbg.wait_for_next_event(WFNE_SUSP | WFNE_SILENT, {timeout})
         ip = safe_hex(ida_dbg.get_ip_val())
         make_result(True, {{"event_code": code, "ip": ip, "pid": _child_pid, "state": ida_dbg.get_process_state(), "remote": True, "port": _port}})
     else:
         _os.kill(_child_pid, 9)
-        make_result(False, error=f"attach_process returned {{ret}} for pid {{_child_pid}}")
+        make_result(False, error=f"attach_process returned {{ret}} for pid {{_child_pid}} after 3 attempts")
 "#,
             DBGSRV_HELPERS = DBGSRV_HELPERS,
             srv_path = srv_path.replace('"', "\\\""),
@@ -317,13 +349,27 @@ else:
     if state != 0:
         make_result(False, error=f"Cannot attach: state={{state}}, need DSTATE_NOTASK(0)")
     else:
-        ret = ida_dbg.attach_process(int(_pid), -1)
+        ret = -1
+        for _attempt in range(3):
+            ret = ida_dbg.attach_process(int(_pid), -1)
+            if ret == 1:
+                break
+            _time.sleep(0.5 * (_attempt + 1))
         if ret == 1:
             code = ida_dbg.wait_for_next_event(WFNE_SUSP | WFNE_SILENT, {timeout})
             ip = safe_hex(ida_dbg.get_ip_val())
             make_result(True, {{"event_code": code, "ip": ip, "pid": _pid, "remote": True, "port": _port}})
         else:
-            make_result(False, error=f"attach_process returned {{ret}}")
+            import os as _os
+            _alive = _os.path.exists(f"/proc/{{int(_pid)}}") if _os.name != "nt" else True
+            try:
+                _os.kill(int(_pid), 0)
+                _proc_exists = True
+            except (OSError, ProcessLookupError):
+                _proc_exists = False
+            _srv_alive = idaapi._mcp_dbgsrv['proc'].poll() is None if hasattr(idaapi, '_mcp_dbgsrv') else False
+            _srv_listen = _wait_port(_port, timeout=0.5) if _srv_alive else False
+            make_result(False, error=f"attach_process returned {{ret}} after 3 attempts (pid={{_pid}}, pid_exists={{_proc_exists}}, srv_alive={{_srv_alive}}, srv_listening={{_srv_listen}}, port={{_port}})")
 "#,
             DBGSRV_HELPERS = DBGSRV_HELPERS,
             pid_py = pid_py,
