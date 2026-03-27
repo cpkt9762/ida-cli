@@ -78,15 +78,16 @@
 
 use std::path::PathBuf;
 
+pub mod cli;
 pub mod disasm;
 pub mod dsc;
-pub mod sbpf;
 pub mod error;
 pub mod ida;
 pub mod router;
+pub mod rpc_dispatch;
+pub mod sbpf;
 pub mod server;
 pub mod tool_registry;
-pub mod rpc_dispatch;
 
 pub use error::ToolError;
 pub use ida::{

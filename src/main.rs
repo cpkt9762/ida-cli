@@ -56,6 +56,8 @@ enum Command {
     ServeWorker,
     /// Run a direct CLI probe to exercise idalib
     Probe(ProbeArgs),
+    /// CLI client: send commands to a running server via Unix socket
+    Cli(ida_mcp::cli::CliArgs),
 }
 
 #[derive(Args, Default)]
@@ -225,11 +227,16 @@ fn main() -> anyhow::Result<()> {
         Command::ServeHttp(args) => run_server_http(args),
         Command::ServeWorker => run_serve_worker(),
         Command::Probe(args) => run_probe(args),
+        Command::Cli(args) => run_cli(args),
     }
 }
 
-// IDA library initialization is now deferred to the worker loop's first request.
-// This avoids license contention when open_dsc needs to run idat first.
+fn run_cli(args: ida_mcp::cli::CliArgs) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(ida_mcp::cli::run(args))
+}
 
 async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     #[cfg(unix)]
@@ -276,11 +283,26 @@ fn run_server_multi() -> anyhow::Result<()> {
         rt.block_on(async move {
             info!("MCP server (router mode) listening on stdio");
             let server = IdaMcpServer::new(worker.clone(), ServerMode::Router(router.clone()));
-            // Start idle-GC watchdog: close workers idle for >4h, check every 5min.
             router.start_watchdog(
-                std::time::Duration::from_secs(4 * 60 * 60),
+                std::time::Duration::from_secs(8 * 3600),
                 std::time::Duration::from_secs(5 * 60),
+                None,
             );
+
+            let socket_path = PathBuf::from(format!("/tmp/ida-mcp-{}.sock", std::process::id()));
+            let socket_path_cleanup = socket_path.clone();
+            let router_for_socket = router.clone();
+            tokio::spawn(async move {
+                if let Err(e) = ida_mcp::server::socket_listener::run_socket_listener(
+                    socket_path,
+                    router_for_socket,
+                )
+                .await
+                {
+                    warn!("Socket listener failed: {e}");
+                }
+            });
+
             let sanitized = ida_mcp::server::SanitizedIdaServer(server);
             let mut service = Some(sanitized.serve(stdio()).await?);
             let shutdown_notify = Arc::new(Notify::new());
@@ -291,6 +313,7 @@ fn run_server_multi() -> anyhow::Result<()> {
                 if wait_for_shutdown_signal().await.is_ok() {
                     info!("Shutdown signal received (router mode)");
                     router_for_signal.shutdown_all().await;
+                    ida_mcp::server::socket_listener::cleanup_socket_files(&socket_path_cleanup);
                     shutdown_signal.notify_one();
                 }
             });
@@ -527,11 +550,26 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 session_manager,
                 config,
             );
-            // Start idle-GC watchdog: close workers idle for >4h, check every 5min.
             router.start_watchdog(
-                std::time::Duration::from_secs(4 * 60 * 60),
+                std::time::Duration::from_secs(8 * 3600),
                 std::time::Duration::from_secs(5 * 60),
+                Some(std::time::Duration::from_secs(60)),
             );
+
+            let socket_path = PathBuf::from(format!("/tmp/ida-mcp-{}.sock", std::process::id()));
+            let socket_path_cleanup = socket_path.clone();
+            let router_for_socket = router.clone();
+            tokio::spawn(async move {
+                if let Err(e) = ida_mcp::server::socket_listener::run_socket_listener(
+                    socket_path,
+                    router_for_socket,
+                )
+                .await
+                {
+                    warn!("Socket listener failed: {e}");
+                }
+            });
+
             let allowed_origins: std::collections::HashSet<String> = args
                 .allow_origin
                 .iter()
@@ -555,6 +593,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                     router_for_signal.shutdown_all().await;
                     let _ = shutdown_worker.close_for_shutdown().await;
                     let _ = shutdown_worker.shutdown().await;
+                    ida_mcp::server::socket_listener::cleanup_socket_files(&socket_path_cleanup);
                     cancel_for_shutdown.cancel();
                 }
             });

@@ -1,6 +1,8 @@
 //! MCP server implementation with IDA Pro tools.
 
 mod requests;
+pub mod response_cache;
+pub mod socket_listener;
 pub mod task;
 
 pub use requests::*;
@@ -525,19 +527,7 @@ impl IdaMcpServer {
         method: &str,
         params: Value,
     ) -> Result<CallToolResult, McpError> {
-        // Enforce db_handle when multiple IDBs are open
-        if handle.is_none() {
-            let count = router.worker_count().await;
-            if count > 1 {
-                return Ok(ToolError::InvalidParams(
-                    "db_handle is required when multiple databases are open. \
-                     Provide the db_handle returned by open_idb."
-                        .to_string(),
-                )
-                .to_tool_result());
-            }
-        }
-
+        // Multi-IDB guard is enforced in RouterState::route_request itself.
         match router.route_request(handle, method, params).await {
             Ok(v) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| format!("{v:?}")),
@@ -556,19 +546,6 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let outer_timeout = timeout_secs + 5;
         if let ServerMode::Router(ref router) = self.mode {
-            // Enforce db_handle when multiple IDBs are open
-            if db_handle.is_none() {
-                let count = router.worker_count().await;
-                if count > 1 {
-                    return Ok(ToolError::InvalidParams(
-                        "db_handle is required when multiple databases are open. \
-                         Provide the db_handle returned by open_idb."
-                            .to_string(),
-                    )
-                    .to_tool_result());
-                }
-            }
-
             let params = json!({"code": script, "timeout_secs": outer_timeout});
             return match router.route_request(db_handle, "run_script", params).await {
                 Ok(result) => match crate::ida::handlers::debug::parse_debug_output(&result) {

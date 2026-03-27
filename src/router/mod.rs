@@ -11,11 +11,11 @@ use crate::router::protocol::{RpcRequest, RpcResponse};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, error, info, warn};
-use std::time::{Duration, Instant};
 
 pub type DbHandle = String;
 pub type ReqId = String;
@@ -212,7 +212,10 @@ impl RouterState {
                             if inner.active.as_deref() == Some(handle_for_reader.as_str()) {
                                 inner.active = inner.workers.keys().next().cloned();
                             }
-                            warn!("Worker {} removed from registry after unexpected exit", handle_for_reader);
+                            warn!(
+                                "Worker {} removed from registry after unexpected exit",
+                                handle_for_reader
+                            );
                         }
                         break;
                     }
@@ -270,7 +273,10 @@ impl RouterState {
                         if inner.active.as_deref() == Some(handle_for_reader.as_str()) {
                             inner.active = inner.workers.keys().next().cloned();
                         }
-                        warn!("Worker {} removed from registry after I/O error", handle_for_reader);
+                        warn!(
+                            "Worker {} removed from registry after I/O error",
+                            handle_for_reader
+                        );
                         break;
                     }
                 }
@@ -308,6 +314,13 @@ impl RouterState {
                 }
                 h.to_string()
             } else {
+                if inner.workers.len() > 1 {
+                    return Err(ToolError::InvalidParams(
+                        "db_handle is required when multiple databases are open. \
+                         Provide the db_handle returned by open_idb."
+                            .to_string(),
+                    ));
+                }
                 inner.active.clone().ok_or(ToolError::NoDatabaseOpen)?
             }
         };
@@ -440,37 +453,163 @@ impl RouterState {
         info!("All workers shut down");
     }
 
-    /// Start the idle-GC watchdog. Must be called from within a tokio runtime.
-    ///
-    /// Workers that have had no requests for longer than `idle_timeout` (and have
-    /// no in-flight requests) are closed automatically. The watchdog runs until the
-    /// process exits; it holds only a weak clone of the router state so it does not
-    /// process exits.
-    pub fn start_watchdog(&self, idle_timeout: Duration, check_interval: Duration) {
+    pub async fn issue_ref_for_handle(&self, handle: &str) -> String {
+        let mut inner = self.inner.lock().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let nonce = inner.req_counter;
+        inner.req_counter += 1;
+        let token = format!("cli-{now:x}-{nonce:x}");
+
+        inner
+            .token_to_handle
+            .insert(token.clone(), handle.to_string());
+        inner
+            .ref_tokens
+            .entry(handle.to_string())
+            .or_default()
+            .insert(token.clone());
+        token
+    }
+
+    /// Returns `(db_handle, ref_token)`. Caller MUST release `ref_token` when done.
+    pub async fn ensure_worker_with_ref(
+        &self,
+        path: &str,
+    ) -> Result<(DbHandle, String), crate::error::ToolError> {
+        use crate::error::ToolError;
+
+        // Resolve sBPF .so → host-native dylib/i64 path for IDA.
+        let resolved = resolve_open_path(path);
+        let open_path = resolved.as_deref().unwrap_or(path);
+
+        let canonical =
+            std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+        let canonical_open = std::fs::canonicalize(open_path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(open_path));
+
+        let existing = {
+            let inner = self.inner.lock().await;
+            inner.path_to_handle.get(&canonical).cloned()
+        };
+
+        let handle = if let Some(h) = existing {
+            let mut inner = self.inner.lock().await;
+            if let Some(worker) = inner.workers.get_mut(&h) {
+                worker.last_active = Instant::now();
+            }
+            h
+        } else {
+            let (h, initial_token) = self
+                .spawn_worker(path)
+                .await
+                .map_err(|e| ToolError::IdaError(format!("spawn_worker failed: {e}")))?;
+
+            if let Some(token) = initial_token {
+                self.release_ref_token(&token).await;
+            }
+
+            let open_params = serde_json::json!({
+                "path": canonical_open.display().to_string(),
+                "auto_analyse": true,
+            });
+            match self.route_request(Some(&h), "open", open_params).await {
+                Ok(_) => {}
+                Err(e) => {
+                    // Open failed — clean up the spawned worker so it doesn't
+                    // linger as a zombie in the routing table.
+                    warn!(handle = %h, error = %e, "open failed, cleaning up worker");
+                    let _ = self.close_worker(&h).await;
+                    return Err(e);
+                }
+            }
+            h
+        };
+
+        let ref_token = self.issue_ref_for_handle(&handle).await;
+
+        Ok((handle, ref_token))
+    }
+
+    pub async fn close_by_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(), crate::error::ToolError> {
+        let handle = {
+            let inner = self.inner.lock().await;
+            inner.path_to_handle.get(path).cloned()
+        };
+        if let Some(h) = handle {
+            let _ = self
+                .route_request(Some(&h), "close", serde_json::json!({}))
+                .await;
+            let _ = self
+                .route_request(Some(&h), "shutdown", serde_json::json!({}))
+                .await;
+            self.close_worker(&h).await
+        } else {
+            Err(crate::error::ToolError::NoDatabaseOpen)
+        }
+    }
+
+    /// `auto_exit_grace`: `Some(duration)` → exit when no workers remain for that
+    /// long. `None` → disable auto-exit (stdio MCP mode).
+    pub fn start_watchdog(
+        &self,
+        idle_timeout: Duration,
+        check_interval: Duration,
+        auto_exit_grace: Option<Duration>,
+    ) {
         let state = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(check_interval);
+            let mut empty_since: Option<tokio::time::Instant> = None;
+
             loop {
                 ticker.tick().await;
-                // Collect expired handles without holding the lock during close.
                 let expired: Vec<DbHandle> = {
                     let inner = state.inner.lock().await;
                     inner
                         .workers
                         .iter()
-                        .filter(|(_, w)| {
-                            w.pending.is_empty() && w.last_active.elapsed() > idle_timeout
+                        .filter(|(h, w)| {
+                            let ref_count =
+                                inner.ref_tokens.get(*h).map(|set| set.len()).unwrap_or(0);
+                            ref_count == 0
+                                && w.pending.is_empty()
+                                && w.last_active.elapsed() > idle_timeout
                         })
                         .map(|(h, _)| h.clone())
                         .collect()
                 };
                 for handle in expired {
                     warn!(
-                        "GC: closing idle worker {} (idle > {}s)",
+                        "GC: closing idle worker {} (ref_count=0, idle > {}s)",
                         handle,
                         idle_timeout.as_secs()
                     );
                     let _ = state.close_worker(&handle).await;
+                }
+
+                if let Some(grace) = auto_exit_grace {
+                    let worker_count = state.worker_count().await;
+                    if worker_count == 0 {
+                        if let Some(since) = empty_since {
+                            if since.elapsed() >= grace {
+                                info!(
+                                    "No workers remaining for {}s, server auto-exiting",
+                                    grace.as_secs()
+                                );
+                                std::process::exit(0);
+                            }
+                        } else {
+                            empty_since = Some(tokio::time::Instant::now());
+                        }
+                    } else {
+                        empty_since = None;
+                    }
                 }
             }
         });
@@ -480,6 +619,64 @@ impl RouterState {
 impl Default for RouterState {
     fn default() -> Self {
         Self::new().expect("Failed to create RouterState")
+    }
+}
+
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const EM_BPF: u16 = 247;
+const EM_SBF: u16 = 263;
+
+fn is_sbpf_elf(path: &std::path::Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    if f.read_exact(&mut header).is_err() {
+        return false;
+    }
+    if header[..4] != ELF_MAGIC {
+        return false;
+    }
+    let machine = u16::from_le_bytes([header[18], header[19]]);
+    machine == EM_BPF || machine == EM_SBF
+}
+
+fn resolve_open_path(path: &str) -> Option<String> {
+    let input = crate::expand_path(path);
+    if !is_sbpf_elf(&input) {
+        return None;
+    }
+
+    info!(path = %input.display(), "Detected sBPF ELF, resolving via sbpf2host");
+
+    let output_dir = crate::sbpf::resolve_output_dir(&input, None);
+    let dylib_path = crate::sbpf::sbpf2host_output_path(&input, Some(&output_dir));
+    let i64_path = dylib_path.with_extension("i64");
+    let id0_path = dylib_path.with_extension("id0");
+
+    if i64_path.exists() {
+        info!(path = %i64_path.display(), "sBPF fast-path: existing .i64");
+        return Some(i64_path.display().to_string());
+    }
+    if id0_path.exists() {
+        info!(path = %dylib_path.display(), "sBPF fast-path: existing unpacked .id0");
+        return Some(dylib_path.display().to_string());
+    }
+    if dylib_path.exists() {
+        info!(path = %dylib_path.display(), "sBPF fast-path: existing dylib");
+        return Some(dylib_path.display().to_string());
+    }
+
+    match crate::sbpf::run_sbpf2host(&input, Some(&output_dir), false) {
+        Ok(result) => {
+            info!(dylib = %result.dylib_path.display(), "sbpf2host compilation succeeded");
+            Some(result.dylib_path.display().to_string())
+        }
+        Err(e) => {
+            warn!(error = %e, "sbpf2host failed; IDA cannot open raw sBPF directly");
+            None
+        }
     }
 }
 
