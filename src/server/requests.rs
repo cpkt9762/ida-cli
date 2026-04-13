@@ -1212,20 +1212,14 @@ pub struct OpenDscRequest {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct OpenSbpfRequest {
     #[schemars(
-        description = "Path to the Solana sBPF .so program. sbpf2host will AOT-compile it to a \
-        host-native shared library (.dylib on macOS) which IDA opens with full Hex-Rays support."
+        description = "Path to the Solana sBPF .so program. `sbx aot i64` will AOT-compile it \
+        and produce a fully-analysed `.i64` database which the server opens directly."
     )]
     pub path: String,
     #[schemars(
-        description = "Output directory for the compiled .dylib (default: same directory as input .so)."
+        description = "Explicit path to the sbx binary. If omitted, searches PATH and ~/.cargo/bin."
     )]
-    pub output_dir: Option<String>,
-    #[schemars(
-        description = "Explicit path to the sbpf2host binary. If omitted, searches PATH and ~/.cargo/bin."
-    )]
-    pub sbpf2host_path: Option<String>,
-    #[schemars(description = "Pass --dump-ir to sbpf2host to also emit LLVM IR (default: false)")]
-    pub dump_ir: Option<bool>,
+    pub sbx_path: Option<String>,
     #[schemars(
         description = "Skip automatic import of sbpf_runtime.h types (SbpfContext, etc). \
         Default: false (types are imported automatically on first open)."

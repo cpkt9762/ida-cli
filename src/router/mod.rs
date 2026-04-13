@@ -498,16 +498,19 @@ impl RouterState {
         let canonical_open = std::fs::canonicalize(open_path)
             .unwrap_or_else(|_| std::path::PathBuf::from(open_path));
 
-        let existing = {
-            let inner = self.inner.lock().await;
-            inner.path_to_handle.get(&canonical).cloned()
+        let handle = {
+            let mut inner = self.inner.lock().await;
+            if let Some(h) = inner.path_to_handle.get(&canonical).cloned() {
+                if let Some(worker) = inner.workers.get_mut(&h) {
+                    worker.last_active = Instant::now();
+                }
+                Some(h)
+            } else {
+                None
+            }
         };
 
-        let handle = if let Some(h) = existing {
-            let mut inner = self.inner.lock().await;
-            if let Some(worker) = inner.workers.get_mut(&h) {
-                worker.last_active = Instant::now();
-            }
+        let handle = if let Some(h) = handle {
             h
         } else {
             let (h, initial_token) = self
@@ -583,7 +586,11 @@ impl RouterState {
             Some(e) => e.clone(),
             None => return,
         };
-        let nodes = cg_val.get("nodes").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let nodes = cg_val
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
 
         let addr_to_name: std::collections::HashMap<&str, &str> = nodes
             .iter()
@@ -600,7 +607,11 @@ impl RouterState {
         let direct: Vec<&str> = edges
             .iter()
             .filter_map(|e| {
-                if e.get("from")?.as_str()? == ep_hex { e.get("to")?.as_str() } else { None }
+                if e.get("from")?.as_str()? == ep_hex {
+                    e.get("to")?.as_str()
+                } else {
+                    None
+                }
             })
             .filter(|addr| !is_syscall(addr))
             .collect();
@@ -608,8 +619,14 @@ impl RouterState {
             return;
         }
 
-        let c0 = edges.iter().filter(|e| e.get("from").and_then(|v| v.as_str()) == Some(direct[0])).count();
-        let c1 = edges.iter().filter(|e| e.get("from").and_then(|v| v.as_str()) == Some(direct[1])).count();
+        let c0 = edges
+            .iter()
+            .filter(|e| e.get("from").and_then(|v| v.as_str()) == Some(direct[0]))
+            .count();
+        let c1 = edges
+            .iter()
+            .filter(|e| e.get("from").and_then(|v| v.as_str()) == Some(direct[1]))
+            .count();
         if c0 == c1 {
             return;
         }
@@ -625,7 +642,6 @@ impl RouterState {
 
         info!(handle = %handle, pi = %pi_hex, "sBPF: renamed process_instruction");
     }
-
 
     pub async fn close_by_path(
         &self,
@@ -768,15 +784,13 @@ fn resolve_open_path(path: &str) -> ResolvedPath {
 
     // sBPF ELF handling
     if is_sbpf_elf(&input) {
-        let idb_output = store.idb_path(&input).display().to_string();
-        // resolve_sbpf_path returns the dylib path to open
-        if let Some(open_path) = resolve_sbpf_path(&input) {
+        let i64_path = store.idb_path(&input);
+        if let Some(open_path) = resolve_sbpf_path(&input, &i64_path) {
             return ResolvedPath {
                 open_path: Some(open_path),
-                idb_output_path: Some(idb_output),
+                idb_output_path: None,
             };
         }
-        // sbpf2host failed — cannot open
         return ResolvedPath {
             open_path: None,
             idb_output_path: None,
@@ -809,39 +823,21 @@ fn resolve_open_path(path: &str) -> ResolvedPath {
     }
 }
 
-fn resolve_sbpf_path(input: &std::path::Path) -> Option<String> {
-    info!(path = %input.display(), "Detected sBPF ELF, resolving via sbpf2host");
+fn resolve_sbpf_path(input: &std::path::Path, i64_path: &std::path::Path) -> Option<String> {
+    info!(path = %input.display(), "Detected sBPF ELF, running sbx aot i64");
 
-    let output_dir = crate::sbpf::resolve_output_dir(input, None);
-    let dylib_path = crate::sbpf::sbpf2host_output_path(input, Some(&output_dir));
-
-    for candidate in [
-        dylib_path.with_extension("i64"),
-        dylib_path.with_extension("id0"),
-    ] {
-        if candidate.exists() {
-            let open = if candidate.extension().map(|e| e == "id0").unwrap_or(false) {
-                &dylib_path
-            } else {
-                &candidate
-            };
-            info!(path = %open.display(), "sBPF fast-path: existing database");
-            return Some(open.display().to_string());
-        }
+    if i64_path.exists() {
+        info!(path = %i64_path.display(), "sBPF fast-path: existing .i64");
+        return Some(i64_path.display().to_string());
     }
 
-    if dylib_path.exists() {
-        info!(path = %dylib_path.display(), "sBPF fast-path: existing dylib");
-        return Some(dylib_path.display().to_string());
-    }
-
-    match crate::sbpf::run_sbpf2host(input, Some(&output_dir), false) {
+    match crate::sbpf::run_sbx_aot_i64(input, i64_path) {
         Ok(result) => {
-            info!(dylib = %result.dylib_path.display(), "sbpf2host compilation succeeded");
-            Some(result.dylib_path.display().to_string())
+            info!(i64 = %result.i64_path.display(), "sbx aot i64 succeeded");
+            Some(result.i64_path.display().to_string())
         }
         Err(e) => {
-            warn!(error = %e, "sbpf2host failed; IDA cannot open raw sBPF directly");
+            warn!(error = %e, "sbx aot i64 failed; cannot open sBPF program");
             None
         }
     }

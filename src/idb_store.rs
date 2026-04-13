@@ -47,7 +47,18 @@ pub fn socket_is_live() -> bool {
     sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok()
 }
 
-/// Create required directories under `~/.ida/`.
+pub fn clean_stale_imcp_locks() {
+    if let Ok(entries) = std::fs::read_dir(idb_root()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("imcp") {
+                tracing::info!(path = %path.display(), "Removing stale .imcp lock on server startup");
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(idb_root())?;
     std::fs::create_dir_all(log_dir())?;
@@ -98,14 +109,14 @@ impl IdbStore {
         hex[..12].to_string()
     }
 
-    /// Return the `.i64` file name for a binary: `{basename}.{hash12}.i64`
+    /// Return the `.i64` file name for a binary: `{basename}.{hash12}.dylib.i64`
     pub fn idb_name(binary_path: &Path) -> String {
         let basename = binary_path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
         let hash = Self::compute_hash(binary_path);
-        format!("{}.{}.i64", basename, hash)
+        format!("{}.{}.dylib.i64", basename, hash)
     }
 
     /// Full path to the `.i64` file inside this store's root.
@@ -124,12 +135,12 @@ impl IdbStore {
 
     /// Search for an existing `.i64` whose filename contains `hash`.
     pub fn lookup_by_hash(&self, hash: &str) -> Option<PathBuf> {
-        let pattern = format!(".{hash}.i64");
+        let pattern = format!(".{}.", hash);
         let entries = std::fs::read_dir(&self.root).ok()?;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.ends_with(&pattern) {
+            if name.contains(&pattern) && name.ends_with(".i64") {
                 return Some(entry.path());
             }
         }
@@ -305,13 +316,12 @@ mod tests {
         let file = dir.join("pump.so");
         std::fs::write(&file, b"pump program data").unwrap();
         let name = IdbStore::idb_name(&file);
-        // Expected: "pump.so.{12hex}.i64"
         assert!(name.starts_with("pump.so."), "unexpected name: {name}");
-        assert!(name.ends_with(".i64"), "unexpected name: {name}");
+        assert!(name.ends_with(".dylib.i64"), "unexpected name: {name}");
         let hash_part = name
             .strip_prefix("pump.so.")
             .unwrap()
-            .strip_suffix(".i64")
+            .strip_suffix(".dylib.i64")
             .unwrap();
         assert_eq!(hash_part.len(), 12, "hash part wrong length: {hash_part}");
         assert!(
