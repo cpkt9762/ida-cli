@@ -1,6 +1,6 @@
 [package]
 name = "ida-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Headless IDA Pro MCP server for AI-assisted binary analysis"
 license = "MIT"
