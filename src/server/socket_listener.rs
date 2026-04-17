@@ -134,6 +134,77 @@ async fn dispatch_cli_request(
             );
             (resp, None)
         }
+        "list_tasks" => {
+            let tasks: Vec<_> = router
+                .list_task_states()
+                .into_iter()
+                .filter_map(|state| {
+                    Some(serde_json::json!({
+                        "task_id": state.id,
+                        "message": state.message,
+                        "created_at": state.created_at_iso,
+                        "updated_at": state.updated_at_iso,
+                        "status": match state.status {
+                            crate::server::task::TaskStatus::Running => "running",
+                            crate::server::task::TaskStatus::Completed => "completed",
+                            crate::server::task::TaskStatus::Failed => "failed",
+                            crate::server::task::TaskStatus::Cancelled => "cancelled",
+                        },
+                        "result": state.result,
+                    }))
+                })
+                .collect();
+            let resp = RpcResponse::ok(&req.id, serde_json::json!({ "tasks": tasks }));
+            (resp, None)
+        }
+        "task_status" => {
+            let task_id = req
+                .params
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let resp = match task_id.and_then(|id| router.task_state(&id)) {
+                Some(state) => RpcResponse::ok(
+                    &req.id,
+                    serde_json::json!({
+                        "task_id": state.id,
+                        "message": state.message,
+                        "created_at": state.created_at_iso,
+                        "updated_at": state.updated_at_iso,
+                        "status": match state.status {
+                            crate::server::task::TaskStatus::Running => "running",
+                            crate::server::task::TaskStatus::Completed => "completed",
+                            crate::server::task::TaskStatus::Failed => "failed",
+                            crate::server::task::TaskStatus::Cancelled => "cancelled",
+                        },
+                        "result": state.result,
+                    }),
+                ),
+                None => RpcResponse::err(&req.id, -32001, "unknown task_id"),
+            };
+            (resp, None)
+        }
+        "cancel_task" => {
+            let task_id = req
+                .params
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let resp = match task_id {
+                Some(task_id) => {
+                    if router.cancel_task(&task_id).await {
+                        RpcResponse::ok(
+                            &req.id,
+                            serde_json::json!({ "ok": true, "task_id": task_id }),
+                        )
+                    } else {
+                        RpcResponse::err(&req.id, -32001, "task not found")
+                    }
+                }
+                None => RpcResponse::err(&req.id, -32001, "cancel_task requires task_id"),
+            };
+            (resp, None)
+        }
 
         "prewarm" => {
             let resp = if let Some(ref p) = path {
@@ -172,6 +243,50 @@ async fn dispatch_cli_request(
                 }
             } else {
                 RpcResponse::err(&req.id, -32001, "prewarm requires 'path' parameter")
+            };
+            (resp, None)
+        }
+        "enqueue" => {
+            let method_name = req
+                .params
+                .get("method")
+                .and_then(|v| v.as_str())
+                .map(primary_name_for)
+                .map(str::to_string);
+            let priority = req
+                .params
+                .get("priority")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u8;
+            let tenant_id = req
+                .params
+                .get("tenant_id")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned);
+            let dedupe_key = req
+                .params
+                .get("dedupe_key")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned);
+            let task_params = req
+                .params
+                .get("task_params")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            let resp = match (path.as_deref(), method_name.as_deref()) {
+                (Some(path), Some(method)) => match router
+                    .enqueue_route_task(path, method, task_params, tenant_id, priority, dedupe_key)
+                    .await
+                {
+                    Ok(value) => RpcResponse::ok(&req.id, value),
+                    Err(err) => RpcResponse::err(&req.id, -32000, err.to_string()),
+                },
+                _ => RpcResponse::err(
+                    &req.id,
+                    -32001,
+                    "enqueue requires path and method",
+                ),
             };
             (resp, None)
         }

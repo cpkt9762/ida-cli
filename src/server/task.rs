@@ -67,22 +67,28 @@ impl TaskRegistry {
         Self::default()
     }
 
-    /// Create a task with a deduplication key. If a running task with
-    /// the same key already exists, returns `Err(existing_task_id)`.
-    pub fn create_keyed(&self, key: &str, message: &str) -> Result<String, String> {
+    fn create_internal(
+        &self,
+        prefix: &str,
+        key: Option<&str>,
+        message: &str,
+    ) -> Result<String, String> {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-        if let Some(existing_id) = entries
-            .values()
-            .find(|entry| {
-                entry.state.status == TaskStatus::Running && entry.state.key.as_deref() == Some(key)
-            })
-            .map(|entry| entry.state.id.clone())
-        {
-            return Err(existing_id);
+        if let Some(key) = key {
+            if let Some(existing_id) = entries
+                .values()
+                .find(|entry| {
+                    entry.state.status == TaskStatus::Running
+                        && entry.state.key.as_deref() == Some(key)
+                })
+                .map(|entry| entry.state.id.clone())
+            {
+                return Err(existing_id);
+            }
         }
 
-        let id = next_task_id("dsc");
+        let id = next_task_id(prefix);
         let (now, created) = now_with_iso();
         let state = TaskState {
             id: id.clone(),
@@ -93,7 +99,7 @@ impl TaskRegistry {
             updated_at: now,
             created_at_iso: created.clone(),
             updated_at_iso: created,
-            key: Some(key.to_string()),
+            key: key.map(ToOwned::to_owned),
         };
         entries.insert(
             id.clone(),
@@ -104,6 +110,28 @@ impl TaskRegistry {
         );
         prune_terminal_tasks(&mut entries);
         Ok(id)
+    }
+
+    /// Create a task with a deduplication key. If a running task with
+    /// the same key already exists, returns `Err(existing_task_id)`.
+    pub fn create_keyed(&self, key: &str, message: &str) -> Result<String, String> {
+        self.create_internal("dsc", Some(key), message)
+    }
+
+    /// Create a generic running task without deduplication.
+    pub fn create(&self, prefix: &str, message: &str) -> String {
+        self.create_internal(prefix, None, message)
+            .expect("unkeyed task creation must succeed")
+    }
+
+    /// Create a generic running task with an optional deduplication key.
+    pub fn create_with_key(
+        &self,
+        prefix: &str,
+        key: Option<&str>,
+        message: &str,
+    ) -> Result<String, String> {
+        self.create_internal(prefix, key, message)
     }
 
     /// Store the `JoinHandle` for a task so it can be cancelled.

@@ -90,6 +90,24 @@ pub enum CliCommand {
         #[arg(long)]
         tenant: Option<String>,
     },
+    Enqueue {
+        method: String,
+        #[arg(long, default_value_t = 0)]
+        priority: u8,
+        #[arg(long)]
+        dedupe_key: Option<String>,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long)]
+        params: Option<String>,
+    },
+    TaskStatus {
+        task_id: String,
+    },
+    ListTasks,
+    CancelTask {
+        task_id: String,
+    },
     Close,
     Status,
     Shutdown,
@@ -140,6 +158,48 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
                 timeout,
             )
             .await
+        }
+        CliCommand::Enqueue {
+            method,
+            priority,
+            dedupe_key,
+            tenant,
+            params,
+        } => {
+            let mut payload = serde_json::Map::new();
+            if let Some(path) = args.path.as_deref() {
+                payload.insert("path".to_string(), serde_json::json!(path));
+            }
+            payload.insert("method".to_string(), serde_json::json!(method));
+            payload.insert("priority".to_string(), serde_json::json!(priority));
+            if let Some(tenant) = tenant {
+                payload.insert("tenant_id".to_string(), serde_json::json!(tenant));
+            }
+            if let Some(dedupe_key) = dedupe_key {
+                payload.insert("dedupe_key".to_string(), serde_json::json!(dedupe_key));
+            }
+            if let Some(params) = params {
+                let value: serde_json::Value = serde_json::from_str(&params)?;
+                payload.insert("task_params".to_string(), value);
+            }
+            let req = RpcRequest::new("1", "enqueue", serde_json::Value::Object(payload));
+            let resp = send_request(&socket_path, &req, timeout).await?;
+            handle_response(&resp, "enqueue", &output_mode)
+        }
+        CliCommand::TaskStatus { task_id } => {
+            let req = RpcRequest::new("1", "task_status", serde_json::json!({ "task_id": task_id }));
+            let resp = send_request(&socket_path, &req, timeout).await?;
+            handle_response(&resp, "task_status", &output_mode)
+        }
+        CliCommand::ListTasks => {
+            let req = RpcRequest::new("1", "list_tasks", serde_json::json!({}));
+            let resp = send_request(&socket_path, &req, timeout).await?;
+            handle_response(&resp, "list_tasks", &output_mode)
+        }
+        CliCommand::CancelTask { task_id } => {
+            let req = RpcRequest::new("1", "cancel_task", serde_json::json!({ "task_id": task_id }));
+            let resp = send_request(&socket_path, &req, timeout).await?;
+            handle_response(&resp, "cancel_task", &output_mode)
         }
         CliCommand::Raw { json_str } => {
             let req = complete_envelope(&json_str, 1)?;
@@ -227,6 +287,10 @@ fn build_rpc_params(
         CliCommand::Close => "close",
         CliCommand::Status => "status",
         CliCommand::Shutdown => "shutdown",
+        CliCommand::Enqueue { .. }
+        | CliCommand::TaskStatus { .. }
+        | CliCommand::ListTasks
+        | CliCommand::CancelTask { .. } => unreachable!(),
         CliCommand::PrewarmMany { .. } => unreachable!(),
         _ => unreachable!(),
     };

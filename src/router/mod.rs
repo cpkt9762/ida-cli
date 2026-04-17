@@ -9,6 +9,7 @@ pub mod protocol;
 
 use crate::ida::{RuntimeProbeResult, WorkerBackendKind};
 use crate::router::protocol::{RpcRequest, RpcResponse};
+use crate::server::task::{TaskRegistry, TaskState, TaskStatus};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +55,9 @@ pub struct RouterConfig {
     pub max_prewarms_per_tenant: usize,
     pub max_idb_cache_bytes: u64,
     pub max_response_cache_bytes: u64,
+    pub max_queued_tasks: usize,
+    pub max_active_tasks: usize,
+    pub max_tasks_per_tenant: usize,
     pub node_id: String,
 }
 
@@ -116,6 +120,21 @@ impl RouterConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(2 * 1024 * 1024 * 1024);
+        let max_queued_tasks = std::env::var("IDA_CLI_MAX_QUEUED_TASKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(512);
+        let max_active_tasks = std::env::var("IDA_CLI_MAX_ACTIVE_TASKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(16);
+        let max_tasks_per_tenant = std::env::var("IDA_CLI_MAX_TASKS_PER_TENANT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8);
         let node_id = std::env::var("IDA_CLI_NODE_ID").unwrap_or_else(|_| {
             format!(
                 "{}-{}",
@@ -136,6 +155,9 @@ impl RouterConfig {
             max_prewarms_per_tenant,
             max_idb_cache_bytes,
             max_response_cache_bytes,
+            max_queued_tasks,
+            max_active_tasks,
+            max_tasks_per_tenant,
             node_id,
         }
     }
@@ -182,12 +204,40 @@ struct ActivePrewarmTask {
     started_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct QueuedRouteTask {
+    task_id: String,
+    path: String,
+    method: String,
+    params: serde_json::Value,
+    tenant_id: String,
+    priority: u8,
+    enqueued_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveRouteTask {
+    task_id: String,
+    path: String,
+    method: String,
+    tenant_id: String,
+    priority: u8,
+    started_at: Instant,
+}
+
 #[derive(Debug, Default)]
 struct PrewarmQueueState {
     queued: Vec<QueuedPrewarmTask>,
     active: HashMap<String, ActivePrewarmTask>,
     recent: Vec<serde_json::Value>,
     next_task_id: u64,
+    tenant_active: HashMap<String, usize>,
+}
+
+#[derive(Debug, Default)]
+struct RouteQueueState {
+    queued: Vec<QueuedRouteTask>,
+    active: HashMap<String, ActiveRouteTask>,
     tenant_active: HashMap<String, usize>,
 }
 
@@ -198,6 +248,17 @@ pub struct PrewarmTaskStatus {
     pub tenant_id: String,
     pub priority: u8,
     pub keep_warm: bool,
+    pub state: String,
+    pub age_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteTaskStatus {
+    pub task_id: String,
+    pub path: String,
+    pub method: String,
+    pub tenant_id: String,
+    pub priority: u8,
     pub state: String,
     pub age_secs: u64,
 }
@@ -230,6 +291,9 @@ pub struct RouterStatus {
     pub max_prewarms_per_tenant: usize,
     pub max_idb_cache_bytes: u64,
     pub max_response_cache_bytes: u64,
+    pub max_queued_tasks: usize,
+    pub max_active_tasks: usize,
+    pub max_tasks_per_tenant: usize,
     pub node_id: String,
     pub runtime_probe: Option<RuntimeProbeResult>,
     pub backend_counts: HashMap<String, usize>,
@@ -240,6 +304,9 @@ pub struct RouterStatus {
     pub prewarm_queue: Vec<PrewarmTaskStatus>,
     pub prewarm_active: Vec<PrewarmTaskStatus>,
     pub prewarm_recent: Vec<serde_json::Value>,
+    pub route_queue: Vec<RouteTaskStatus>,
+    pub route_active: Vec<RouteTaskStatus>,
+    pub recent_tasks: Vec<serde_json::Value>,
     pub idb_cache: crate::idb_store::IdbStoreStats,
     pub response_cache: crate::server::response_cache::ResponseCacheStats,
 }
@@ -252,6 +319,8 @@ pub struct RouterState {
     cached_probe: Arc<Mutex<Option<RuntimeProbeResult>>>,
     warm_pool: Arc<Mutex<HashMap<PathBuf, WarmLease>>>,
     prewarm_queue: Arc<Mutex<PrewarmQueueState>>,
+    route_queue: Arc<Mutex<RouteQueueState>>,
+    task_registry: TaskRegistry,
     maintenance_started: Arc<AtomicBool>,
 }
 
@@ -306,6 +375,8 @@ impl RouterState {
             cached_probe: Arc::new(Mutex::new(None)),
             warm_pool: Arc::new(Mutex::new(HashMap::new())),
             prewarm_queue: Arc::new(Mutex::new(PrewarmQueueState::default())),
+            route_queue: Arc::new(Mutex::new(RouteQueueState::default())),
+            task_registry: TaskRegistry::new(),
             maintenance_started: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -964,6 +1035,45 @@ impl RouterState {
         let prewarm_recent = queue.recent.clone();
         drop(queue);
 
+        let route_queue = self.route_queue.lock().await;
+        let queued_route_tasks = route_queue
+            .queued
+            .iter()
+            .map(|task| RouteTaskStatus {
+                task_id: task.task_id.clone(),
+                path: task.path.clone(),
+                method: task.method.clone(),
+                tenant_id: task.tenant_id.clone(),
+                priority: task.priority,
+                state: "queued".to_string(),
+                age_secs: task.enqueued_at.elapsed().as_secs(),
+            })
+            .collect();
+        let active_route_tasks = route_queue
+            .active
+            .values()
+            .map(|task| RouteTaskStatus {
+                task_id: task.task_id.clone(),
+                path: task.path.clone(),
+                method: task.method.clone(),
+                tenant_id: task.tenant_id.clone(),
+                priority: task.priority,
+                state: "running".to_string(),
+                age_secs: task.started_at.elapsed().as_secs(),
+            })
+            .collect();
+        drop(route_queue);
+
+        let recent_tasks = self
+            .task_registry
+            .list_all()
+            .into_iter()
+            .filter(|task| task.status != TaskStatus::Running)
+            .rev()
+            .take(32)
+            .filter_map(|task| task_state_json(&task))
+            .collect();
+
         RouterStatus {
             worker_count: inner.workers.len(),
             active_handle: inner.active.clone(),
@@ -978,6 +1088,9 @@ impl RouterState {
             max_prewarms_per_tenant: self.config.max_prewarms_per_tenant,
             max_idb_cache_bytes: self.config.max_idb_cache_bytes,
             max_response_cache_bytes: self.config.max_response_cache_bytes,
+            max_queued_tasks: self.config.max_queued_tasks,
+            max_active_tasks: self.config.max_active_tasks,
+            max_tasks_per_tenant: self.config.max_tasks_per_tenant,
             node_id: self.config.node_id.clone(),
             runtime_probe,
             backend_counts,
@@ -988,6 +1101,9 @@ impl RouterState {
             prewarm_queue,
             prewarm_active,
             prewarm_recent,
+            route_queue: queued_route_tasks,
+            route_active: active_route_tasks,
+            recent_tasks,
             idb_cache: crate::idb_store::IdbStore::new().stats(),
             response_cache: crate::server::response_cache::stats(),
         }
@@ -1391,7 +1507,7 @@ impl RouterState {
                 .then_with(|| lhs.enqueued_at.cmp(&rhs.enqueued_at))
         });
         let queued = queue.queued.len();
-        Ok(serde_json::json!({
+        let result = serde_json::json!({
             "task_id": task_id,
             "status": "queued",
             "path": path,
@@ -1399,7 +1515,93 @@ impl RouterState {
             "priority": priority,
             "keep_warm": keep_warm,
             "queued": queued,
-        }))
+        });
+        drop(queue);
+        self.drive_prewarm_queue().await;
+        Ok(result)
+    }
+
+    pub async fn enqueue_route_task(
+        &self,
+        path: &str,
+        method: &str,
+        params: serde_json::Value,
+        tenant_id: Option<String>,
+        priority: u8,
+        dedupe_key: Option<String>,
+    ) -> Result<serde_json::Value, crate::error::ToolError> {
+        use crate::error::ToolError;
+
+        let tenant_id = Self::normalize_tenant(tenant_id.as_deref());
+        let mut queue = self.route_queue.lock().await;
+        if queue.queued.len() >= self.config.max_queued_tasks {
+            return Err(ToolError::Busy);
+        }
+
+        let active_for_tenant = queue.tenant_active.get(&tenant_id).copied().unwrap_or(0);
+        if active_for_tenant >= self.config.max_tasks_per_tenant {
+            return Err(ToolError::Busy);
+        }
+
+        let task_id = match self.task_registry.create_with_key(
+            "job",
+            dedupe_key.as_deref(),
+            &format!("Queued {method}"),
+        ) {
+            Ok(id) => id,
+            Err(existing) => existing,
+        };
+
+        if self.task_registry.get(&task_id).is_some() && !queue.active.contains_key(&task_id) {
+            queue.queued.push(QueuedRouteTask {
+                task_id: task_id.clone(),
+                path: path.to_string(),
+                method: method.to_string(),
+                params,
+                tenant_id: tenant_id.clone(),
+                priority,
+                enqueued_at: Instant::now(),
+            });
+            queue.queued.sort_by(|lhs, rhs| {
+                rhs.priority
+                    .cmp(&lhs.priority)
+                    .then_with(|| lhs.enqueued_at.cmp(&rhs.enqueued_at))
+            });
+        }
+
+        let result = serde_json::json!({
+            "task_id": task_id,
+            "status": "queued",
+            "path": path,
+            "method": method,
+            "tenant_id": tenant_id,
+            "priority": priority,
+        });
+        drop(queue);
+        self.drive_route_queue().await;
+        Ok(result)
+    }
+
+    pub fn task_state(&self, task_id: &str) -> Option<TaskState> {
+        self.task_registry.get(task_id)
+    }
+
+    pub fn list_task_states(&self) -> Vec<TaskState> {
+        self.task_registry.list_all()
+    }
+
+    pub async fn cancel_task(&self, task_id: &str) -> bool {
+        if self.task_registry.cancel(task_id) {
+            return true;
+        }
+
+        let mut queue = self.route_queue.lock().await;
+        if let Some(idx) = queue.queued.iter().position(|task| task.task_id == task_id) {
+            queue.queued.remove(idx);
+            self.task_registry.fail(task_id, "Cancelled before execution");
+            return true;
+        }
+        false
     }
 
     async fn drive_prewarm_queue(&self) {
@@ -1478,6 +1680,79 @@ impl RouterState {
         }
     }
 
+    async fn drive_route_queue(&self) {
+        loop {
+            let task = {
+                let mut queue = self.route_queue.lock().await;
+                if queue.active.len() >= self.config.max_active_tasks {
+                    None
+                } else {
+                    let pos = queue.queued.iter().position(|task| {
+                        queue
+                            .tenant_active
+                            .get(&task.tenant_id)
+                            .copied()
+                            .unwrap_or(0)
+                            < self.config.max_tasks_per_tenant
+                    });
+                    pos.map(|idx| {
+                        let task = queue.queued.remove(idx);
+                        queue
+                            .tenant_active
+                            .entry(task.tenant_id.clone())
+                            .and_modify(|count| *count += 1)
+                            .or_insert(1);
+                        queue.active.insert(
+                            task.task_id.clone(),
+                            ActiveRouteTask {
+                                task_id: task.task_id.clone(),
+                                path: task.path.clone(),
+                                method: task.method.clone(),
+                                tenant_id: task.tenant_id.clone(),
+                                priority: task.priority,
+                                started_at: Instant::now(),
+                            },
+                        );
+                        task
+                    })
+                }
+            };
+
+            let Some(task) = task else { break };
+            self.task_registry
+                .update_message(&task.task_id, &format!("Running {}", task.method));
+
+            let state = self.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let (handle, token) =
+                        state.ensure_worker_with_ref(&task.path, Some(&task.tenant_id)).await?;
+                    let value = state
+                        .route_request(Some(&handle), &task.method, task.params.clone())
+                        .await?;
+                    state.release_ref_token(&token).await;
+                    Ok::<serde_json::Value, crate::error::ToolError>(value)
+                }
+                .await;
+
+                let mut queue = state.route_queue.lock().await;
+                queue.active.remove(&task.task_id);
+                if let Some(count) = queue.tenant_active.get_mut(&task.tenant_id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        queue.tenant_active.remove(&task.tenant_id);
+                    }
+                }
+                drop(queue);
+
+                match result {
+                    Ok(value) => state.task_registry.complete(&task.task_id, value),
+                    Err(err) => state.task_registry.fail(&task.task_id, &err.to_string()),
+                }
+            });
+        }
+    }
+
     async fn prune_caches(&self) {
         let warm_pool = self.warm_pool.lock().await;
         let pinned_groups: HashSet<String> = warm_pool
@@ -1540,6 +1815,7 @@ impl RouterState {
                 }
 
                 state.drive_prewarm_queue().await;
+                state.drive_route_queue().await;
                 state.prune_caches().await;
 
                 if let Some(grace) = auto_exit_grace {
@@ -1569,6 +1845,23 @@ impl Default for RouterState {
     fn default() -> Self {
         Self::new().expect("Failed to create RouterState")
     }
+}
+
+fn task_state_json(state: &TaskState) -> Option<serde_json::Value> {
+    let status = match state.status {
+        TaskStatus::Running => "running",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+    };
+    Some(serde_json::json!({
+        "task_id": state.id,
+        "status": status,
+        "message": state.message,
+        "created_at": state.created_at_iso,
+        "updated_at": state.updated_at_iso,
+        "result": state.result,
+    }))
 }
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
