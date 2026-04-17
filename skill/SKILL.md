@@ -1,6 +1,6 @@
 ---
 name: ida-cli
-description: "Reverse engineering and binary analysis with IDA Pro and ida-cli. Use when driving headless IDA workflows from the shell or from an agent loop: disassembly, decompilation, cross-references, struct recovery, type work, patching, FLIRT, IDAPython scripting. Covers the ida-cli flat CLI, the router service, stdio + streamable HTTP transports, and the installable skill bootstrap. Supports PE, ELF, Mach-O, and firmware binaries."
+description: "Reverse engineering and binary analysis with IDA Pro and ida-cli. Use when driving headless IDA workflows from the shell or from an agent loop: disassembly, decompilation, cross-references, struct recovery, type work, patching, FLIRT, IDAPython scripting, emulation-based call tracing, and devirtualization of commercial VM protectors (Themida / VMProtect / Code Virtualizer / WinLicense). Covers the ida-cli flat CLI, the router service, stdio + streamable HTTP transports, the installable skill bootstrap, and the bundled `vm_devirt.py` emulator. Supports PE, ELF, Mach-O, and firmware binaries."
 ---
 
 # ida-cli Reverse Engineering
@@ -412,6 +412,34 @@ Move immediately into disassembly-first mode when any of these are true:
 
 Dedicated reference page: [obfuscation-triage.md](references/obfuscation-triage.md).
 
+### Workflow 3d: Commercial VM Protection (Themida / VMProtect / Code Virtualizer / WinLicense)
+
+If the target is a Windows x86-64 PE and any of these hold, the target is a
+commercial VM protector, not ordinary obfuscation:
+
+1. the function body is a single `jmp` / `push+ret` / `call` that lands in a
+   section named `.themida`, `.vlizer`, `.vmp0`/`vmp1`/`vmp2`, `.winlice`,
+   `.pelock`, `.svmp`, `.xxx`, or any other non-standard RX section
+2. the IAT is stripped and APIs resolve through a dark `.rdata` pointer table
+3. pseudocode degenerates into thousands of dispatched handlers
+4. IDA segfaults, stalls, or shows a bytecode-style decode loop
+
+In that case do **not** try to reverse handlers. Run the bundled
+emulation-based devirtualizer, open the patched PE in IDA, and decompile
+normally:
+
+```bash
+pip install -r skill/scripts/vm_devirt_requirements.txt
+
+python3 skill/scripts/vm_devirt.py protected.bin --auto -o protected-devirt.bin
+
+ida-cli --path protected-devirt.bin list-functions --limit 20
+ida-cli --path protected-devirt.bin decompile --addr 0x140001000
+```
+
+Full methodology, the capability matrix, and the post-devirt IDA workflow
+live in [vm-devirt.md](references/vm-devirt.md).
+
 ### Workflow 4: Error Code Mapping
 
 1. search immediate values
@@ -511,6 +539,7 @@ by default.
 |---|---|
 | [cli-tool-reference.md](references/cli-tool-reference.md) | CLI command patterns and capability lookup |
 | [obfuscation-triage.md](references/obfuscation-triage.md) | F5 failure, flattening, VM handlers, opaque predicates, disassembly-first work |
+| [vm-devirt.md](references/vm-devirt.md) | commercial VM protectors (Themida / VMProtect / Code Virtualizer / WinLicense) — emulation-based devirtualization with `scripts/vm_devirt.py` |
 | [counterfactual-patch.md](references/counterfactual-patch.md) | counterfactual patching workflows |
 | [headless-api.md](references/headless-api.md) | headless IDA execution and API choice |
 | [idapython-cheatsheet.md](references/idapython-cheatsheet.md) | writing IDAPython scripts |

@@ -84,6 +84,28 @@ Focus on:
 
 Do not expect decompilation to help much until the VM structure is mapped.
 
+#### Commercial protectors: devirtualize first, reverse later
+
+If the binary is a **Windows x86-64 PE** and the VM section is one of the
+well-known commercial markers (`.themida`, `.vlizer`, `.vmp0`/`vmp1`/`vmp2`,
+`.winlice`, `.pelock`, `.svmp`, `.xxx`), stop trying to reverse handlers by
+hand. The bundled tool emulates the VM and rewrites the PE back to native
+code:
+
+```bash
+pip install -r skill/scripts/vm_devirt_requirements.txt
+python3 skill/scripts/vm_devirt.py protected.bin --auto -o protected-devirt.bin
+
+ida-cli --path protected-devirt.bin list-functions --limit 20
+ida-cli --path protected-devirt.bin decompile --addr 0x140001000
+```
+
+Detailed methodology (register-diff across call boundaries, Win64 volatile
+clobber trick, fake PEB/LDR, EP-init API recovery, limitations) lives in
+[vm-devirt.md](vm-devirt.md). Only fall back to manual handler reversing
+when the tool explicitly fails (custom non-standard protector, PE32, 32-bit
+VMs).
+
 ### Exception-Driven or CFG-Breaking Code
 
 Look for:

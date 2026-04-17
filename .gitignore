@@ -29,3 +29,7 @@ assets/
 # Release
 dist/
 *.o
+
+# Python bytecode from skill helper scripts
+__pycache__/
+*.py[cod]
