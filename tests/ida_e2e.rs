@@ -42,7 +42,7 @@ fn find_ida_mcp_exe() -> PathBuf {
     let manifest = std::env::var("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
-    manifest.join("target/debug/ida-mcp")
+    manifest.join("target/debug/ida-cli")
 }
 
 async fn spawn_worker() -> WorkerClient {
@@ -71,7 +71,7 @@ async fn spawn_worker() -> WorkerClient {
     let mut std_cmd = cmd.into_std();
     let mut child = std_cmd
         .spawn()
-        .expect("failed to spawn ida-mcp serve-worker");
+        .expect("failed to spawn ida-cli serve-worker");
     let stdin = child.stdin.take().expect("failed to capture child stdin");
     let stdout = child.stdout.take().expect("failed to capture child stdout");
 

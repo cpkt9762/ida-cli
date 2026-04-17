@@ -2,7 +2,7 @@ PREFIX      ?= $(HOME)/.skillshub/ida
 BINDIR      := $(PREFIX)/bin
 CARGO       := cargo
 RELEASE_DIR := target/release
-BIN_NAME    := ida-mcp
+BIN_NAME    := ida-cli
 CLI_NAME    := ida-cli
 
 .PHONY: build install uninstall clean test lint fmt check
@@ -29,7 +29,7 @@ install: build
 	@echo "Installed to $(BINDIR)/"
 	@ls -lh $(BINDIR)/
 	@echo ""
-	@echo "Usage:  $(BINDIR)/$(CLI_NAME) cli --path <file> list-functions --limit 20"
+	@echo "Usage:  $(BINDIR)/$(CLI_NAME) --path <file> list-functions --limit 20"
 
 uninstall:
 	rm -f $(BINDIR)/$(CLI_NAME) $(BINDIR)/sbpf2host

@@ -24,7 +24,7 @@ pub struct OpenIdbRequest {
     pub debug_info_verbose: Option<bool>,
     #[schemars(
         description = "If true, clean up stale lock files from crashed sessions before opening. \
-        Use this when a previous ida-mcp session crashed and left behind lock files."
+        Use this when a previous ida-cli session crashed and left behind lock files."
     )]
     #[serde(alias = "recover")]
     pub force: Option<bool>,

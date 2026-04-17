@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::path::Path;
 
 const DEFAULT_MAX_INLINE_BYTES: usize = 512;
-const CACHE_DIR: &str = "/tmp/ida-mcp-out";
+const CACHE_DIR: &str = "/tmp/ida-cli-out";
 
 pub fn guard_response_size(method: &str, result: Value) -> Value {
     let max_bytes = std::env::var("IDA_MCP_MAX_INLINE_BYTES")

@@ -1,4 +1,4 @@
-//! Headless IDA Pro MCP Server
+//! Headless IDA CLI and MCP Server
 //!
 //! This binary runs an MCP server that provides headless IDA Pro access
 //! via stdin/stdout transport.
@@ -14,11 +14,12 @@ use hyper::http::{header::ORIGIN, Request, Response, StatusCode};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
+use ida_mcp::ida::{IdaBackend, RawDatabaseOptions, WorkerBackendKind};
 use ida_mcp::{
     disasm::generate_disasm_line, expand_path, ida, rpc_dispatch, DbInfo, FunctionInfo,
     IdaMcpServer, IdaWorker, ServerMode,
 };
-use idalib::{idb::IDBOpenOptions, Address, IDB};
+use idalib::{Address, IDB};
 use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -39,7 +40,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter, Layer};
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Parser)]
-#[command(name = "ida-mcp", version, about = "Headless IDA Pro MCP Server")]
+#[command(name = "ida-cli", version, about = "Headless IDA CLI and MCP Server")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -53,7 +54,10 @@ enum Command {
     ServeHttp(ServeHttpArgs),
     /// Internal: worker subprocess controlled by a router.
     /// Reads JSON-RPC requests from stdin, dispatches to IDA worker, writes responses to stdout.
-    ServeWorker,
+    ServeWorker(ServeWorkerArgs),
+    /// Internal: probe the active IDA runtime and select the worker backend.
+    #[command(hide = true)]
+    ProbeRuntime,
 
     /// CLI client: send commands to a running server via Unix socket
     Cli(ida_mcp::cli::CliArgs),
@@ -83,6 +87,13 @@ struct ServeHttpArgs {
         default_value = "http://localhost,http://127.0.0.1"
     )]
     allow_origin: Vec<String>,
+}
+
+#[derive(Args, Clone)]
+struct ServeWorkerArgs {
+    /// Internal backend selection used by the router.
+    #[arg(long, value_enum, default_value_t = WorkerBackendKind::NativeLinked, hide = true)]
+    backend: WorkerBackendKind,
 }
 
 #[derive(Clone)]
@@ -212,10 +223,10 @@ fn main() -> anyhow::Result<()> {
                     .with(stderr_layer)
                     .with(file_layer)
                     .init();
-                eprintln!("[ida-mcp] log -> {log_path_str}");
+                eprintln!("[ida-cli] log -> {log_path_str}");
             }
             Err(e) => {
-                eprintln!("[ida-mcp] warn: cannot open log file {log_path_str}: {e}");
+                eprintln!("[ida-cli] warn: cannot open log file {log_path_str}: {e}");
                 tracing_subscriber::registry().with(stderr_layer).init();
             }
         }
@@ -224,7 +235,7 @@ fn main() -> anyhow::Result<()> {
     info!(
         pid = std::process::id(),
         version = env!("CARGO_PKG_VERSION"),
-        "=== ida-mcp started ==="
+        "=== ida-cli started ==="
     );
 
     // Detect if invoked as "ida-cli" → flat CLI mode
@@ -238,7 +249,7 @@ fn main() -> anyhow::Result<()> {
         let first_arg = std::env::args().nth(1);
         let is_server_mode = matches!(
             first_arg.as_deref(),
-            Some("serve" | "serve-http" | "serve-worker")
+            Some("serve" | "serve-http" | "serve-worker" | "probe-runtime")
         );
 
         if !is_server_mode {
@@ -253,10 +264,25 @@ fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Serve(ServeArgs::default())) {
         Command::Serve(args) => run_server(args),
         Command::ServeHttp(args) => run_server_http(args),
-        Command::ServeWorker => run_serve_worker(),
+        Command::ServeWorker(args) => run_serve_worker(args),
+        Command::ProbeRuntime => run_probe_runtime(),
 
         Command::Cli(args) => run_cli(args),
     }
+}
+
+fn run_probe_runtime() -> anyhow::Result<()> {
+    let probe = match std::panic::catch_unwind(|| {
+        ida::native_backend().init_library();
+        ida::native_backend().version()
+    }) {
+        Ok(Ok(version)) => ida::probe_native_runtime(version),
+        Ok(Err(err)) => ida::RuntimeProbeResult::error(err.to_string()),
+        Err(_) => ida::RuntimeProbeResult::error("native runtime probe panicked"),
+    };
+
+    println!("{}", serde_json::to_string(&probe)?);
+    Ok(())
 }
 
 fn run_cli(args: ida_mcp::cli::CliArgs) -> anyhow::Result<()> {
@@ -290,7 +316,7 @@ fn run_server(_args: ServeArgs) -> anyhow::Result<()> {
 }
 
 fn run_server_multi() -> anyhow::Result<()> {
-    info!("Starting IDA MCP Server (multi-IDB router mode)");
+    info!("Starting ida-cli server (multi-IDB router mode)");
 
     if ida_mcp::idb_store::socket_is_live() {
         let pid = std::fs::read_to_string(ida_mcp::idb_store::pid_path()).unwrap_or_default();
@@ -324,7 +350,7 @@ fn run_server_multi() -> anyhow::Result<()> {
                 std::process::id().to_string(),
             );
 
-            info!("MCP server (router mode) listening on stdio");
+            info!("ida-cli server (router mode) listening on stdio");
             let server = IdaMcpServer::new(worker.clone(), ServerMode::Router(router.clone()));
             router.start_watchdog(
                 std::time::Duration::from_secs(8 * 3600),
@@ -336,12 +362,10 @@ fn run_server_multi() -> anyhow::Result<()> {
             let socket_path = ida_mcp::idb_store::socket_path();
             let socket_path_cleanup = socket_path.clone();
             let router_for_socket = router.clone();
-            let cancel_for_socket = cancel.clone();
             tokio::spawn(async move {
                 if let Err(e) = ida_mcp::server::socket_listener::run_socket_listener(
                     socket_path,
                     router_for_socket,
-                    cancel_for_socket,
                 )
                 .await
                 {
@@ -391,7 +415,7 @@ fn run_server_multi() -> anyhow::Result<()> {
                     }
                 }
             }
-            info!("MCP server shutting down (router mode)");
+            info!("ida-cli server shutting down (router mode)");
             router.shutdown_all().await;
             let _ = std::fs::remove_file(ida_mcp::idb_store::pid_path());
             let _ = std::fs::remove_file(ida_mcp::idb_store::socket_path());
@@ -407,11 +431,15 @@ fn run_server_multi() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_serve_worker() -> anyhow::Result<()> {
+fn run_serve_worker(args: ServeWorkerArgs) -> anyhow::Result<()> {
     use ida_mcp::router::protocol::{RpcRequest, RpcResponse};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    info!("Starting IDA MCP Server (worker mode)");
+    info!(backend = %args.backend, "Starting ida-cli worker");
+
+    if matches!(args.backend, WorkerBackendKind::IdatCompat) {
+        return ida_mcp::idat_compat::run_worker();
+    }
 
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
     let worker = IdaWorker::new(tx);
@@ -552,7 +580,7 @@ fn run_serve_worker() -> anyhow::Result<()> {
 }
 
 fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
-    info!("Starting IDA MCP Server (streamable HTTP + multi-IDB router mode)");
+    info!("Starting ida-cli server (streamable HTTP + multi-IDB router mode)");
     if args.json_response && !args.stateless {
         info!("--json-response is ignored unless --stateless is also set");
     }
@@ -634,12 +662,10 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             let socket_path = ida_mcp::idb_store::socket_path();
             let socket_path_cleanup = socket_path.clone();
             let router_for_socket = router.clone();
-            let cancel_for_socket = cancel.clone();
             tokio::spawn(async move {
                 if let Err(e) = ida_mcp::server::socket_listener::run_socket_listener(
                     socket_path,
                     router_for_socket,
-                    cancel_for_socket,
                 )
                 .await
                 {
@@ -659,7 +685,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(bind_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
-            info!("MCP HTTP server listening on http://{bind_addr}");
+            info!("ida-cli HTTP server listening on http://{bind_addr}");
 
             let shutdown_worker = worker_for_shutdown.clone();
             let cancel_for_shutdown = cancel.clone();
@@ -723,14 +749,14 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
 }
 
 fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
-    info!("Starting IDA MCP Server (probe mode)");
+    info!("Starting ida-cli probe mode");
     if let Ok(idadir) = std::env::var("IDADIR") {
         info!("IDADIR={}", idadir);
     }
     info!("Initializing IDA library on main thread");
-    idalib::init_library();
+    ida::native_backend().init_library();
     info!("IDA library initialized successfully");
-    if let Ok(ver) = idalib::version() {
+    if let Ok(ver) = ida::native_backend().version() {
         info!(
             "IDA version {}.{}.{}",
             ver.major(),
@@ -739,7 +765,7 @@ fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
         );
     }
     if args.ida_console {
-        idalib::enable_console_messages(true);
+        ida::native_backend().enable_console_messages(true);
         info!("IDA console messages enabled");
     }
 
@@ -773,19 +799,6 @@ fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
 
     let meta = db.meta();
     let path_str = path.display().to_string();
-    let idb_path = {
-        let p = std::path::Path::new(&path_str);
-        if p.extension().and_then(|e| e.to_str()) == Some("i64") {
-            Some(path_str.clone())
-        } else {
-            let db_path = db.path();
-            if db_path.extension().and_then(|e| e.to_str()) == Some("i64") {
-                Some(db_path.display().to_string())
-            } else {
-                None
-            }
-        }
-    };
     let info = DbInfo {
         path: path_str,
         file_type: format!("{:?}", meta.filetype()),
@@ -800,7 +813,6 @@ fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
         function_count: db.function_count(),
         debug_info: None,
         analysis_status: ida::handlers::analysis::build_analysis_status(&db),
-        idb_path,
     };
     info!("Database opened in {}s", open_start.elapsed().as_secs());
     println!("{}", serde_json::to_string_pretty(&info)?);
@@ -853,15 +865,12 @@ fn open_db_for_probe(path: &PathBuf, args: &ProbeArgs) -> Result<IDB, idalib::ID
     let is_idb = ext == "i64" || ext == "idb";
 
     if is_idb {
-        if args.auto_analyse {
+        let auto_analyse = args.auto_analyse;
+        if auto_analyse {
             info!("Opening existing IDB with auto-analysis enabled");
-            IDB::open_with(path, true, true) // auto_analyse=true, save=true to pack on close
-        } else {
-            IDB::open_with(path, false, true) // save=true to pack on close
         }
+        ida::native_backend().open_existing_database(path, auto_analyse, true)
     } else {
-        let mut opts = IDBOpenOptions::new();
-        opts.auto_analyse(true);
         let out_path = if let Some(out) = args.idb_out.as_deref() {
             PathBuf::from(out)
         } else {
@@ -871,7 +880,16 @@ fn open_db_for_probe(path: &PathBuf, args: &ProbeArgs) -> Result<IDB, idalib::ID
             "Opening raw binary with auto-analysis (idb_out={})",
             out_path.display()
         );
-        opts.idb(&out_path).save(true).open(path)
+        ida::native_backend().open_raw_binary(
+            path,
+            RawDatabaseOptions {
+                auto_analyse: true,
+                save: true,
+                idb_output: &out_path,
+                file_type: None,
+                extra_args: &[],
+            },
+        )
     }
 }
 

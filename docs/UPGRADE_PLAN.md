@@ -2,7 +2,7 @@
 
 ## Overview
 
-Two phases of work on `ida-mcp-rs`:
+Two phases of work on `ida-cli`:
 
 1. **Phase 1**: Upgrade rmcp 0.15 → 0.17 while preserving multi-IDB Router
 2. **Phase 2**: Add 5 new reverse-engineering MCP tools

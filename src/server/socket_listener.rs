@@ -14,7 +14,7 @@ pub async fn run_socket_listener(socket_path: PathBuf, router: RouterState) -> a
     let listener = UnixListener::bind(&socket_path)?;
     info!("CLI socket listening on {:?}", socket_path);
 
-    let discovery_path = std::path::Path::new("/tmp/ida-mcp.socket");
+    let discovery_path = std::path::Path::new("/tmp/ida-cli.socket");
     std::fs::write(discovery_path, socket_path.to_string_lossy().as_bytes())?;
 
     loop {
@@ -30,7 +30,7 @@ pub async fn run_socket_listener(socket_path: PathBuf, router: RouterState) -> a
 
 pub fn cleanup_socket_files(socket_path: &std::path::Path) {
     let _ = std::fs::remove_file(socket_path);
-    let _ = std::fs::remove_file("/tmp/ida-mcp.socket");
+    let _ = std::fs::remove_file("/tmp/ida-cli.socket");
 }
 
 async fn handle_cli_connection(

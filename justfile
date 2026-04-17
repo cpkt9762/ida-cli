@@ -1,4 +1,4 @@
-# ida-mcp-skill — IDA Pro MCP server for Solana RE
+# ida-cli — Headless IDA CLI and MCP server
 
 # Show available recipes
 default:
@@ -14,15 +14,15 @@ release:
 
 # Run integration test (debug)
 test: build
-    cd test && SERVER_BIN=../target/debug/ida-mcp-skill RUST_LOG=ida_mcp=trace just test
+    cd test && SERVER_BIN=../target/debug/ida-cli RUST_LOG=ida_mcp=trace just test
 
 # Run HTTP integration test (debug)
 test-http: build
-    cd test && SERVER_BIN=../target/debug/ida-mcp-skill RUST_LOG=ida_mcp=trace just test-http
+    cd test && SERVER_BIN=../target/debug/ida-cli RUST_LOG=ida_mcp=trace just test-http
 
 # Run IDAPython script integration test (debug)
 test-script: build
-    cd test && SERVER_BIN=../target/debug/ida-mcp-skill RUST_LOG=ida_mcp=trace just test-script
+    cd test && SERVER_BIN=../target/debug/ida-cli RUST_LOG=ida_mcp=trace just test-script
 
 # Run cargo unit tests
 cargo-test:

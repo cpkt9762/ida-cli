@@ -7,7 +7,7 @@ import time
 
 IDA_MCP_BIN = os.environ.get(
     "IDA_MCP_BIN",
-    os.path.join(os.path.dirname(__file__), "..", "target", "release", "ida-mcp"),
+    os.path.join(os.path.dirname(__file__), "..", "target", "release", "ida-cli"),
 )
 TARGET_BIN = sys.argv[1] if len(sys.argv) > 1 else IDA_MCP_BIN
 TEST_SCRIPT = os.path.join(os.path.dirname(__file__), "test_dbg_headless.py")
@@ -96,13 +96,13 @@ def recv_until_id(proc, target_id, timeout=300):
 
 def main():
     if not os.path.isfile(IDA_MCP_BIN):
-        print(f"ida-mcp binary not found: {IDA_MCP_BIN}", file=sys.stderr)
+        print(f"ida-cli binary not found: {IDA_MCP_BIN}", file=sys.stderr)
         sys.exit(1)
     if not os.path.isfile(TEST_SCRIPT):
         print(f"test script not found: {TEST_SCRIPT}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[*] ida-mcp:    {IDA_MCP_BIN}")
+    print(f"[*] ida-cli:    {IDA_MCP_BIN}")
     print(f"[*] target:     {TARGET_BIN}")
     print(f"[*] test script: {TEST_SCRIPT}")
 

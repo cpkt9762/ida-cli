@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::ToolError;
+use crate::ida::install;
 
 /// Escape a string for safe interpolation into Python double-quoted strings.
 ///
@@ -46,46 +47,8 @@ pub fn dsc_file_type(arch: &str, ida_version: u8) -> String {
 /// Checks `$IDADIR` first, then falls back to platform-specific
 /// default installation paths.
 pub fn find_idat() -> Result<PathBuf, ToolError> {
-    let bin_name = if cfg!(target_os = "windows") {
-        "idat.exe"
-    } else {
-        "idat"
-    };
-
-    // Check IDADIR environment variable
-    if let Ok(dir) = std::env::var("IDADIR") {
-        let idat = Path::new(&dir).join(bin_name);
-        if idat.exists() {
-            return Ok(idat);
-        }
-    }
-
-    // Platform defaults
-    let candidates: &[&str] = if cfg!(target_os = "macos") {
-        &[
-            "/Applications/IDA Professional 9.3.app/Contents/MacOS/idat",
-            "/Applications/IDA Professional 9.0.app/Contents/MacOS/idat",
-            "/Applications/IDA Pro 9.3.app/Contents/MacOS/idat",
-            "/Applications/IDA Pro 9.0.app/Contents/MacOS/idat",
-        ]
-    } else if cfg!(target_os = "linux") {
-        &["/opt/ida/idat", "/opt/idapro/idat"]
-    } else if cfg!(target_os = "windows") {
-        &[
-            r"C:\Program Files\IDA Professional 9.3\idat.exe",
-            r"C:\Program Files\IDA Pro 9.3\idat.exe",
-            r"C:\Program Files\IDA Professional 9.0\idat.exe",
-            r"C:\Program Files\IDA Pro 9.0\idat.exe",
-        ]
-    } else {
-        &[]
-    };
-
-    for path in candidates {
-        let p = Path::new(path);
-        if p.exists() {
-            return Ok(p.to_path_buf());
-        }
+    if let Some(idat) = install::find_idat_binary() {
+        return Ok(idat);
     }
 
     Err(ToolError::InvalidParams(
@@ -152,7 +115,7 @@ def dscu_load_module(module):
     // Load primary module
     script.push_str(&format!(
         "\n# Load primary module\n\
-         print(\"[ida-mcp] loading module: {escaped_module}\")\n\
+         print(\"[ida-cli] loading module: {escaped_module}\")\n\
          dscu_load_module(\"{escaped_module}\")\n"
     ));
 
@@ -160,7 +123,7 @@ def dscu_load_module(module):
     for fw in frameworks {
         let escaped_fw = escape_python_string(fw);
         script.push_str(&format!(
-            "\nprint(\"[ida-mcp] loading framework: {escaped_fw}\")\n\
+            "\nprint(\"[ida-cli] loading framework: {escaped_fw}\")\n\
              dscu_load_module(\"{escaped_fw}\")\n"
         ));
     }
@@ -169,21 +132,21 @@ def dscu_load_module(module):
     script.push_str(
         "\
 \n# ObjC type analysis
-print(\"[ida-mcp] analyzing objc types\")
+print(\"[ida-cli] analyzing objc types\")
 load_and_run_plugin(\"objc\", 1)
-print(\"[ida-mcp] analyzing NSConcreteGlobalBlock objects\")
+print(\"[ida-cli] analyzing NSConcreteGlobalBlock objects\")
 load_and_run_plugin(\"objc\", 4)
 
 # Auto-analysis
-print(\"[ida-mcp] performing auto-analysis...\")
+print(\"[ida-cli] performing auto-analysis...\")
 auto_mark_range(0, BADADDR, AU_FINAL)
 auto_wait()
 
 # Stack block analysis
-print(\"[ida-mcp] analyzing NSConcreteStackBlock objects\")
+print(\"[ida-cli] analyzing NSConcreteStackBlock objects\")
 load_and_run_plugin(\"objc\", 5)
 
-print(\"[ida-mcp] DSC module loading complete\")
+print(\"[ida-cli] DSC module loading complete\")
 ",
     );
 
@@ -235,16 +198,16 @@ def dscu_load_module(module):
     node.supset(2, module)
     run_plugin_checked(\"dscu\", 1, f\"loading module {{module}}\", True)
 
-print(\"[ida-mcp] loading additional dylib: {escaped}\")
+print(\"[ida-cli] loading additional dylib: {escaped}\")
 dscu_load_module(\"{escaped}\")
 
 # ObjC type analysis (lightweight, no full auto-analysis)
-print(\"[ida-mcp] analyzing objc types\")
+print(\"[ida-cli] analyzing objc types\")
 run_plugin_checked(\"objc\", 1, \"objc type analysis\", False)
-print(\"[ida-mcp] analyzing NSConcreteGlobalBlock objects\")
+print(\"[ida-cli] analyzing NSConcreteGlobalBlock objects\")
 run_plugin_checked(\"objc\", 4, \"objc global block analysis\", False)
 
-print(\"[ida-mcp] dsc_add_dylib complete for: {escaped}\")
+print(\"[ida-cli] dsc_add_dylib complete for: {escaped}\")
 "
     )
 }
@@ -270,9 +233,9 @@ def dscu_load_region(ea):
     node.altset(3, ea)
     run_plugin_checked(\"dscu\", 2, \"loading region {ea_hex}\", True)
 
-print(\"[ida-mcp] loading DSC region: {ea_hex}\")
+print(\"[ida-cli] loading DSC region: {ea_hex}\")
 dscu_load_region({ea})
-print(\"[ida-mcp] dsc_add_region complete for: {ea_hex}\")
+print(\"[ida-cli] dsc_add_region complete for: {ea_hex}\")
 "
     )
 }

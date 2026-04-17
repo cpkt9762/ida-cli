@@ -1,5 +1,6 @@
 //! Main IDA worker loop.
 
+use crate::ida::backend::{native_backend, IdaBackend};
 use crate::ida::handlers::resolve_address;
 use crate::ida::handlers::{
     address, analysis, annotations, controlflow, database, disasm, functions, globals, imports,
@@ -67,7 +68,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<EnqueuedRequest>) {
         // Must happen on the main thread (which this loop runs on).
         if !lib_initialized {
             info!("Initializing IDA library on main thread (deferred)");
-            idalib::init_library();
+            native_backend().init_library();
             info!("IDA library initialized successfully");
             lib_initialized = true;
         }

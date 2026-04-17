@@ -356,17 +356,7 @@ impl IdaMcpServer {
         let i64_str = out_i64.display().to_string();
         let open_result = self
             .worker
-            .open(
-                &i64_str,
-                None,
-                false,
-                None,
-                false,
-                false,
-                None,
-                true,
-                Vec::new(),
-            )
+            .open(&i64_str, false, None, false, false, None, true, Vec::new())
             .await;
 
         let db_info = match open_result {
@@ -497,17 +487,7 @@ impl IdaMcpServer {
         // Phase 2: open the .i64 with idalib
         let i64_str = out_i64.display().to_string();
         let open_result = worker
-            .open(
-                &i64_str,
-                None,
-                false,
-                None,
-                false,
-                false,
-                None,
-                true,
-                Vec::new(),
-            )
+            .open(&i64_str, false, None, false, false, None, true, Vec::new())
             .await;
 
         let db_info = match open_result {
@@ -873,7 +853,6 @@ impl IdaMcpServer {
             .worker
             .open(
                 &req.path,
-                None,
                 req.load_debug_info.unwrap_or(false),
                 req.debug_info_path.clone(),
                 req.debug_info_verbose.unwrap_or(false),

@@ -3,6 +3,83 @@ use std::path::{Path, PathBuf};
 
 use autocxx_bindgen::Builder as BindgenBuilder;
 
+fn normalize_sdk_root(path: impl AsRef<Path>) -> Option<PathBuf> {
+    let path = path.as_ref();
+
+    if path.join("include").join("pro.h").exists() {
+        return Some(path.to_path_buf());
+    }
+
+    let src = path.join("src");
+    if src.join("include").join("pro.h").exists() {
+        return Some(src);
+    }
+
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("include"))
+        .unwrap_or(false)
+        && path.join("pro.h").exists()
+    {
+        return path.parent().map(Path::to_path_buf);
+    }
+
+    None
+}
+
+fn candidate_sdk_paths() -> Vec<PathBuf> {
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set"));
+    let third_party_dir = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+
+    let mut candidates = Vec::new();
+
+    for key in ["IDALIB_SDK", "IDASDKDIR", "IDASDK"] {
+        if let Some(path) = env::var_os(key).map(PathBuf::from) {
+            candidates.push(path);
+        }
+    }
+
+    candidates.push(manifest_dir.join("sdk/src"));
+    candidates.push(manifest_dir.join("sdk"));
+
+    if let Some(third_party_dir) = third_party_dir {
+        candidates.push(third_party_dir.join("ida-sdk"));
+        candidates.push(third_party_dir.join("idasdk"));
+        candidates.push(third_party_dir.join("ida-sdk").join("src"));
+        candidates.push(third_party_dir.join("idasdk").join("src"));
+    }
+
+    candidates
+}
+
+fn resolve_sdk_root() -> PathBuf {
+    let candidates = candidate_sdk_paths();
+
+    for candidate in &candidates {
+        if let Some(root) = normalize_sdk_root(candidate) {
+            return root;
+        }
+    }
+
+    let tried = candidates
+        .iter()
+        .map(|path| format!("  - {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    panic!(
+        "Could not locate a usable IDA SDK.\n\
+         Set IDASDKDIR (or IDALIB_SDK) to an SDK root containing include/pro.h and lib/...\n\
+         Tried:\n{}",
+        tried
+    );
+}
+
 /// Get the target OS from Cargo's environment (supports cross-compilation)
 fn target_os() -> String {
     env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| {
@@ -69,10 +146,14 @@ fn configure_and_generate(builder: BindgenBuilder, ida: &Path, output: impl AsRe
 }
 
 fn main() {
-    let sdk_path =
-        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set"))
-            .join("sdk/src");
+    println!("cargo::rerun-if-env-changed=IDASDKDIR");
+    println!("cargo::rerun-if-env-changed=IDALIB_SDK");
+    println!("cargo::rerun-if-env-changed=IDASDK");
+
+    let sdk_path = resolve_sdk_root();
     let ida = sdk_path.join("include");
+
+    println!("cargo::warning=Using IDA SDK at {}", sdk_path.display());
 
     cxx_build::CFG.exported_header_dirs.push(&ida);
 

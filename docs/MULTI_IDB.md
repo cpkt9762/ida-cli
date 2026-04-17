@@ -27,15 +27,15 @@ needed in the PR description.
 opencode
     │  stdio (MCP)
     ▼
-ida-mcp  [router mode, default]
+ida-cli  [router mode, default]
     │
-    ├─ db_handle = "abc" ──► ida-mcp --mode worker  (IDB: binary1.i64)
-    ├─ db_handle = "def" ──► ida-mcp --mode worker  (IDB: libc.so.i64)
-    └─ db_handle = "xyz" ──► ida-mcp --mode worker  (IDB: firmware.i64)
+    ├─ db_handle = "abc" ──► ida-cli --mode worker  (IDB: binary1.i64)
+    ├─ db_handle = "def" ──► ida-cli --mode worker  (IDB: libc.so.i64)
+    └─ db_handle = "xyz" ──► ida-cli --mode worker  (IDB: firmware.i64)
 ```
 
 The router is a regular MCP server. Every tool gains an optional `db_handle`
-parameter. When `open_idb` is called the router spawns a child `ida-mcp` process in
+parameter. When `open_idb` is called the router spawns a child `ida-cli` process in
 worker mode, assigns it a handle, and returns that handle to the caller. Subsequent
 tool calls carrying the handle are transparently proxied to the correct child.
 
@@ -164,7 +164,7 @@ struct WorkerProcess {
 ```
 
 `spawn_worker()`:
-1. Spawn `ida-mcp serve-worker` as a child process.
+1. Spawn `ida-cli serve-worker` as a child process.
 2. Generate `db_handle = nanoid(10)` (or `uuid::Uuid::new_v4().to_string()`).
 3. Insert into `workers` map and set as `active`.
 4. Return handle.
@@ -375,7 +375,7 @@ Attach `test/multi_idb_probe_output.txt` to the upstream PR. Expected outcomes:
 
 - Remove `--multi` flag; make router mode the default for `serve` and `serve-http`.
 - Update `docs/TRANSPORTS.md` with multi-IDB usage examples.
-- Submit PR to `pingzi/ida-mcp-skill`:
+- Submit PR to `pingzi/ida-cli`:
   - PR title: `feat: multi-IDB support via subprocess router`
   - Include Phase 0 test output as evidence for the subprocess model choice.
   - Confirm 100% backward compat via existing test suite.

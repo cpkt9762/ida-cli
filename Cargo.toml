@@ -1,5 +1,5 @@
 [package]
-name = "ida-mcp"
+name = "ida-cli"
 version = "0.9.3"
 edition = "2021"
 description = "Headless IDA Pro MCP server for AI-assisted binary analysis"
@@ -13,7 +13,7 @@ categories = ["development-tools", "command-line-utilities"]
 name = "ida_mcp"
 
 [[bin]]
-name = "ida-mcp"
+name = "ida-cli"
 path = "src/main.rs"
 
 [dependencies]

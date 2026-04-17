@@ -1,15 +1,33 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+#[path = "../../../../shared/ida_install.rs"]
+mod ida_install;
+
 fn link_path() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    return PathBuf::from("/Applications/IDA Professional 9.3.app/Contents/MacOS");
+    ida_install::find_runtime_dir().unwrap_or_else(|| {
+        #[cfg(target_os = "macos")]
+        return PathBuf::from("/Applications/IDA Professional.app/Contents/MacOS");
 
-    #[cfg(target_os = "linux")]
-    return PathBuf::from(env::var("HOME").unwrap()).join("ida-pro-9.3");
+        #[cfg(target_os = "linux")]
+        return PathBuf::from(env::var("HOME").unwrap_or_default()).join("ida-pro");
 
-    #[cfg(target_os = "windows")]
-    return PathBuf::from("C:\\Program Files\\IDA Professional 9.3");
+        #[cfg(target_os = "windows")]
+        return PathBuf::from("C:\\Program Files\\IDA Professional");
+    })
+}
+
+fn first_existing_path(paths: &[PathBuf]) -> PathBuf {
+    paths
+        .iter()
+        .find(|path| path.exists())
+        .cloned()
+        .unwrap_or_else(|| {
+            paths
+                .first()
+                .cloned()
+                .expect("at least one SDK path candidate")
+        })
 }
 
 pub fn idalib_sdk_paths() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
@@ -25,21 +43,37 @@ pub fn idalib_sdk_paths_with(check: bool) -> (PathBuf, PathBuf, PathBuf, PathBuf
     }
 
     let (stubs_path, idalib, ida) = if cfg!(target_os = "linux") {
-        let path = sdk_path.join("lib/x64_linux_gcc_64");
+        let path = if cfg!(target_arch = "aarch64") {
+            first_existing_path(&[sdk_path.join("lib/arm64_linux_64")])
+        } else {
+            first_existing_path(&[
+                sdk_path.join("lib/x64_linux_gcc_64"),
+                sdk_path.join("lib/x64_linux_64"),
+            ])
+        };
         let idalib = path.join("libidalib.so");
         let ida = path.join("libida.so");
         (path, idalib, ida)
     } else if cfg!(target_os = "macos") {
         let path = if cfg!(target_arch = "x86_64") {
-            sdk_path.join("lib/x64_mac_clang_64")
+            first_existing_path(&[
+                sdk_path.join("lib/x64_mac_clang_64"),
+                sdk_path.join("lib/x64_mac_64"),
+            ])
         } else {
-            sdk_path.join("lib/arm64_mac_clang_64")
+            first_existing_path(&[
+                sdk_path.join("lib/arm64_mac_clang_64"),
+                sdk_path.join("lib/arm64_mac_64"),
+            ])
         };
         let idalib = path.join("libidalib.dylib");
         let ida = path.join("libida.dylib");
         (path, idalib, ida)
     } else if cfg!(target_os = "windows") {
-        let path = sdk_path.join("lib\\x64_win_vc_64");
+        let path = first_existing_path(&[
+            sdk_path.join("lib\\x64_win_vc_64"),
+            sdk_path.join("lib\\x64_win_64"),
+        ]);
         let idalib = path.join("idalib.lib");
         let ida = path.join("ida.lib");
         (path, idalib, ida)

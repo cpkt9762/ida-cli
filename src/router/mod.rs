@@ -1,18 +1,20 @@
 //! Multi-IDB Router — manages worker subprocesses.
 //!
 //! Architecture:
-//! - Each open IDB gets a `WorkerProcess` running `ida-mcp serve-worker`
+//! - Each open IDB gets a `WorkerProcess` running `ida-cli serve-worker`
 //! - Requests are routed to workers via JSON-RPC over stdin/stdout
 //! - Router maintains an "active" handle for backward compatibility
 
 pub mod protocol;
 
+use crate::ida::{RuntimeProbeResult, WorkerBackendKind};
 use crate::router::protocol::{RpcRequest, RpcResponse};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::process::Command;
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, error, info, warn};
@@ -21,6 +23,7 @@ pub type DbHandle = String;
 pub type ReqId = String;
 
 pub struct WorkerProcess {
+    pub backend: WorkerBackendKind,
     pub child: Child,
     pub writer: BufWriter<ChildStdin>,
     pub pending: HashMap<ReqId, oneshot::Sender<Result<serde_json::Value, String>>>,
@@ -52,7 +55,7 @@ struct RouterInner {
 
 impl RouterState {
     pub fn new() -> anyhow::Result<Self> {
-        let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ida-mcp"));
+        let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ida-cli"));
 
         Ok(Self {
             inner: Arc::new(Mutex::new(RouterInner {
@@ -67,6 +70,47 @@ impl RouterState {
         })
     }
 
+    fn apply_worker_env(cmd: &mut Command) {
+        for var in &["DYLD_LIBRARY_PATH", "IDADIR", "LD_LIBRARY_PATH", "PATH"] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+    }
+
+    async fn probe_worker_backend(
+        exe_path: &std::path::Path,
+    ) -> Result<RuntimeProbeResult, anyhow::Error> {
+        let mut cmd = Command::new(exe_path);
+        cmd.arg("probe-runtime")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        Self::apply_worker_env(&mut cmd);
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to run probe-runtime: {e}"))?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        if !output.status.success() {
+            let mut msg = format!("probe-runtime exited with status {}", output.status);
+            if !stderr.is_empty() {
+                msg.push_str(&format!(": {stderr}"));
+            }
+            return Err(anyhow::anyhow!(msg));
+        }
+
+        serde_json::from_str::<RuntimeProbeResult>(&stdout).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to parse probe-runtime output: {e}; stdout={stdout:?}; stderr={stderr:?}"
+            )
+        })
+    }
+
     /// Spawn a new worker subprocess for the given IDB path.
     /// Returns the db_handle (existing handle if file already open).
     pub async fn spawn_worker(
@@ -75,11 +119,63 @@ impl RouterState {
     ) -> Result<(DbHandle, Option<String>), anyhow::Error> {
         let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
 
-        let mut inner = self.inner.lock().await;
+        let exe_path = {
+            let mut inner = self.inner.lock().await;
 
+            if let Some(existing_handle) = inner.path_to_handle.get(&canonical_path).cloned() {
+                info!(
+                    "Path {:?} already open with handle {}, issuing new ref token",
+                    canonical_path, existing_handle
+                );
+                let now = {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                };
+                let pid = std::process::id();
+                let nonce = inner.req_counter;
+                inner.req_counter += 1;
+                let ref_token = format!("{now:x}-{pid:x}-{nonce:x}");
+
+                inner
+                    .token_to_handle
+                    .insert(ref_token.clone(), existing_handle.clone());
+                inner
+                    .ref_tokens
+                    .entry(existing_handle.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(ref_token.clone());
+
+                return Ok((existing_handle, Some(ref_token)));
+            }
+
+            inner.exe_path.clone()
+        };
+        let probe = Self::probe_worker_backend(&exe_path).await?;
+        let backend = probe.backend.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                probe.reason.unwrap_or_else(|| {
+                    "runtime probe reported no usable worker backend".to_string()
+                })
+            )
+        })?;
+        let runtime = probe
+            .runtime
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unknown".to_string());
+        info!(
+            "Spawning worker {} for path {:?} using backend {} (runtime {})",
+            "<pending>", canonical_path, backend, runtime
+        );
+
+        let mut inner = self.inner.lock().await;
         if let Some(existing_handle) = inner.path_to_handle.get(&canonical_path).cloned() {
             info!(
-                "Path {:?} already open with handle {}, issuing new ref token",
+                "Path {:?} became active while probing backend; reusing handle {}",
                 canonical_path, existing_handle
             );
             let now = {
@@ -117,22 +213,20 @@ impl RouterState {
             inner.req_counter += 1;
             t ^ (pid << 32) ^ counter
         });
+        info!(
+            "Spawning worker {} for path {:?} using backend {} (runtime {})",
+            handle, canonical_path, backend, runtime
+        );
 
-        let exe_path = inner.exe_path.clone();
-        info!("Spawning worker {} for path {:?}", handle, canonical_path);
-
-        let mut cmd = tokio::process::Command::new(&exe_path);
+        let mut cmd = Command::new(&exe_path);
         cmd.arg("serve-worker")
+            .arg("--backend")
+            .arg(backend.as_cli_arg())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
-
-        for var in &["DYLD_LIBRARY_PATH", "IDADIR", "LD_LIBRARY_PATH", "PATH"] {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
+        Self::apply_worker_env(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -161,6 +255,7 @@ impl RouterState {
         };
 
         let worker = WorkerProcess {
+            backend,
             child,
             writer,
             pending: HashMap::new(),

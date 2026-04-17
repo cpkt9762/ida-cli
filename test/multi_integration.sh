@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Dynamic multi-IDB integration test for ida-mcp router mode.
+# Dynamic multi-IDB integration test for ida-cli router mode.
 # Tests that two IDB files can be opened simultaneously with isolated routing.
 # db_handle values are runtime hex strings — extracted dynamically from responses.
 set -euo pipefail
 
-SERVER_BIN="${SERVER_BIN:-../target/release/ida-mcp}"
+SERVER_BIN="${SERVER_BIN:-../target/release/ida-cli}"
 RUST_LOG="${RUST_LOG:-ida_mcp=warn}"
 
 if [ ! -x "$SERVER_BIN" ]; then

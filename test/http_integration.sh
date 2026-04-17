@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PORT="${PORT:-8765}"
-BIN="${MCP_HTTP_BIN:-./target/release/ida-mcp}"
+BIN="${MCP_HTTP_BIN:-./target/release/ida-cli}"
 ORIGIN="${MCP_HTTP_ORIGIN:-http://localhost}"
 IDB_PATH="${IDB_PATH:-fixtures/mini}"
 

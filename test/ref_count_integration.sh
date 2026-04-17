@@ -3,7 +3,7 @@
 # open same IDB twice, close with two tokens, verify ref release then final close.
 set -euo pipefail
 
-SERVER_BIN="${SERVER_BIN:-../target/release/ida-mcp}"
+SERVER_BIN="${SERVER_BIN:-../target/release/ida-cli}"
 RUST_LOG="${RUST_LOG:-ida_mcp=warn}"
 
 if [ ! -x "$SERVER_BIN" ]; then

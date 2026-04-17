@@ -6,7 +6,7 @@
 - Use with CLI agents that launch a child process.
 
 ```bash
-./target/release/ida-mcp
+./target/release/ida-cli
 ```
 
 ## Streamable HTTP (multi-client)
@@ -16,7 +16,7 @@
 - The server validates Origin headers; defaults allow localhost only.
 
 ```bash
-./target/release/ida-mcp serve-http --bind 127.0.0.1:8765
+./target/release/ida-cli serve-http --bind 127.0.0.1:8765
 ```
 
 Options:

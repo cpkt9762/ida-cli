@@ -4,16 +4,21 @@
 //! It uses a channel-based worker pattern to ensure IDA operations run on the main thread
 //! (IDA types are not thread-safe).
 
+pub mod backend;
 pub mod handlers;
+pub mod install;
 pub mod lock;
 mod loop_impl;
 pub mod request;
+pub mod runtime;
 pub mod types;
 pub mod worker;
 pub mod worker_trait;
 
+pub use backend::{native_backend, IdaBackend, NativeIdalibBackend, RawDatabaseOptions};
 pub use loop_impl::run_ida_loop;
 pub use request::{EnqueuedRequest, IdaRequest};
+pub use runtime::{probe_native_runtime, IdaRuntimeVersion, RuntimeProbeResult, WorkerBackendKind};
 pub use types::*;
 pub use worker::IdaWorker;
 pub use worker_trait::WorkerDispatch;

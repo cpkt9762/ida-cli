@@ -1,110 +1,113 @@
-# ida-mcp
+# ida-cli
 
-Headless IDA Pro MCP server for AI-assisted binary analysis, powered by [idalib](https://docs.hex-rays.com/release-notes/9_0#idalib-the-idapro-library).
+Headless IDA CLI and MCP server for binary analysis with automatic runtime backend selection.
+
+[中文说明](README.zh-CN.md)
 
 ## Overview
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that exposes 73 IDA Pro tools — decompilation, disassembly, cross-references, type reconstruction, IDAPython scripting, and more — to any MCP-compatible AI client. Runs entirely headless via idalib; no GUI required.
+`ida-cli` exposes IDA Pro analysis over:
 
-Ships with an [OpenCode](https://opencode.ai) AI skill (`skill/`) for structured reverse engineering workflows.
+- CLI over Unix socket
+- MCP over stdio
+- MCP over Streamable HTTP
 
-## Prerequisites
+It supports two runtime modes:
 
-- IDA Pro 9.2+ with valid license and Hex-Rays decompiler
-- Rust 1.77+ (if building from source)
+- `native-linked`
+  Uses the vendored `idalib` backend for newer runtimes that can safely open databases in-process.
+- `idat-compat`
+  Uses `idat` + IDAPython as a compatibility backend for older runtimes that would otherwise crash in `open_database_quiet()`.
+
+On the current branch, older 9.x runtimes such as the tested local 9.1 installation are routed to `idat-compat` automatically.
+
+## What Works Today
+
+On the tested local IDA 9.1 runtime, `ida-cli` can already:
+
+- Open raw binaries and reuse cached databases
+- List and resolve functions
+- Disassemble by address or function
+- Decompile functions
+- Show address info, segments, strings, imports, exports, entry points, globals
+- Read bytes, strings, and integers
+- Query xrefs to/from an address
+- Search text and byte patterns
+- Run IDAPython snippets
+
+The sample `/Users/gmh/code/devmp/example2-devirt.bin` was verified end-to-end:
+
+- `list-functions` found `main` at `0x140001000`
+- `decompile --addr 0x140001000` succeeded
+
+Some write-heavy and advanced type-editing operations still require further parity work in `idat-compat`.
 
 ## Quick Start
 
-```python
-# Open a binary
-open_idb(path: "~/samples/target.elf")
-
-# List functions
-list_functions(limit: 50)
-
-# Decompile with Hex-Rays
-decompile(address: "0x100000f00")
-
-# Disassemble a function by name
-disasm_by_name(name: "main", count: 40)
-
-# Cross-references
-xrefs_to(address: "0x100001234")
-
-# Run IDAPython
-run_script(code: "import idautils\nfor f in idautils.Functions():\n    print(hex(f), idc.get_func_name(f))")
-
-# Discover tools
-tool_catalog(query: "cross references")
-```
-
-### Key Tools
-
-| Tool | Purpose |
-|------|---------|
-| `open_idb` | Open binary or `.i64` database |
-| `decompile` | Hex-Rays decompilation |
-| `decompile_structured` | Structured decompilation with type info |
-| `disasm_by_name` | Disassemble by function name |
-| `list_functions` | Enumerate all functions |
-| `xrefs_to` / `xrefs_from` | Cross-references |
-| `build_callgraph` | Call graph construction |
-| `rename_symbol` | Rename functions/globals |
-| `batch_rename` | Bulk rename operations |
-| `declare_c_type` / `apply_type` | Type reconstruction |
-| `run_script` | Execute IDAPython scripts |
-| `search_pseudocode` | Search across decompiled code |
-
-Use `tool_catalog` / `tool_help` to discover the full set of 73 tools.
-
-### IDAPython Scripting
-
-`run_script` executes Python code in the open database via IDA's IDAPython engine.
-
-```python
-# Inline script
-run_script(code: "import idautils\nfor f in idautils.Functions():\n    print(hex(f))")
-
-# Run a .py file from disk
-run_script(file: "/path/to/analysis_script.py")
-
-# With timeout (default 120s, max 600s)
-run_script(code: "import ida_bytes; print(ida_bytes.get_bytes(0x1000, 16).hex())",
-           timeout_secs: 30)
-```
-
-All `ida_*` modules, `idc`, and `idautils` are available. See the [IDAPython API reference](https://python.docs.hex-rays.com).
-
-### CLI Client
-
-`ida-cli` provides direct access via Unix socket — no MCP protocol needed:
+### Run the server
 
 ```bash
-ida-cli --path target.elf list-functions --limit 20
-ida-cli --path target.elf decompile-function --address 0x1234
-ida-cli --path target.elf rename-symbol --address 0x1234 --new-name parse_header
-ida-cli --path target.elf build-callgraph --roots 0x1234 --max-depth 3
+export IDADIR="/Applications/IDA Professional 9.1.app/Contents/MacOS"
+export IDASDKDIR=/tmp/ida-sdk-sdk3
 
-# Multiple files in parallel (each gets its own worker process)
-ida-cli --path a.elf list-functions &
-ida-cli --path b.elf list-functions &
-wait
+cargo build --bin ida-cli
+./target/debug/ida-cli serve
 ```
 
-## AI Skill
-
-The `skill/` directory contains an [OpenCode](https://opencode.ai) skill with structured RE methodologies, tool reference, and workflow templates. Copy it to your OpenCode skills directory to use:
+### Use the CLI
 
 ```bash
-cp -r skill/ ~/.config/opencode/skills/ida/
+./target/debug/ida-cli --path /Users/gmh/code/devmp/example2-devirt.bin list-functions --limit 20
+./target/debug/ida-cli --path /Users/gmh/code/devmp/example2-devirt.bin decompile --addr 0x140001000
+./target/debug/ida-cli --path /Users/gmh/code/devmp/example2-devirt.bin raw '{"method":"get_xrefs_to","params":{"path":"/Users/gmh/code/devmp/example2-devirt.bin","address":"0x140001000"}}'
 ```
 
-## Docs
+### Probe the selected runtime backend
 
-- [docs/TOOLS.md](docs/TOOLS.md) — Tool catalog and discovery workflow
-- [docs/TRANSPORTS.md](docs/TRANSPORTS.md) — Stdio vs Streamable HTTP
-- [docs/BUILDING.md](docs/BUILDING.md) — Build from source
-- [docs/TESTING.md](docs/TESTING.md) — Running tests
+```bash
+./target/debug/ida-cli probe-runtime
+```
+
+Example output on the tested 9.1 installation:
+
+```json
+{"runtime":{"major":9,"minor":0,"build":250226},"backend":"idat-compat","supported":true,"reason":null}
+```
+
+## Build Requirements
+
+- Rust 1.77+
+- LLVM/Clang
+- IDA installation via `IDADIR`
+- IDA SDK via `IDASDKDIR` or `IDALIB_SDK`
+
+The SDK lookup accepts both layouts:
+
+- `/path/to/ida-sdk`
+- `/path/to/ida-sdk/src`
+
+## Runtime Notes
+
+### `native-linked`
+
+This backend links against the vendored `idalib` line and is intended for newer compatible runtimes.
+
+### `idat-compat`
+
+This backend shells out to `idat`, runs short IDAPython scripts, and returns structured JSON results to the router. It exists to keep older runtimes operational without hard-crashing workers.
+
+### Cache and socket paths
+
+- Database cache: `~/.ida/idb/`
+- Logs: `~/.ida/logs/server.log`
+- CLI discovery socket: `/tmp/ida-cli.socket`
+- Large JSON response cache: `/tmp/ida-cli-out/`
+
+## Documentation
+
+- [docs/BUILDING.md](docs/BUILDING.md)
+- [docs/TRANSPORTS.md](docs/TRANSPORTS.md)
+- [docs/TOOLS.md](docs/TOOLS.md)
 
 ## License
 

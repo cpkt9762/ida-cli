@@ -5,6 +5,7 @@ pub mod analysis;
 pub mod annotations;
 pub mod controlflow;
 pub mod database;
+pub mod debug;
 pub mod disasm;
 pub mod functions;
 pub mod globals;
@@ -17,7 +18,6 @@ pub mod strings;
 pub mod structs;
 pub mod types;
 pub mod xrefs;
-pub mod debug;
 
 use crate::error::ToolError;
 use idalib::IDB;

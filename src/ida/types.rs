@@ -1,9 +1,9 @@
 //! Response types for IDA worker operations.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Database info returned after opening
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbInfo {
     pub path: String,
     pub file_type: String,
@@ -14,14 +14,14 @@ pub struct DbInfo {
     pub analysis_status: AnalysisStatus,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugInfoLoad {
     pub path: String,
     pub loaded: bool,
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisStatus {
     pub auto_enabled: bool,
     pub auto_is_ok: bool,
@@ -58,7 +58,7 @@ pub struct AddressInfo {
 }
 
 /// Function info for listing
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionInfo {
     pub address: String,
     pub name: String,
@@ -66,7 +66,7 @@ pub struct FunctionInfo {
 }
 
 /// Paginated function list result
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionListResult {
     pub functions: Vec<FunctionInfo>,
     pub total: usize,

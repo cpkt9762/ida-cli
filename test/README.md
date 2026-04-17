@@ -1,6 +1,6 @@
 # Tests
 
-Integration tests for ida-mcp using a minimal `mini.c` fixture.
+Integration tests for ida-cli using a minimal `mini.c` fixture.
 
 ## Prerequisites
 

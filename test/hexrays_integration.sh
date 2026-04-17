@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Hex-Rays integration test for ida-mcp.
+# Hex-Rays integration test for ida-cli.
 # Probes idb_meta for hexrays_available; skips gracefully if not present.
 set -euo pipefail
 
-SERVER_BIN="${SERVER_BIN:-../target/release/ida-mcp}"
+SERVER_BIN="${SERVER_BIN:-../target/release/ida-cli}"
 RUST_LOG="${RUST_LOG:-ida_mcp=warn}"
 
 if [ ! -x "$SERVER_BIN" ]; then

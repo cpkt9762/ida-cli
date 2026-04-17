@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ida-mcp HTTP stress test — loops common MCP tools to find bugs.
+ida-cli HTTP stress test — loops common MCP tools to find bugs.
 
 Usage:
   1. Start the server:
-     ./target/release/ida-mcp serve-http --bind 127.0.0.1:8765
+     ./target/release/ida-cli serve-http --bind 127.0.0.1:8765
   2. Run this script:
      python3 scripts/stress_test.py [OPTIONS]
 
@@ -516,7 +516,7 @@ def check_server(url: str, timeout: int = 5) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ida-mcp HTTP stress test")
+    parser = argparse.ArgumentParser(description="ida-cli HTTP stress test")
     parser.add_argument(
         "--url",
         default="http://127.0.0.1:8765",
@@ -570,7 +570,7 @@ def main():
     if not check_server(args.url):
         log.error("Server not reachable at %s", args.url)
         log.error("Start the server first:")
-        log.error("  ./target/release/ida-mcp serve-http --bind 127.0.0.1:8765")
+        log.error("  ./target/release/ida-cli serve-http --bind 127.0.0.1:8765")
         sys.exit(1)
     log.info("Server is reachable")
 

@@ -2,12 +2,13 @@
 
 use crate::error::ToolError;
 use crate::expand_path;
+use crate::ida::backend::{native_backend, IdaBackend, RawDatabaseOptions};
 use crate::ida::handlers::analysis::build_analysis_status;
 use crate::ida::lock::{
     acquire_mcp_lock, clean_stale_mcp_lock, detect_db_lock, release_mcp_lock_file,
 };
 use crate::ida::types::{DbInfo, DebugInfoLoad};
-use idalib::{IDBOpenOptions, IDB};
+use idalib::IDB;
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::fs::File;
@@ -137,7 +138,7 @@ pub fn handle_open(
         );
     }
 
-    // Acquire MCP lock file (to detect other ida-mcp instances)
+    // Acquire MCP lock file (to detect other ida-cli instances)
     let mcp_lock = acquire_mcp_lock(&expanded)?;
 
     // Open database
@@ -163,13 +164,13 @@ pub fn handle_open(
     let mut opened_path = expanded.clone();
     let db = if is_idb {
         // Open existing IDA database (no auto-analysis needed, but save=true to pack on close)
-        let mut db = IDB::open_with(&expanded, false, true);
+        let mut db = native_backend().open_existing_database(&expanded, false, true);
         if db.is_err() {
             if let Some(id0_path) = unpacked_id0_path(&expanded) {
                 if id0_path.exists() {
                     info!(path = %id0_path.display(), "Falling back to unpacked ID0 database");
                     opened_path = id0_path.clone();
-                    db = IDB::open_with(&id0_path, false, true);
+                    db = native_backend().open_existing_database(&id0_path, false, true);
                 }
             }
         }
@@ -184,16 +185,19 @@ pub fn handle_open(
             out_path.display()
         );
         opened_path = out_path.clone();
-        let mut opts = IDBOpenOptions::new();
-        opts.auto_analyse(auto_analyse);
         if let Some(ft) = file_type {
             info!(file_type = ft, "Using file type selector (-T flag)");
-            opts.file_type(ft);
         }
-        for arg in extra_args {
-            opts.arg(arg);
-        }
-        opts.idb(out_path).save(true).open(&expanded)
+        native_backend().open_raw_binary(
+            &expanded,
+            RawDatabaseOptions {
+                auto_analyse,
+                save: true,
+                idb_output: out_path,
+                file_type,
+                extra_args,
+            },
+        )
     };
     done.store(true, Ordering::Relaxed);
     let _ = ticker.join();

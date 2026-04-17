@@ -1,8 +1,8 @@
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
-const DISCOVERY_PATH: &str = "/tmp/ida-mcp.socket";
-const STARTUP_LOCK: &str = "/tmp/ida-mcp.startup.lock";
+const DISCOVERY_PATH: &str = "/tmp/ida-cli.socket";
+const STARTUP_LOCK: &str = "/tmp/ida-cli.startup.lock";
 
 pub fn discover_socket(explicit: Option<&str>) -> Result<PathBuf, String> {
     if let Some(s) = explicit {
@@ -29,8 +29,9 @@ pub fn discover_socket(explicit: Option<&str>) -> Result<PathBuf, String> {
 
     auto_start_server()?;
 
-    read_discovery_file()
-        .ok_or_else(|| "Server started but socket not found. Check logs: /tmp/ida-mcp.log".into())
+    read_discovery_file().ok_or_else(|| {
+        "Server started but socket not found. Check logs: ~/.ida/logs/server.log".into()
+    })
 }
 
 fn read_discovery_file() -> Option<PathBuf> {

@@ -2,7 +2,7 @@
 # 3DB concurrent router test: open/query/close three Solana IDBs via db routing.
 set -euo pipefail
 
-SERVER_BIN="${SERVER_BIN:-../target/release/ida-mcp}"
+SERVER_BIN="${SERVER_BIN:-../target/release/ida-cli}"
 RUST_LOG="${RUST_LOG:-ida_mcp=warn}"
 
 PUMPFUN_IDB="${PUMPFUN_IDB:?PUMPFUN_IDB is required}"

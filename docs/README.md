@@ -1,6 +1,6 @@
 # Documentation
 
-ida-mcp is a headless IDA Pro MCP server with a discovery-first tool model.
+ida-cli is a headless IDA Pro MCP server with a discovery-first tool model.
 
 ## Design
 
