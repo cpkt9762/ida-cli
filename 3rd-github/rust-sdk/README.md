@@ -1,0 +1,159 @@
+<div align = "right">
+<a href="docs/readme/README.zh-cn.md">简体中文</a>
+</div>
+
+# RMCP
+[![Crates.io Version](https://img.shields.io/crates/v/rmcp)](https://crates.io/crates/rmcp)
+[![docs.rs](https://img.shields.io/docsrs/rmcp)](https://docs.rs/rmcp/latest/rmcp)
+[![CI](https://github.com/modelcontextprotocol/rust-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/modelcontextprotocol/rust-sdk/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/rmcp)](LICENSE)
+
+An official Rust Model Context Protocol SDK implementation with tokio async runtime.
+
+This repository contains the following crates:
+
+- [rmcp](crates/rmcp): The core crate providing the RMCP protocol implementation - see [rmcp](crates/rmcp/README.md)
+- [rmcp-macros](crates/rmcp-macros): A procedural macro crate for generating RMCP tool implementations - see [rmcp-macros](crates/rmcp-macros/README.md)
+
+## Usage
+
+### Import the crate
+
+```toml
+rmcp = { version = "0.16.0", features = ["server"] }
+## or dev channel
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", branch = "main" }
+```
+### Third Dependencies
+
+Basic dependencies:
+- [tokio](https://github.com/tokio-rs/tokio)
+- [serde](https://github.com/serde-rs/serde)
+Json Schema generation (version 2020-12):
+- [schemars](https://github.com/GREsau/schemars)
+
+### Build a Client
+
+<details>
+<summary>Start a client</summary>
+
+```rust, ignore
+use rmcp::{ServiceExt, transport::{TokioChildProcess, ConfigureCommandExt}};
+use tokio::process::Command;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = ().serve(TokioChildProcess::new(Command::new("npx").configure(|cmd| {
+        cmd.arg("-y").arg("@modelcontextprotocol/server-everything");
+    }))?).await?;
+    Ok(())
+}
+```
+</details>
+
+### Build a Server
+
+<details>
+<summary>Build a transport</summary>
+
+```rust, ignore
+use tokio::io::{stdin, stdout};
+let transport = (stdin(), stdout());
+```
+
+</details>
+
+<details>
+<summary>Build a service</summary>
+
+You can easily build a service by using [`ServerHandler`](crates/rmcp/src/handler/server.rs) or [`ClientHandler`](crates/rmcp/src/handler/client.rs).
+
+```rust, ignore
+let service = common::counter::Counter::new();
+```
+</details>
+
+<details>
+<summary>Start the server</summary>
+
+```rust, ignore
+// this call will finish the initialization process
+let server = service.serve(transport).await?;
+```
+</details>
+
+<details>
+<summary>Interact with the server</summary>
+
+Once the server is initialized, you can send requests or notifications:
+
+```rust, ignore
+// request
+let roots = server.list_roots().await?;
+
+// or send notification
+server.notify_cancelled(...).await?;
+```
+</details>
+
+<details>
+<summary>Waiting for service shutdown</summary>
+
+```rust, ignore
+let quit_reason = server.waiting().await?;
+// or cancel it
+let quit_reason = server.cancel().await?;
+```
+</details>
+
+
+## Examples
+
+See [examples](examples/README.md).
+
+## Feature Documentation
+
+See [docs/FEATURES.md](docs/FEATURES.md) for detailed documentation on core MCP features: resources, prompts, sampling, roots, logging, completions, notifications, and subscriptions.
+
+## OAuth Support
+
+See [Oauth_support](docs/OAUTH_SUPPORT.md) for details.
+
+## Related Resources
+
+- [MCP Specification](https://modelcontextprotocol.io/specification/2025-11-25)
+- [Schema](https://github.com/modelcontextprotocol/specification/blob/main/schema/2025-11-25/schema.ts)
+
+## Related Projects
+
+### Extending `rmcp`
+
+- [rmcp-actix-web](https://gitlab.com/lx-industries/rmcp-actix-web) - An `actix_web` backend for `rmcp`
+- [rmcp-openapi](https://gitlab.com/lx-industries/rmcp-openapi) - Transform OpenAPI definition endpoints into MCP tools
+
+### Built with `rmcp`
+
+- [goose](https://github.com/block/goose) - An open-source, extensible AI agent that goes beyond code suggestions
+- [apollo-mcp-server](https://github.com/apollographql/apollo-mcp-server) - MCP server that connects AI agents to GraphQL APIs via Apollo GraphOS
+- [rustfs-mcp](https://github.com/rustfs/rustfs/tree/main/crates/mcp) - High-performance MCP server providing S3-compatible object storage operations for AI/LLM integration
+- [containerd-mcp-server](https://github.com/jokemanfire/mcp-containerd) - A containerd-based MCP server implementation
+- [rmcp-openapi-server](https://gitlab.com/lx-industries/rmcp-openapi/-/tree/main/crates/rmcp-openapi-server) - High-performance MCP server that exposes OpenAPI definition endpoints as MCP tools
+- [nvim-mcp](https://github.com/linw1995/nvim-mcp) - A MCP server to interact with Neovim
+- [terminator](https://github.com/mediar-ai/terminator) - AI-powered desktop automation MCP server with cross-platform support and >95% success rate
+- [stakpak-agent](https://github.com/stakpak/agent) - Security-hardened terminal agent for DevOps with MCP over mTLS, streaming, secret tokenization, and async task management
+- [video-transcriber-mcp-rs](https://github.com/nhatvu148/video-transcriber-mcp-rs) - High-performance MCP server for transcribing videos from 1000+ platforms using whisper.cpp
+- [NexusCore MCP](https://github.com/sjkim1127/Nexuscore_MCP) - Advanced malware analysis & dynamic instrumentation MCP server with Frida integration and stealth unpacking capabilities
+- [spreadsheet-mcp](https://github.com/PSU3D0/spreadsheet-mcp) - Token-efficient MCP server for spreadsheet analysis with automatic region detection, recalculation, screenshot, and editing support for LLM agents
+- [hyper-mcp](https://github.com/hyper-mcp-rs/hyper-mcp) - A fast, secure MCP server that extends its capabilities through WebAssembly (WASM) plugins
+- [rudof-mcp](https://github.com/rudof-project/rudof/tree/master/rudof_mcp) - RDF validation and data processing MCP server with ShEx/SHACL validation, SPARQL queries, and format conversion. Supports stdio and streamable HTTP transports with full MCP capabilities (tools, prompts, resources, logging, completions, tasks)
+
+
+## Development
+
+### Tips for Contributors
+
+See [docs/CONTRIBUTE.MD](docs/CONTRIBUTE.MD) to get some tips for contributing.
+
+### Using Dev Container
+
+If you want to use dev container, see [docs/DEVCONTAINER.md](docs/DEVCONTAINER.md) for instructions on using Dev Container for development.
