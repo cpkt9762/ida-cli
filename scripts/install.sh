@@ -395,8 +395,8 @@ echo "installed:"
 echo "  launcher: $LAUNCHER"
 echo "  binary:   $REAL_BIN"
 if [[ "$ADD_PATH" -eq 0 && ":$PATH:" != *":$BIN_DIR:"* ]]; then
-  echo "add this to PATH:"
+echo "add this to PATH:"
   echo "  export PATH=\"$BIN_DIR:\$PATH\""
 fi
 echo "skill install:"
-echo "  npx -y skills add https://github.com/${REPO} --skill ida --agent codex --yes --global"
+echo "  npx -y skills add https://github.com/${REPO} --skill ida-cli --agent codex --yes --global"

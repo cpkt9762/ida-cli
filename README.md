@@ -110,18 +110,18 @@ The tested command is `npx skills add`, not `npx skill add`.
 # List the skill exposed by this repository
 npx -y skills add https://github.com/cpkt9762/ida-cli --list
 
-# Install the ida skill for Codex
-npx -y skills add https://github.com/cpkt9762/ida-cli --skill ida --agent codex --yes --global
+# Install the ida-cli skill for Codex
+npx -y skills add https://github.com/cpkt9762/ida-cli --skill ida-cli --agent codex --yes --global
 ```
 
-This was verified locally: the CLI detected the `ida` skill from `skill/SKILL.md` and installed it to `~/.agents/skills/ida`.
+This was verified locally: the CLI detected the `ida-cli` skill from `skill/SKILL.md` and installed it to `~/.agents/skills/ida-cli`.
 
 After installation, the skill ships its own bootstrap wrapper:
 
 ```bash
-~/.agents/skills/ida/scripts/ida-cli.sh --help
-~/.agents/skills/ida/scripts/ida-cli.sh probe-runtime
-~/.agents/skills/ida/scripts/ida-cli.sh --path /path/to/binary list-functions --limit 20
+~/.agents/skills/ida-cli/scripts/ida-cli.sh --help
+~/.agents/skills/ida-cli/scripts/ida-cli.sh probe-runtime
+~/.agents/skills/ida-cli/scripts/ida-cli.sh --path /path/to/binary list-functions --limit 20
 ```
 
 That wrapper installs `ida-cli` automatically if it is missing, then runs the requested command.
