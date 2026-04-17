@@ -1,100 +1,150 @@
 # yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
-name: Build
+name: Build and Release
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [master]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  IDASDKDIR: ${{ github.workspace }}/ida-sdk
 
 jobs:
-  build-linux:
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           submodules: true
 
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: HexRaysSA/ida-sdk
+          path: ida-sdk
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev llvm-dev
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
-      - name: Build
-        env:
-          IDADIR: /opt/idapro-9.3
-          # Enable verbose C++ compiler output
-          CC_ENABLE_DEBUG_OUTPUT: "1"
-        run: cargo build --release --locked -vv
+      - name: Validate Rust library tests
+        run: cargo test --locked --lib -- --nocapture
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        with:
-          name: ida-mcp-skill-linux-x86_64
-          path: target/release/ida-mcp-skill
+      - name: Validate Python scripts
+        run: |
+          python3 -m py_compile \
+            scripts/decompile_structured.py \
+            scripts/run_dbg_test.py \
+            scripts/stress_test.py \
+            scripts/test_dbg_headless.py \
+            scripts/verify_9x_compat.py
 
-  build-macos:
-    runs-on: macos-latest
+  build-linux:
+    needs: validate
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           submodules: true
 
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: HexRaysSA/ida-sdk
+          path: ida-sdk
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev llvm-dev
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
-      - name: Build
-        env:
-          IDADIR: /Applications/IDA Professional 9.3.app/Contents/MacOS
-        run: cargo build --release --locked
+      - name: Build release binary
+        run: cargo build --release --locked --bin ida-cli -vv
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: ida-mcp-skill-macos-arm64
-          path: target/release/ida-mcp-skill
+          name: ida-cli-linux-x86_64
+          path: target/release/ida-cli
+
+  build-macos:
+    needs: validate
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          submodules: true
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: HexRaysSA/ida-sdk
+          path: ida-sdk
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin ida-cli
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ida-cli-darwin-arm64
+          path: target/release/ida-cli
 
   build-windows:
+    needs: validate
     runs-on: windows-latest
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          submodules: true
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: HexRaysSA/ida-sdk
+          path: ida-sdk
+          fetch-depth: 1
+
       - name: Install LLVM
         uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0  # v2
         with:
           version: "20"
-          directory: "${{ runner.temp }}/llvm-20"
+          directory: ${{ runner.temp }}/llvm-20
 
       - name: Configure LLVM environment
-        run: echo "LIBCLANG_PATH=$((gcm clang).source -replace "clang.exe")" >> $env:GITHUB_ENV
-
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with:
-          submodules: true
+        shell: pwsh
+        run: |
+          "LIBCLANG_PATH=$env:RUNNER_TEMP\llvm-20\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
-      - name: Build
-        env:
-          IDADIR: C:\Program Files\IDA Professional 9.3
-        run: cargo build --release --locked
+      - name: Build release binary
+        shell: pwsh
+        run: cargo build --release --locked --bin ida-cli
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: ida-mcp-skill-windows-x86_64
-          path: target/release/ida-mcp-skill.exe
-
-  lint-python:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-      - name: Validate Python scripts
-        run: python3 -m py_compile scripts/decompile_structured.py
+          name: ida-cli-windows-x86_64
+          path: target/release/ida-cli.exe
 
   release:
-    needs: [build-linux, build-macos, build-windows, lint-python]
+    needs: [validate, build-linux, build-macos, build-windows]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -109,33 +159,36 @@ jobs:
         with:
           path: artifacts
 
-      - name: Package artifacts
+      - name: Package release assets
         run: |
-          cd artifacts
+          mkdir -p release
 
-          # Linux
-          chmod +x ida-mcp-skill-linux-x86_64/ida-mcp-skill
-          tar -czvf ida-mcp-skill_${GITHUB_REF_NAME#v}_Linux_x86_64.tar.gz \
-            -C ida-mcp-skill-linux-x86_64 ida-mcp-skill \
-            -C ${{ github.workspace }} README.md LICENSE
+          chmod +x artifacts/ida-cli-linux-x86_64/ida-cli
+          tar -czf release/ida-cli-Linux_x86_64.tar.gz \
+            -C artifacts/ida-cli-linux-x86_64 ida-cli \
+            -C "${GITHUB_WORKSPACE}" README.md README.zh-CN.md LICENSE
 
-          # macOS
-          chmod +x ida-mcp-skill-macos-arm64/ida-mcp-skill
-          tar -czvf ida-mcp-skill_${GITHUB_REF_NAME#v}_Darwin_arm64.tar.gz \
-            -C ida-mcp-skill-macos-arm64 ida-mcp-skill \
-            -C ${{ github.workspace }} README.md LICENSE
+          chmod +x artifacts/ida-cli-darwin-arm64/ida-cli
+          tar -czf release/ida-cli-Darwin_arm64.tar.gz \
+            -C artifacts/ida-cli-darwin-arm64 ida-cli \
+            -C "${GITHUB_WORKSPACE}" README.md README.zh-CN.md LICENSE
 
-          # Windows
-          zip ida-mcp-skill_${GITHUB_REF_NAME#v}_Windows_x86_64.zip \
-            ida-mcp-skill-windows-x86_64/ida-mcp-skill.exe \
-            -j ${{ github.workspace }}/README.md \
-            -j ${{ github.workspace }}/LICENSE
+          (
+            cd artifacts/ida-cli-windows-x86_64
+            zip "${GITHUB_WORKSPACE}/release/ida-cli-Windows_x86_64.zip" ida-cli.exe
+          )
 
-      - name: Create Release
+          cp scripts/install.sh release/install.sh
+          chmod +x release/install.sh
+          sha256sum release/ida-cli-* > release/sha256sums.txt
+
+      - name: Create release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b  # v2
         with:
           files: |
-            artifacts/*.tar.gz
-            artifacts/*.zip
+            release/ida-cli-*.tar.gz
+            release/ida-cli-*.zip
+            release/install.sh
+            release/sha256sums.txt
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'rc') }}

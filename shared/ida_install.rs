@@ -257,12 +257,7 @@ pub fn runtime_rpath_dirs(primary: Option<&Path>) -> Vec<PathBuf> {
         if has_runtime_libraries(&primary) {
             push_unique(&mut paths, primary);
         }
-    }
-
-    for path in candidate_install_dirs() {
-        if has_runtime_libraries(&path) {
-            push_unique(&mut paths, path);
-        }
+        return paths;
     }
 
     paths
@@ -270,8 +265,10 @@ pub fn runtime_rpath_dirs(primary: Option<&Path>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_install_dir, version_key};
+    use super::{normalize_install_dir, runtime_rpath_dirs, version_key};
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_versions_from_common_names() {
@@ -296,5 +293,38 @@ mod tests {
             normalize_install_dir("/Applications/IDA Professional 9.3.app/Contents"),
             Path::new("/Applications/IDA Professional 9.3.app/Contents/MacOS")
         );
+    }
+
+    #[test]
+    fn runtime_rpath_dirs_prefers_primary_only() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ida-install-test-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(target_os = "macos")]
+        {
+            fs::write(dir.join("libida.dylib"), b"").unwrap();
+            fs::write(dir.join("libidalib.dylib"), b"").unwrap();
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            fs::write(dir.join("libida.so"), b"").unwrap();
+            fs::write(dir.join("libidalib.so"), b"").unwrap();
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            fs::write(dir.join("ida.dll"), b"").unwrap();
+            fs::write(dir.join("idalib.dll"), b"").unwrap();
+        }
+
+        let rpaths = runtime_rpath_dirs(Some(&dir));
+        assert_eq!(rpaths, vec![dir.clone()]);
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

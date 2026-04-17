@@ -44,11 +44,39 @@ Some write-heavy and advanced type-editing operations still require further pari
 
 ## Quick Start
 
-### Run the server
+### Install `ida-cli`
+
+Recommended: use the installer script. It downloads the latest tagged release when one exists, otherwise it can fall back to a local source build.
 
 ```bash
-export IDADIR="/Applications/IDA Professional 9.3.app/Contents/MacOS"
-export IDASDKDIR=/tmp/ida-sdk-sdk3
+curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/install.sh | bash -s -- --add-path
+```
+
+Useful variants:
+
+```bash
+# Install a specific release
+curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/install.sh | bash -s -- --tag v0.9.3 --add-path
+
+# Build directly from a branch or ref
+curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/install.sh | bash -s -- --ref master --build-from-source --add-path
+```
+
+Notes:
+
+- The installer places the launcher in `~/.local/bin/ida-cli` by default.
+- `--add-path` appends that bin directory to your shell rc file.
+- If `IDASDKDIR` / `IDALIB_SDK` is not already set and the script needs a local build, it will clone the open-source `HexRaysSA/ida-sdk` automatically.
+- If you keep multiple IDA installations side by side, export `IDADIR` explicitly before installing or running `ida-cli`.
+
+### Build from source
+
+```bash
+git clone https://github.com/cpkt9762/ida-cli.git
+cd ida-cli
+
+export IDADIR="/path/to/ida/Contents/MacOS"
+export IDASDKDIR="/path/to/ida-sdk"
 
 cargo build --bin ida-cli
 ./target/debug/ida-cli serve
@@ -73,6 +101,20 @@ Example output on the tested 9.3 installation:
 ```json
 {"runtime":{"major":9,"minor":0,"build":260213},"backend":"idat-compat","supported":true,"reason":null}
 ```
+
+### Install the skill
+
+The tested command is `npx skills add`, not `npx skill add`.
+
+```bash
+# List the skill exposed by this repository
+npx -y skills add https://github.com/cpkt9762/ida-cli --list
+
+# Install the ida skill for Codex
+npx -y skills add https://github.com/cpkt9762/ida-cli --skill ida --agent codex --yes --global
+```
+
+This was verified locally: the CLI detected the `ida` skill from `skill/SKILL.md` and installed it to `~/.agents/skills/ida`.
 
 ## Build Requirements
 
@@ -102,6 +144,18 @@ This backend shells out to `idat`, runs short IDAPython scripts, and returns str
 - Logs: `~/.ida/logs/server.log`
 - CLI discovery socket: `/tmp/ida-cli.socket`
 - Large JSON response cache: `/tmp/ida-cli-out/`
+
+## CI and Releases
+
+GitHub Actions now uses the open-source `HexRaysSA/ida-sdk` on hosted runners so it can compile and test the current tree without relying on a private machine layout.
+
+Current workflow behavior:
+
+- Pushes and pull requests against `master` run validation
+- Tagged pushes like `v0.9.3` build release archives for Linux, macOS, and Windows
+- Releases attach `install.sh` plus platform archives
+
+The release archives are built against SDK stubs, while the installed launcher resolves your local IDA runtime through `IDADIR` or common install paths before starting `ida-cli`.
 
 ## Documentation
 

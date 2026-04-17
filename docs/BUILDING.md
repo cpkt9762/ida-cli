@@ -19,7 +19,7 @@ That means the build is not restricted to one exact installed IDA runtime, but t
 ## Clone and Build
 
 ```bash
-git clone https://github.com/cpkt9762/ida-cli.git
+git clone https://github.com/gmh5225/ida-cli.git
 cd ida-cli
 
 export IDADIR="/Applications/IDA Professional 9.1.app/Contents/MacOS"
