@@ -24,6 +24,7 @@ target
 sdk/
 target-aot/
 assets/
+.sisyphus/
 
 # Release
 dist/
