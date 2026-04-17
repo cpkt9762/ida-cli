@@ -570,12 +570,23 @@ fn main() -> anyhow::Result<()> {
         "=== ida-cli started ==="
     );
 
-    // Detect if invoked as "ida-cli" → flat CLI mode
+    // Detect if invoked as "ida-cli" → flat CLI mode.
+    // Check both the real executable path AND argv[0], because install.sh
+    // saves the binary as "ida-cli.real" and the launcher script uses
+    // `exec -a ida-cli` to set argv[0].  current_exe() resolves the
+    // filesystem path (ida-cli.real) while args()[0] reflects the -a name.
     let exe_name = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+    let argv0_name = std::env::args().next().and_then(|s| {
+        std::path::Path::new(&s)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    });
+    let is_flat_cli =
+        exe_name.as_deref() == Some("ida-cli") || argv0_name.as_deref() == Some("ida-cli");
 
-    if exe_name.as_deref() == Some("ida-cli") {
+    if is_flat_cli {
         // If first arg is a server command, still use full Command parsing
         // (auto_start_server() spawns self + "serve-http" arg)
         let first_arg = std::env::args().nth(1);
