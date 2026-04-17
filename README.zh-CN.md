@@ -139,7 +139,7 @@ cargo build --bin ida-cli
 
 ## 构建要求
 
-- Rust 1.77+
+- Rust 1.87+
 - LLVM / Clang
 - macOS 或 Linux 宿主机
 - 通过 `IDADIR` 指定 IDA 安装目录（运行时最低要求 IDA 9.0）

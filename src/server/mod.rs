@@ -277,7 +277,7 @@ impl IdaMcpServer {
                 if hex_str.is_empty() {
                     return Err(ToolError::InvalidParams("no bytes provided".to_string()));
                 }
-                if hex_str.len() % 2 != 0 {
+                if !hex_str.len().is_multiple_of(2) {
                     return Err(ToolError::InvalidParams(
                         "hex string has odd length".to_string(),
                     ));

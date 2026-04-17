@@ -33,20 +33,36 @@ Dependencies: pefile, capstone, unicorn, keystone-engine. Install via
 `pip install -r vm_devirt_requirements.txt`.
 """
 
+# ruff: noqa: F403, F405
+# Unicorn exposes ~50 register constants from `unicorn.x86_const`. Enumerating
+# them individually hurts readability far more than the star-import risk, so
+# the F403/F405 lints are silenced at the file level.
+
 from __future__ import annotations
-import argparse, struct, re, os, time
-from collections import OrderedDict, Counter
+
+import argparse
+import os
+import re
+import struct
+import time
+from collections import Counter, OrderedDict
 from typing import Optional
 
 import pefile
-from capstone import Cs, CS_ARCH_X86, CS_MODE_64
-from capstone.x86_const import X86_OP_IMM, X86_OP_MEM, X86_OP_REG, X86_REG_RSP
-from keystone import Ks, KS_ARCH_X86, KS_MODE_64, KsError
-from unicorn import (Uc, UcError, UC_ARCH_X86, UC_MODE_64,
-                     UC_HOOK_CODE, UC_HOOK_INSN,
-                     UC_HOOK_MEM_READ_UNMAPPED,
-                     UC_HOOK_MEM_WRITE_UNMAPPED,
-                     UC_HOOK_MEM_WRITE)
+from capstone import CS_ARCH_X86, CS_MODE_64, Cs
+from capstone.x86_const import X86_OP_IMM, X86_OP_REG, X86_REG_RSP
+from keystone import KS_ARCH_X86, KS_MODE_64, Ks, KsError
+from unicorn import (
+    UC_ARCH_X86,
+    UC_HOOK_CODE,
+    UC_HOOK_INSN,
+    UC_HOOK_MEM_READ_UNMAPPED,
+    UC_HOOK_MEM_WRITE,
+    UC_HOOK_MEM_WRITE_UNMAPPED,
+    UC_MODE_64,
+    Uc,
+    UcError,
+)
 from unicorn.x86_const import *
 
 # ═══════════════════════════ ABI & Registers ═══════════════════════
@@ -694,7 +710,6 @@ class VMDevirtualizer:
                 return
             s0 = (e0f >> 15) & 1
             N = 63
-            QQ = (m0 << N) // m1
             new_raw = (m0 << N) % m1
             if new_raw == 0:
                 new_m, new_ef = 0, s0 << 15
@@ -909,7 +924,8 @@ class VMDevirtualizer:
             self._fprem_apply_fixup(uc)
             self.n_insns += 1
             if self.n_insns > MAX_INSNS:
-                uc.emu_stop(); return
+                uc.emu_stop()
+                return
             self._fprem_detect(uc, a, sz)
             if not self.in_vm:
                 if vms <= a < vme:
@@ -1054,7 +1070,7 @@ class VMDevirtualizer:
         self._emulate(func_va, vms, vme)
         if not self.vm_exit_addr:
             if not quiet:
-                print(f"    [!] VM did not exit")
+                print("    [!] VM did not exit")
             return None
 
         unknown = sum(1 for ev in self.events if ev["dll"] == "?")
@@ -1084,12 +1100,14 @@ class VMDevirtualizer:
             return False
         self.vm_sec_name = self._detect_vm_section()
         if not self.vm_sec_name:
-            print("[!] No VM section detected"); return False
+            print("[!] No VM section detected")
+            return False
         print(f"[*] VM section: {self.vm_sec_name}")
 
         result = self._devirt_one(func_va)
         if not result:
-            print("[!] Devirtualization failed"); return False
+            print("[!] Devirtualization failed")
+            return False
 
         self._print_trace()
         self._print_asm(result["asm_lines"])
@@ -1544,7 +1562,8 @@ class VMDevirtualizer:
             return False
         self.vm_sec_name = self._detect_vm_section()
         if not self.vm_sec_name:
-            print("[!] No VM section detected"); return False
+            print("[!] No VM section detected")
+            return False
         print(f"[*] VM section: {self.vm_sec_name}")
 
         if ep_timeout > 0:
@@ -1616,16 +1635,21 @@ class VMDevirtualizer:
             if Sentinel.is_clobber(new):
                 continue
             if last_ev and prax is not None and new == prax:
-                ops.append(("ret", rn, last_ev)); continue
+                ops.append(("ret", rn, last_ev))
+                continue
             src = self._find_reg_src(rn, new, prev)
             if src:
-                ops.append(("reg", rn, src)); continue
+                ops.append(("reg", rn, src))
+                continue
             if new in self.hook_map:
-                ops.append(("iat", rn, self.hook_map[new])); continue
+                ops.append(("iat", rn, self.hook_map[new]))
+                continue
             if self.frame_rsp and 0 <= (new - self.frame_rsp) < self.frame_size:
-                ops.append(("lea_rsp", rn, new - self.frame_rsp)); continue
+                ops.append(("lea_rsp", rn, new - self.frame_rsp))
+                continue
             if self._is_data_addr(new):
-                ops.append(("lea_data", rn, new)); continue
+                ops.append(("lea_data", rn, new))
+                continue
             ops.append(("imm", rn, new))
         return ops
 
@@ -1639,7 +1663,8 @@ class VMDevirtualizer:
             cv, pv = cf.get(k), pf.get(k)
             if cv is not None and cv != pv:
                 writes.append(("sq", o, cv & 0xFFFFFFFF))
-                done.add(o); done.add(o + 4)
+                done.add(o)
+                done.add(o + 4)
         for o in range(shadow, scan, 4):
             if o in done:
                 continue
@@ -1661,8 +1686,10 @@ class VMDevirtualizer:
         for ev in self.events:
             cur = ev["regs"]
             if self._is_marker_dll(ev["dll"]):
-                prev = dict(cur); prev["rax"] = ev["ret"]
-                pf = dict(ev["frame"]); last_ev = ev
+                prev = dict(cur)
+                prev["rax"] = ev["ret"]
+                pf = dict(ev["frame"])
+                last_ev = ev
                 continue
 
             ops = self._classify_delta(prev, cur, last_ev)

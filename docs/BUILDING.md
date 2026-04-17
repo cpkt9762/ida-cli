@@ -3,7 +3,7 @@
 ## Requirements
 
 - macOS or Linux host
-- Rust 1.77+
+- Rust 1.87+
 - LLVM / Clang
 - An IDA installation, provided via `IDADIR` or discoverable from common
   install paths

@@ -24,6 +24,10 @@ struct CompatWorker {
 }
 
 impl CompatWorker {
+    // The open-request payload carries a fixed set of optional flags that
+    // all have to be forwarded into idat-compat. Introducing a struct just
+    // to satisfy clippy would add a level of indirection for no real gain.
+    #[allow(clippy::too_many_arguments)]
     fn open(
         &mut self,
         path: &str,

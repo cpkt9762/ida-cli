@@ -160,7 +160,7 @@ For the complete CLI surface see
 
 ## Build Requirements
 
-- Rust 1.77+
+- Rust 1.87+
 - LLVM / Clang
 - macOS or Linux host
 - An IDA installation via `IDADIR` (runtime support starts at IDA 9.0)

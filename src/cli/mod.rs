@@ -517,6 +517,10 @@ async fn send_request(
     serde_json::from_str(line.trim()).map_err(|e| anyhow::anyhow!("Invalid response: {e}"))
 }
 
+// prewarm-many is the top-level CLI entry for batch prewarms; every flag
+// is a direct mirror of a request field, so lumping them into a struct
+// would only add boilerplate.
+#[allow(clippy::too_many_arguments)]
 async fn run_prewarm_many(
     socket_path: &Path,
     list_file: &str,

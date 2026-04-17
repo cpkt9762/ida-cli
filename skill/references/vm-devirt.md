@@ -4,7 +4,7 @@ Use this reference when a function is protected by a commercial x86-64 PE
 virtualizer — Themida, VMProtect, Code Virtualizer, WinLicense, or similar —
 and manual handler reversing is not a good use of time.
 
-The bundled tool is `skill/scripts/vm_devirt.py`. It turns the VM body back
+The bundled tool is `scripts/vm_devirt.py`. It turns the VM body back
 into native code and writes a new `.devrt` section so the PE is cleanly
 decompilable by IDA / Hex-Rays.
 
@@ -90,19 +90,19 @@ Phase 3 — emit
 
 ```bash
 # Install deps once (or use a venv):
-pip install -r skill/scripts/vm_devirt_requirements.txt
+pip install -r scripts/vm_devirt_requirements.txt
 
 # Fully automatic: EP init + scan every VM function + emit patched PE
-python3 skill/scripts/vm_devirt.py protected.bin --auto
+python3 scripts/vm_devirt.py protected.bin --auto
 
 # Single function only (fastest, useful for RE drill-down)
-python3 skill/scripts/vm_devirt.py protected.bin 0x140001000 -o out.bin
+python3 scripts/vm_devirt.py protected.bin 0x140001000 -o out.bin
 
 # Skip EP init — 3 seconds, but API calls stay unnamed
-python3 skill/scripts/vm_devirt.py protected.bin --auto --no-ep
+python3 scripts/vm_devirt.py protected.bin --auto --no-ep
 
 # Give EP init more time so more API names resolve
-python3 skill/scripts/vm_devirt.py protected.bin --auto --ep-timeout 300
+python3 scripts/vm_devirt.py protected.bin --auto --ep-timeout 300
 ```
 
 Inputs: PE32+ (x86-64) Windows PE only. PE32 (32-bit) is rejected.
@@ -127,7 +127,7 @@ Artifacts: defaults to `<input>-devirt.bin` next to the input; override with
 2. **Run devirtualization.**
 
    ```bash
-   python3 skill/scripts/vm_devirt.py protected.bin --auto -o protected-devirt.bin
+   python3 scripts/vm_devirt.py protected.bin --auto -o protected-devirt.bin
    ```
 
    Watch stdout:
@@ -162,7 +162,7 @@ If the protector imports a DLL / SYS that is not in `win_exports.json`:
   [!] EP init: 1 module(s) NOT in win_exports.json — need manual export dump:
       custom.dll  →  run: dumpbin /exports custom.dll
   ```
-- Add the exports to `skill/scripts/win_exports.json` under
+- Add the exports to `scripts/win_exports.json` under
   `exports.custom.dll = [...]`. Use `dumpbin /exports` or pefile to get the
   list:
   ```python

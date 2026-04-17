@@ -5,7 +5,7 @@ use std::path::PathBuf;
 fn open_raw(src: &str, out: &str) -> Result<IDB, idalib::IDAError> {
     let mut opts = IDBOpenOptions::new();
     opts.auto_analyse(true);
-    opts.idb(&PathBuf::from(out)).save(false).open(src)
+    opts.idb(PathBuf::from(out)).save(false).open(src)
 }
 
 fn main() {

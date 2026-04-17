@@ -429,9 +429,9 @@ emulation-based devirtualizer, open the patched PE in IDA, and decompile
 normally:
 
 ```bash
-pip install -r skill/scripts/vm_devirt_requirements.txt
+pip install -r scripts/vm_devirt_requirements.txt
 
-python3 skill/scripts/vm_devirt.py protected.bin --auto -o protected-devirt.bin
+python3 scripts/vm_devirt.py protected.bin --auto -o protected-devirt.bin
 
 ida-cli --path protected-devirt.bin list-functions --limit 20
 ida-cli --path protected-devirt.bin decompile --addr 0x140001000
