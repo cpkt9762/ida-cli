@@ -35,7 +35,7 @@
 - 搜索文本和字节模式
 - 执行 IDAPython 代码
 
-样本 `/Users/gmh/code/devmp/example2-devirt.bin` 已完成端到端验证：
+样本 `example2-devirt.bin` 已完成端到端验证：
 
 - `list-functions` 找到 `main`，地址 `0x140001000`
 - `decompile --addr 0x140001000` 成功
@@ -57,9 +57,9 @@ cargo build --bin ida-cli
 ### 使用 CLI
 
 ```bash
-./target/debug/ida-cli --path /Users/gmh/code/devmp/example2-devirt.bin list-functions --limit 20
-./target/debug/ida-cli --path /Users/gmh/code/devmp/example2-devirt.bin decompile --addr 0x140001000
-./target/debug/ida-cli --path /Users/gmh/code/devmp/example2-devirt.bin raw '{"method":"get_xrefs_to","params":{"path":"/Users/gmh/code/devmp/example2-devirt.bin","address":"0x140001000"}}'
+./target/debug/ida-cli --path /path/to/example2-devirt.bin list-functions --limit 20
+./target/debug/ida-cli --path /path/to/example2-devirt.bin decompile --addr 0x140001000
+./target/debug/ida-cli --path /path/to/example2-devirt.bin raw '{"method":"get_xrefs_to","params":{"path":"/path/to/example2-devirt.bin","address":"0x140001000"}}'
 ```
 
 ### 查看运行时选中的后端

@@ -35,7 +35,7 @@ On the tested local IDA 9.1 runtime, `ida-cli` can already:
 - Search text and byte patterns
 - Run IDAPython snippets
 
-The sample `/Users/gmh/code/devmp/example2-devirt.bin` was verified end-to-end:
+The sample `example2-devirt.bin` was verified end-to-end:
 
 - `list-functions` found `main` at `0x140001000`
 - `decompile --addr 0x140001000` succeeded
@@ -57,9 +57,9 @@ cargo build --bin ida-cli
 ### Use the CLI
 
 ```bash
-./target/debug/ida-cli --path /Users/gmh/code/devmp/example2-devirt.bin list-functions --limit 20
-./target/debug/ida-cli --path /Users/gmh/code/devmp/example2-devirt.bin decompile --addr 0x140001000
-./target/debug/ida-cli --path /Users/gmh/code/devmp/example2-devirt.bin raw '{"method":"get_xrefs_to","params":{"path":"/Users/gmh/code/devmp/example2-devirt.bin","address":"0x140001000"}}'
+./target/debug/ida-cli --path /path/to/example2-devirt.bin list-functions --limit 20
+./target/debug/ida-cli --path /path/to/example2-devirt.bin decompile --addr 0x140001000
+./target/debug/ida-cli --path /path/to/example2-devirt.bin raw '{"method":"get_xrefs_to","params":{"path":"/path/to/example2-devirt.bin","address":"0x140001000"}}'
 ```
 
 ### Probe the selected runtime backend

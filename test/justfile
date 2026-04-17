@@ -7,9 +7,9 @@ test_bin := "fixtures/mini"
 test_lock := "fixtures/mini.imcp"
 server_bin := env_var_or_default("SERVER_BIN", "../target/release/ida-cli")
 rust_log := env_var_or_default("RUST_LOG", "ida_mcp=trace")
-PUMPFUN_IDB := "/Users/pingzi/Developer/work/solana/sbpf-test/data/programs/pumpfun/6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P.i64"
-RAYDIUM_IDB := "/Users/pingzi/Developer/work/solana/sbpf-test/data/programs/raydium-v4/675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8.i64"
-JUPITER_IDB := "/Users/pingzi/Developer/work/solana/sbpf-test/data/programs/jupiter-perps/PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu.i64"
+PUMPFUN_IDB := env_var_or_default("PUMPFUN_IDB", "/path/to/pumpfun.i64")
+RAYDIUM_IDB := env_var_or_default("RAYDIUM_IDB", "/path/to/raydium.i64")
+JUPITER_IDB := env_var_or_default("JUPITER_IDB", "/path/to/jupiter.i64")
 
 # Show available recipes
 default:
