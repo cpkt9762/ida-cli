@@ -178,6 +178,7 @@ async fn dispatch_cli_request(
                             crate::server::task::TaskStatus::Cancelled => "cancelled",
                         },
                         "result": state.result,
+                        "remote": state.result.as_ref().and_then(|v| v.get("remote")).and_then(|v| v.as_bool()).unwrap_or(false),
                     }),
                 ),
                 None => RpcResponse::err(&req.id, -32001, "unknown task_id"),
