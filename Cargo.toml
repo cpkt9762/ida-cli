@@ -43,7 +43,3 @@ idalib-build = { path = "3rd-github/idalib/idalib-build" }
 
 [dev-dependencies]
 rstest = "0.25"
-
-[[bin]]
-name = "multi_idb_probe"
-path = "tests/multi_idb_probe.rs"

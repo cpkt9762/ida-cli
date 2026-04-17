@@ -239,6 +239,11 @@ pub fn find_runtime_dir() -> Option<PathBuf> {
         .find(|path| has_runtime_libraries(path))
 }
 
+// `find_idat_binary` is consumed by `src/dsc.rs` and `src/ida/install.rs`,
+// but the file is also included (via `#[path]`) into build scripts that do
+// not reach those call sites. Without this suppression every build script
+// that uses the shared module warns about a stale definition.
+#[allow(dead_code)]
 pub fn find_idat_binary() -> Option<PathBuf> {
     if let Some(path) = configured_install_dir().and_then(|path| idat_binary(&path)) {
         return Some(path);
@@ -249,6 +254,11 @@ pub fn find_idat_binary() -> Option<PathBuf> {
         .find_map(|path| idat_binary(&path))
 }
 
+// Consumed by the top-level build.rs when wiring rpaths for the linked
+// binary. Inside idalib-build only `find_runtime_dir` is called, so this
+// function is unused from the vendored crate's view; the attribute keeps
+// both build graphs quiet.
+#[allow(dead_code)]
 pub fn runtime_rpath_dirs(primary: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 

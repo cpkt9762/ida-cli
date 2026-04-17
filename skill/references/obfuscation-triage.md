@@ -1,6 +1,7 @@
 # Obfuscation Triage
 
-Use this page when a function is hostile to decompilation and needs a disassembly-first workflow.
+Use this page when a function is hostile to decompilation and needs a
+disassembly-first workflow.
 
 ## When to Classify a Function as Obfuscated
 
@@ -11,7 +12,9 @@ Treat a function as currently non-decompilable when any of these are true:
 - the pseudocode is mostly nonsense despite obvious code being present
 - repeated retries produce no meaningful improvement
 
-Once any of those conditions triggers, stop retrying F5 in a loop. Move down to disassembly and only retry decompilation after meaningful progress has been made.
+Once any of those conditions triggers, stop retrying F5 in a loop. Move down
+to disassembly and only retry decompilation after meaningful progress has
+been made.
 
 ## Common Obfuscation Signals
 
@@ -23,12 +26,13 @@ Look for:
 - a state variable that is read and rewritten constantly
 - many branches converging back to the same block
 
-Typical workflow:
+Typical workflow (the flat CLI exposes `disasm`; the rest goes through
+`raw`):
 
 ```bash
-ida-cli --path <file> disassemble-function-at --address 0x1000 --count 300
-ida-cli --path <file> get-basic-blocks --address 0x1000
-ida-cli --path <file> build-callgraph --roots 0x1000 --max-depth 2
+ida-cli --path <file> disasm --addr 0x1000 --count 300
+ida-cli --path <file> raw '{"method":"get_basic_blocks","params":{"address":"0x1000"}}'
+ida-cli --path <file> raw '{"method":"build_callgraph","params":{"roots":["0x1000"],"max_depth":2}}'
 ```
 
 ### Heavy Indirect Branching
@@ -42,9 +46,9 @@ Look for:
 Useful commands:
 
 ```bash
-ida-cli --path <file> search-instructions --patterns "jmp,call,br,blr"
-ida-cli --path <file> read-bytes --address 0x1000 --size 64
-ida-cli --path <file> get-xrefs-to --address 0x1000
+ida-cli --path <file> raw '{"method":"search_instructions","params":{"patterns":["jmp","call","br","blr"]}}'
+ida-cli --path <file> raw '{"method":"read_bytes","params":{"address":"0x1000","size":64}}'
+ida-cli --path <file> xrefs-to --addr 0x1000
 ```
 
 ### Opaque Predicates
@@ -78,7 +82,7 @@ Focus on:
 - handler table
 - operand decode helpers
 
-Do not expect F5 to help much until the VM structure is mapped.
+Do not expect decompilation to help much until the VM structure is mapped.
 
 ### Exception-Driven or CFG-Breaking Code
 
@@ -111,11 +115,11 @@ Once the 10-second gate triggers:
 Suggested commands:
 
 ```bash
-ida-cli --path <file> disassemble-function-at --address 0x1000 --count 400
-ida-cli --path <file> get-basic-blocks --address 0x1000
-ida-cli --path <file> get-xrefs-from --address 0x1000
-ida-cli --path <file> get-callees --address 0x1000
-ida-cli --path <file> search-instructions --patterns "cmp,test,cmov,jmp,br,blr"
+ida-cli --path <file> disasm --addr 0x1000 --count 400
+ida-cli --path <file> raw '{"method":"get_basic_blocks","params":{"address":"0x1000"}}'
+ida-cli --path <file> raw '{"method":"get_xrefs_from","params":{"address":"0x1000"}}'
+ida-cli --path <file> raw '{"method":"get_callees","params":{"address":"0x1000"}}'
+ida-cli --path <file> raw '{"method":"search_instructions","params":{"patterns":["cmp","test","cmov","jmp","br","blr"]}}'
 ```
 
 ## When to Retry F5

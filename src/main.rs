@@ -14,24 +14,18 @@ use hyper::http::{header::ORIGIN, Request, Response, StatusCode};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use ida_mcp::ida::{IdaBackend, RawDatabaseOptions, WorkerBackendKind};
-use ida_mcp::{
-    disasm::generate_disasm_line, expand_path, federation, ida, rpc_dispatch, DbInfo, FunctionInfo,
-    IdaMcpServer, IdaWorker, ServerMode,
-};
-use idalib::{Address, IDB};
+use ida_mcp::ida::{IdaBackend, WorkerBackendKind};
+use ida_mcp::{federation, ida, rpc_dispatch, IdaMcpServer, IdaWorker, ServerMode};
 use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use rmcp::ServiceExt;
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Notify;
 use tower_service::Service;
 use tracing::{error, info, warn};
@@ -527,40 +521,6 @@ fn metrics_response(
         .expect("valid response")
 }
 
-#[derive(Args)]
-struct ProbeArgs {
-    /// Path to the .i64/.idb database
-    #[arg(long)]
-    path: String,
-    /// Output .i64/.idb path when opening a raw binary (defaults to <path>.i64)
-    #[arg(long)]
-    idb_out: Option<String>,
-    /// Force auto-analysis (default: on for raw binaries, off for .i64/.idb)
-    #[arg(long)]
-    auto_analyse: bool,
-    /// List the first N functions (optional)
-    #[arg(long)]
-    list: Option<usize>,
-    /// Resolve a function name (optional)
-    #[arg(long)]
-    resolve: Option<String>,
-    /// Disassemble a function by name (optional)
-    #[arg(long)]
-    disasm_by_name: Option<String>,
-    /// Disassemble at an address (hex 0x... or decimal, optional)
-    #[arg(long)]
-    disasm_addr: Option<String>,
-    /// Decompile a function at an address (hex 0x... or decimal, optional)
-    #[arg(long)]
-    decompile_addr: Option<String>,
-    /// Instruction count for disassembly (default: 20)
-    #[arg(long, default_value_t = 20)]
-    count: usize,
-    /// Enable IDA console messages (may be verbose)
-    #[arg(long)]
-    ida_console: bool,
-}
-
 fn main() -> anyhow::Result<()> {
     // Initialize logging:
     //   stderr : RUST_LOG  or  ida_mcp=info  (low-noise)
@@ -694,7 +654,7 @@ fn run_server_multi() -> anyhow::Result<()> {
         let pid = std::fs::read_to_string(ida_mcp::idb_store::pid_path()).unwrap_or_default();
         anyhow::bail!(
             "Another server instance is already running (pid {}). \
-             Use `ida-cli server-stop` to stop it first.",
+             Use `ida-cli shutdown` to stop it first.",
             pid.trim()
         );
     }
@@ -961,7 +921,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
         let pid = std::fs::read_to_string(ida_mcp::idb_store::pid_path()).unwrap_or_default();
         anyhow::bail!(
             "Another server instance is already running (pid {}). \
-             Use `ida-cli server-stop` to stop it first.",
+             Use `ida-cli shutdown` to stop it first.",
             pid.trim()
         );
     }
@@ -1127,249 +1087,3 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
-    info!("Starting ida-cli probe mode");
-    if let Ok(idadir) = std::env::var("IDADIR") {
-        info!("IDADIR={}", idadir);
-    }
-    info!("Initializing IDA library on main thread");
-    ida::native_backend().init_library();
-    info!("IDA library initialized successfully");
-    if let Ok(ver) = ida::native_backend().version() {
-        info!(
-            "IDA version {}.{}.{}",
-            ver.major(),
-            ver.minor(),
-            ver.build()
-        );
-    }
-    if args.ida_console {
-        ida::native_backend().enable_console_messages(true);
-        info!("IDA console messages enabled");
-    }
-
-    let path = expand_path(&args.path);
-    info!("Opening database: {}", path.display());
-
-    let done = Arc::new(AtomicBool::new(false));
-    let done_clone = done.clone();
-    let path_display = path.display().to_string();
-    let ticker = thread::spawn(move || {
-        let start = Instant::now();
-        loop {
-            thread::sleep(Duration::from_secs(10));
-            if done_clone.load(Ordering::Relaxed) {
-                break;
-            }
-            info!(
-                path = %path_display,
-                elapsed = start.elapsed().as_secs(),
-                "Still opening database..."
-            );
-        }
-    });
-
-    let open_start = Instant::now();
-    let db = open_db_for_probe(&path, &args);
-    done.store(true, Ordering::Relaxed);
-    let _ = ticker.join();
-    let db =
-        db.map_err(|e| anyhow::anyhow!("Failed to open database: {}: {}", path.display(), e))?;
-
-    let meta = db.meta();
-    let path_str = path.display().to_string();
-    let info = DbInfo {
-        path: path_str,
-        file_type: format!("{:?}", meta.filetype()),
-        processor: db.processor().long_name(),
-        bits: if meta.is_64bit() {
-            64
-        } else if meta.is_32bit_exactly() {
-            32
-        } else {
-            16
-        },
-        function_count: db.function_count(),
-        debug_info: None,
-        analysis_status: ida::handlers::analysis::build_analysis_status(&db),
-    };
-    info!("Database opened in {}s", open_start.elapsed().as_secs());
-    println!("{}", serde_json::to_string_pretty(&info)?);
-
-    if let Some(limit) = args.list {
-        let list = list_functions(&db, 0, limit);
-        println!("{}", serde_json::to_string_pretty(&list)?);
-    }
-
-    if let Some(name) = args.resolve.as_deref() {
-        let func = resolve_function(&db, name)?;
-        println!("{}", serde_json::to_string_pretty(&func)?);
-    }
-
-    if let Some(name) = args.disasm_by_name.as_deref() {
-        let text = disasm_by_name(&db, name, args.count)?;
-        println!("{}", text);
-    }
-
-    if let Some(addr_str) = args.disasm_addr.as_deref() {
-        let addr = parse_address(addr_str)?;
-        let text = disasm_at(&db, addr, args.count)?;
-        println!("{}", text);
-    }
-
-    if let Some(addr_str) = args.decompile_addr.as_deref() {
-        let addr = parse_address(addr_str)?;
-        let func = db
-            .function_at(addr)
-            .ok_or_else(|| anyhow::anyhow!("Function not found at address {:#x}", addr))?;
-        if !db.decompiler_available() {
-            return Err(anyhow::anyhow!("Decompiler not available"));
-        }
-        let cfunc = db
-            .decompile(&func)
-            .map_err(|e| anyhow::anyhow!("Decompile failed: {}", e))?;
-        println!("{}", cfunc.pseudocode());
-    }
-
-    info!("Probe completed");
-    Ok(())
-}
-
-fn open_db_for_probe(path: &PathBuf, args: &ProbeArgs) -> Result<IDB, idalib::IDAError> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let is_idb = ext == "i64" || ext == "idb";
-
-    if is_idb {
-        let auto_analyse = args.auto_analyse;
-        if auto_analyse {
-            info!("Opening existing IDB with auto-analysis enabled");
-        }
-        ida::native_backend().open_existing_database(path, auto_analyse, true)
-    } else {
-        let out_path = if let Some(out) = args.idb_out.as_deref() {
-            PathBuf::from(out)
-        } else {
-            let store = ida_mcp::idb_store::IdbStore::new();
-            store.lookup(path).unwrap_or_else(|| store.idb_path(path))
-        };
-        info!(
-            "Opening raw binary with auto-analysis (idb_out={})",
-            out_path.display()
-        );
-        ida::native_backend().open_raw_binary(
-            path,
-            RawDatabaseOptions {
-                auto_analyse: true,
-                save: true,
-                idb_output: &out_path,
-                file_type: None,
-                extra_args: &[],
-            },
-        )
-    }
-}
-
-fn parse_address(s: &str) -> anyhow::Result<u64> {
-    let s = s.trim();
-    if s.starts_with("0x") || s.starts_with("0X") {
-        u64::from_str_radix(&s[2..], 16)
-            .map_err(|_| anyhow::anyhow!("Invalid address format: {}", s))
-    } else {
-        s.parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("Invalid address format: {}", s))
-    }
-}
-
-fn list_functions(db: &IDB, offset: usize, limit: usize) -> ida_mcp::FunctionListResult {
-    let total = db.function_count();
-    let mut functions = Vec::with_capacity(limit.min(total.saturating_sub(offset)));
-
-    for (idx, (_id, func)) in db.functions().enumerate() {
-        if idx < offset {
-            continue;
-        }
-        if functions.len() >= limit {
-            break;
-        }
-
-        let addr = func.start_address();
-        let name = func.name().unwrap_or_else(|| format!("sub_{:x}", addr));
-        let size = func.len();
-
-        functions.push(FunctionInfo {
-            address: format!("{:#x}", addr),
-            name,
-            size,
-        });
-    }
-
-    let next_offset = if offset + functions.len() < total {
-        Some(offset + functions.len())
-    } else {
-        None
-    };
-
-    ida_mcp::FunctionListResult {
-        functions,
-        total,
-        next_offset,
-    }
-}
-
-fn resolve_function(db: &IDB, name: &str) -> anyhow::Result<FunctionInfo> {
-    for (_id, func) in db.functions() {
-        if let Some(func_name) = func.name() {
-            if func_name == name || func_name.contains(name) {
-                let addr = func.start_address();
-                let size = func.len();
-                return Ok(FunctionInfo {
-                    address: format!("{:#x}", addr),
-                    name: func_name,
-                    size,
-                });
-            }
-        }
-    }
-
-    Err(anyhow::anyhow!("Function not found: {}", name))
-}
-
-fn disasm_by_name(db: &IDB, name: &str, count: usize) -> anyhow::Result<String> {
-    let func = resolve_function(db, name)?;
-    let addr = parse_address(&func.address)?;
-    disasm_at(db, addr, count)
-}
-
-fn disasm_at(db: &IDB, addr: Address, count: usize) -> anyhow::Result<String> {
-    let mut lines = Vec::with_capacity(count);
-    let mut current_addr: Address = addr;
-
-    for _ in 0..count {
-        if let Some(line) = generate_disasm_line(db, current_addr) {
-            lines.push(format!("{:#x}:\t{}", current_addr, line));
-        } else {
-            break;
-        }
-
-        if let Some(insn) = db.insn_at(current_addr) {
-            current_addr += insn.len() as u64;
-        } else if let Some(next) = db.next_head(current_addr) {
-            if next <= current_addr {
-                break;
-            }
-            current_addr = next;
-        } else {
-            break;
-        }
-    }
-
-    if lines.is_empty() {
-        return Err(anyhow::anyhow!("Address out of range: {:#x}", addr));
-    }
-
-    Ok(lines.join("\n"))
-}

@@ -1,130 +1,238 @@
 ---
 name: ida-cli
-description: "Reverse engineering and binary analysis with IDA Pro and ida-cli. Use when writing IDAPython scripts, using the IDA Domain API or idalib, analyzing binaries in IDA Pro, or operating the ida-cli headless server and CLI. Covers disassembly, decompilation, cross-references, type recovery, byte patching, headless automation, plugin development, FLIRT signatures, and CLI-first workflows. Supports PE, ELF, Mach-O, and firmware binaries."
+description: "Reverse engineering and binary analysis with IDA Pro and ida-cli. Use when driving headless IDA workflows from the shell or from an agent loop: disassembly, decompilation, cross-references, struct recovery, type work, patching, FLIRT, IDAPython scripting. Covers the ida-cli flat CLI, the router service, stdio + streamable HTTP transports, and the installable skill bootstrap. Supports PE, ELF, Mach-O, and firmware binaries."
 ---
 
-# IDA CLI Reverse Engineering
+# ida-cli Reverse Engineering
 
-General reverse engineering methodology plus a practical ida-cli bootstrap and workflow.
+General reverse engineering methodology plus a practical `ida-cli` bootstrap
+and workflow. The CLI is a thin client on top of an auto-managed local
+server that talks to IDA through a worker per database.
 
 ---
 
 ## Part 0: Zero-Config Bootstrap
 
-Install the skill with:
+Install the skill once:
 
-`npx -y skills add https://github.com/cpkt9762/ida-cli --skill ida-cli --agent codex --yes --global`
+```bash
+npx -y skills add https://github.com/cpkt9762/ida-cli --skill ida-cli --agent codex --yes --global
+```
 
-After that, do not assume the user has already installed, configured, or started `ida-cli`.
+After installation, do not assume the user already has `ida-cli` on PATH or
+a live server running.
 
 ### Boot Rule
 
 - On first use in a new environment, run `scripts/ida-cli.sh --help`.
-- This wrapper checks whether `ida-cli` is already available.
-- If the binary is missing, it automatically downloads and installs it through the repository installer.
-- After installation, it runs a `--help` smoke test before continuing.
+- The wrapper detects whether `ida-cli` is available on PATH or at
+  `~/.local/bin/ida-cli`.
+- If the binary is missing, the wrapper downloads and runs the repository
+  installer, then re-runs the smoke test.
 
 ### Runtime Rule
 
-- Before starting real analysis, run `scripts/ida-cli.sh probe-runtime`.
-- Do not guess whether the machine will select `native-linked` or `idat-compat`.
-- If multiple IDA installations are present, set `IDADIR` explicitly before probing.
+- Before real analysis, run `scripts/ida-cli.sh probe-runtime`.
+- Do not guess whether the host will pick `native-linked` or `idat-compat`.
+- If multiple IDA installations are present, export `IDADIR` explicitly:
+  - `export IDADIR="/Applications/IDA Professional 9.1.app/Contents/MacOS"`
+  - `export IDADIR=/opt/ida-pro-9.3`
 
 ### Use Rule
 
-- Prefer `scripts/ida-cli.sh` as the single entrypoint.
-- Do not ask the user to start the server manually for routine work.
-- The flat `ida-cli` CLI auto-manages the local socket server.
-- Only run `serve-http` explicitly when a long-lived HTTP control plane is actually required.
+- Prefer `scripts/ida-cli.sh` as the single entrypoint inside the skill.
+- Do not ask the user to run `serve` or `serve-http` for routine work. Any
+  client subcommand auto-starts a local HTTP server bound to a random port
+  and writes `/tmp/ida-cli.socket` for discovery.
+- Run `serve-http --bind ...` explicitly only when a long-lived, addressable
+  HTTP control plane is actually required.
 
 ### Zero-Config Commands
 
 ```bash
-# 1. Install ida-cli or confirm it is available
+# 1. install ida-cli or confirm it is available
 scripts/ida-cli.sh --help
 
-# 2. Probe the selected runtime backend
+# 2. probe the selected runtime backend
 scripts/ida-cli.sh probe-runtime
 
-# 3. Analyze a binary directly
+# 3. routine analysis (client mode, auto-starts a server)
 scripts/ida-cli.sh --path /path/to/sample.bin list-functions --limit 20
 scripts/ida-cli.sh --path /path/to/sample.bin decompile --addr 0x140001000
 
-# 4. Start HTTP only when needed
+# 4. only when a shared HTTP endpoint is actually needed
 scripts/ida-cli.sh serve-http --bind 127.0.0.1:8765
 ```
 
-### Environment Notes
+### Environment Knobs
 
-- Default install path: `~/.local/bin/ida-cli`
-- To pin the repository or branch:
+- Installer target: `~/.local/bin/ida-cli`
+- Pin the source repository / ref:
   - `IDA_CLI_REPO=cpkt9762/ida-cli`
   - `IDA_CLI_INSTALL_REF=master`
-- To pass extra installer arguments:
+- Pass extra installer arguments:
   - `IDA_CLI_INSTALL_ARGS="--add-path"`
-- To pin a specific IDA installation:
+- Pin a specific IDA installation:
   - `export IDADIR=/path/to/ida/Contents/MacOS`
 
-Within this skill, `scripts/ida-cli.sh` is the single entrypoint for install, download, execution, and verification.
+Within this skill, `scripts/ida-cli.sh` is the single entrypoint for install,
+download, execution, and verification.
 
 ---
 
-## Part 1: General Reverse Engineering Methodology
+## Part 1: CLI Surface
+
+`ida-cli` has two faces:
+
+1. **Flat client** — what the skill uses. Sends one request per invocation.
+2. **Service** — `serve` (stdio MCP), `serve-http` (Streamable HTTP MCP),
+   `serve-worker` (internal subprocess), `probe-runtime` (internal).
+
+When the binary name is `ida-cli` and the first argument is not a service
+subcommand, the CLI parses its arguments as a client call and routes the
+request through the local socket.
+
+### Direct Subcommands (Client Mode)
+
+```bash
+ida-cli --path <file> list-functions [--filter NAME] [--limit 100] [--offset 0]
+ida-cli --path <file> decompile --addr 0x1000
+ida-cli --path <file> disasm --addr 0x1000 [--count 20]
+ida-cli --path <file> disasm --name main [--count 20]
+ida-cli --path <file> xrefs-to --addr 0x1000
+ida-cli --path <file> list-strings [--query X] [--limit 100]
+ida-cli --path <file> list-segments
+```
+
+Service / queue helpers:
+
+```bash
+ida-cli --path <file> prewarm [--keep-warm] [--queue]
+ida-cli prewarm-many samples.txt [--jobs 4]
+ida-cli --path <file> enqueue <method> [--priority 0] [--dedupe-key K] [--params '{...}']
+ida-cli task-status <id>
+ida-cli list-tasks
+ida-cli cancel-task <id>
+ida-cli status
+ida-cli --path <file> close
+ida-cli shutdown
+```
+
+### Everything Else: `raw` / `pipe`
+
+The flat subcommands cover the most common reads. For everything else use
+`raw` for a single request or `pipe` for a stdin batch. Both take JSON-RPC
+payloads whose `method` field must match an MCP method name (see
+[cli-tool-reference.md](references/cli-tool-reference.md)).
+
+```bash
+ida-cli --path <file> raw '{"method":"get_function_by_name","params":{"name":"main"}}'
+ida-cli --path <file> raw '{"method":"rename_symbol","params":{"address":"0x1000","new_name":"parse_header"}}'
+ida-cli --path <file> raw '{"method":"batch_decompile","params":{"addresses":["0x1000","0x2000"]}}'
+
+ida-cli --json --path <file> pipe <<'EOF'
+{"method":"list_functions","params":{"limit":5}}
+{"method":"get_xrefs_from","params":{"address":"0x1000"}}
+EOF
+```
+
+### Output Modes
+
+```bash
+ida-cli --json    --path <file> list-functions --limit 5   # pretty JSON
+ida-cli --compact --path <file> list-functions --limit 5   # single-line JSON
+```
+
+### File Types
+
+| Type | Behavior |
+|---|---|
+| `.i64` / `.idb` | reopens the existing IDA database directly |
+| raw PE / ELF / Mach-O | analysed and cached as `.i64` alongside the input |
+
+### Local Runtime Paths
+
+- Database cache: `~/.ida/idb/`
+- Log: `~/.ida/logs/server.log`
+- Server Unix socket: `~/.ida/server.sock`
+- PID file: `~/.ida/server.pid`
+- Discovery file (maps flat CLI → socket): `/tmp/ida-cli.socket`
+- Large response cache: `/tmp/ida-cli-out/`
+
+### Failure Recovery
+
+If the local server wedges:
+
+```bash
+ida-cli shutdown
+pkill -9 -f "ida-cli"
+rm -f ~/.ida/server.sock ~/.ida/server.pid ~/.ida/.startup.lock /tmp/ida-cli.socket
+```
+
+Then rerun the original client subcommand and let it restart the server.
+
+---
+
+## Part 2: General Reverse Engineering Methodology
 
 ### Key Principles
 
-- **F5 first, disasm second (HARD RULE)** — Always attempt decompilation once before dropping to disassembly.
-- **10-second F5 gate (HARD RULE)** — If a decompilation attempt clearly fails, or if F5 / `decompile_function` stalls for more than 10 seconds, treat the target as currently non-decompilable and likely heavily obfuscated.
-- **Rename as you go (HARD RULE)** — Rename every function immediately after understanding its purpose. Do not keep a backlog of `sub_XXXXX` names.
-- **Iterate aggressively** — F5 → apply types → rename → F5 again → validate new offsets → repeat.
-- **Treat constants literally** — If IDA shows `0x6E`, write `110` until you have evidence for higher-level meaning.
-- **Use disassembly when the diff is small** — A 1-10 value mismatch usually means an off-by-one, saturation behavior, or width issue.
-- **Keep an analysis log (HARD RULE)** — After each analyzed function, append one log entry with address, rename, and purpose.
+- **F5 first, disasm second (HARD RULE)** — always attempt decompilation once
+  before dropping to disassembly.
+- **10-second F5 gate (HARD RULE)** — if decompilation clearly fails or
+  `decompile_function` stalls beyond 10 seconds, treat the target as
+  currently non-decompilable and move to disassembly.
+- **Rename as you go (HARD RULE)** — rename every function the moment its
+  purpose is understood. Do not accumulate `sub_XXXXX` names.
+- **Iterate aggressively** — F5 → apply types → rename → F5 again → validate
+  new offsets → repeat.
+- **Treat constants literally** — if IDA shows `0x6E`, write `110` until you
+  have evidence for higher-level meaning.
+- **Use disassembly for small diffs** — a 1-10 value mismatch usually means
+  an off-by-one, saturation, or width issue.
+- **Keep an analysis log (HARD RULE)** — after each analysed function, log
+  address, rename, and purpose.
 
 ### Decompilation Strategy
 
 Drop to disassembly when:
 
-- F5 errors out
-- F5 or `decompile_function` takes longer than 10 seconds
-- The pseudocode shows obvious artifacts
+- `decompile_function` returns an error
+- `decompile_function` exceeds 10 seconds
+- pseudocode shows obvious artifacts
 
-When any of the above happens, do **not** keep retrying decompilation in a loop. Assume the function is currently too obfuscated, flattened, or otherwise hostile to the decompiler. Move the investigation down to the disassembly layer and only retry F5 after the underlying blockers are understood or removed.
+Do not keep retrying in a loop once the gate fires. Move down one layer:
 
-Recommended response after the 10-second gate triggers:
-
-1. Stop repeated decompilation attempts.
-2. Work from disassembly and basic blocks.
-3. Recover control flow manually with xrefs, callgraph, and instruction searches.
-4. Rename, comment, and apply types from disassembly evidence.
-5. Patch or simplify only when you have a clear reason.
-6. Retry decompilation after the function is cleaner or better understood.
+1. stop repeated decompilation attempts
+2. work from disassembly and basic blocks
+3. recover control flow via xrefs and callgraph
+4. rename, comment, and apply types from disassembly evidence
+5. patch or simplify only with a clear reason
+6. retry decompilation after the blockers are resolved
 
 Common "stop F5 and switch to disassembly" signals:
 
-- one dispatcher block dominates the whole function
+- one dispatcher block dominates the function
 - heavy indirect branching or computed jumps
 - obvious flattening state variables
 - VM-like decode-dispatch-execute loops
 - opaque predicates with constant-looking outcomes
 - exception-driven or CFG-breaking control flow
 
-For a dedicated playbook, see [obfuscation-triage.md](references/obfuscation-triage.md).
+Dedicated playbook: [obfuscation-triage.md](references/obfuscation-triage.md).
 
 Common decompiler lies:
 
 | Symptom | Pseudocode | Real instruction pattern |
 |---|---|---|
 | Constant folding | `result = x * 1718750 / 1000000` | `MUL` + `UDIV` with literal constants |
-| Hidden `+1/-1` | `discount = bias * 110 / 64` | There is still an `ADD #1` after division |
-| Type confusion | `int v10 = *(int *)(ctx + 0x1DC)` | Real load is `LDR W8` and behaves like `u32` |
+| Hidden `+1/-1` | `discount = bias * 110 / 64` | there is still an `ADD #1` after division |
+| Type confusion | `int v10 = *(int *)(ctx + 0x1DC)` | real load is `LDR W8` and behaves like `u32` |
 | Hidden saturation | `result = a - b` | `SUBS` + conditional select to zero |
 
 ### Naming Strategy
 
 Rename functions as soon as they are understood.
-
-Suggested prefixes:
 
 | Prefix | Meaning |
 |---|---|
@@ -134,7 +242,8 @@ Suggested prefixes:
 | `dispatch_` | dispatch entrypoint |
 | `init_` / `setup_` | initialization |
 
-After renaming a callee, re-decompile the caller immediately. The readability improvement compounds quickly.
+After renaming a callee, re-decompile the caller immediately. Readability
+compounds quickly.
 
 ### Analysis Log
 
@@ -174,58 +283,52 @@ Recover structs from repeated `*(ptr + 0xNNN)` patterns.
 Typical ARM64 load-width mapping:
 
 ```text
-LDR X8, [X0, #0x130]   -> u64
-LDR W8, [X0, #0x144]   -> u32
-LDRH W8, [X0, #0x168]  -> u16
-LDRB W8, [X0, #0x178]  -> u8
+LDR  X8, [X0, #0x130]   -> u64
+LDR  W8, [X0, #0x144]   -> u32
+LDRH W8, [X0, #0x168]   -> u16
+LDRB W8, [X0, #0x178]   -> u8
 ```
 
 Recommended loop:
 
-1. Decompile and collect pointer+offset accesses.
-2. Confirm widths in disassembly.
-3. Read live values with byte/word/dword/qword helpers when needed.
-4. Declare the struct type.
-5. Apply the type.
-6. Re-decompile and confirm fields replace raw offsets.
-7. Use xrefs on struct fields to propagate understanding.
+1. decompile, collect pointer+offset accesses
+2. confirm widths in disassembly
+3. read live values if needed
+4. declare the struct
+5. apply the type
+6. re-decompile and confirm fields replace raw offsets
+7. use xrefs on struct fields to propagate understanding
 
 ### Call Graph Navigation
 
-Do not read giant dispatchers linearly.
+Never read giant dispatchers linearly. Use a leaf-first strategy:
 
-Use a leaf-first strategy:
-
-1. `build_callgraph` from the entrypoint
-2. Decompile leaf functions
-3. Rename each leaf immediately
-4. Re-decompile callers
-5. Repeat upward
+1. build the call graph from the entrypoint
+2. decompile leaf functions
+3. rename each leaf immediately
+4. re-decompile callers
+5. repeat upward
 
 ### Search Strategy
 
 Remember little-endian byte order on x86 and ARM64:
 
-```text
-search_bytes(pattern: "6E 00 00 00")
-search_bytes(pattern: "80 96 98 00")
+```bash
+ida-cli --path <file> raw '{"method":"search_bytes","params":{"pattern":"6E 00 00 00"}}'
+ida-cli --path <file> raw '{"method":"search_text","params":{"targets":["110","10000"],"kind":"imm"}}'
+ida-cli --path <file> raw '{"method":"search_pseudocode","params":{"pattern":"amount"}}'
+ida-cli --path <file> raw '{"method":"search_instructions","params":{"patterns":["MUL","UDIV"]}}'
 ```
-
-Use:
-
-- `search_text(kind: "imm", targets: ["110", "10000"])`
-- `search_pseudocode(pattern: "amount")`
-- `search_instructions(patterns: ["MUL", "UDIV"])`
 
 ### Formula Extraction
 
 Rules:
 
-1. Translate constants literally.
-2. Preserve operation order exactly as IDA shows it.
-3. Use `u128` for multi-step 64-bit multiplication chains.
-4. Watch for saturating behavior.
-5. Verify suspicious arithmetic in disassembly.
+1. translate constants literally
+2. preserve operation order exactly as IDA shows it
+3. use `u128` for multi-step 64-bit multiplication chains
+4. watch for saturating behaviour
+5. verify suspicious arithmetic in disassembly
 
 Diff triage:
 
@@ -238,7 +341,8 @@ Diff triage:
 
 ### Structured Decompilation
 
-Use `decompile_structured` when arithmetic chains are too complex for manual comparison.
+Use `decompile_structured` when arithmetic chains are too complex for manual
+comparison.
 
 Look for:
 
@@ -251,144 +355,92 @@ Generate the expression from the AST, then cross-check with disassembly.
 
 ---
 
-## Part 2: CLI Quick Reference
-
-This skill is CLI-first. Use the CLI reference page for common commands and argument shapes:
-
-- [cli-tool-reference.md](references/cli-tool-reference.md)
-
-### CLI Examples
-
-```bash
-ida-cli --path <file> list-functions --limit 20
-ida-cli --path <file> get-function-by-name --name main
-ida-cli --path <file> decompile-function --address 0x1234
-ida-cli --path <file> disassemble-function --name func_name --count 20
-ida-cli --path <file> rename-symbol --address 0x1234 --new-name parse_pool
-ida-cli --path <file> get-callees --address 0x1234
-ida-cli --path <file> build-callgraph --roots 0x1234 --max-depth 3
-ida-cli --path <file> search-pseudocode --pattern "amount" --limit 10
-ida-cli --path <file> get-xrefs-to --address 0x1234
-ida-cli --path <file> batch-decompile --addresses "0x1234,0x5678"
-```
-
-Output modes:
-
-```bash
-ida-cli --json --path <file> list-functions --limit 5
-ida-cli --compact --path <file> list-functions --limit 5
-```
-
-### File Types
-
-| Type | Behavior |
-|---|---|
-| `.i64` / `.idb` | open the existing IDA database directly |
-| raw PE / ELF / Mach-O | analyze the binary and cache the database |
-
-### Concurrency Notes
-
-- Different files map to different worker processes.
-- Multiple clients can operate on the same file safely, but write-heavy changes should still be serialized deliberately.
-- Cold-start races are guarded by the server bootstrap lock.
-
-### Failure Recovery
-
-If the local server wedges:
-
-```bash
-ida-cli server-stop
-pkill -9 -f "ida-cli"
-rm -f ~/.ida/server.sock ~/.ida/server.pid ~/.ida/startup.lock
-```
-
-Then retry the CLI call and let it restart automatically.
-
----
-
 ## Part 3: Common Workflows
 
 ### Workflow 1: Binary Orientation
 
-1. `get_database_info()`
-2. `list_segments()`
-3. `list_exports()`
-4. `list_imports()`
-5. `list_functions(limit: 50)`
-6. `build_callgraph(...)`
+```bash
+ida-cli --path <file> raw '{"method":"get_database_info"}'
+ida-cli --path <file> list-segments
+ida-cli --path <file> raw '{"method":"list_exports"}'
+ida-cli --path <file> raw '{"method":"list_imports"}'
+ida-cli --path <file> list-functions --limit 50
+ida-cli --path <file> raw '{"method":"build_callgraph","params":{"roots":["0x1000"],"max_depth":3}}'
+```
 
 ### Workflow 2: Struct Reconstruction
 
-1. Decompile and collect offsets
-2. Confirm widths in disassembly
-3. Read values if needed
-4. Declare the struct
-5. Apply the type
-6. Re-decompile
-7. Follow field xrefs
+1. decompile and collect offsets
+2. confirm widths in disassembly
+3. read values if needed
+4. declare the struct
+5. apply the type
+6. re-decompile
+7. follow field xrefs
 
 ### Workflow 3: Arithmetic Verification
 
-1. `decompile_function`
-2. `get_pseudocode_at`
-3. `disassemble_function_at`
-4. `search_instructions`
-5. `search_instruction_operands`
-6. Compare operand order and widths
+```bash
+ida-cli --path <file> decompile --addr 0x1000
+ida-cli --path <file> raw '{"method":"get_pseudocode_at","params":{"address":"0x1024"}}'
+ida-cli --path <file> disasm --addr 0x1000 --count 200
+ida-cli --path <file> raw '{"method":"search_instructions","params":{"patterns":["MUL","UDIV"]}}'
+ida-cli --path <file> raw '{"method":"search_instruction_operands","params":{"patterns":["#0x6E"]}}'
+```
 
 ### Workflow 3b: Obfuscation Triage After F5 Failure
 
 If decompilation fails immediately or exceeds the 10-second gate:
 
-1. Stop retrying F5.
-2. Use `disassemble-function-at` or `disassemble-function` for the full body.
-3. Build control-flow understanding from basic blocks, xrefs, and callgraph edges.
-4. Mark dispatcher branches, opaque predicates, and flattening state variables.
-5. Rename symbols and annotate intent directly from disassembly.
-6. Retry decompilation only after meaningful progress has been made at the assembly level.
+1. stop retrying decompilation
+2. use `disasm --addr 0x... --count N` for the full body
+3. build control-flow understanding from basic blocks, xrefs, and call graph
+4. mark dispatcher branches, opaque predicates, flattening state variables
+5. rename symbols and annotate intent directly from disassembly
+6. retry decompilation only after meaningful progress has been made
 
 ### Workflow 3c: Strong Obfuscation Signals
 
-If you see any of these, move immediately into disassembly-first mode:
+Move immediately into disassembly-first mode when any of these are true:
 
-1. one central block repeatedly dispatches on a state variable
+1. one central block dispatches on a state variable
 2. most edges return to the same controller block
 3. branch targets are computed indirectly
 4. the function looks like a bytecode interpreter or handler VM
-5. branches rely on opaque arithmetic that does not simplify cleanly in pseudocode
-6. exception flow or anti-analysis logic makes the decompiler unstable
+5. branches rely on opaque arithmetic that does not simplify in pseudocode
+6. exception flow or anti-analysis logic destabilises the decompiler
 
-Use the dedicated reference page:
-
-- [obfuscation-triage.md](references/obfuscation-triage.md)
+Dedicated reference page: [obfuscation-triage.md](references/obfuscation-triage.md).
 
 ### Workflow 4: Error Code Mapping
 
-1. Search immediate values
-2. Resolve the containing function
-3. Inspect the pseudocode context
-4. Add comments
-5. Search for similar return sites
+1. search immediate values
+2. resolve the containing function
+3. inspect the pseudocode context
+4. add comments
+5. search for similar return sites
 
 ### Workflow 5: Table and Dispatch Analysis
 
-1. Search strings like `factory` or `registry`
-2. Follow xrefs
-3. Identify the table builder
-4. Scan the table
-5. Resolve and decompile each function pointer
+1. search strings like `factory` or `registry`
+2. follow xrefs
+3. identify the table builder
+4. scan the table
+5. resolve and decompile each function pointer
 
 ### Workflow 6: Multi-Database Analysis
 
-1. Open multiple databases
-2. Share handles across concurrent agents
-3. Parallelize read-heavy work
-4. Serialize write-heavy work
-5. Close cleanly after analysis
+1. open multiple databases (one `--path` per request; the server spawns one
+   worker per database automatically)
+2. share the handle returned by `open_idb` across concurrent agents
+3. parallelise read-heavy work
+4. serialise write-heavy work
+5. close cleanly with `close_idb` (HTTP/SSE requires the `close_token`
+   returned by `open_idb`)
 
 ### Workflow 7: Batch Annotation
 
-Use:
+Dispatch through `raw` when needed:
 
 - `batch_rename`
 - `set_function_prototype`
@@ -400,17 +452,13 @@ Use:
 
 ### Workflow 8: Dynamic Debugging
 
-Use the `dbg_*` tool family for:
+The `dbg_*` method family covers debugger loading, process start/attach,
+breakpoints, stepping, register inspection, memory reads/writes, and thread
+inspection. It is only available on runtimes that expose the debugger; the
+headless `idat-compat` path does not.
 
-- debugger loading
-- process start / attach
-- breakpoints
-- stepping
-- register inspection
-- memory reads and writes
-- thread inspection
-
-When ASLR is active, address-based debug operations must use rebased runtime addresses unless the tool explicitly accepts IDB addresses.
+When ASLR is active, address-based debug operations must use rebased runtime
+addresses unless the method explicitly accepts IDB addresses.
 
 ---
 
@@ -418,9 +466,8 @@ When ASLR is active, address-based debug operations must use rebased runtime add
 
 ### Decompilation Failure
 
-If decompilation fails:
-
-- if the failure is explicit, or if the decompiler stalls past 10 seconds, classify it as a strong-obfuscation case
+- if the failure is explicit, or the decompiler stalls past 10 seconds,
+  classify the function as strong-obfuscation
 - stop repeated F5 attempts
 - use `get_pseudocode_at` only for narrow, already-promising ranges
 - move to disassembly, basic blocks, xrefs, and callgraph work
@@ -439,6 +486,8 @@ Do not trust xrefs or decompilation quality before analysis is complete.
 
 - `run_script` defaults to 120 seconds and can go up to 600
 - very large `batch_decompile` calls should be split into smaller batches
+- the CLI’s `--timeout` flag controls per-request timeout from the client
+  side
 
 ### Common Mistakes
 
@@ -448,14 +497,15 @@ Do not trust xrefs or decompilation quality before analysis is complete.
 4. Forgetting little-endian byte order in searches
 5. Ignoring xref fan-out counts
 6. Trusting signed pseudocode types without checking load width
-7. Re-opening the raw binary instead of the `.i64`
+7. Re-opening the raw binary instead of the cached `.i64`
 8. Querying before auto analysis finishes
 
 ---
 
 ## Part 5: References
 
-Load only the reference that matches the current task. Do not read them all by default.
+Load only the reference that matches the current task. Do not read them all
+by default.
 
 | Reference | Use when |
 |---|---|
