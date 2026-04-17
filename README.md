@@ -60,9 +60,33 @@ Some write-heavy and advanced type-editing operations still require further pari
 
 ## Quick Start
 
-### Install `ida-cli`
+### Recommended Path: Install the Skill
 
-Recommended: use the installer script. It downloads the latest tagged release when one exists, otherwise it can fall back to a local source build.
+The default entrypoint is the `ida-cli` skill, not a manual CLI install.
+
+```bash
+# List the skill exposed by this repository
+npx -y skills add https://github.com/cpkt9762/ida-cli --list
+
+# Install the ida-cli skill for Codex
+npx -y skills add https://github.com/cpkt9762/ida-cli --skill ida-cli --agent codex --yes --global
+```
+
+This was verified locally: the CLI detected the `ida-cli` skill from `skill/SKILL.md` and installed it to `~/.agents/skills/ida-cli`.
+
+After installation, the skill ships its own bootstrap wrapper:
+
+```bash
+~/.agents/skills/ida-cli/scripts/ida-cli.sh --help
+~/.agents/skills/ida-cli/scripts/ida-cli.sh probe-runtime
+~/.agents/skills/ida-cli/scripts/ida-cli.sh --path /path/to/binary list-functions --limit 20
+```
+
+That wrapper installs `ida-cli` automatically if it is missing, then runs the requested command.
+
+### Direct CLI Install (Optional)
+
+Use this only if you want the standalone CLI without going through the skill.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/install.sh | bash -s -- --add-path
@@ -121,30 +145,6 @@ Example backend selections:
 ```json
 {"runtime":{"major":9,"minor":3,"build":260213},"backend":"native-linked","supported":true,"reason":null}
 ```
-
-### Install the skill
-
-The tested command is `npx skills add`, not `npx skill add`.
-
-```bash
-# List the skill exposed by this repository
-npx -y skills add https://github.com/cpkt9762/ida-cli --list
-
-# Install the ida-cli skill for Codex
-npx -y skills add https://github.com/cpkt9762/ida-cli --skill ida-cli --agent codex --yes --global
-```
-
-This was verified locally: the CLI detected the `ida-cli` skill from `skill/SKILL.md` and installed it to `~/.agents/skills/ida-cli`.
-
-After installation, the skill ships its own bootstrap wrapper:
-
-```bash
-~/.agents/skills/ida-cli/scripts/ida-cli.sh --help
-~/.agents/skills/ida-cli/scripts/ida-cli.sh probe-runtime
-~/.agents/skills/ida-cli/scripts/ida-cli.sh --path /path/to/binary list-functions --limit 20
-```
-
-That wrapper installs `ida-cli` automatically if it is missing, then runs the requested command.
 
 ## Build Requirements
 

@@ -60,9 +60,33 @@
 
 ## 快速开始
 
-### 安装 `ida-cli`
+### 最推荐路径：直接安装 skill
 
-推荐直接用安装脚本。它会优先拉取最新 release；如果当前没有可用二进制资产，也可以回退到本地源码构建。
+默认入口应该是 `ida-cli` skill，而不是手动先装 CLI。
+
+```bash
+# 查看这个仓库暴露出来的 skill
+npx -y skills add https://github.com/cpkt9762/ida-cli --list
+
+# 给 Codex 安装 ida-cli skill
+npx -y skills add https://github.com/cpkt9762/ida-cli --skill ida-cli --agent codex --yes --global
+```
+
+这条链路我已经本地验证过，CLI 能正确识别 `skill/SKILL.md` 里的 `ida-cli`，并安装到 `~/.agents/skills/ida-cli`。
+
+安装完成后，skill 自带一个 bootstrap wrapper：
+
+```bash
+~/.agents/skills/ida-cli/scripts/ida-cli.sh --help
+~/.agents/skills/ida-cli/scripts/ida-cli.sh probe-runtime
+~/.agents/skills/ida-cli/scripts/ida-cli.sh --path /path/to/binary list-functions --limit 20
+```
+
+这个 wrapper 会在本机缺少 `ida-cli` 时自动安装，然后再执行实际命令。
+
+### 直接安装 CLI（可选）
+
+只有你明确想单独使用 CLI，而不是通过 skill 时，再走这条路。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/install.sh | bash -s -- --add-path
@@ -121,30 +145,6 @@ cargo build --bin ida-cli
 ```json
 {"runtime":{"major":9,"minor":3,"build":260213},"backend":"native-linked","supported":true,"reason":null}
 ```
-
-### 安装 skill
-
-这里实测可用的是 `npx skills add`，不是 `npx skill add`。
-
-```bash
-# 查看这个仓库暴露出来的 skill
-npx -y skills add https://github.com/cpkt9762/ida-cli --list
-
-# 给 Codex 安装 ida-cli skill
-npx -y skills add https://github.com/cpkt9762/ida-cli --skill ida-cli --agent codex --yes --global
-```
-
-这条链路我已经本地验证过，CLI 能正确识别 `skill/SKILL.md` 里的 `ida-cli`，并安装到 `~/.agents/skills/ida-cli`。
-
-安装完成后，skill 自带一个 bootstrap wrapper：
-
-```bash
-~/.agents/skills/ida-cli/scripts/ida-cli.sh --help
-~/.agents/skills/ida-cli/scripts/ida-cli.sh probe-runtime
-~/.agents/skills/ida-cli/scripts/ida-cli.sh --path /path/to/binary list-functions --limit 20
-```
-
-这个 wrapper 会在本机缺少 `ida-cli` 时自动安装，然后再执行实际命令。
 
 ## 构建要求
 
