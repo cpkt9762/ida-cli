@@ -293,16 +293,28 @@ mod tests {
         );
     }
 
+    // `normalize_install_dir` rewrites `.app` / `Contents` into the
+    // `Contents/MacOS` layout when the host target is macOS. On other
+    // platforms it is an identity transform. Assert both behaviours from the
+    // same test so CI catches regressions no matter which runner executes it.
     #[test]
     fn normalizes_macos_app_paths() {
-        assert_eq!(
-            normalize_install_dir("/Applications/IDA Professional 9.3.app"),
-            Path::new("/Applications/IDA Professional 9.3.app/Contents/MacOS")
-        );
-        assert_eq!(
-            normalize_install_dir("/Applications/IDA Professional 9.3.app/Contents"),
-            Path::new("/Applications/IDA Professional 9.3.app/Contents/MacOS")
-        );
+        let app = "/Applications/IDA Professional 9.3.app";
+        let contents = "/Applications/IDA Professional 9.3.app/Contents";
+
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                normalize_install_dir(app),
+                Path::new("/Applications/IDA Professional 9.3.app/Contents/MacOS")
+            );
+            assert_eq!(
+                normalize_install_dir(contents),
+                Path::new("/Applications/IDA Professional 9.3.app/Contents/MacOS")
+            );
+        } else {
+            assert_eq!(normalize_install_dir(app), Path::new(app));
+            assert_eq!(normalize_install_dir(contents), Path::new(contents));
+        }
     }
 
     #[test]
