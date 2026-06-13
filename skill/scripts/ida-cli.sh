@@ -46,7 +46,7 @@ if ! "$IDA_CLI_BIN_PATH" --help >/dev/null 2>&1; then
 [ida skill] ida-cli exists at ${IDA_CLI_BIN_PATH} but failed a smoke test.
 If this machine has multiple IDA versions installed, export IDADIR explicitly and retry.
 Example:
-  export IDADIR="/Applications/IDA Professional 9.1.app/Contents/MacOS"
+  export IDADIR="/Applications/IDA Professional 9.4.app/Contents/MacOS"
   ${IDA_CLI_BIN_PATH} probe-runtime
 EOF
   exit 1

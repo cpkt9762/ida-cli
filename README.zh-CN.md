@@ -100,7 +100,7 @@ curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/ins
 git clone https://github.com/cpkt9762/ida-cli.git
 cd ida-cli
 
-export IDADIR="/Applications/IDA Professional 9.1.app/Contents/MacOS"   # 或 Linux 安装目录
+export IDADIR="/Applications/IDA Professional 9.4.app/Contents/MacOS"   # 或 Linux 安装目录
 export IDASDKDIR="/path/to/ida-sdk"                                     # 根目录或 ida-sdk/src 都可
 
 cargo build --bin ida-cli

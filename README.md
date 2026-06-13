@@ -117,7 +117,7 @@ Notes:
 git clone https://github.com/cpkt9762/ida-cli.git
 cd ida-cli
 
-export IDADIR="/Applications/IDA Professional 9.1.app/Contents/MacOS"   # or a Linux install
+export IDADIR="/Applications/IDA Professional 9.4.app/Contents/MacOS"   # or a Linux install
 export IDASDKDIR="/path/to/ida-sdk"                                     # root or ida-sdk/src
 
 cargo build --bin ida-cli

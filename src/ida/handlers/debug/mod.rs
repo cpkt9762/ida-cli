@@ -79,16 +79,22 @@ pub fn find_debug_server_path() -> Option<String> {
     {
         let candidates: &[&str] = if cfg!(target_arch = "aarch64") {
             &[
+                "/Applications/IDA Professional 9.4.app/Contents/MacOS/dbgsrv/mac_server_arm",
                 "/Applications/IDA Professional 9.3.app/Contents/MacOS/dbgsrv/mac_server_arm",
                 "/Applications/IDA Professional 9.2.app/Contents/MacOS/dbgsrv/mac_server_arm",
+                "/Applications/IDA Home 9.4.app/Contents/MacOS/dbgsrv/mac_server_arm",
                 "/Applications/IDA Home 9.3.app/Contents/MacOS/dbgsrv/mac_server_arm",
+                "/Applications/IDA Essential 9.4.app/Contents/MacOS/dbgsrv/mac_server_arm",
                 "/Applications/IDA Essential 9.3.app/Contents/MacOS/dbgsrv/mac_server_arm",
             ]
         } else {
             &[
+                "/Applications/IDA Professional 9.4.app/Contents/MacOS/dbgsrv/mac_server",
                 "/Applications/IDA Professional 9.3.app/Contents/MacOS/dbgsrv/mac_server",
                 "/Applications/IDA Professional 9.2.app/Contents/MacOS/dbgsrv/mac_server",
+                "/Applications/IDA Home 9.4.app/Contents/MacOS/dbgsrv/mac_server",
                 "/Applications/IDA Home 9.3.app/Contents/MacOS/dbgsrv/mac_server",
+                "/Applications/IDA Essential 9.4.app/Contents/MacOS/dbgsrv/mac_server",
                 "/Applications/IDA Essential 9.3.app/Contents/MacOS/dbgsrv/mac_server",
             ]
         };
@@ -102,7 +108,7 @@ pub fn find_debug_server_path() -> Option<String> {
 
     #[cfg(target_os = "linux")]
     {
-        let bases = ["/opt/idapro-9.3", "/opt/idapro-9.2"];
+        let bases = ["/opt/idapro-9.4", "/opt/idapro-9.3", "/opt/idapro-9.2"];
         for base in &bases {
             let p = format!("{}/dbgsrv/linux_server64", base);
             if std::path::Path::new(&p).exists() {
