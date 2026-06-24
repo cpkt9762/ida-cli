@@ -70,52 +70,43 @@ pub fn build_script(body: &str) -> String {
 
 /// Auto-detect the platform-appropriate IDA remote debug server binary.
 ///
+/// Scans every detected IDA installation (honoring `IDADIR`, then newest
+/// version first) for the platform's debug server under `dbgsrv/`. This
+/// avoids hardcoding version-specific paths, so a freshly installed IDA
+/// release is picked up automatically.
+///
 /// Returns the absolute path to `mac_server_arm` (macOS ARM64),
 /// `mac_server` (macOS x86_64), `linux_server64` (Linux), or `None` if
-/// no debug server is found.  The caller passes this to script generators
+/// no debug server is found. The caller passes this to script generators
 /// so the generated Python can spawn the server on demand.
 pub fn find_debug_server_path() -> Option<String> {
+    let server_name = debug_server_binary_name()?;
+
+    for install_dir in crate::ida::install::candidate_install_dirs() {
+        let candidate = install_dir.join("dbgsrv").join(server_name);
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+
+    None
+}
+
+/// The debug server executable name for the current target platform, or
+/// `None` on platforms where the remote debug server is unsupported.
+fn debug_server_binary_name() -> Option<&'static str> {
     #[cfg(target_os = "macos")]
     {
-        let candidates: &[&str] = if cfg!(target_arch = "aarch64") {
-            &[
-                "/Applications/IDA Professional 9.4.app/Contents/MacOS/dbgsrv/mac_server_arm",
-                "/Applications/IDA Professional 9.3.app/Contents/MacOS/dbgsrv/mac_server_arm",
-                "/Applications/IDA Professional 9.2.app/Contents/MacOS/dbgsrv/mac_server_arm",
-                "/Applications/IDA Home 9.4.app/Contents/MacOS/dbgsrv/mac_server_arm",
-                "/Applications/IDA Home 9.3.app/Contents/MacOS/dbgsrv/mac_server_arm",
-                "/Applications/IDA Essential 9.4.app/Contents/MacOS/dbgsrv/mac_server_arm",
-                "/Applications/IDA Essential 9.3.app/Contents/MacOS/dbgsrv/mac_server_arm",
-            ]
+        if cfg!(target_arch = "aarch64") {
+            Some("mac_server_arm")
         } else {
-            &[
-                "/Applications/IDA Professional 9.4.app/Contents/MacOS/dbgsrv/mac_server",
-                "/Applications/IDA Professional 9.3.app/Contents/MacOS/dbgsrv/mac_server",
-                "/Applications/IDA Professional 9.2.app/Contents/MacOS/dbgsrv/mac_server",
-                "/Applications/IDA Home 9.4.app/Contents/MacOS/dbgsrv/mac_server",
-                "/Applications/IDA Home 9.3.app/Contents/MacOS/dbgsrv/mac_server",
-                "/Applications/IDA Essential 9.4.app/Contents/MacOS/dbgsrv/mac_server",
-                "/Applications/IDA Essential 9.3.app/Contents/MacOS/dbgsrv/mac_server",
-            ]
-        };
-        for p in candidates {
-            if std::path::Path::new(p).exists() {
-                return Some(p.to_string());
-            }
+            Some("mac_server")
         }
-        None
     }
 
     #[cfg(target_os = "linux")]
     {
-        let bases = ["/opt/idapro-9.4", "/opt/idapro-9.3", "/opt/idapro-9.2"];
-        for base in &bases {
-            let p = format!("{}/dbgsrv/linux_server64", base);
-            if std::path::Path::new(&p).exists() {
-                return Some(p);
-            }
-        }
-        None
+        Some("linux_server64")
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

@@ -152,7 +152,7 @@ Example backend-probe output:
 ```
 
 ```json
-{"runtime":{"major":9,"minor":3,"build":260213},"backend":"native-linked","supported":true,"reason":null}
+{"runtime":{"major":9,"minor":4,"build":260610},"backend":"native-linked","supported":true,"reason":null}
 ```
 
 For the complete CLI surface see

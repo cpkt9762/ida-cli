@@ -132,7 +132,7 @@ cargo build --bin ida-cli
 ```
 
 ```json
-{"runtime":{"major":9,"minor":3,"build":260213},"backend":"native-linked","supported":true,"reason":null}
+{"runtime":{"major":9,"minor":4,"build":260610},"backend":"native-linked","supported":true,"reason":null}
 ```
 
 完整 CLI 使用方式见 [skill/references/cli-tool-reference.md](skill/references/cli-tool-reference.md)。
