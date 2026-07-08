@@ -110,7 +110,31 @@ impl RuntimeProbeResult {
     }
 }
 
+fn forced_worker_backend() -> Option<WorkerBackendKind> {
+    match std::env::var("IDA_CLI_WORKER_BACKEND")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some("native-linked") => Some(WorkerBackendKind::NativeLinked),
+        Some("idat-compat") => Some(WorkerBackendKind::IdatCompat),
+        Some(other) => {
+            tracing::warn!(
+                backend = other,
+                "ignoring invalid IDA_CLI_WORKER_BACKEND; expected native-linked or idat-compat"
+            );
+            None
+        }
+        None => None,
+    }
+}
+
 pub fn select_worker_backend(runtime: &IdaRuntimeVersion) -> RuntimeProbeResult {
+    if let Some(backend) = forced_worker_backend() {
+        return RuntimeProbeResult::supported(runtime.clone(), backend);
+    }
+
     if runtime.major() == 9 && runtime.minor() < 3 {
         return RuntimeProbeResult::supported(runtime.clone(), WorkerBackendKind::IdatCompat);
     }
@@ -122,10 +146,42 @@ pub fn select_worker_backend(runtime: &IdaRuntimeVersion) -> RuntimeProbeResult 
         );
     }
 
+    // Bundled idalib is pinned to 9.3; native-linked crashes on 9.4+ until bindings catch up.
+    if runtime.major() == 9 && runtime.minor() >= 4 {
+        return RuntimeProbeResult::supported(runtime.clone(), WorkerBackendKind::IdatCompat);
+    }
+
     RuntimeProbeResult::supported(runtime.clone(), WorkerBackendKind::NativeLinked)
 }
 
 pub fn probe_native_runtime(version: IDAVersion) -> RuntimeProbeResult {
     let runtime = IdaRuntimeVersion::from(version);
     select_worker_backend(&runtime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime(major: i32, minor: i32) -> IdaRuntimeVersion {
+        IdaRuntimeVersion {
+            major,
+            minor,
+            build: 0,
+        }
+    }
+
+    #[test]
+    fn selects_idat_compat_for_ida_94() {
+        let probe = select_worker_backend(&runtime(9, 4));
+        assert_eq!(probe.backend, Some(WorkerBackendKind::IdatCompat));
+        assert!(probe.supported);
+    }
+
+    #[test]
+    fn selects_native_linked_for_ida_93() {
+        let probe = select_worker_backend(&runtime(9, 3));
+        assert_eq!(probe.backend, Some(WorkerBackendKind::NativeLinked));
+        assert!(probe.supported);
+    }
 }

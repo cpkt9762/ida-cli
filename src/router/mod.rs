@@ -477,11 +477,33 @@ impl RouterState {
             return Err(anyhow::anyhow!(msg));
         }
 
-        let probe = serde_json::from_str::<RuntimeProbeResult>(&stdout).map_err(|e| {
+        let mut probe = serde_json::from_str::<RuntimeProbeResult>(&stdout).map_err(|e| {
             anyhow::anyhow!(
                 "failed to parse probe-runtime output: {e}; stdout={stdout:?}; stderr={stderr:?}"
             )
         })?;
+        if let Ok(forced) = std::env::var("IDA_CLI_WORKER_BACKEND") {
+            let forced = forced.trim();
+            if probe.supported {
+                let backend = match forced {
+                    "native-linked" => Some(WorkerBackendKind::NativeLinked),
+                    "idat-compat" => Some(WorkerBackendKind::IdatCompat),
+                    "" => None,
+                    other => {
+                        warn!(
+                            backend = other,
+                            "ignoring invalid IDA_CLI_WORKER_BACKEND; expected native-linked or idat-compat"
+                        );
+                        None
+                    }
+                };
+                if let Some(backend) = backend {
+                    if let Some(runtime) = probe.runtime.clone() {
+                        probe = RuntimeProbeResult::supported(runtime, backend);
+                    }
+                }
+            }
+        }
         *self.cached_probe.lock().await = Some(probe.clone());
         Ok(probe)
     }

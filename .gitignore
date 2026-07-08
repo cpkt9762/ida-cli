@@ -22,6 +22,8 @@ target
 
 # Dev
 sdk/
+.local-sdk/
+3rd-github/ida-sdk/
 target-aot/
 assets/
 .sisyphus/
