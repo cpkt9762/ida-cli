@@ -37,6 +37,10 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
       - name: Validate Rust library tests
+        # No IDA on the runner: the test binary links the SDK stub libraries,
+        # so the loader has to be pointed at them explicitly.
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ida-sdk/src/lib/x64_linux_64
         run: cargo test --locked --lib -- --nocapture
 
       - name: Validate Python scripts
