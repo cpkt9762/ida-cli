@@ -24,9 +24,10 @@
 |---|---|---|
 | `< 9.0` | 不支持 | — |
 | `9.0 – 9.2` | `idat-compat` | 通过 `idat` + IDAPython 兼容 |
-| `9.3+` | `native-linked` | 链接 vendored `idalib` 直接进程内打开 |
+| `9.3`、`9.5`，且用对应版本 SDK 编译 | `native-linked` | 链接 vendored `idalib` 直接进程内打开 |
+| 其余 `9.3+`（含 `9.4`，或 SDK 版本不一致） | `idat-compat` | native 层与 SDK 版本绑定 |
 
-后端选择由 `probe-runtime` 在运行时决定。编译期仍然需要 IDA SDK，因为 vendored native 层要参与编译；运行时实际加载的 IDA 本体来自 `IDADIR` 或常见安装路径。
+后端选择由 `probe-runtime` 在运行时决定。只有运行时的 IDA 与编译所用 SDK 版本一致时（例如用 9.5 SDK 编译、跑在 IDA 9.5 上）且该组合经过验证，才会选 `native-linked`，因为 vendored native 层调用了 IDA 的私有结构，其布局在 9.4 和 9.5 都变过。IDA 9.4 保持 `idat-compat`：公开的 9.4 SDK 的 Hex-Rays API 魔数是 5，而 9.4.260610 构建仍是 4，native 下会没有反编译器。编译期仍然需要 IDA SDK，因为 vendored native 层要参与编译；运行时实际加载的 IDA 本体来自 `IDADIR` 或常见安装路径。
 
 ## 当前已经可用的能力
 
@@ -100,8 +101,8 @@ curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/ins
 git clone https://github.com/cpkt9762/ida-cli.git
 cd ida-cli
 
-export IDADIR="/Applications/IDA Professional 9.4.app/Contents/MacOS"   # 或 Linux 安装目录
-export IDASDKDIR="/path/to/ida-sdk"                                     # 根目录或 ida-sdk/src 都可
+export IDADIR="/Applications/IDA Professional 9.5.app/Contents/MacOS"   # 或 Linux 安装目录
+export IDASDKDIR="/path/to/ida-sdk"   # 与 IDADIR 同版本，如 HexRaysSA/ida-sdk 的 releases/9.5
 
 cargo build --bin ida-cli
 ./target/debug/ida-cli --help
@@ -132,7 +133,7 @@ cargo build --bin ida-cli
 ```
 
 ```json
-{"runtime":{"major":9,"minor":4,"build":260610},"backend":"native-linked","supported":true,"reason":null}
+{"runtime":{"major":9,"minor":5,"build":261001},"backend":"native-linked","supported":true,"reason":null}
 ```
 
 完整 CLI 使用方式见 [skill/references/cli-tool-reference.md](skill/references/cli-tool-reference.md)。
@@ -158,7 +159,7 @@ IDA 9.0–9.2 的兼容后端。通过 `idat` 启动批处理脚本，跑 IDAPyt
 
 ### `native-linked`
 
-IDA 9.3+ 的原生后端。直接链接 vendored `idalib` 在进程内打开数据库。
+IDA 9.3+ 的原生后端。直接链接 vendored `idalib` 在进程内打开数据库。用于 IDA 9.3 和 9.5，且运行时与编译 SDK 版本一致时启用，否则 probe 退回 `idat-compat`。可用 `IDA_CLI_WORKER_BACKEND=native-linked|idat-compat` 强制指定。
 
 ### 缓存和本地运行时路径
 

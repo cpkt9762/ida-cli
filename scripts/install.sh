@@ -167,6 +167,46 @@ download_release_asset() {
   chmod +x "$REAL_BIN"
 }
 
+# Print the major.minor version of the IDA install the build will link against
+# (IDADIR, else the newest common install path), e.g. "9.5".
+detect_ida_version() {
+  local dir="${IDADIR:-}"
+  if [[ -z "$dir" ]]; then
+    case "$OS" in
+      Darwin)
+        dir="$(
+          for app in /Applications/IDA\ Professional*.app "$HOME"/Applications/IDA\ Professional*.app; do
+            [[ -d "$app/Contents/MacOS" ]] && printf '%s\n' "$app"
+          done | sort -V | tail -n 1
+        )"
+        ;;
+      Linux)
+        dir="$(
+          for candidate in "$HOME"/ida-pro /opt/ida* /opt/ida-pro* /usr/local/ida*; do
+            [[ -d "$candidate" ]] && printf '%s\n' "$candidate"
+          done | sort -V | tail -n 1
+        )"
+        ;;
+    esac
+  fi
+
+  [[ -n "$dir" ]] || return 1
+  printf '%s\n' "$dir" | grep -oE '[0-9]+\.[0-9]+' | tail -n 1
+}
+
+# Pick the ida-sdk ref for an IDA version: the releases/X.Y branch, else the
+# newest vX.Y.*-release tag. Prints nothing when no matching ref exists.
+sdk_ref_for_version() {
+  local version="$1" refs
+  refs="$(git ls-remote --heads --tags "$2" 2>/dev/null | awk '{print $2}')" || return 0
+  if grep -qx "refs/heads/releases/${version}" <<<"$refs"; then
+    printf 'releases/%s\n' "$version"
+    return 0
+  fi
+  grep -E "^refs/tags/v${version//./\\.}\.[0-9]+-release$" <<<"$refs" \
+    | sed 's|^refs/tags/||' | sort -V | tail -n 1
+}
+
 ensure_sdk_for_source_build() {
   if [[ -n "${IDASDKDIR:-}" || -n "${IDALIB_SDK:-}" ]]; then
     return 0
@@ -174,8 +214,22 @@ ensure_sdk_for_source_build() {
 
   need_cmd git
   local sdk_dir="$TMP_DIR/ida-sdk"
-  echo "cloning open-source IDA SDK into ${sdk_dir}"
-  git clone --depth 1 https://github.com/HexRaysSA/ida-sdk.git "$sdk_dir" >/dev/null 2>&1
+  local sdk_url="https://github.com/HexRaysSA/ida-sdk.git"
+  local ida_version sdk_ref=""
+  # native-linked is only enabled when the build SDK matches the IDA runtime.
+  # Runtimes before 9.3 always use idat-compat, so keep the default SDK there.
+  ida_version="$(detect_ida_version || true)"
+  if [[ -n "$ida_version" && "$(printf '%s\n' 9.3 "$ida_version" | sort -V | head -n 1)" == "9.3" ]]; then
+    sdk_ref="$(sdk_ref_for_version "$ida_version" "$sdk_url")"
+  fi
+
+  if [[ -n "$sdk_ref" ]]; then
+    echo "cloning IDA SDK ${sdk_ref} (matches IDA ${ida_version}) into ${sdk_dir}"
+    git clone --depth 1 --branch "$sdk_ref" "$sdk_url" "$sdk_dir" >/dev/null 2>&1
+  else
+    echo "cloning open-source IDA SDK (default branch) into ${sdk_dir}"
+    git clone --depth 1 "$sdk_url" "$sdk_dir" >/dev/null 2>&1
+  fi
   export IDASDKDIR="$sdk_dir"
 }
 

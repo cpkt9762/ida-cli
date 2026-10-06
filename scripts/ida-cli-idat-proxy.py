@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""ida-cli front-end that forces idat-compat on IDA 9.4+ (native-linked crashes)."""
+"""ida-cli front-end that forces idat-compat.
+
+Only needed for old ida-cli binaries (0.1.8 and earlier) running on an IDA
+newer than their build SDK, where native-linked crashes. Newer builds pick
+idat-compat on their own whenever the runtime differs from the build SDK.
+"""
 
 from __future__ import annotations
 

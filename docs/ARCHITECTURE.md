@@ -44,11 +44,11 @@ This split is the foundation for long-running RE server workloads:
 
 ### `native-linked`
 
-Used for runtimes that can safely open databases in-process through the vendored `idalib` line.
+Used for IDA 9.3 and 9.5 when the runtime matches the SDK version the binary was built against, so the vendored `idalib` line can safely open databases in-process.
 
 ### `idat-compat`
 
-Used for older runtimes where the vendored `idalib` line would crash when opening databases.
+Used for IDA 9.0–9.2, IDA 9.4, and runtimes that differ from the build SDK, where the vendored `idalib` line would crash or lose the decompiler.
 
 This backend:
 
