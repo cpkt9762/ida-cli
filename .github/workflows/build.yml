@@ -17,6 +17,18 @@ env:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Lib tests run against the 9.3 SDK: from 9.4 on, the Linux stub
+        # libidalib.so exports libstdc++ symbols (so the test binary ends up
+        # depending on it) and its initializers crash without a real IDA.
+        # The 9.5 SDK is still compiled to cover its layout branches.
+        include:
+          - sdk: v9.3.1-release
+            cargo_args: ""
+          - sdk: releases/9.5
+            cargo_args: "--no-run"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -26,6 +38,7 @@ jobs:
         with:
           repository: HexRaysSA/ida-sdk
           path: ida-sdk
+          ref: ${{ matrix.sdk }}
           fetch-depth: 1
 
       - name: Install build dependencies
@@ -37,11 +50,7 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
       - name: Validate Rust library tests
-        # No IDA on the runner: the test binary links the SDK stub libraries,
-        # so the loader has to be pointed at them explicitly.
-        env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ida-sdk/src/lib/x64_linux_64
-        run: cargo test --locked --lib -- --nocapture
+        run: cargo test --locked --lib ${{ matrix.cargo_args }} -- --nocapture
 
       - name: Validate Python scripts
         run: |
