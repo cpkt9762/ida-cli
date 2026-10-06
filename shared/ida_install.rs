@@ -292,6 +292,10 @@ mod tests {
             vec![9, 4]
         );
         assert_eq!(
+            version_key(Path::new("IDA Professional 9.5.app")),
+            vec![9, 5]
+        );
+        assert_eq!(
             version_key(Path::new("IDA Professional 10.0.app")),
             vec![10, 0]
         );

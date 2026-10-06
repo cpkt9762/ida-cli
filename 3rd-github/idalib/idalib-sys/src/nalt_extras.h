@@ -10,7 +10,9 @@ rust::String idalib_get_input_file_path() {
   auto size = get_input_file_path(path, sizeof(path));
 
   if (size > 0) {
-    return rust::String(path, size);
+    // The stored blob may include the terminating NUL (seen on IDA 9.5), so
+    // use the C string length rather than the returned size.
+    return rust::String(path, ::qstrlen(path));
   } else {
     return rust::String();
   }

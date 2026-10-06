@@ -29,9 +29,16 @@ when you actually want a long-lived, externally addressable service.
 |---|---|---|
 | `< 9.0` | unsupported | — |
 | `9.0 – 9.2` | `idat-compat` | shells out to `idat` + IDAPython |
-| `9.3+` | `native-linked` | links against vendored `idalib` |
+| `9.3`, `9.5` built with the matching SDK | `native-linked` | links against vendored `idalib` |
+| other `9.3+` (incl. `9.4`, or a mismatched SDK) | `idat-compat` | native layer is SDK-version specific |
 
-Backend selection is made at runtime by `probe-runtime`. Building still
+Backend selection is made at runtime by `probe-runtime`. `native-linked` is
+only chosen when the IDA runtime matches the SDK the binary was built
+against (for example a 9.5 SDK build on IDA 9.5) and that pairing has been
+verified; the vendored native layer calls private IDA structures whose
+layout changed in 9.4 and 9.5. IDA 9.4 stays on `idat-compat`: the public
+9.4 SDK uses Hex-Rays API magic 5 while the 9.4.260610 build answers 4, so
+native-linked would run without a decompiler. Building still
 requires an IDA SDK because the vendored native layer is linked against it;
 at runtime the CLI opens IDA itself from `IDADIR` or a normalised common
 install path.
@@ -117,8 +124,8 @@ Notes:
 git clone https://github.com/cpkt9762/ida-cli.git
 cd ida-cli
 
-export IDADIR="/Applications/IDA Professional 9.4.app/Contents/MacOS"   # or a Linux install
-export IDASDKDIR="/path/to/ida-sdk"                                     # root or ida-sdk/src
+export IDADIR="/Applications/IDA Professional 9.5.app/Contents/MacOS"   # or a Linux install
+export IDASDKDIR="/path/to/ida-sdk"   # same version as IDADIR, e.g. HexRaysSA/ida-sdk releases/9.5
 
 cargo build --bin ida-cli
 ./target/debug/ida-cli --help
@@ -152,7 +159,7 @@ Example backend-probe output:
 ```
 
 ```json
-{"runtime":{"major":9,"minor":4,"build":260610},"backend":"native-linked","supported":true,"reason":null}
+{"runtime":{"major":9,"minor":5,"build":261001},"backend":"native-linked","supported":true,"reason":null}
 ```
 
 For the complete CLI surface see
@@ -181,7 +188,9 @@ IDAPython scripts, and returns structured JSON back to the CLI runtime.
 ### `native-linked`
 
 IDA 9.3+ backend. Links against the vendored `idalib` line and opens
-databases in-process.
+databases in-process. Used for IDA 9.3 and 9.5 when the runtime matches the
+build SDK version; otherwise the probe falls back to `idat-compat`. Set
+`IDA_CLI_WORKER_BACKEND=native-linked|idat-compat` to override.
 
 ### Cache and Local Runtime Paths
 

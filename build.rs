@@ -24,7 +24,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // relying on version-specific hardcoded paths.
     set_rpaths(install_path.as_deref());
 
+    // The native layer hardcodes private IDA layouts per SDK version, so the
+    // runtime probe needs to know which SDK this binary was compiled against.
+    let sdk_version = sdk_version()?;
+    println!("cargo::rustc-env=IDA_CLI_SDK_VERSION={sdk_version}");
+
     Ok(())
+}
+
+fn sdk_version() -> Result<u32, Box<dyn std::error::Error>> {
+    let (sdk_path, _, _, _) = idalib_build::idalib_sdk_paths_with(false);
+    let pro_h = sdk_path.join("include").join("pro.h");
+    println!("cargo::rerun-if-changed={}", pro_h.display());
+
+    let source = std::fs::read_to_string(&pro_h)
+        .map_err(|e| format!("cannot read {}: {e}", pro_h.display()))?;
+    source
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some("#define"), Some("IDA_SDK_VERSION"), Some(value)) => value.parse().ok(),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| format!("IDA_SDK_VERSION not found in {}", pro_h.display()).into())
 }
 
 fn set_rpaths(install_path: Option<&Path>) {

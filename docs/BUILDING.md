@@ -13,10 +13,16 @@
 probes the active IDA install and picks a backend automatically:
 
 - `idat-compat` — IDA 9.0–9.2, shells out to `idat` + IDAPython
-- `native-linked` — IDA 9.3+, opens the database in-process via `idalib`
+- `native-linked` — IDA 9.3 and 9.5, opens the database in-process via
+  `idalib`, chosen only when the runtime matches the SDK version used for the build
+- `idat-compat` is also used for IDA 9.4 (the public 9.4 SDK's Hex-Rays API
+  magic does not match the 9.4.260610 build) and for runtimes that differ
+  from the build SDK
 
-The build tree is not restricted to one exact installed IDA runtime, but the
-SDK must still be present during compilation.
+The vendored native layer calls private IDA structures whose layout is
+selected from `IDA_SDK_VERSION` at compile time (it changed in 9.4 and 9.5),
+so build with the SDK that matches the IDA you run, e.g. the `releases/9.5`
+branch of `HexRaysSA/ida-sdk` for IDA 9.5.
 
 ## Clone and Build
 
@@ -24,8 +30,8 @@ SDK must still be present during compilation.
 git clone https://github.com/cpkt9762/ida-cli.git
 cd ida-cli
 
-export IDADIR="/Applications/IDA Professional 9.4.app/Contents/MacOS"   # or a Linux install
-export IDASDKDIR="/path/to/ida-sdk"                                     # root or ida-sdk/src
+export IDADIR="/Applications/IDA Professional 9.5.app/Contents/MacOS"   # or a Linux install
+export IDASDKDIR="/path/to/ida-sdk"   # root or ida-sdk/src, same version as IDADIR
 
 cargo build --bin ida-cli
 ```
@@ -64,7 +70,7 @@ Typical outputs:
 ```
 
 ```json
-{"runtime":{"major":9,"minor":4,"build":260610},"backend":"native-linked","supported":true,"reason":null}
+{"runtime":{"major":9,"minor":5,"build":261001},"backend":"native-linked","supported":true,"reason":null}
 ```
 
 ## Binary Names

@@ -35,8 +35,11 @@ a live server running.
 - Before real analysis, run `scripts/ida-cli.sh probe-runtime`.
 - Do not guess whether the host will pick `native-linked` or `idat-compat`.
 - If multiple IDA installations are present, export `IDADIR` explicitly:
-  - `export IDADIR="/Applications/IDA Professional 9.4.app/Contents/MacOS"`
-  - `export IDADIR=/opt/ida-pro-9.4`
+  - `export IDADIR="/Applications/IDA Professional 9.5.app/Contents/MacOS"`
+  - `export IDADIR=/opt/ida-pro-9.5`
+- `native-linked` is only picked for IDA 9.3 / 9.5 when the runtime matches
+  the SDK the binary was built with; otherwise the probe reports
+  `idat-compat`, which supports a smaller method set.
 
 ### Use Rule
 

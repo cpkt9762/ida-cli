@@ -61,7 +61,14 @@ struct license_manager_t_vtbl {
   int (*get_or_borrow_license)(license_manager_t *, void *, license_info_t *,
                                uint64_t, qstring *);
   void *(*get_license_location)(license_manager_t *);
+  // IDA 9.4 inserted a virtual method before `check`, moving it from slot
+  // 11 to slot 12. IDA 9.5 keeps `check` at slot 12 (its new method is
+  // appended after `check`). Calling the 9.3 slot on 9.4+ segfaults.
+#if IDA_SDK_VERSION >= 940
+  void *_skip_b[6];
+#else
   void *_skip_b[5];
+#endif
   license_result_t *(*check)(license_manager_t *, bool *, int);
 };
 
@@ -89,12 +96,24 @@ struct license_manager_t {
 };
 
 struct config_t {
+#if IDA_SDK_VERSION >= 950
+  // IDA 9.5 grew config_t by 0x18 bytes ahead of the license fields
+  // (measured on macOS arm64 and Linux x86_64; 9.4 matches 9.3).
+#if defined(__MACOS__)
+  uint8_t _skip_a[0x270];
+#elif defined(__LINUX__)
+  uint8_t _skip_a[0x2b8];
+#elif defined(__NT__)
+#error "config_t layout for IDA 9.5+ on Windows has not been verified"
+#endif
+#else
 #if defined(__MACOS__)
   uint8_t _skip_a[0x258];
 #elif defined(__LINUX__)
   uint8_t _skip_a[0x2a0];
 #elif defined(__NT__)
   uint8_t _skip_a[0x240];
+#endif
 #endif
   license_location_t *license_location;
   license_info_t *license_info;
