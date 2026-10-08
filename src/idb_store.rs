@@ -31,6 +31,11 @@ pub fn pid_path() -> PathBuf {
     ida_home().join("server.pid")
 }
 
+/// MCP over a Unix socket, served by the daemon next to `server.sock`.
+pub fn mcp_socket_path() -> PathBuf {
+    ida_home().join("mcp.sock")
+}
+
 pub fn log_dir() -> PathBuf {
     ida_home().join("logs")
 }

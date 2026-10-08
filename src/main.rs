@@ -966,9 +966,11 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
 
     let worker_for_factory = worker.clone();
     let worker_for_shutdown = worker.clone();
+    let worker_for_mcp_socket = worker.clone();
     let router_for_factory = router.clone();
     let router_for_shutdown = router.clone();
     let router_for_final = router.clone();
+    let router_for_mcp_socket = router.clone();
     let server_handle = thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1026,6 +1028,25 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 .await
                 {
                     warn!("Socket listener failed: {e}");
+                }
+            });
+
+            let cancel_for_mcp_socket = cancel.clone();
+            tokio::spawn(async move {
+                let make_server = move || {
+                    ida_mcp::server::SanitizedIdaServer(IdaMcpServer::new(
+                        worker_for_mcp_socket.clone(),
+                        ServerMode::Router(router_for_mcp_socket.clone()),
+                    ))
+                };
+                if let Err(e) = ida_mcp::server::mcp_socket::run_mcp_socket_listener(
+                    ida_mcp::idb_store::mcp_socket_path(),
+                    make_server,
+                    cancel_for_mcp_socket,
+                )
+                .await
+                {
+                    warn!("MCP socket listener failed: {e}");
                 }
             });
 

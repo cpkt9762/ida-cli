@@ -50,6 +50,7 @@ pub async fn run_socket_listener(
 pub fn cleanup_socket_files(socket_path: &std::path::Path) {
     let _ = std::fs::remove_file(socket_path);
     let _ = std::fs::remove_file("/tmp/ida-cli.socket");
+    let _ = std::fs::remove_file(crate::idb_store::mcp_socket_path());
 }
 
 async fn handle_cli_connection(
