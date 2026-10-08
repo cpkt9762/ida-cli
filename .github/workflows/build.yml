@@ -73,6 +73,9 @@ jobs:
         with:
           repository: HexRaysSA/ida-sdk
           path: ida-sdk
+          # Release binaries only use native-linked on the IDA version whose
+          # SDK they were built with, so pin the SDK they target.
+          ref: releases/9.5
           fetch-depth: 1
 
       - name: Install build dependencies
@@ -104,6 +107,7 @@ jobs:
         with:
           repository: HexRaysSA/ida-sdk
           path: ida-sdk
+          ref: releases/9.5
           fetch-depth: 1
 
       - name: Install Rust toolchain
