@@ -1035,7 +1035,11 @@ impl RouterState {
     }
 
     async fn status_snapshot_inner(&self, include_federation: bool) -> RouterStatus {
-        let runtime_probe = match self.cached_probe.lock().await.clone() {
+        // Release the cache lock before probing: a guard held in the match
+        // scrutinee lives through the arms, and probe_worker_backend locks
+        // the same (non-reentrant) mutex, which deadlocked a fresh daemon.
+        let cached_probe = self.cached_probe.lock().await.clone();
+        let runtime_probe = match cached_probe {
             Some(probe) => Some(probe),
             None => {
                 let exe_path = {
@@ -2322,6 +2326,21 @@ mod tests {
         assert_eq!(router.worker_count().await, 0);
         assert!(router.active_handle().await.is_none());
         assert!(router.all_handles().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_status_snapshot_with_empty_probe_cache_does_not_deadlock() {
+        let router = RouterState::new().expect("RouterState should be created");
+        router.inner.lock().await.exe_path =
+            PathBuf::from("/nonexistent/ida-cli-for-probe-test");
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router.status_snapshot(),
+        )
+        .await
+        .expect("status_snapshot must not deadlock when the probe cache is empty");
+        assert!(status.runtime_probe.is_none());
+        assert!(router.cached_probe.try_lock().is_ok());
     }
 
     #[tokio::test]
