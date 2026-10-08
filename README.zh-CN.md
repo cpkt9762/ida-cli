@@ -29,6 +29,8 @@
 
 后端选择由 `probe-runtime` 在运行时决定。只有运行时的 IDA 与编译所用 SDK 版本一致时（例如用 9.5 SDK 编译、跑在 IDA 9.5 上）且该组合经过验证，才会选 `native-linked`，因为 vendored native 层调用了 IDA 的私有结构，其布局在 9.4 和 9.5 都变过。IDA 9.4 保持 `idat-compat`：公开的 9.4 SDK 的 Hex-Rays API 魔数是 5，而 9.4.260610 构建仍是 4，native 下会没有反编译器。编译期仍然需要 IDA SDK，因为 vendored native 层要参与编译；运行时实际加载的 IDA 本体来自 `IDADIR` 或常见安装路径。
 
+Release 预编译包用 IDA 9.5 SDK（`HexRaysSA/ida-sdk` 的 `releases/9.5`，对应 IDA 9.5.261001）编译，因此在 IDA 9.5 上走 `native-linked`，其他版本走 `idat-compat`。想在 IDA 9.3 上用 `native-linked`，请用对应 SDK 从源码编译。
+
 ## 当前已经可用的能力
 
 在支持的 IDA 9.x 运行时上，`ida-cli` 可以：
