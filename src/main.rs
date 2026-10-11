@@ -58,7 +58,20 @@ enum Command {
 }
 
 #[derive(Args, Default)]
-struct ServeArgs {}
+struct ServeArgs {
+    /// Proxy stdin/stdout to the MCP Unix socket of the existing daemon.
+    #[arg(long)]
+    attach: bool,
+    /// Only connect to an existing daemon; never start one.
+    #[arg(long, requires = "attach")]
+    no_autostart: bool,
+    /// Maximum duration for one MCP socket connection attempt.
+    #[arg(long, default_value_t = 5, requires = "attach")]
+    connect_timeout_secs: u64,
+    /// Maximum duration to wait for an explicitly auto-started daemon.
+    #[arg(long, default_value_t = 10, requires = "attach")]
+    startup_timeout_secs: u64,
+}
 
 #[derive(Args)]
 struct ServeHttpArgs {
@@ -656,8 +669,20 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_server(_args: ServeArgs) -> anyhow::Result<()> {
-    run_server_multi()
+fn run_server(args: ServeArgs) -> anyhow::Result<()> {
+    if !args.attach {
+        return run_server_multi();
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(ida_mcp::attach::run_stdio_proxy(
+        ida_mcp::attach::AttachOptions {
+            no_autostart: args.no_autostart,
+            connect_timeout: Duration::from_secs(args.connect_timeout_secs),
+            startup_timeout: Duration::from_secs(args.startup_timeout_secs),
+        },
+    ))
 }
 
 fn run_server_multi() -> anyhow::Result<()> {

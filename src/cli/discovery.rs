@@ -1,9 +1,6 @@
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
-const DISCOVERY_PATH: &str = "/tmp/ida-cli.socket";
-const STARTUP_LOCK: &str = "/tmp/ida-cli.startup.lock";
-
 pub fn discover_socket(explicit: Option<&str>) -> Result<PathBuf, String> {
     if let Some(s) = explicit {
         let p = PathBuf::from(s);
@@ -35,12 +32,13 @@ pub fn discover_socket(explicit: Option<&str>) -> Result<PathBuf, String> {
 }
 
 fn read_discovery_file() -> Option<PathBuf> {
-    let content = std::fs::read_to_string(DISCOVERY_PATH).ok()?;
+    let discovery_path = crate::idb_store::discovery_path();
+    let content = std::fs::read_to_string(&discovery_path).ok()?;
     let p = PathBuf::from(content.trim());
     if p.exists() {
         Some(p)
     } else {
-        let _ = std::fs::remove_file(DISCOVERY_PATH);
+        let _ = std::fs::remove_file(discovery_path);
         None
     }
 }
@@ -55,11 +53,12 @@ fn flock_exclusive(fd: i32, blocking: bool) -> bool {
 }
 
 fn auto_start_server() -> Result<(), String> {
+    let startup_lock = crate::idb_store::startup_lock_path();
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(STARTUP_LOCK)
+        .open(&startup_lock)
         .map_err(|e| format!("Cannot create lock file: {e}"))?;
 
     let fd = lock_file.as_raw_fd();

@@ -4,15 +4,24 @@
 //! metadata about every analysed binary.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-fn home_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+fn ida_home_from(explicit: Option<&OsStr>, home: Option<&OsStr>) -> PathBuf {
+    if let Some(explicit) = explicit.filter(|value| !value.is_empty()) {
+        return PathBuf::from(explicit);
+    }
+    home.map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".ida")
 }
 
 pub fn ida_home() -> PathBuf {
-    home_dir().join(".ida")
+    ida_home_from(
+        std::env::var_os("IDA_CLI_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
 }
 
 pub fn idb_root() -> PathBuf {
@@ -46,6 +55,17 @@ pub fn log_path() -> PathBuf {
 
 pub fn startup_lock_path() -> PathBuf {
     ida_home().join(".startup.lock")
+}
+
+pub fn discovery_path() -> PathBuf {
+    if std::env::var_os("IDA_CLI_HOME")
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        ida_home().join("discovery.socket")
+    } else {
+        PathBuf::from("/tmp/ida-cli.socket")
+    }
 }
 
 pub fn socket_is_live() -> bool {
@@ -596,5 +616,19 @@ mod tests {
         let home = std::env::var("HOME").expect("HOME not set");
         let expected = PathBuf::from(home).join(".ida").join("server.sock");
         assert_eq!(socket_path(), expected);
+    }
+
+    #[test]
+    fn test_explicit_ida_home_does_not_modify_process_home() {
+        let explicit = OsStr::new("/tmp/ida-cli-isolated");
+        let home = OsStr::new("/Users/example");
+        assert_eq!(
+            ida_home_from(Some(explicit), Some(home)),
+            PathBuf::from(explicit)
+        );
+        assert_eq!(
+            ida_home_from(None, Some(home)),
+            PathBuf::from(home).join(".ida")
+        );
     }
 }

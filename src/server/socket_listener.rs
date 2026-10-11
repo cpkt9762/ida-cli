@@ -22,8 +22,8 @@ pub async fn run_socket_listener(
     let listener = UnixListener::bind(&socket_path)?;
     info!("CLI socket listening on {:?}", socket_path);
 
-    let discovery_path = std::path::Path::new("/tmp/ida-cli.socket");
-    std::fs::write(discovery_path, socket_path.to_string_lossy().as_bytes())?;
+    let discovery_path = crate::idb_store::discovery_path();
+    std::fs::write(&discovery_path, socket_path.to_string_lossy().as_bytes())?;
 
     loop {
         tokio::select! {
@@ -49,7 +49,7 @@ pub async fn run_socket_listener(
 
 pub fn cleanup_socket_files(socket_path: &std::path::Path) {
     let _ = std::fs::remove_file(socket_path);
-    let _ = std::fs::remove_file("/tmp/ida-cli.socket");
+    let _ = std::fs::remove_file(crate::idb_store::discovery_path());
     let _ = std::fs::remove_file(crate::idb_store::mcp_socket_path());
 }
 
