@@ -17,7 +17,7 @@ pub mod worker;
 pub mod worker_trait;
 
 pub use backend::{native_backend, IdaBackend, NativeIdalibBackend, RawDatabaseOptions};
-pub use capabilities::supported_methods_for;
+pub use capabilities::{supported_methods_for, supported_tools_for};
 pub use loop_impl::run_ida_loop;
 pub use request::{EnqueuedRequest, IdaRequest};
 pub use runtime::{probe_native_runtime, IdaRuntimeVersion, RuntimeProbeResult, WorkerBackendKind};

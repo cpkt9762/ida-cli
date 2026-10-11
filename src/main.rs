@@ -996,13 +996,12 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     let router_for_shutdown = router.clone();
     let router_for_final = router.clone();
     let router_for_mcp_socket = router.clone();
-    let server_handle = thread::spawn(move || {
+    let server_handle = thread::spawn(move || -> anyhow::Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime");
+            .build()?;
 
-        let result = rt.block_on(async move {
+        rt.block_on(async move {
             let _ = std::fs::write(
                 ida_mcp::idb_store::pid_path(),
                 std::process::id().to_string(),
@@ -1034,6 +1033,40 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 session_manager,
                 config,
             );
+
+            let allowed_origins: std::collections::HashSet<String> = args
+                .allow_origin
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let allowed_origins = Arc::new(allowed_origins);
+            let inflight_limit =
+                Arc::new(tokio::sync::Semaphore::new(args.max_inflight_requests.max(1)));
+            let service = GatewayService::new(
+                service,
+                allowed_origins,
+                router.clone(),
+                inflight_limit,
+            );
+
+            let listener = tokio::net::TcpListener::bind(bind_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
+            let actual_http_address = format!(
+                "http://{}",
+                listener
+                    .local_addr()
+                    .map_err(|error| anyhow::anyhow!("cannot read HTTP bind address: {error}"))?
+            );
+            let mcp_socket = ida_mcp::server::mcp_socket::bind_mcp_socket(
+                ida_mcp::idb_store::mcp_socket_path(),
+            )?;
+            router
+                .set_http_address(Some(actual_http_address.clone()))
+                .await;
+            info!("ida-cli HTTP server listening on {actual_http_address}");
+
             router.start_watchdog(
                 std::time::Duration::from_secs(8 * 3600),
                 std::time::Duration::from_secs(5 * 60),
@@ -1064,37 +1097,17 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                         ServerMode::Router(router_for_mcp_socket.clone()),
                     ))
                 };
-                if let Err(e) = ida_mcp::server::mcp_socket::run_mcp_socket_listener(
-                    ida_mcp::idb_store::mcp_socket_path(),
-                    make_server,
-                    cancel_for_mcp_socket,
-                )
-                .await
+                if let Err(e) =
+                    ida_mcp::server::mcp_socket::run_bound_mcp_socket_listener(
+                        mcp_socket,
+                        make_server,
+                        cancel_for_mcp_socket,
+                    )
+                    .await
                 {
                     warn!("MCP socket listener failed: {e}");
                 }
             });
-
-            let allowed_origins: std::collections::HashSet<String> = args
-                .allow_origin
-                .iter()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let allowed_origins = Arc::new(allowed_origins);
-            let inflight_limit =
-                Arc::new(tokio::sync::Semaphore::new(args.max_inflight_requests.max(1)));
-            let service = GatewayService::new(
-                service,
-                allowed_origins,
-                router.clone(),
-                inflight_limit,
-            );
-
-            let listener = tokio::net::TcpListener::bind(bind_addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
-            info!("ida-cli HTTP server listening on http://{bind_addr}");
 
             let shutdown_worker = worker_for_shutdown.clone();
             let cancel_for_shutdown = cancel.clone();
@@ -1134,15 +1147,13 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             }
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
-        });
-        if let Err(err) = result {
-            error!("HTTP server error: {err}");
-        }
+        })
     });
 
-    if let Err(e) = server_handle.join() {
-        error!("Server thread panicked: {:?}", e);
-    }
+    let server_result = match server_handle.join() {
+        Ok(result) => result,
+        Err(panic) => Err(anyhow::anyhow!("HTTP server thread panicked: {panic:?}")),
+    };
 
     {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1153,6 +1164,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
 
     let _ = std::fs::remove_file(ida_mcp::idb_store::pid_path());
     ida_mcp::server::socket_listener::cleanup_socket_files(&ida_mcp::idb_store::socket_path());
+    server_result?;
     info!("Server stopped");
     Ok(())
 }

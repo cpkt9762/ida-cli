@@ -134,6 +134,41 @@ fn format_status(v: &Value) -> String {
     }
     lines.push(format!("active_handle: {active}"));
 
+    if let Some(metadata) = v.get("metadata") {
+        let version = metadata
+            .get("version")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let rpc_socket = metadata
+            .get("rpc_socket_path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        let mcp_socket = metadata
+            .get("mcp_socket_path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        let http_address = metadata
+            .get("http_address")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        lines.push(format!("daemon_version: {version}"));
+        lines.push(format!("rpc_socket: {rpc_socket}"));
+        lines.push(format!("mcp_socket: {mcp_socket}"));
+        lines.push(format!("http_address: {http_address}"));
+        if let Some(methods) = metadata
+            .get("supported_methods")
+            .and_then(|value| value.as_array())
+        {
+            lines.push(format!("supported_methods: {}", methods.len()));
+        }
+        if let Some(tools) = metadata
+            .get("supported_tools")
+            .and_then(|value| value.as_array())
+        {
+            lines.push(format!("supported_tools: {}", tools.len()));
+        }
+    }
+
     if let Some(runtime) = v.get("runtime_probe") {
         let backend = runtime
             .get("backend")

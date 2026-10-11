@@ -278,6 +278,7 @@ pub struct WorkerStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RouterStatus {
+    pub metadata: DaemonMetadata,
     pub worker_count: usize,
     pub active_handle: Option<String>,
     pub max_workers: usize,
@@ -312,6 +313,18 @@ pub struct RouterStatus {
     pub federation_nodes: Vec<crate::federation::FederationNodeStatus>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DaemonMetadata {
+    pub version: String,
+    pub rpc_socket_path: String,
+    pub mcp_socket_path: String,
+    pub http_address: Option<String>,
+    pub backend: Option<String>,
+    pub ida_version: Option<String>,
+    pub supported_methods: Vec<String>,
+    pub supported_tools: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct RouterState {
     inner: Arc<Mutex<RouterInner>>,
@@ -323,6 +336,7 @@ pub struct RouterState {
     route_queue: Arc<Mutex<RouteQueueState>>,
     task_registry: TaskRegistry,
     federation_nodes: Arc<Mutex<HashMap<String, crate::federation::FederationNodeRecord>>>,
+    http_address: Arc<Mutex<Option<String>>>,
     maintenance_started: Arc<AtomicBool>,
 }
 
@@ -380,8 +394,13 @@ impl RouterState {
             route_queue: Arc::new(Mutex::new(RouteQueueState::default())),
             task_registry: TaskRegistry::new(),
             federation_nodes: Arc::new(Mutex::new(crate::federation::load_node_map_from_env())),
+            http_address: Arc::new(Mutex::new(None)),
             maintenance_started: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub async fn set_http_address(&self, address: Option<String>) {
+        *self.http_address.lock().await = address;
     }
 
     pub async fn federation_nodes_snapshot(&self) -> Vec<crate::federation::FederationNodeRecord> {
@@ -1049,6 +1068,32 @@ impl RouterState {
                 self.probe_worker_backend(&exe_path).await.ok()
             }
         };
+        let (backend, ida_version, supported_methods, supported_tools) =
+            match runtime_probe.as_ref().and_then(|probe| probe.backend) {
+                Some(backend) => (
+                    Some(backend.to_string()),
+                    runtime_probe
+                        .as_ref()
+                        .and_then(|probe| probe.runtime.as_ref())
+                        .map(ToString::to_string),
+                    crate::ida::supported_methods_for(backend)
+                        .iter()
+                        .map(|method| (*method).to_string())
+                        .collect(),
+                    crate::ida::supported_tools_for(backend),
+                ),
+                None => (None, None, Vec::new(), Vec::new()),
+            };
+        let metadata = DaemonMetadata {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            rpc_socket_path: crate::idb_store::socket_path().display().to_string(),
+            mcp_socket_path: crate::idb_store::mcp_socket_path().display().to_string(),
+            http_address: self.http_address.lock().await.clone(),
+            backend,
+            ida_version,
+            supported_methods,
+            supported_tools,
+        };
         let inner = self.inner.lock().await;
         let mut backend_counts: HashMap<String, usize> = HashMap::new();
         let mut tenant_worker_counts: HashMap<String, usize> = HashMap::new();
@@ -1164,6 +1209,7 @@ impl RouterState {
             .collect();
 
         RouterStatus {
+            metadata,
             worker_count: inner.workers.len(),
             active_handle: inner.active.clone(),
             max_workers: self.config.max_workers,
@@ -2341,6 +2387,42 @@ mod tests {
         .expect("status_snapshot must not deadlock when the probe cache is empty");
         assert!(status.runtime_probe.is_none());
         assert!(router.cached_probe.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_status_metadata_reports_daemon_endpoints_and_capabilities() {
+        let router = RouterState::new().expect("RouterState should be created");
+        let probe: RuntimeProbeResult = serde_json::from_value(serde_json::json!({
+            "runtime": {"major": 9, "minor": 5, "build": 261001},
+            "backend": "native-linked",
+            "supported": true,
+            "reason": null,
+            "supported_methods": []
+        }))
+        .expect("valid runtime probe fixture");
+        *router.cached_probe.lock().await = Some(probe);
+        router
+            .set_http_address(Some("http://127.0.0.1:43123".to_string()))
+            .await;
+
+        let status = router.status_snapshot().await;
+        assert_eq!(status.metadata.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            status.metadata.rpc_socket_path,
+            crate::idb_store::socket_path().display().to_string()
+        );
+        assert_eq!(
+            status.metadata.mcp_socket_path,
+            crate::idb_store::mcp_socket_path().display().to_string()
+        );
+        assert_eq!(
+            status.metadata.http_address.as_deref(),
+            Some("http://127.0.0.1:43123")
+        );
+        assert_eq!(status.metadata.backend.as_deref(), Some("native-linked"));
+        assert_eq!(status.metadata.ida_version.as_deref(), Some("9.5.261001"));
+        assert!(status.metadata.supported_methods.len() > 50);
+        assert!(status.metadata.supported_tools.len() > 50);
     }
 
     #[tokio::test]

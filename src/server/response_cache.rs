@@ -1,9 +1,7 @@
 use serde_json::Value;
-use std::path::Path;
 use std::time::SystemTime;
 
 const DEFAULT_MAX_INLINE_BYTES: usize = 512;
-const CACHE_DIR: &str = "/tmp/ida-cli-out";
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResponseCacheStats {
@@ -32,7 +30,8 @@ pub fn guard_response_size(method: &str, result: Value) -> Value {
         return result;
     }
 
-    let _ = std::fs::create_dir_all(CACHE_DIR);
+    let cache_dir = crate::idb_store::response_cache_dir();
+    let _ = std::fs::create_dir_all(&cache_dir);
 
     let hash = {
         use std::hash::{Hash, Hasher};
@@ -41,7 +40,7 @@ pub fn guard_response_size(method: &str, result: Value) -> Value {
         format!("{:016x}", hasher.finish())
     };
     let filename = format!("{}-{}.json", method, hash);
-    let file_path = Path::new(CACHE_DIR).join(&filename);
+    let file_path = cache_dir.join(&filename);
 
     if let Err(e) = std::fs::write(&file_path, &json_str) {
         tracing::warn!("Failed to cache response to {:?}: {}", file_path, e);
@@ -97,11 +96,11 @@ fn count_items(v: &Value) -> Option<usize> {
 }
 
 pub fn stats() -> ResponseCacheStats {
-    let path = Path::new(CACHE_DIR);
+    let path = crate::idb_store::response_cache_dir();
     let mut file_count = 0usize;
     let mut total_size_bytes = 0u64;
 
-    if let Ok(entries) = std::fs::read_dir(path) {
+    if let Ok(entries) = std::fs::read_dir(&path) {
         for entry in entries.flatten() {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_file() {
@@ -120,11 +119,11 @@ pub fn stats() -> ResponseCacheStats {
 }
 
 pub fn prune_to_limit(max_bytes: u64) -> ResponseCacheEvictionStats {
-    let path = Path::new(CACHE_DIR);
+    let path = crate::idb_store::response_cache_dir();
     let mut files = Vec::new();
     let mut total_size = 0u64;
 
-    if let Ok(entries) = std::fs::read_dir(path) {
+    if let Ok(entries) = std::fs::read_dir(&path) {
         for entry in entries.flatten() {
             let Ok(meta) = entry.metadata() else {
                 continue;

@@ -68,6 +68,17 @@ pub fn discovery_path() -> PathBuf {
     }
 }
 
+pub fn response_cache_dir() -> PathBuf {
+    if std::env::var_os("IDA_CLI_HOME")
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        ida_home().join("responses")
+    } else {
+        PathBuf::from("/tmp/ida-cli-out")
+    }
+}
+
 pub fn socket_is_live() -> bool {
     let sock = socket_path();
     sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok()
@@ -606,15 +617,18 @@ mod tests {
 
     #[test]
     fn test_ida_home() {
-        let home = std::env::var("HOME").expect("HOME not set");
-        let expected = PathBuf::from(home).join(".ida");
+        let expected = std::env::var_os("IDA_CLI_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var("HOME").expect("HOME not set")).join(".ida")
+            });
         assert_eq!(ida_home(), expected);
     }
 
     #[test]
     fn test_socket_path() {
-        let home = std::env::var("HOME").expect("HOME not set");
-        let expected = PathBuf::from(home).join(".ida").join("server.sock");
+        let expected = ida_home().join("server.sock");
         assert_eq!(socket_path(), expected);
     }
 
