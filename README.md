@@ -43,6 +43,11 @@ requires an IDA SDK because the vendored native layer is linked against it;
 at runtime the CLI opens IDA itself from `IDADIR` or a normalised common
 install path.
 
+Release binaries are built against the IDA 9.5 SDK (`releases/9.5` of
+`HexRaysSA/ida-sdk`, matching IDA 9.5.261001), so they use `native-linked`
+on IDA 9.5 and `idat-compat` elsewhere. Build from source with the matching
+SDK to get `native-linked` on IDA 9.3.
+
 ## Current Capabilities
 
 On supported IDA 9.x runtimes, `ida-cli` can:
