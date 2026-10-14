@@ -236,6 +236,32 @@ impl<C: Clock> NexusSessions<C> {
         Ok(())
     }
 
+    /// A pending acquisition must still be current and uncancelled before send.
+    pub(super) fn open_send_eligible(&self, identity: &OpenIdentity) -> Result<(), NexusError> {
+        let opening = self
+            .openings
+            .get(&identity.operation_id)
+            .ok_or_else(|| NexusError::new(NexusErrorCode::InvalidIdentity, "unknown opening"))?;
+        if &opening.identity != identity {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidIdentity,
+                "opening identity mismatch",
+            ));
+        }
+        if opening.cancel_requested
+            || opening.uncertain
+            || opening.failure.is_some()
+            || opening.acquired.is_some()
+            || opening.request.deadline.expired(self.clock.now())
+        {
+            return Err(NexusError::new(
+                NexusErrorCode::Cancelled,
+                "opening no longer permits acquisition",
+            ));
+        }
+        Ok(())
+    }
+
     /// There is no public handle yet to cancel an IDA operation. Retain the
     /// opening and its bounded startup wait; a late handle goes to cleanup.
     /// This records intent only and never claims startup/native work stopped.

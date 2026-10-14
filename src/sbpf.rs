@@ -76,29 +76,36 @@ pub async fn run_sbx_aot_i64(
             },
         ))
         .await??;
-    preparation.check()?;
-    let mut command = Command::new(&bin);
-    command
-        .arg("aot")
-        .arg("i64")
-        .arg("--program")
-        .arg(&abs_input)
-        .arg("--output")
-        .arg(&stage.output);
-    let output = crate::preprocess::run(command, preparation.clone()).await?;
-    if !output.status.success() {
-        return Err(ToolError::InvalidParams(format!(
-            "sbx aot i64 failed (exit {})\nstderr: {}\nstdout: {}",
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
-        )));
+    let cleanup = stage.cleanup_receipt();
+    let result = async {
+        preparation.check()?;
+        let mut command = Command::new(&bin);
+        command
+            .arg("aot")
+            .arg("i64")
+            .arg("--program")
+            .arg(&abs_input)
+            .arg("--output")
+            .arg(&stage.output);
+        let output = crate::preprocess::run(command, preparation.clone()).await?;
+        if !output.status.success() {
+            return Err(ToolError::InvalidParams(format!(
+                "sbx aot i64 failed (exit {})\nstderr: {}\nstdout: {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            )));
+        }
+        let publish = preparation.clone();
+        crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
+            stage.publish(&publish)
+        })
+        .await??;
+        Ok::<_, ToolError>(())
     }
-    let publish = preparation.clone();
-    crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
-        stage.publish(&publish)
-    })
-    .await??;
+    .await;
+    cleanup.wait().await?;
+    result?;
     cancellation_guard.disarm();
     Ok(SbxAotResult {
         i64_path: output_i64.into(),

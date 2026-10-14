@@ -418,6 +418,7 @@ pub enum IdaRequest {
 pub struct EnqueuedRequest {
     pub request: IdaRequest,
     pub enqueued_at: std::time::Instant,
+    pub(crate) preparation: Option<crate::preprocess::Preparation>,
 }
 
 impl EnqueuedRequest {
@@ -425,6 +426,7 @@ impl EnqueuedRequest {
         Self {
             request,
             enqueued_at: std::time::Instant::now(),
+            preparation: crate::preprocess::current(),
         }
     }
 }

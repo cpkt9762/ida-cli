@@ -3,7 +3,7 @@
 use crate::nexus::*;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 type Sessions = Arc<Mutex<NexusSessions<SystemClock>>>;
@@ -91,6 +91,12 @@ impl Delivery {
             }
         }
     }
+    fn eligible(&self) -> Result<(), NexusError> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send_eligible(&self.command, &self.attempt)
+    }
     /// Call only when the independent public API adapter is about to perform I/O.
     /// Queue residence is deducted before giving N3 a command.
     pub fn begin(&mut self) -> Result<SessionCommand, NexusError> {
@@ -100,26 +106,9 @@ impl Delivery {
                 "delivery may begin only once",
             ));
         }
-        let cancelled = if let SessionCommand::Execute(command) = &self.command {
-            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            sessions
-                .operation_status(&command.identity.lease.client_id, &command.identity)
-                .map(|snapshot| snapshot.cancel_reason.is_some() || snapshot.execution_stopped)
-        } else {
-            Ok(false)
-        };
-        match cancelled {
-            Ok(true) => {
-                let error =
-                    NexusError::new(NexusErrorCode::Cancelled, "cancelled before transport send");
-                self.report(DispatchFailure::NotSent(error.clone()));
-                return Err(error);
-            }
-            Err(error) => {
-                self.report(DispatchFailure::NotSent(error.clone()));
-                return Err(error);
-            }
-            Ok(false) => {}
+        if let Err(error) = self.eligible() {
+            self.report(DispatchFailure::NotSent(error.clone()));
+            return Err(error);
         }
         if let Some(deadline) = self.deadline {
             let ms = u64::try_from(
@@ -167,6 +156,7 @@ impl Delivery {
         // Encoding alone proves no send. Reset the possible-send flag until the first write.
         self.possible = false;
         let attempt = self.attempt.clone();
+        let expires_monotonic_ns = wire_expiry(self.deadline)?;
         let encoding = async {
             if matches!(
                 command,
@@ -176,14 +166,20 @@ impl Delivery {
             ) {
                 // Control DTOs contain bounded identities/booleans only; they never
                 // compete with heavy business encoding for blocking-worker permits.
-                Ok(serde_json::to_vec(
-                    &serde_json::json!({"nexus_frame":1,"attempt":attempt,"payload":command}),
-                ))
+                Ok(serde_json::to_vec(&NexusWireFrame {
+                    nexus_frame: 2,
+                    expires_monotonic_ns,
+                    attempt,
+                    payload: command,
+                }))
             } else {
                 crate::blocking::run(crate::blocking::WorkClass::Encode, move || {
-                    serde_json::to_vec(
-                        &serde_json::json!({"nexus_frame":1,"attempt":attempt,"payload":command}),
-                    )
+                    serde_json::to_vec(&NexusWireFrame {
+                        nexus_frame: 2,
+                        expires_monotonic_ns,
+                        attempt,
+                        payload: command,
+                    })
                 })
                 .await
             }
@@ -206,10 +202,12 @@ impl Delivery {
         let mut bytes = match encoded {
             Ok(Ok(b)) if b.len() < super::transport::MAX_FRAME_BYTES => b,
             other => {
-                let error = NexusError::new(
-                    NexusErrorCode::OperationFailed,
-                    format!("Nexus frame encoding: {other:?}"),
-                );
+                let message = match other {
+                    Ok(Ok(bytes)) => format!("Nexus frame exceeds 16 MiB ({} bytes)", bytes.len()),
+                    Ok(Err(error)) => format!("Nexus frame encoding: {error}"),
+                    Err(error) => format!("Nexus frame encoding worker: {error}"),
+                };
+                let error = NexusError::new(NexusErrorCode::OperationFailed, message);
                 self.report(DispatchFailure::NotSent(error.clone()));
                 return Err(error);
             }
@@ -217,13 +215,33 @@ impl Delivery {
         bytes.push(b'\n');
         let mut offset = 0;
         while offset < bytes.len() {
-            self.possible = true; // Dropping an in-progress write has no zero-send proof.
-            let write = async { writer.write(&bytes[offset..]).await };
-            let result = if let Some(deadline) = self.deadline {
+            // Recheck after encoding and on every write poll. No session lock is
+            // held during I/O. A concurrent transition after this gate is possible
+            // delivery, never proof of non-delivery or permission to replay.
+            let deadline = self.deadline;
+            let write = std::future::poll_fn(|cx| {
+                if let Err(error) = self.eligible() {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                self.possible = true;
+                match std::pin::Pin::new(&mut *writer).poll_write(cx, &bytes[offset..]) {
+                    std::task::Poll::Pending => {
+                        self.possible = offset != 0;
+                        std::task::Poll::Pending
+                    }
+                    std::task::Poll::Ready(result) => std::task::Poll::Ready(result.map_err(|e| {
+                        NexusError::new(
+                            NexusErrorCode::Disconnected,
+                            format!("Nexus pipe write: {e}"),
+                        )
+                    })),
+                }
+            });
+            let result = if let Some(deadline) = deadline {
                 match tokio::time::timeout_at(deadline.into(), write).await {
                     Ok(result) => result,
-                    Err(_) => Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
+                    Err(_) => Err(NexusError::new(
+                        NexusErrorCode::QueueExpired,
                         "total transport deadline",
                     )),
                 }
@@ -252,6 +270,73 @@ impl Delivery {
         // Write success does not ACK or confirm native execution. N3 owns the response.
         self.reported = true;
         Ok(())
+    }
+}
+/// Same-host wire deadline. CLOCK_MONOTONIC has a process-independent epoch;
+/// unlike remaining_ms it continues expiring in encoding, pipes and receiver queues.
+/// N3 must call consume immediately before dispatch, on the same host/boot.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct NexusWireFrame {
+    pub nexus_frame: u8,
+    pub expires_monotonic_ns: u64,
+    pub attempt: DeliveryAttempt,
+    pub payload: SessionCommand,
+}
+pub(crate) fn monotonic_ns() -> Result<u64, NexusError> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: valid initialized output; read-only system clock query.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return Err(NexusError::new(
+            NexusErrorCode::OperationFailed,
+            format!("monotonic clock: {}", std::io::Error::last_os_error()),
+        ));
+    }
+    u64::try_from(time.tv_sec)
+        .ok()
+        .and_then(|sec| sec.checked_mul(1_000_000_000))
+        .and_then(|ns| ns.checked_add(time.tv_nsec as u64))
+        .ok_or_else(|| NexusError::new(NexusErrorCode::InvalidTimeout, "monotonic clock overflow"))
+}
+pub(crate) fn wire_expiry(deadline: Option<Instant>) -> Result<u64, NexusError> {
+    let now = monotonic_ns()?;
+    let remaining = deadline
+        .ok_or_else(|| {
+            NexusError::new(NexusErrorCode::InvalidTimeout, "missing transport deadline")
+        })?
+        .saturating_duration_since(Instant::now());
+    now.checked_add(
+        u64::try_from(remaining.as_nanos()).map_err(|_| {
+            NexusError::new(NexusErrorCode::InvalidTimeout, "wire deadline overflow")
+        })?,
+    )
+    .ok_or_else(|| NexusError::new(NexusErrorCode::InvalidTimeout, "wire deadline overflow"))
+}
+impl NexusWireFrame {
+    pub fn consume(mut self) -> Result<(SessionCommand, DeliveryAttempt), NexusError> {
+        if self.nexus_frame != 2 {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "unsupported Nexus frame",
+            ));
+        }
+        let remaining = self.expires_monotonic_ns.saturating_sub(monotonic_ns()?) / 1_000_000;
+        if remaining == 0 {
+            return Err(NexusError::new(
+                NexusErrorCode::QueueExpired,
+                "wire deadline expired before receiver dispatch",
+            ));
+        }
+        let budget = RemainingBudget::try_from(remaining)?;
+        match &mut self.payload {
+            SessionCommand::Open { remaining_ms, .. }
+            | SessionCommand::Shutdown { remaining_ms, .. } => *remaining_ms = budget,
+            SessionCommand::Execute(c) => c.remaining_ms = budget,
+            _ => {}
+        }
+        Ok((self.payload, self.attempt))
     }
 }
 impl NexusTransport {

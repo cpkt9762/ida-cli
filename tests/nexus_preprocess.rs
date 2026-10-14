@@ -218,6 +218,9 @@ async fn staged_publication_preserves_existing_user_output_and_rejects_cancel() 
     std::fs::write(&fixture.marker, b"user output").unwrap();
     assert!(stage.publish(&preparation).is_err());
     assert_eq!(std::fs::read(&fixture.marker).unwrap(), b"user output");
+    let cleanup = stage.cleanup_receipt();
+    drop(stage);
+    cleanup.wait().await.unwrap();
 }
 #[tokio::test(flavor = "current_thread")]
 async fn successful_disposable_idat_uses_output_and_finite_capture() {
@@ -277,6 +280,9 @@ async fn dsc_production_idat_preserves_arguments_env_and_cancellation_cleanup() 
         "cancelled task cannot write staged output after cleanup"
     );
     fixture.assert_clean(&identity);
+    let cleanup = stage.cleanup_receipt();
+    drop(stage);
+    cleanup.wait().await.unwrap();
 }
 #[test]
 fn runtime_exit_emergency_reaper_stops_task_owned_group() {
@@ -464,4 +470,53 @@ async fn sbx_production_entry_cancellation_never_publishes_final_output() {
         },
     }
     fixture.assert_clean(&identity);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sbx_nonzero_exit_waits_for_staging_cleanup_and_preserves_published_user_file() {
+    let _fixture_gate = PROCESS_FIXTURE_GATE.lock().await;
+    let fixture = Fixture::new();
+    let executable = fixture.directory.join("sbx-fails");
+    let input = fixture.directory.join("program.so");
+    std::fs::write(&input, b"fixture").unwrap();
+    std::fs::write(&fixture.marker, b"user file").unwrap();
+    let body=format!("#!/usr/bin/python3\nimport sys,os,json\nfrom pathlib import Path\nwith open({:?},'a') as audit: audit.write(json.dumps(dict(pid=os.getpid(),pgid=os.getpgrp(),kind='sbx-nonzero'))+'\\n')\noutput=sys.argv[sys.argv.index('--output')+1]\nPath(output).write_text('unpublished')\nsys.stderr.write('fixture exit seven')\nsys.exit(7)\n",fixture.directory.parent().unwrap().join("n2-process-identities.jsonl").display().to_string());
+    std::fs::write(&executable, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let old_sbx = std::env::var_os("SBX");
+    unsafe {
+        std::env::set_var("SBX", &executable);
+    }
+    let result = ida_mcp::sbpf::run_sbx_aot_i64(
+        &input,
+        &fixture.marker,
+        Preparation::new(Duration::from_secs(3)),
+    )
+    .await;
+    match old_sbx {
+        Some(value) => unsafe {
+            std::env::set_var("SBX", value);
+        },
+        None => unsafe {
+            std::env::remove_var("SBX");
+        },
+    }
+    let error = result
+        .err()
+        .expect("nonzero sbx must preserve source failure");
+    assert!(
+        error.to_string().contains("exit 7") && error.to_string().contains("fixture exit seven")
+    );
+    assert_eq!(std::fs::read(&fixture.marker).unwrap(), b"user file");
+    for entry in std::fs::read_dir(&fixture.directory).unwrap() {
+        assert!(
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".n2-prepare-"),
+            "cleanup must be complete before failed sbx returns"
+        );
+    }
 }

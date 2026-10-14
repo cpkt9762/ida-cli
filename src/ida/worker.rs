@@ -121,6 +121,9 @@ impl IdaWorker {
     }
 
     fn try_send(&self, req: IdaRequest) -> Result<(), ToolError> {
+        if let Some(preparation) = crate::preprocess::current() {
+            preparation.check()?;
+        }
         match self.tx.try_send(EnqueuedRequest::new(req)) {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(_)) => Err(ToolError::Busy),
@@ -136,6 +139,9 @@ impl IdaWorker {
         let start = Instant::now();
         let mut pending = EnqueuedRequest::new(req);
         loop {
+            if let Some(preparation) = crate::preprocess::current() {
+                preparation.check()?;
+            }
             match self.tx.try_send(pending) {
                 Ok(()) => return Ok(()),
                 Err(mpsc::TrySendError::Full(enq)) => {
@@ -162,6 +168,9 @@ impl IdaWorker {
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
                 .min(MAX_TIMEOUT_SECS),
         );
+        if let Some(preparation) = crate::preprocess::current() {
+            return preparation.native(async { rx.await? }).await;
+        }
         match tokio::time::timeout(timeout, rx).await {
             Ok(result) => result?,
             Err(_) => Err(ToolError::Timeout(timeout.as_secs())),

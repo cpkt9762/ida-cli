@@ -353,13 +353,17 @@ impl IdaMcpServer {
         out_i64: &std::path::Path,
         module: &str,
         frameworks: &[String],
+        preparation: crate::preprocess::Preparation,
     ) -> Result<CallToolResult, McpError> {
+        let _guard = preparation.cancel_on_drop();
         info!(out_i64 = %out_i64.display(), "Opening existing DSC .i64");
 
         let i64_str = out_i64.display().to_string();
-        let open_result = self
-            .worker
-            .open(&i64_str, false, None, false, false, None, true, Vec::new())
+        let open_result = preparation
+            .native(
+                self.worker
+                    .open(&i64_str, false, None, false, false, None, true, Vec::new()),
+            )
             .await;
 
         let db_info = match open_result {
@@ -454,11 +458,16 @@ impl IdaMcpServer {
             );
             return;
         }
+        let cleanup = stage.cleanup_receipt();
         let publish = preparation.clone();
         let result = crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
             stage.publish(&publish)
         })
         .await;
+        if let Err(error) = cleanup.wait().await {
+            registry.fail(&task_id, &error.to_string());
+            return;
+        }
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) | Err(error) => {
@@ -476,14 +485,26 @@ impl IdaMcpServer {
 
         // Phase 2: open the .i64 with idalib
         let i64_str = out_i64.display().to_string();
-        let open_result = worker
-            .open(&i64_str, false, None, false, false, None, true, Vec::new())
+        let open_result = preparation
+            .native(worker.open(&i64_str, false, None, false, false, None, true, Vec::new()))
             .await;
 
         let db_info = match open_result {
             Ok(info) => info,
             Err(e) => {
-                registry.fail(&task_id, &e.to_string());
+                if preparation.cancel.is_cancelled()
+                    && matches!(
+                        e,
+                        ToolError::Preparation {
+                            execution_stopped: true,
+                            ..
+                        }
+                    )
+                {
+                    registry.cancellation_confirmed(&task_id);
+                } else {
+                    registry.fail(&task_id, &e.to_string());
+                }
                 return;
             }
         };
@@ -518,19 +539,24 @@ impl IdaMcpServer {
         params: Value,
     ) -> Result<CallToolResult, McpError> {
         // Multi-IDB guard is enforced in RouterState::route_request itself.
-        match router.route_request(handle, method, params).await {
-            Ok(v) => match crate::blocking::run(crate::blocking::WorkClass::Encode, move || {
-                serde_json::to_string_pretty(&v)
-            })
-            .await
-            {
-                Ok(Ok(encoded)) => Ok(CallToolResult::success(vec![Content::text(encoded)])),
-                Ok(Err(error)) => Ok(ToolError::IdaError(format!(
-                    "MCP response encoding: {error}"
-                ))
-                .to_tool_result()),
-                Err(error) => Ok(error.to_tool_result()),
-            },
+        let result = if let Some(preparation) = crate::preprocess::current() {
+            router
+                .route_request_prepared(handle, method, params, preparation)
+                .await
+        } else {
+            router.route_request(handle, method, params).await
+        };
+        match result {
+            Ok(v) => {
+                match crate::blocking::response(move || serde_json::to_string_pretty(&v)).await {
+                    Ok(Ok(encoded)) => Ok(CallToolResult::success(vec![Content::text(encoded)])),
+                    Ok(Err(error)) => Ok(ToolError::IdaError(format!(
+                        "MCP response encoding: {error}"
+                    ))
+                    .to_tool_result()),
+                    Err(error) => Ok(error.to_tool_result()),
+                }
+            }
             Err(e) => Ok(e.to_tool_result()),
         }
     }
@@ -4123,7 +4149,9 @@ impl IdaMcpServer {
 
         // If .i64 already exists, open synchronously (fast path).
         if out_i64.exists() {
-            return self.open_dsc_i64(&out_i64, &req.module, &frameworks).await;
+            return self
+                .open_dsc_i64(&out_i64, &req.module, &frameworks, preparation)
+                .await;
         }
 
         // .i64 doesn't exist — need to run idat, which takes minutes.
@@ -4502,17 +4530,30 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<RunScriptRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let preparation = crate::preprocess::current().unwrap_or_else(|| {
+            crate::preprocess::Preparation::new(std::time::Duration::from_secs(
+                req.timeout_secs.unwrap_or(120).min(600),
+            ))
+        });
+        let _cancellation_guard = preparation.cancel_on_drop();
         let code = match (req.code, req.file) {
             (Some(code), None) => code,
             (None, Some(path)) => {
-                if !Self::validate_path(&path) {
-                    return Ok(ToolError::InvalidPath(path).to_tool_result());
-                }
                 let source = path.clone();
-                match crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
-                    std::fs::read_to_string(source)
-                })
-                .await
+                match preparation
+                    .wait(crate::blocking::run(
+                        crate::blocking::WorkClass::Prepare,
+                        move || {
+                            if !Self::validate_path(&source) {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "invalid script path",
+                                ));
+                            }
+                            read_script_file(source)
+                        },
+                    ))
+                    .await
                 {
                     Ok(Ok(contents)) => contents,
                     Ok(Err(e)) => {
@@ -4540,26 +4581,36 @@ impl IdaMcpServer {
         };
         let timeout = req.timeout_secs.map(|t| t.min(600));
         if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
+            return preparation
+                .scope(self.route_or_err(
                     router,
                     req.db_handle.as_deref(),
                     "run_script",
                     json!({"code": code, "timeout_secs": timeout}),
-                )
+                ))
                 .await;
         }
-        match self.worker.run_script(&code, timeout).await {
+        match preparation
+            .native(self.worker.run_script(&code, timeout))
+            .await
+        {
             Ok(result) => {
-                if !run_script_succeeded(&result) {
-                    let message = run_script_failure_message(&result);
-                    warn!(code_len = code.len(), error = %message, "run_script failed");
-                    return Ok(ToolError::IdaError(message).to_tool_result());
+                let code_len = code.len();
+                match crate::blocking::response(move || {
+                    if !run_script_succeeded(&result) {
+                        let message = run_script_failure_message(&result);
+                        warn!(code_len, error = %message, "run_script failed");
+                        return Err(ToolError::IdaError(message));
+                    }
+                    serde_json::to_string_pretty(&result).map_err(|error| {
+                        ToolError::IdaError(format!("MCP script response encoding: {error}"))
+                    })
+                })
+                .await
+                {
+                    Ok(Ok(encoded)) => Ok(CallToolResult::success(vec![Content::text(encoded)])),
+                    Ok(Err(error)) | Err(error) => Ok(error.to_tool_result()),
                 }
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )]))
             }
             Err(ToolError::Timeout(timeout_secs)) => {
                 let message = run_script_timeout_message(timeout_secs, &code);
@@ -5827,3 +5878,28 @@ mod tests {
         assert_eq!(parsed.content.len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/n2_f1_server.rs"]
+mod n2_f1_regressions;
+
+fn read_script_file(source: String) -> std::io::Result<String> {
+    #[cfg(test)]
+    {
+        let barrier = SCRIPT_READ_BARRIERS.lock().unwrap().remove(&source);
+        if let Some((started, release)) = barrier {
+            started.send(()).unwrap();
+            release.recv().unwrap();
+        }
+    }
+    std::fs::read_to_string(source)
+}
+#[cfg(test)]
+type ScriptReadBarrier = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+#[cfg(test)]
+static SCRIPT_READ_BARRIERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, ScriptReadBarrier>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));

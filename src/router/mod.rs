@@ -894,6 +894,8 @@ impl RouterState {
             inner.req_counter = counter.checked_add(1).ok_or(ToolError::Busy)?;
             (target, format!("r{counter}"))
         };
+        let mut params = params;
+        protocol::attach_deadline(&mut params, deadline)?;
         let bytes = preparation
             .wait(transport::RpcConnection::encode(RpcRequest::new(
                 &req_id, method, params,
@@ -1386,20 +1388,32 @@ impl RouterState {
                     if let Some(ref idb_out) = effective_idb_output {
                         let binary = canonical.clone();
                         let destination = PathBuf::from(idb_out);
-                        crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
-                            let _ = destination;
-                            crate::idb_store::IdbStore::new()
-                                .try_record(&binary)
-                                .map_err(|e| {
-                                    crate::error::ToolError::IdaError(format!(
-                                        "IDB index record: {e}"
-                                    ))
-                                })
-                        })
-                        .await??;
+                        preparation
+                            .wait(crate::blocking::run(
+                                crate::blocking::WorkClass::Prepare,
+                                move || {
+                                    let _ = destination;
+                                    crate::idb_store::IdbStore::new()
+                                        .try_record(&binary)
+                                        .map_err(|e| {
+                                            crate::error::ToolError::IdaError(format!(
+                                                "IDB index record: {e}"
+                                            ))
+                                        })
+                                },
+                            ))
+                            .await??;
                     }
-                    if is_sbpf_elf(&canonical) {
-                        self.detect_and_rename_sbpf_entry(&h).await;
+                    let binary = canonical.clone();
+                    if preparation
+                        .wait(crate::blocking::run(
+                            crate::blocking::WorkClass::Prepare,
+                            move || is_sbpf_elf(&binary),
+                        ))
+                        .await?
+                    {
+                        self.detect_and_rename_sbpf_entry(&h, preparation.clone())
+                            .await?;
                     }
                 }
                 Err(e) => {
@@ -1416,36 +1430,44 @@ impl RouterState {
         Ok((handle, ref_token))
     }
 
-    async fn detect_and_rename_sbpf_entry(&self, handle: &str) {
+    async fn detect_and_rename_sbpf_entry(
+        &self,
+        handle: &str,
+        preparation: crate::preprocess::Preparation,
+    ) -> Result<(), crate::error::ToolError> {
         let ep_addr: Option<u64> = self
-            .route_request(
+            .route_request_prepared(
                 Some(handle),
                 "get_function_by_name",
                 serde_json::json!({"name": "entrypoint"}),
+                preparation.clone(),
             )
-            .await
-            .ok()
-            .and_then(|v| v.get("address")?.as_str().map(String::from))
+            .await?
+            .get("address")
+            .and_then(|v| v.as_str().map(String::from))
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
 
-        let Some(ep_addr) = ep_addr else { return };
+        let Some(ep_addr) = ep_addr else {
+            return Ok(());
+        };
         let ep_hex = format!("0x{:x}", ep_addr);
 
         let cg_val = match self
-            .route_request(
+            .route_request_prepared(
                 Some(handle),
                 "build_callgraph",
                 serde_json::json!({"roots": ep_hex, "max_depth": 2, "max_nodes": 256}),
+                preparation.clone(),
             )
             .await
         {
             Ok(v) => v,
-            Err(_) => return,
+            Err(error) => return Err(error),
         };
 
         let edges = match cg_val.get("edges").and_then(|v| v.as_array()) {
             Some(e) => e.clone(),
-            None => return,
+            None => return Ok(()),
         };
         let nodes = cg_val
             .get("nodes")
@@ -1477,7 +1499,7 @@ impl RouterState {
             .filter(|addr| !is_syscall(addr))
             .collect();
         if direct.len() != 2 {
-            return;
+            return Ok(());
         }
 
         let c0 = edges
@@ -1489,19 +1511,21 @@ impl RouterState {
             .filter(|e| e.get("from").and_then(|v| v.as_str()) == Some(direct[1]))
             .count();
         if c0 == c1 {
-            return;
+            return Ok(());
         }
         let pi_hex = if c0 > c1 { direct[0] } else { direct[1] };
 
         let _ = self
-            .route_request(
+            .route_request_prepared(
                 Some(handle),
                 "rename_symbol",
                 serde_json::json!({"address": pi_hex, "new_name": "process_instruction"}),
+                preparation.clone(),
             )
-            .await;
+            .await?;
 
         info!(handle = %handle, pi = %pi_hex, "sBPF: renamed process_instruction");
+        Ok(())
     }
 
     pub async fn close_by_path(
@@ -1753,7 +1777,16 @@ impl RouterState {
             &format!("Queued {method}"),
         ) {
             Ok(id) => id,
-            Err(existing) => existing,
+            Err(existing) => {
+                let original = self
+                    .task_registry
+                    .get(&existing)
+                    .ok_or(ToolError::WorkerClosed)?;
+                let meta = original.meta.unwrap_or(serde_json::Value::Null);
+                return Ok(
+                    serde_json::json!({"task_id":existing,"status":"queued","path":meta["path"],"method":meta["method"],"tenant_id":meta["tenant_id"],"priority":meta["priority"]}),
+                );
+            }
         };
         self.task_registry.merge_meta(
             &task_id,
@@ -2004,14 +2037,18 @@ impl RouterState {
     pub async fn cancel_task(&self, task_id: &str) -> bool {
         let queued = {
             let mut queue = self.route_queue.lock().await;
-            queue
-                .queued
-                .iter()
-                .position(|task| task.task_id == task_id)
-                .map(|position| queue.queued.remove(position))
+            let mut removed = false;
+            queue.queued.retain(|task| {
+                if task.task_id != task_id {
+                    return true;
+                }
+                task.preparation.cancel.cancel();
+                removed = true;
+                false
+            });
+            removed
         };
-        if let Some(task) = queued {
-            let _ = task.preparation.cancel.cancel();
+        if queued {
             self.task_registry.cancellation_confirmed(task_id);
             return true;
         }
@@ -2447,6 +2484,131 @@ pub(crate) async fn resolve_open_path(
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_dedupe_cancel_removes_all_work_without_overwriting_original() {
+        let router = RouterState::new().unwrap();
+        {
+            let mut queue = router.route_queue.lock().await;
+            for i in 0..router.config.max_active_tasks {
+                let id = format!("occupied-{i}");
+                queue.active.insert(
+                    id.clone(),
+                    ActiveRouteTask {
+                        task_id: id,
+                        path: "fixture".into(),
+                        method: "barrier".into(),
+                        tenant_id: "occupant".into(),
+                        priority: 0,
+                        started_at: Instant::now(),
+                    },
+                );
+            }
+        }
+        let first = router
+            .enqueue_route_task(
+                "/fixture/first",
+                "fixture",
+                serde_json::json!({"timeout_secs":1}),
+                Some("tenant".into()),
+                1,
+                Some("same".into()),
+            )
+            .await
+            .unwrap();
+        let id = first["task_id"].as_str().unwrap();
+        let original = router.route_queue.lock().await.queued[0]
+            .preparation
+            .clone();
+        let second = router
+            .enqueue_route_task(
+                "/fixture/second",
+                "fixture",
+                serde_json::json!({"timeout_secs":600}),
+                Some("other".into()),
+                9,
+                Some("same".into()),
+            )
+            .await
+            .unwrap();
+        let count = router.route_queue.lock().await.queued.len();
+        let meta = router.task_registry.get(id).unwrap().meta.unwrap();
+        let cancelled = router.cancel_task(id).await;
+        router.route_queue.lock().await.active.clear();
+        router.drive_route_queue().await;
+        assert_eq!(second["task_id"], first["task_id"]);
+        assert_eq!(count, 1, "dedupe must not insert a second queued operation");
+        assert_eq!(
+            meta["path"], "/fixture/first",
+            "dedupe must not overwrite accepted metadata"
+        );
+        assert_eq!(meta["tenant_id"], "tenant");
+        assert!(
+            cancelled && original.cancel.is_cancelled(),
+            "original token must receive cancellation"
+        );
+        let queue = router.route_queue.lock().await;
+        assert!(
+            queue.queued.is_empty() && queue.active.is_empty() && queue.tenant_active.is_empty()
+        );
+        assert_eq!(
+            router.task_registry.get(id).unwrap().status,
+            crate::server::task::TaskStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn nexus_business_capacity_uses_tenant_configuration_and_control_remains_independent() {
+        let mut router = RouterState::new().unwrap();
+        let mut config = (*router.config).clone();
+        config.max_pending_per_worker = 1;
+        config.max_pending_per_tenant = 3;
+        router.config = Arc::new(config);
+        let caps = crate::nexus::NexusCapabilities {
+            runtime: crate::nexus::NexusRuntime {
+                ida: crate::nexus::Version(9, 5, 0),
+                python: crate::nexus::Version(3, 14, 7),
+                nexus: Some(crate::nexus::Version(0, 13, 4)),
+                domain: Some(crate::nexus::Version(0, 5, 1)),
+            },
+            methods: Default::default(),
+        };
+        router.install_nexus_capabilities(caps).unwrap();
+        let endpoint = router.nexus_endpoint();
+        let lanes = endpoint.take_lanes().unwrap();
+        assert_eq!(lanes.business.max_capacity(), 3);
+        assert_eq!(lanes.control.max_capacity(), 8);
+        for i in 0..4 {
+            let request = crate::nexus::AcceptedRequest::new(
+                &crate::nexus::SystemClock,
+                crate::nexus::RequestId::new(format!("r-{i}")).unwrap(),
+                None,
+                "open",
+                serde_json::json!({}),
+            )
+            .unwrap();
+            let client = crate::nexus::ClientId::new("fixture").unwrap();
+            let result = endpoint.transition(|sessions, backend| {
+                sessions.open(
+                    &client,
+                    request,
+                    crate::nexus::OpenSpec {
+                        operation_id: crate::nexus::OperationId::new(format!("o-{i}")).unwrap(),
+                        path: "/fixture.i64".into(),
+                        options: serde_json::json!({}),
+                    },
+                    backend,
+                )
+            });
+            if i < 3 {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().code, crate::nexus::NexusErrorCode::Busy);
+            }
+        }
+        drop(lanes);
+        endpoint.transition(|_, _| ());
+    }
+
     #[test]
     fn test_router_module_exists() {
         let _ = std::module_path!();
@@ -2483,6 +2645,11 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("fixture child");
+        crate::preprocess::record_owned_fixture(
+            child.id().expect("owned spawned PID"),
+            false,
+            "router-blocked-pipe",
+        );
         let stdin = child.stdin.take().expect("fixture stdin");
         let mut reader = BufReader::new(child.stdout.take().expect("fixture stdout"));
         let mut started = String::new();
@@ -2678,3 +2845,7 @@ mod tests {
     #[ignore = "requires IDA Pro license and compiled binary"]
     fn test_worker_eof_graceful_shutdown() {}
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/n2_f1_router.rs"]
+mod n2_f1_regressions;

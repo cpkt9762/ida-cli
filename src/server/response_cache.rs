@@ -22,10 +22,7 @@ pub async fn guard_response_size(
     result: Value,
 ) -> Result<Value, crate::error::ToolError> {
     let method = method.to_string();
-    crate::blocking::run(crate::blocking::WorkClass::Encode, move || {
-        guard_response_size_sync(&method, result)
-    })
-    .await?
+    crate::blocking::response(move || guard_response_size_sync(&method, result)).await?
 }
 
 fn guard_response_size_sync(method: &str, result: Value) -> Result<Value, crate::error::ToolError> {

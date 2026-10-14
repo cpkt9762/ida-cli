@@ -1,8 +1,9 @@
 //! Task-owned offline processes. Never manages Nexus owners or shared IDA workers.
 //! The unreaped group leader pins PID/PGID until the last destructive signal.
 use crate::error::ToolError;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -23,22 +24,18 @@ pub struct Preparation {
 pub struct PreparationCancellation {
     token: CancellationToken,
     publication: Arc<AtomicU8>,
+    input_jobs: Arc<AtomicUsize>,
 }
 impl PreparationCancellation {
-    /// Returns false once publication has won; callers must not report cancellation.
+    /// Cancellation belongs to the whole preparation. A committed artifact is
+    /// retained, but must not disable cancellation of later open/query phases.
     pub fn cancel(&self) -> bool {
-        if self
-            .publication
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return false;
-        }
+        let first = self.publication.fetch_or(1, Ordering::SeqCst) & 1 == 0;
         self.token.cancel();
-        true
+        first
     }
     pub fn is_cancelled(&self) -> bool {
-        self.publication.load(Ordering::SeqCst) == 1
+        self.token.is_cancelled()
     }
     pub async fn cancelled(&self) {
         self.token.cancelled().await;
@@ -51,6 +48,7 @@ impl Preparation {
             cancel: PreparationCancellation {
                 token: CancellationToken::new(),
                 publication: Arc::new(AtomicU8::new(0)),
+                input_jobs: Arc::new(AtomicUsize::new(0)),
             },
         }
     }
@@ -61,11 +59,11 @@ impl Preparation {
         work: impl std::future::Future<Output = Result<T, ToolError>>,
     ) -> Result<T, ToolError> {
         self.check()?;
-        tokio::select! {biased;
+        self.scope(async { tokio::select! {biased;
             _=self.cancel.cancelled()=>Err(ToolError::Preparation {message:"cancelled during bounded input work; no command sent; background permit retained".into(),execution_stopped:false}),
             _=tokio::time::sleep_until(self.deadline.into())=>Err(ToolError::Preparation {message:"total deadline expired during bounded input work; no command sent; background permit retained".into(),execution_stopped:false}),
             result=work=>result,
-        }
+        }}).await
     }
     pub fn check(&self) -> Result<(), ToolError> {
         if self.cancel.is_cancelled() {
@@ -135,11 +133,17 @@ pub async fn run(
     let pid = child
         .id()
         .ok_or_else(|| ToolError::IdaError("offline child PID missing".into()))?;
+    #[cfg(test)]
+    record_owned_fixture(pid, true, "offline-supervisor");
     let owner = OwnedChild {
         child: Some(child),
         pid: i32::try_from(pid).map_err(|e| ToolError::IdaError(e.to_string()))?,
         reaped: false,
         cleanup_confirmed: false,
+        #[cfg(unix)]
+        pipes: Vec::new(),
+        #[cfg(unix)]
+        pipes_observed: false,
         permits: Some((permit, admission)),
     };
     let (send, receive) = oneshot::channel();
@@ -160,6 +164,10 @@ struct OwnedChild {
     pid: i32,
     reaped: bool,
     cleanup_confirmed: bool,
+    #[cfg(unix)]
+    pipes: Vec<OwnedFd>,
+    #[cfg(unix)]
+    pipes_observed: bool,
     permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
 }
 impl Drop for OwnedChild {
@@ -187,6 +195,10 @@ impl Drop for OwnedChild {
         let reaped = self.reaped;
         let child = self.child.take();
         let permits = self.permits.take();
+        #[cfg(unix)]
+        let mut pipes = std::mem::take(&mut self.pipes);
+        #[cfg(unix)]
+        let pipes_observed = self.pipes_observed;
         // Never block a runtime thread on an uninterruptible child. At most four
         // emergency reapers can exist: they retain both process/admission permits.
         std::thread::spawn(move || {
@@ -208,7 +220,28 @@ impl Drop for OwnedChild {
             }
             // No destructive signals after reaping: only observe this owned group.
             // Unconfirmed descendants retain the finite capacity, including at runtime exit.
-            while !matches!(group_gone(pid), Ok(true)) {
+            #[cfg(unix)]
+            let mut pipe_error_logged = false;
+            #[cfg(unix)]
+            let pipes_closed = || {
+                if !pipes_observed {
+                    return false;
+                }
+                match pipes_eof(&mut pipes) {
+                    Ok(closed) => closed,
+                    Err(error) => {
+                        if !pipe_error_logged {
+                            tracing::error!(%error,"offline pipe cleanup remains unconfirmed");
+                            pipe_error_logged = true;
+                        }
+                        false
+                    }
+                }
+            };
+            #[cfg(not(unix))]
+            let pipes_closed = || false;
+            let mut pipes_closed = pipes_closed;
+            while !matches!(group_gone(pid), Ok(true)) || !pipes_closed() {
                 std::thread::sleep(Duration::from_millis(10));
             }
         });
@@ -243,77 +276,47 @@ fn exited_without_reaping(pid: i32) -> std::io::Result<bool> {
         Ok(info.si_pid() == pid)
     }
 }
+mod process_query;
 #[cfg(target_os = "macos")]
-fn group_members(pid: i32) -> std::io::Result<Vec<libc::proc_bsdinfo>> {
-    // Apple libproc.h: PROC_PGRP_ONLY=2, PROC_PIDTBSDINFO=3. The group is
-    // pinned by our unreaped leader; no process-name or global PID scan is used.
-    let mut pids = [0i32; 256];
-    // SAFETY: bounded writable PID array, exact byte size, read-only kernel query.
-    let count = unsafe {
-        libc::proc_listpids(
-            2,
-            pid as u32,
-            pids.as_mut_ptr().cast(),
-            std::mem::size_of_val(&pids) as i32,
-        )
-    };
-    if count < 0 || count as usize >= std::mem::size_of_val(&pids) {
-        return Err(std::io::Error::other(
-            "owned process group enumeration failed or truncated",
-        ));
+use process_query::group_members;
+use process_query::signal_group;
+
+#[cfg(unix)]
+fn duplicate_pipe(fd: std::os::fd::RawFd) -> std::io::Result<OwnedFd> {
+    // SAFETY: duplicate a live owned pipe; CLOEXEC prevents descriptor leaks.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    let mut members = Vec::new();
-    for member in pids
-        .into_iter()
-        .take(count as usize / std::mem::size_of::<i32>())
-        .filter(|p| *p > 0)
-    {
-        // SAFETY: zero initializes C output storage; libproc writes exactly its size.
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of_val(&info) as i32;
-        let read = unsafe {
-            libc::proc_pidinfo(
-                member,
-                3,
-                0,
-                (&mut info as *mut libc::proc_bsdinfo).cast(),
-                size,
+    // SAFETY: successful fcntl returned a new exclusively owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+#[cfg(unix)]
+fn pipes_eof(pipes: &mut Vec<OwnedFd>) -> std::io::Result<bool> {
+    let mut buffer = [0u8; 8192];
+    let mut index = 0;
+    while index < pipes.len() {
+        // SAFETY: live nonblocking owned pipe and bounded writable byte buffer.
+        let n = unsafe {
+            libc::read(
+                pipes[index].as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
             )
         };
-        if read != size {
+        if n == 0 {
+            pipes.swap_remove(index);
+            continue;
+        }
+        if n < 0 {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                continue;
+            if !matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
+                return Err(error);
             }
-            return Err(error);
         }
-        if info.pbi_pid != member as u32 || info.pbi_pgid != pid as u32 {
-            return Err(std::io::Error::other("owned group identity changed"));
-        }
-        members.push(info);
+        index += 1;
     }
-    Ok(members)
-}
-fn signal_group(pid: i32, signal: i32) -> std::io::Result<()> {
-    // SAFETY: caller still exclusively owns the unreaped group leader.
-    if unsafe { libc::kill(-pid, signal) } == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(());
-    }
-    #[cfg(target_os = "macos")]
-    if error.raw_os_error() == Some(libc::EPERM)
-        && group_members(pid)?
-            .iter()
-            .all(|member| member.pbi_status == 5)
-    {
-        // Darwin refuses signals to an all-zombie group. Explicit kernel status
-        // proves no member can run; EPERM alone is never interpreted as stopped.
-        return Ok(());
-    }
-    Err(error)
+    Ok(pipes.is_empty())
 }
 async fn drain<R: AsyncRead + Unpin>(mut pipe: R) -> std::io::Result<Vec<u8>> {
     let mut captured = Vec::new();
@@ -356,6 +359,16 @@ async fn supervise(
         .stderr
         .take()
         .ok_or_else(|| ToolError::IdaError("offline stderr missing".into()))?;
+    #[cfg(unix)]
+    {
+        owner.pipes = vec![
+            duplicate_pipe(stdout.as_raw_fd())
+                .map_err(|error| ToolError::IdaError(format!("stdout ownership: {error}")))?,
+            duplicate_pipe(stderr.as_raw_fd())
+                .map_err(|error| ToolError::IdaError(format!("stderr ownership: {error}")))?,
+        ];
+        owner.pipes_observed = true;
+    }
     let mut drains = DrainTasks {
         stdout: tokio::spawn(drain(stdout)),
         stderr: tokio::spawn(drain(stderr)),
@@ -459,64 +472,143 @@ async fn supervise(
     })
 }
 
-/// Unique sibling directory; final output is published without replacing a valid file.
-#[derive(Debug)]
-pub struct StagedArtifact {
-    pub directory: PathBuf,
-    pub output: PathBuf,
-    destination: PathBuf,
+mod cleanup;
+pub use cleanup::{CleanupReceipt, StagedArtifact};
+
+tokio::task_local! { pub(crate) static CURRENT_PREPARATION: Preparation; }
+pub(crate) fn current() -> Option<Preparation> {
+    CURRENT_PREPARATION.try_with(Clone::clone).ok()
 }
-impl StagedArtifact {
-    pub fn create(destination: &Path) -> std::io::Result<Self> {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let parent = destination.parent().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "output has no parent")
-        })?;
-        std::fs::create_dir_all(parent)?;
-        let directory = parent.join(format!(
-            ".n2-prepare-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&directory)?;
-        let output = directory.join(destination.file_name().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "output has no file name")
-        })?);
-        Ok(Self {
-            directory,
-            output,
-            destination: destination.into(),
-        })
+impl Preparation {
+    pub(crate) async fn scope<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        CURRENT_PREPARATION.scope(self.clone(), work).await
     }
-    pub fn publish(&self, preparation: &Preparation) -> Result<(), ToolError> {
-        preparation.check()?;
-        preparation
-            .cancel
-            .publication
-            .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
-            .map_err(|_| ToolError::Preparation {
-                message: "cancelled before publication".into(),
-                execution_stopped: true,
-            })?;
-        // This is the commit point. Later cancellation explicitly returns false.
-        // The blocking job retains its permit and stage until the syscall returns.
-        let result = std::fs::hard_link(&self.output, &self.destination).map_err(|e| {
-            ToolError::IdaError(format!(
-                "publish {} without overwrite: {e}",
-                self.destination.display()
-            ))
-        });
-        preparation
-            .cancel
-            .publication
-            .store(if result.is_ok() { 3 } else { 0 }, Ordering::SeqCst);
-        result
+    /// Native work is not interrupted by dropping its receiver. A sent request
+    /// without its real response remains unknown, regardless of cancellation.
+    pub(crate) async fn native<T>(
+        &self,
+        work: impl std::future::Future<Output = Result<T, ToolError>>,
+    ) -> Result<T, ToolError> {
+        self.check()?;
+        self.scope(async {
+            tokio::select! { biased;
+                result=work => result,
+                _=self.cancel.cancelled() => Err(ToolError::Preparation { message: "native request may have been sent; cancellation requires stop evidence; never replay".into(), execution_stopped:false }),
+                _=tokio::time::sleep_until(self.deadline.into()) => Err(ToolError::Preparation { message: "native request total deadline expired; stop unconfirmed; never replay".into(), execution_stopped:false }),
+            }
+        }).await
     }
 }
-impl Drop for StagedArtifact {
+
+pub(crate) struct InputJob(Arc<AtomicUsize>);
+impl Drop for InputJob {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.directory) {
-            tracing::warn!(path = %self.directory.display(), error = %e, "staging cleanup failed");
-        }
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl Preparation {
+    pub fn active_input_jobs(&self) -> usize {
+        self.cancel.input_jobs.load(Ordering::SeqCst)
+    }
+    pub(crate) fn track_input(&self) -> InputJob {
+        self.cancel.input_jobs.fetch_add(1, Ordering::SeqCst);
+        InputJob(self.cancel.input_jobs.clone())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn record_owned_fixture(pid: u32, group_owned: bool, kind: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("n2-process-identities.jsonl");
+    let record = serde_json::json!({"pid":pid,"pgid":if group_owned {Some(pid)}else{None},"kind":kind,"owned_spawn":true});
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("isolated owned fixture audit")
+        .write_all(format!("{record}\n").as_bytes())
+        .expect("complete audit append");
+}
+
+#[cfg(test)]
+mod pipe_ownership_regressions {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    #[tokio::test(flavor = "current_thread")]
+    async fn escaped_open_pipe_is_unknown_and_retains_owned_capacity_until_real_eof() {
+        let directory =
+            std::env::temp_dir().join(format!("n2-escaped-pipe-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("ready.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/support/n2_process_fixture.py"
+            ))
+            .arg("escaped_pipe")
+            .arg(&socket)
+            .arg(directory.join("unused-final"));
+        let task = tokio::spawn(run(command, Preparation::new(Duration::from_secs(15))));
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stream = BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        let identity: serde_json::Value = serde_json::from_str(&line).unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(
+                directory
+                    .parent()
+                    .unwrap()
+                    .join("n2-process-identities.jsonl"),
+            )
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        stream.get_mut().write_all(b"G").await.unwrap();
+        let result = task.await.unwrap();
+        let retained = PROCESS_GATE.available_permits() < 4;
+        // Release the escaped fixture through its owned handshake, never a PID signal.
+        let mut release = tokio::net::UnixStream::connect(directory.join("escaped.sock"))
+            .await
+            .unwrap();
+        release.write_all(b"R").await.unwrap();
+        let mut closed = String::new();
+        BufReader::new(release)
+            .read_line(&mut closed)
+            .await
+            .unwrap();
+        assert_eq!(closed, "closed\n");
+        let child = identity["child"].as_i64().unwrap() as i32;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                // SAFETY: non-destructive probe of the exact fixture handshake PID.
+                if unsafe { libc::kill(child, 0) } != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    && PROCESS_GATE.available_permits() == 4
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            retained,
+            "a reaped group leader cannot release capacity while task-owned pipe writers remain"
+        );
+        assert!(
+            matches!(result,Err(ToolError::IdaError(ref message)) if message.contains("cleanup unconfirmed") && message.contains("remains open")),
+            "{result:?}"
+        );
     }
 }

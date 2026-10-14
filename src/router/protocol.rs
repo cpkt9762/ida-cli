@@ -81,6 +81,38 @@ impl RpcResponse {
     }
 }
 
+// Reserved internal metadata is attached by the local router, consumed and
+// removed before the legacy dispatcher. External timeout_secs remains seconds.
+const DEADLINE_KEY: &str = "_ida_cli_deadline_monotonic_ns";
+pub(crate) fn attach_deadline(
+    params: &mut Value,
+    deadline: std::time::Instant,
+) -> Result<(), crate::error::ToolError> {
+    let expiry = super::nexus_transport::wire_expiry(Some(deadline))
+        .map_err(|e| crate::error::ToolError::IdaError(e.to_string()))?;
+    let object = params.as_object_mut().ok_or_else(|| {
+        crate::error::ToolError::InvalidParams("request params must be an object".into())
+    })?;
+    object.insert(DEADLINE_KEY.into(), expiry.into());
+    Ok(())
+}
+pub(crate) fn take_deadline(
+    params: &mut Value,
+    fallback: std::time::Instant,
+) -> Result<std::time::Instant, crate::error::ToolError> {
+    let Some(value) = params.as_object_mut().and_then(|p| p.remove(DEADLINE_KEY)) else {
+        return Ok(fallback);
+    };
+    let expiry = value.as_u64().ok_or_else(|| {
+        crate::error::ToolError::InvalidParams("invalid internal deadline".into())
+    })?;
+    let now = super::nexus_transport::monotonic_ns()
+        .map_err(|e| crate::error::ToolError::IdaError(e.to_string()))?;
+    Ok(fallback.min(
+        std::time::Instant::now() + std::time::Duration::from_nanos(expiry.saturating_sub(now)),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

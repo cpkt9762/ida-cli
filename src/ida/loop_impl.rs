@@ -41,6 +41,14 @@ pub fn run_ida_loop(rx: mpsc::Receiver<EnqueuedRequest>) {
 
     while let Ok(enqueued) = rx.recv() {
         let wait_ms = enqueued.enqueued_at.elapsed().as_millis();
+        if enqueued
+            .preparation
+            .as_ref()
+            .is_some_and(|preparation| preparation.check().is_err())
+        {
+            debug!("Skipping native request cancelled or expired before execution");
+            continue;
+        }
         let req = enqueued.request;
 
         // Fix 2: Skip requests whose caller already disconnected (oneshot cancelled).
@@ -71,6 +79,14 @@ pub fn run_ida_loop(rx: mpsc::Receiver<EnqueuedRequest>) {
             native_backend().init_library();
             info!("IDA library initialized successfully");
             lib_initialized = true;
+        }
+        if enqueued
+            .preparation
+            .as_ref()
+            .is_some_and(|preparation| preparation.check().is_err())
+        {
+            debug!("Skipping request cancelled/expired during library initialization");
+            continue;
         }
         match req {
             IdaRequest::Open {

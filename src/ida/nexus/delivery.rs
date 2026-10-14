@@ -175,6 +175,70 @@ impl<C: Clock> NexusSessions<C> {
         Ok(record.snapshot.clone())
     }
 
+    /// Read-only last send gate. ACK/uncertainty authorize callbacks, never a
+    /// second send. Stop controls deliberately permit a live UnknownOutcome.
+    pub fn send_eligible(
+        &self,
+        command: &SessionCommand,
+        attempt: &DeliveryAttempt,
+    ) -> Result<(), NexusError> {
+        if command.target() != attempt.target {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidIdentity,
+                "command/attempt mismatch",
+            ));
+        }
+        let record = self.current_delivery(attempt)?;
+        if record.snapshot.attempt != *attempt || record.snapshot.state != DeliveryState::Queued {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "send attempt is stale or already resolved",
+            ));
+        }
+        if let Some(lease) = attempt.target.lease() {
+            self.current_owner(attempt.target.client(), lease)?;
+        }
+        let eligible = match command {
+            SessionCommand::Open { identity, .. } => return self.open_send_eligible(identity),
+            SessionCommand::Execute(c) => {
+                self.active(&c.identity.lease.client_id, &c.identity.lease)?;
+                let snapshot = self.operation_status(&c.identity.lease.client_id, &c.identity)?;
+                snapshot.status == OperationStatus::Running
+                    && !snapshot.execution_stopped
+                    && snapshot.cancel_reason.is_none()
+                    && !self
+                        .operations
+                        .get(&c.identity.operation_id)
+                        .is_some_and(|operation| {
+                            operation.request.deadline.expired(self.clock.now())
+                        })
+            }
+            SessionCommand::Cancel { identity, reason } => {
+                let snapshot = self.operation_status(&identity.lease.client_id, identity)?;
+                !snapshot.execution_stopped && snapshot.cancel_reason == Some(*reason)
+            }
+            SessionCommand::Release { lease } => matches!(
+                self.authorize(&lease.client_id, lease)?.phase,
+                SessionPhase::ReleaseRequested | SessionPhase::Disconnected
+            ),
+            SessionCommand::Shutdown { identity, .. } => {
+                let session = self.authorize(&identity.lease.client_id, &identity.lease)?;
+                session.pending_shutdown.as_ref() == Some(identity)
+                    && matches!(
+                        session.phase,
+                        SessionPhase::ShutdownRequested | SessionPhase::Disconnected
+                    )
+            }
+        };
+        if !eligible {
+            return Err(NexusError::new(
+                NexusErrorCode::Cancelled,
+                "command lifecycle no longer permits send",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn live_delivery(&self, attempt: &DeliveryAttempt) -> Result<bool, NexusError> {
         let record = self.current_delivery(attempt)?;
         if record.snapshot.attempt != *attempt {

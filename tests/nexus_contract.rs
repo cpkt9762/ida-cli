@@ -729,3 +729,6 @@ mod failures;
 mod delivery_lifecycle;
 #[path = "support/nexus_delivery_regression.rs"]
 mod delivery_regression;
+
+#[path = "support/nexus_send_eligibility.rs"]
+mod send_eligibility;

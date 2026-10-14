@@ -89,10 +89,8 @@ async fn handle_cli_connection(
     let parsed = if bytes.len() <= 64 * 1024 {
         serde_json::from_slice::<RpcRequest>(&bytes)
     } else {
-        crate::blocking::run(crate::blocking::WorkClass::Encode, move || {
-            serde_json::from_slice::<RpcRequest>(&bytes)
-        })
-        .await?
+        crate::blocking::request_decode(move || serde_json::from_slice::<RpcRequest>(&bytes))
+            .await?
     };
     let control = parsed.as_ref().is_ok_and(|request| {
         matches!(
@@ -125,12 +123,14 @@ async fn handle_cli_connection(
         Err(e) => RpcResponse::err("null", -32700, format!("Parse error: {e}")),
     };
 
-    let class = if control {
-        crate::blocking::WorkClass::Control
+    let json = if control {
+        crate::blocking::run(crate::blocking::WorkClass::Control, move || {
+            serde_json::to_vec(&resp)
+        })
+        .await??
     } else {
-        crate::blocking::WorkClass::Encode
+        crate::blocking::response(move || serde_json::to_vec(&resp)).await??
     };
-    let json = crate::blocking::run(class, move || serde_json::to_vec(&resp)).await??;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         writer.write_all(&json).await?;
         writer.write_all(b"\n").await?;
