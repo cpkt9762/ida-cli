@@ -8,6 +8,7 @@ just test-http    # HTTP / SSE integration test
 just test-script  # IDAPython script execution test
 just test-dsc /path/to/dyld_shared_cache_arm64e  # DSC loading test
 just cargo-test   # Unit tests (no IDA required)
+just test-list-idbs  # list_idbs against a real, isolated daemon
 ```
 
 All integration tests require IDA Pro with a valid license. Run
@@ -39,6 +40,19 @@ binary as a worker subprocess.
 - `tools/list` returns the full tool list
 - Database operations work over HTTP (`open_idb`, `list_functions`,
   `close_idb` with `close_token`)
+
+**list_idbs test** (`just test-list-idbs`, `tests/list_idbs_e2e.rs`)
+
+- Starts a temporary `serve-http` daemon under an isolated `IDA_CLI_HOME`
+  (never `~/.ida`) and stops it with `shutdown` through that home
+- Two MCP sessions over the daemon's Unix socket each open one database;
+  `list_idbs` (MCP and `ida-cli list-idbs`) lists both with distinct client
+  ids, paths and worker pids, never a close token
+- Closing one database removes only its entry; a shared database stays listed
+  until its last reference is released
+- Needs `IDA_TEST=1`, an IDA runtime and a C compiler; `IDA_CLI_E2E_BIN`
+  tests another build (for example the release binary) and
+  `LIST_IDBS_E2E_OUT` writes the transcript of every answer
 
 **Script test** (`just test-script`)
 

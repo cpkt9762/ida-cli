@@ -207,6 +207,15 @@ test-3db:
         ./3db_integration.sh
     echo "✅ 3-DB test passed"
 
+# Run the list_idbs test against a real daemon on an isolated IDA_CLI_HOME
+test-list-idbs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "🧪 Running list_idbs real-daemon test..."
+    cd ..
+    IDA_TEST=1 cargo test --test list_idbs_e2e -- --nocapture
+    echo "✅ list_idbs test passed"
+
 # Run reference-count integration test (router mode)
 test-ref-count: fixture
     #!/usr/bin/env bash
