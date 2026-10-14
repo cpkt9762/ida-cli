@@ -31,9 +31,11 @@ struct SmokeCase {
     allow_error: bool,
 }
 
+type PendingResponses = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
+
 struct WorkerClient {
     writer_tx: std_mpsc::Sender<String>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>,
+    pending: PendingResponses,
     counter: AtomicU64,
     child: Mutex<std::process::Child>,
 }
@@ -75,8 +77,7 @@ async fn spawn_worker() -> WorkerClient {
     let stdin = child.stdin.take().expect("failed to capture child stdin");
     let stdout = child.stdout.take().expect("failed to capture child stdout");
 
-    let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
     let pending_for_reader = pending.clone();
     let pending_for_writer = pending.clone();
     let (writer_tx, writer_rx) = std_mpsc::channel::<String>();
@@ -176,9 +177,10 @@ impl WorkerClient {
         });
 
         let (tx, rx) = oneshot::channel();
-        let mut map = self.pending.lock().expect("pending mutex poisoned");
-        map.insert(id.clone(), tx);
-        drop(map);
+        {
+            let mut map = self.pending.lock().expect("pending mutex poisoned");
+            map.insert(id.clone(), tx);
+        }
 
         let line = serde_json::to_string(&req)
             .map_err(|e| format!("serialize request failed: {e}"))?
@@ -234,11 +236,13 @@ async fn client() -> &'static WorkerClient {
                                 &fixture_stem.to_string_lossy().to_string(),
                                 &format!("mini_e2e_{}", std::process::id()),
                             ));
-                            fs::copy(&path, &temp_file).expect(&format!(
-                                "failed to copy fixture file {} to {}",
-                                path.display(),
-                                temp_file.display()
-                            ));
+                            fs::copy(&path, &temp_file).unwrap_or_else(|error| {
+                                panic!(
+                                    "failed to copy fixture file {} to {}: {error}",
+                                    path.display(),
+                                    temp_file.display()
+                                )
+                            });
                         }
                     }
                 }
