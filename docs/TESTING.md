@@ -67,3 +67,124 @@ binary as a worker subprocess.
 Tests use `test/fixtures/mini.c`, a minimal C program compiled into a
 Mach-O binary. The integration tests open the raw binary via `open_idb`;
 IDA auto-analyses it and writes an `.i64` alongside.
+
+## Nexus N0 isolation and baseline
+
+N0 prepares and verifies the dependency environment only. Business handlers
+still use the existing backend. The `nexus_*_e2e` Rust targets in the migration
+plan are future work; do not count them as executed tests.
+
+Use a new worktree and an external, nonexistent environment directory. Install
+GNU `timeout` first. Select an IDA 9.4+ installation with its existing legal
+license available, Python 3.11+, and an already accepted `ida.reg`. Preparation
+never accepts terms or copies `.hexlic` files. An external 0600 bootstrap copy
+of the selected registry is reduced by IDA's public registry API to existing
+EULA records and the selected Python library path. No database is opened during
+that step. The profile marker prevents the helper from modifying user profiles.
+Missing dependencies, rejected EULA/registry state, and failed commands are
+errors; a zero IDA exit without the readiness marker also fails.
+
+Preparation can take 180 seconds for dependency downloads, wheel builds and
+fixture compilation; each child command has its own 30-second shell timeout.
+Choose paths for the local machine; the scripts do not read environment files.
+
+```bash
+N0_ROOT="$(mktemp -d)/environment"
+timeout 180s python3 scripts/prepare_nexus_env.py --root "$N0_ROOT" \
+  --ida-dir "$IDADIR" --eula-registry "$N0_ACCEPTED_REGISTRY"
+timeout 30s "$N0_ROOT/venv/bin/python" tests/test_nexus_n0_support.py -v
+```
+
+The preparation pins Nexus `0.13.4` at
+`d60ff582fde90c59726336c0dbdf3e8286e9df7a`, Domain `0.5.1`, and the IDA-supplied
+`idapro 0.0.10`. `scripts/nexus/requirements.lock` fixes the build/test dependency
+closure. Wheel and sample SHA-256 values, `pip check`, the full package freeze,
+all preparation commands/exit codes and logs are recorded in the external root.
+The root contains independent `venv`, `profile`, `state`, `cli-home`, `fixtures`,
+`backups` and `tmp` directories. Existing roots are refused, including failed
+ones; create another root to retry preparation.
+
+### Loopback DNS patch
+
+Upstream 0.13.4 inherits `HTTPServer.server_bind`, whose `getfqdn()` reverse DNS
+lookup can block startup. `scripts/nexus/loopback-bind.patch` is a local patch
+against that exact source SHA, applied with `git apply --check` before wheel
+construction. It calls `TCPServer.server_bind` and supplies numeric HTTP server
+metadata. Loopback binding, authentication, Host validation and request handling
+remain upstream implementations. It changes neither system DNS nor global
+Python/IDA. When upstream fixes this, update the pinned source and remove the
+patch only after the regression tests pass.
+
+The original-source probe loads the pinned unpatched HTTP module from Git. The
+fault flag injects a blocking reverse lookup in that test process only, allowing
+reproduction even on hosts where natural loopback DNS is currently fast. A
+natural successful probe does not mean the historical issue has disappeared.
+
+```bash
+timeout 20s "$N0_ROOT/venv/bin/python" scripts/verify_nexus_n0.py --root "$N0_ROOT" dns --original
+timeout 8s "$N0_ROOT/venv/bin/python" scripts/verify_nexus_n0.py --root "$N0_ROOT" dns --original --fault
+timeout 30s "$N0_ROOT/venv/bin/python" scripts/verify_nexus_n0.py --root "$N0_ROOT" dns --fault
+```
+
+Only the injected original-source probe is expected to exit 124. Its
+faulthandler output must show `server_bind -> getfqdn -> gethostbyaddr`. The
+patched probe must return `READY` and exit zero. Test processes use no temporary
+`sitecustomize`; a Python distribution's normal hook, if loaded, must be inside
+the selected interpreter installation and is recorded in the evidence.
+
+### Saved copies and bounded cleanup
+
+Build the unmodified input SHA with matching SDK/runtime and an external
+`CARGO_TARGET_DIR`; save its executable, SHA-256, source archive, build command
+and `probe-runtime` output separately. Never use an unidentified installed CLI
+as the old-version baseline. Run each repository check with shell timeout:
+`cargo fmt --all -- --check`, `cargo check --locked`,
+`cargo clippy --locked --all-targets -- -D warnings`, and
+`cargo test --locked --lib`. Defaults are 30 seconds; announce the reason and
+180-second limit before a cold Rust/FFI build. Report existing failures and
+ignored tests explicitly. The old `just` recipes do not add these limits and
+assume a repository-local target directory.
+
+The real baseline suite can take 180 seconds for repeated IDA starts and saves.
+It starts the fixed old executable directly as `serve-worker`, then uses Nexus
+public handles on separate sample copies. Both paths assert functions, saved
+annotations, closed packed backups, reopens, and unchanged backup hashes. It
+does not discover or start the user's CLI daemon. A `processes.jsonl` ledger
+records this test's PID, start identity and command before readiness. Cleanup
+signals only recorded PIDs with matching birth times, allowing normal exec argv
+changes while rejecting PID reuse; no global `pkill` is used. Execute
+the separate cleanup command after success, failure, or an outer forced timeout.
+An environment lock rejects concurrent verification or cleanup in the same root;
+use separate freshly prepared roots for independent suites.
+
+```bash
+timeout --kill-after=10s 180s "$N0_ROOT/venv/bin/python" scripts/verify_nexus_n0.py \
+  --root "$N0_ROOT" --legacy-binary "$N0_OLD_BINARY" baseline
+timeout 30s python3 scripts/verify_nexus_n0.py --root "$N0_ROOT" cleanup
+timeout 30s "$N0_ROOT/venv/bin/python" scripts/verify_nexus_n0.py --root "$N0_ROOT" startup-timeout
+timeout 30s python3 scripts/verify_nexus_n0.py --root "$N0_ROOT" cleanup
+```
+
+The startup-timeout case stops only its newly recorded disposable worker before
+readiness, requires an explicit finite timeout error, and confirms cleanup. Use
+a fresh environment for each such case. For the outer interruption path, set
+`--startup-budget 20` with an outer `timeout --kill-after=10s 2s`; expect exit
+124 and require `startup-timeout-cleanup.json` plus independent cleanup success.
+These are E00/E01 and baseline-support evidence, not E03–E29 acceptance.
+
+### Subsequent concurrency test design
+
+The historical concurrency probe becomes the following maintained design for
+later stages. Create A/B database copies, two independent clients sharing A,
+and confirm instance identity before assertions. Use a remote started-file or
+protocol barrier and an explicit release event, rather than timing guesses.
+During cooperative work, require A's control channel and B's bounded query to
+respond while A's second ordinary query queues. Record upstream's execution
+timeout excluding queue time separately from the router's required total
+deadline. Cancel by operation ID, verify the real cancellation error, then
+query A again. In the artificial GIL-holding native case, expect the affected
+worker health probe to time out, require B/router responsiveness, and verify
+recovery after native return. Later fairness tests must insert a short query
+between batch boundaries; process exit or a cancelled Rust future alone is
+insufficient evidence. N0 does not claim these scenarios passed for ida-cli's
+future Nexus bridge.

@@ -1,0 +1,26 @@
+diff --git a/ida_nexus/_http.py b/ida_nexus/_http.py
+--- a/ida_nexus/_http.py
++++ b/ida_nexus/_http.py
+@@ -8,6 +8,7 @@
+ from dataclasses import dataclass, field
+ from http.server import BaseHTTPRequestHandler, HTTPServer
+ from io import BufferedIOBase
++from socketserver import TCPServer
+ from urllib.parse import urlsplit
+
+ from ._serialization import dumps_json
+@@ -433,6 +434,14 @@ class LocalHTTPServer(HTTPServer):
+     # producing a second latency mode around one scheduler quantum.
+     request_queue_size = socket.SOMAXCONN
+
++    def server_bind(self) -> None:
++        # This server binds a numeric loopback address only. HTTPServer's
++        # getfqdn() reverse lookup adds an unbounded DNS dependency to startup.
++        # Keep TCP binding and HTTP metadata without resolving a host name.
++        TCPServer.server_bind(self)
++        self.server_name = str(self.server_address[0])
++        self.server_port = int(self.server_address[1])
++
+     def __init__(
+         self,
+         token: str,
