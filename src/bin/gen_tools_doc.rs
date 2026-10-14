@@ -127,6 +127,42 @@ fn main() {
     let _ = writeln!(out, "- Addresses accept hex (`0x1000`) or decimal (`4096`)");
     let _ = writeln!(
         out,
+        "- `decompile_function` with `line_addresses=true` (CLI: `decompile --line-addresses`) answers"
+    );
+    let _ = writeln!(
+        out,
+        "  `{{code, lines}}`: `code` is the usual pseudocode and `lines` has one `{{line, text, addresses}}`"
+    );
+    let _ = writeln!(
+        out,
+        "  entry per line. `line` counts from 1, `text` is that line of `code`, and `addresses` are the IDA"
+    );
+    let _ = writeln!(
+        out,
+        "  addresses (hex strings, ascending, no duplicates) of the ctree items Hex-Rays anchored on the line."
+    );
+    let _ = writeln!(
+        out,
+        "  A line can map to several non-contiguous addresses, and the list is not every instruction of the"
+    );
+    let _ = writeln!(
+        out,
+        "  statement. The function signature and local declarations have none; `{{`, `}}`, `else` and blank"
+    );
+    let _ = writeln!(
+        out,
+        "  lines can carry the address of the block or `if` that owns them (the function entry for the"
+    );
+    let _ = writeln!(
+        out,
+        "  outermost braces). The `sub_` rename hint is not added in this mode, and the idat backend answers"
+    );
+    let _ = writeln!(
+        out,
+        "  NotSupported. Without the flag the answer is unchanged."
+    );
+    let _ = writeln!(
+        out,
         "- Raw binaries are auto-analyzed on first open; `.i64` is saved alongside the input"
     );
 

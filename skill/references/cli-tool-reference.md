@@ -35,7 +35,7 @@ ida-cli probe-runtime                   # internal, prints a backend probe JSON
 
 ```bash
 ida-cli --path <file> list-functions [--filter NAME] [--limit 100] [--offset 0]
-ida-cli --path <file> decompile --addr 0x1000
+ida-cli --path <file> decompile --addr 0x1000 [--line-addresses]
 ida-cli --path <file> disasm --addr 0x1000 [--count 20]
 ida-cli --path <file> disasm --name main [--count 20]
 ida-cli --path <file> xrefs-to --addr 0x1000
@@ -47,6 +47,13 @@ ida-cli --path <file> list-imports [--limit 100] [--offset 0]
 ida-cli --path <file> list-strings [--query ERROR] [--limit 100]
 ida-cli --path <file> list-segments
 ```
+
+`decompile --line-addresses` (MCP/RPC: `line_addresses: true`) answers
+`{code, lines}` where each `lines` entry is `{line, text, addresses}`: the IDA
+addresses Hex-Rays anchored on that line. A line can have several
+non-contiguous addresses; signature and declaration lines have none, and `{`,
+`}`, `else` and blank lines can carry the address of the block or `if` that
+owns them. Native-linked backend only.
 
 ## Service / Queue Subcommands
 

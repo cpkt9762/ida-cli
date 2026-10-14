@@ -130,6 +130,19 @@ cargo build --bin ida-cli
 ./target/debug/ida-cli list-idbs --json
 ```
 
+需要每一行伪代码对应的地址时，给 `decompile` 加 `--line-addresses`（MCP / RPC：`decompile_function` 的
+`line_addresses: true`）。返回变为 `{"code": ..., "lines": [...]}`：`code` 与平时相同，`lines` 每项是
+`{"line", "text", "addresses"}`。`line` 从 1 开始，`text` 是 `code` 里的同一行，`addresses` 是 Hex-Rays
+挂在这一行上的 ctree 项的 IDA 地址（十六进制字符串，升序、去重）。一行可能对应多个不连续的地址，
+列表也不是该语句的全部指令；函数签名和局部变量声明没有地址；`{`、`}`、`else` 和空行可能带着所属块或
+`if` 的地址（最外层大括号是函数入口）。该模式不加 `sub_` 改名提示。只有 native-linked 后端支持，
+idat 后端返回 `NotSupported`。经 CLI socket 时，大结果与其他命令一样落到响应缓存
+（`IDA_MCP_MAX_INLINE_BYTES`）。
+
+```json
+{"line": 6, "text": "  while ( a1 != 1 )", "addresses": ["0x10000033c", "0x100000340"]}
+```
+
 第一个参数是服务端子命令（`serve` / `serve-http` / `serve-worker` / `probe-runtime`）时，进入服务端模式：
 
 ```bash

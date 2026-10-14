@@ -63,7 +63,7 @@ Decompile functions to pseudocode (requires Hex-Rays)
 | Tool | Description |
 |------|-------------|
 | `batch_decompile` | Decompile multiple functions at once |
-| `decompile_function` | Decompile function to C pseudocode |
+| `decompile_function` | Decompile function to C pseudocode (line_addresses adds per-line addresses) |
 | `decompile_structured` | Decompile function to structured AST (ctree JSON) |
 | `diff_pseudocode` | Diff two functions' decompiled pseudocode line by line |
 | `get_pseudocode_at` | Get pseudocode for specific address/range |
@@ -217,4 +217,13 @@ Execute Python scripts via IDAPython
 - Many tools accept a single value or array (e.g., `"0x1000"` or `["0x1000", "0x2000"]`)
 - String inputs may be comma-separated: `"0x1000, 0x2000"`
 - Addresses accept hex (`0x1000`) or decimal (`4096`)
+- `decompile_function` with `line_addresses=true` (CLI: `decompile --line-addresses`) answers
+  `{code, lines}`: `code` is the usual pseudocode and `lines` has one `{line, text, addresses}`
+  entry per line. `line` counts from 1, `text` is that line of `code`, and `addresses` are the IDA
+  addresses (hex strings, ascending, no duplicates) of the ctree items Hex-Rays anchored on the line.
+  A line can map to several non-contiguous addresses, and the list is not every instruction of the
+  statement. The function signature and local declarations have none; `{`, `}`, `else` and blank
+  lines can carry the address of the block or `if` that owns them (the function entry for the
+  outermost braces). The `sub_` rename hint is not added in this mode, and the idat backend answers
+  NotSupported. Without the flag the answer is unchanged.
 - Raw binaries are auto-analyzed on first open; `.i64` is saved alongside the input

@@ -162,6 +162,24 @@ tokens are never returned.
 ./target/debug/ida-cli list-idbs --json
 ```
 
+To get the address behind each line of pseudocode, add `--line-addresses` to
+`decompile` (MCP and RPC: `line_addresses: true` on `decompile_function`). The
+answer becomes `{"code": ..., "lines": [...]}`: `code` is the usual text and
+each `lines` entry is `{"line", "text", "addresses"}`. `line` counts from 1,
+`text` is that line of `code`, and `addresses` are the IDA addresses (hex
+strings, ascending, no duplicates) of the ctree items Hex-Rays anchored on the
+line. A line can map to several non-contiguous addresses, and the list is not
+every instruction of the statement. The signature and local declarations have
+none; `{`, `}`, `else` and blank lines can carry the address of the block or
+`if` that owns them (the function entry for the outermost braces). The `sub_`
+rename hint is not added in this mode. Only the native-linked backend can do
+this; the idat backend answers `NotSupported`. Over the CLI socket a large
+answer is stored in the response cache like any other (`IDA_MCP_MAX_INLINE_BYTES`).
+
+```json
+{"line": 6, "text": "  while ( a1 != 1 )", "addresses": ["0x10000033c", "0x100000340"]}
+```
+
 Commands whose first argument is a service subcommand (`serve`,
 `serve-http`, `serve-worker`, `probe-runtime`) enter service mode instead:
 

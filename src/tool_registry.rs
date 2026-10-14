@@ -552,10 +552,21 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "decompile_function",
         category: ToolCategory::Decompile,
-        short_desc: "Decompile function to C pseudocode",
+        short_desc: "Decompile function to C pseudocode (line_addresses adds per-line addresses)",
         full_desc: "Decompile a function using Hex-Rays decompiler (if available). \
-                    Returns C-like pseudocode. Accepts address or function name.",
-        example: r#"{"address": "0x1000"}"#,
+                    Returns C-like pseudocode. Accepts address or function name. \
+                    With line_addresses=true the answer is {code, lines}: `code` is the same text \
+                    and `lines` has one {line, text, addresses} entry per pseudocode line. `line` \
+                    counts from 1, `text` is that line of `code`, and `addresses` are the IDA \
+                    addresses (hex strings, ascending, no duplicates) of the ctree items Hex-Rays \
+                    anchored on the line. Limits: a line can map to several non-contiguous \
+                    addresses and the list is not every instruction of the statement; the \
+                    function signature and local declarations have none; `{`, `}`, `else` and \
+                    blank lines can carry the address of the block or `if` that owns them (the \
+                    function entry for the outermost braces). The sub_ rename hint is not added in \
+                    this mode. Needs the native-linked backend (the idat backend answers \
+                    NotSupported). Default is off and the answer is unchanged.",
+        example: r#"{"address": "0x1000", "line_addresses": true}"#,
         default: false,
         keywords: &["decompile", "pseudocode", "c", "source", "hex-rays"],
         aliases: &["decompile"],
