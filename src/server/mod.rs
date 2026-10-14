@@ -28,6 +28,9 @@ pub struct IdaMcpServer {
     tool_mux: ToolMux<IdaMcpServer>,
     mode: ServerMode,
     task_registry: task::TaskRegistry,
+    /// Identity of the MCP session this server instance serves. The daemon
+    /// builds one instance per session (per request in stateless HTTP mode).
+    client: crate::router::listing::ClientIdentity,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +95,7 @@ impl IdaMcpServer {
             tool_mux: ToolMux::new(call_router),
             mode,
             task_registry: task::TaskRegistry::new(),
+            client: crate::router::listing::ClientIdentity::mcp_session(),
         }
     }
 
@@ -119,7 +123,7 @@ impl IdaMcpServer {
                  \n\nNote: tools/list exposes the full tool set by default; use tool_catalog/tool_help to discover usage. \
                  \n{close_hint} \
                  \n\nTool Categories: \
-                 \n- core: open/close/discover (open_idb, close_idb, tool_catalog, tool_help, idb_meta) \
+                 \n- core: open/close/discover (open_idb, close_idb, list_idbs, tool_catalog, tool_help, idb_meta) \
                  \n- functions: list, resolve, lookup functions \
                  \n- disassembly: disasm at addresses \
                  \n- decompile: Hex-Rays pseudocode \
@@ -591,10 +595,11 @@ impl IdaMcpServer {
         let expanded = crate::expand_path(&req.path);
         let is_sbpf = crate::router::is_sbpf_elf(&expanded);
 
-        let (db_handle, close_token) = match router.spawn_worker(&req.path, None).await {
-            Ok(r) => r,
-            Err(e) => return Ok(ToolError::OpenFailed(e.to_string()).to_tool_result()),
-        };
+        let (db_handle, close_token) =
+            match router.spawn_worker(&req.path, None, &self.client).await {
+                Ok(r) => r,
+                Err(e) => return Ok(ToolError::OpenFailed(e.to_string()).to_tool_result()),
+            };
 
         let params = json!({
             "path": req.path,
@@ -1007,6 +1012,38 @@ impl IdaMcpServer {
             }
             Err(e) => Ok(e.to_tool_result()),
         }
+    }
+
+    #[tool(description = "List the databases the daemon currently holds open. \
+        Per database: db_handle, the input path and the .i64 it was opened from, an opaque id of \
+        the client that opened it, when it was opened, the worker process, whether it is the \
+        active database, and which clients still hold references. \
+        Use it before rebuilding or replacing an .i64 (for example with idat) to confirm no other \
+        client has it open. Returns an empty list when nothing is open. \
+        Never returns close tokens; client ids tell clients apart and are not credentials.")]
+    #[instrument(skip(self))]
+    async fn list_idbs(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: list_idbs");
+        let ServerMode::Router(ref router) = self.mode else {
+            return Ok(ToolError::NotSupported(
+                "list_idbs needs the multi-database daemon (serve-http or serve)".to_string(),
+            )
+            .to_tool_result());
+        };
+        let listing = router.list_idbs(Some(&self.client)).await;
+        let text = match listing
+            .to_json()
+            .and_then(|v| serde_json::to_string_pretty(&v))
+        {
+            Ok(text) => text,
+            Err(e) => {
+                return Ok(
+                    ToolError::IdaError(format!("failed to serialize database list: {e}"))
+                        .to_tool_result(),
+                )
+            }
+        };
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(description = "Discover available tools by query or category. \
@@ -5272,6 +5309,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "dsc_add_dylib" => Some(schema::<DscAddDylibRequest>()),
         "dsc_add_region" => Some(schema::<DscAddRegionRequest>()),
         "close_idb" => Some(schema::<CloseIdbRequest>()),
+        "list_idbs" => Some(schema::<EmptyParams>()),
         "load_debug_info" => Some(schema::<LoadDebugInfoRequest>()),
         "get_analysis_status" => Some(schema::<EmptyParams>()),
         "tool_catalog" => Some(schema::<ToolCatalogRequest>()),
@@ -5770,5 +5808,101 @@ mod tests {
         let wrapped = task_payload_result_value(Some(payload));
         let parsed: CallToolResult = serde_json::from_value(wrapped).expect("must parse");
         assert_eq!(parsed.content.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod list_idbs_tests {
+    use super::{IdaMcpServer, ServerMode};
+    use crate::ida::IdaWorker;
+    use crate::router::RouterState;
+    use serde_json::{json, Value};
+    use std::sync::{mpsc, Arc};
+
+    fn server_on(router: &RouterState) -> IdaMcpServer {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        IdaMcpServer::new(
+            Arc::new(IdaWorker::new(tx)),
+            ServerMode::Router(router.clone()),
+        )
+    }
+
+    async fn call_list_idbs(server: &IdaMcpServer) -> (Value, String) {
+        let result = server.list_idbs().await.expect("tool call succeeds");
+        assert_ne!(result.is_error, Some(true), "list_idbs reported an error");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("text content");
+        (serde_json::from_str(&text).expect("JSON body"), text)
+    }
+
+    #[test]
+    fn list_idbs_is_exposed_by_the_mcp_tool_router() {
+        let router = RouterState::new().expect("router");
+        let server = server_on(&router);
+        assert!(server.tool_mux.get("list_idbs").is_some());
+        assert!(server
+            .tool_mux
+            .list_all()
+            .iter()
+            .any(|tool| tool.name == "list_idbs"));
+    }
+
+    #[tokio::test]
+    async fn list_idbs_tool_returns_an_empty_list_when_nothing_is_open() {
+        let router = RouterState::new().expect("router");
+        let server = server_on(&router);
+        let (value, _) = call_list_idbs(&server).await;
+        assert_eq!(value, json!({"count": 0, "idbs": []}));
+    }
+
+    #[tokio::test]
+    async fn list_idbs_tool_tells_sessions_apart_and_marks_the_callers_own() {
+        let router = RouterState::new().expect("router");
+        let first = server_on(&router);
+        let second = server_on(&router);
+        assert_ne!(first.client, second.client);
+        let (a, a_token) = router.register_test_worker("/db/a.so", &first.client).await;
+        let (b, b_token) = router
+            .register_test_worker("/db/b.so", &second.client)
+            .await;
+
+        let (as_first, text) = call_list_idbs(&first).await;
+        assert_eq!(as_first["count"], 2);
+        let idbs = as_first["idbs"].as_array().expect("array");
+        let find = |handle: &str| {
+            idbs.iter()
+                .find(|idb| idb["db_handle"] == handle)
+                .expect("handle listed")
+        };
+        assert_eq!(find(&a)["opened_by_caller"], true);
+        assert_eq!(find(&b)["opened_by_caller"], false);
+        assert_eq!(find(&a)["opened_by"]["kind"], "mcp");
+        assert_ne!(
+            find(&a)["opened_by"]["client_id"],
+            find(&b)["opened_by"]["client_id"]
+        );
+        assert!(!text.contains(&a_token) && !text.contains(&b_token));
+        assert!(!text.contains("close_token"));
+
+        let (as_second, _) = call_list_idbs(&second).await;
+        let from_second = as_second["idbs"].as_array().expect("array");
+        let mine: Vec<&str> = from_second
+            .iter()
+            .filter(|idb| idb["opened_by_caller"] == true)
+            .filter_map(|idb| idb["db_handle"].as_str())
+            .collect();
+        assert_eq!(mine, vec![b.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn list_idbs_tool_refuses_outside_the_multi_database_daemon() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let server = IdaMcpServer::new(Arc::new(IdaWorker::new(tx)), ServerMode::Stdio);
+        let result = server.list_idbs().await.expect("tool call succeeds");
+        assert_eq!(result.is_error, Some(true));
     }
 }

@@ -135,7 +135,9 @@ fn tool_supported_by_backend(name: &str, backend: WorkerBackendKind) -> bool {
         "open_idb" => "open",
         "close_idb" => "close",
         "read_byte" | "read_word" | "read_dword" | "read_qword" => "read_int",
-        "tool_catalog" | "tool_help" | "get_task_status" | "convert_number" => return true,
+        "tool_catalog" | "tool_help" | "get_task_status" | "convert_number" | "list_idbs" => {
+            return true
+        }
         other => other,
     };
     IDAT_COMPAT_METHODS.contains(&worker_method)
@@ -149,6 +151,17 @@ mod tests {
     fn native_linked_capabilities_are_not_empty() {
         assert!(supported_methods_for(WorkerBackendKind::NativeLinked).len() > 50);
         assert!(supported_tools_for(WorkerBackendKind::NativeLinked).len() > 50);
+    }
+
+    #[test]
+    fn list_idbs_is_a_daemon_tool_every_backend_supports() {
+        for backend in [
+            WorkerBackendKind::NativeLinked,
+            WorkerBackendKind::IdatCompat,
+        ] {
+            let tools = supported_tools_for(backend);
+            assert!(tools.iter().any(|tool| tool == "list_idbs"), "{backend}");
+        }
     }
 
     #[test]

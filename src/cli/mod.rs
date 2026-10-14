@@ -166,6 +166,9 @@ pub enum CliCommand {
     },
     Close,
     Status,
+    /// List the databases the daemon holds open and the clients holding them
+    /// (run it before rebuilding an .i64 to confirm no other client uses it)
+    ListIdbs,
     Shutdown,
     Raw {
         json_str: String,
@@ -453,6 +456,7 @@ fn build_rpc_params(
         }
         CliCommand::Close => "close",
         CliCommand::Status => "status",
+        CliCommand::ListIdbs => "list_idbs",
         CliCommand::Shutdown => "shutdown",
         // The variants below are dispatched in `run()` before `build_rpc_params`
         // is ever called, so reaching them here would be a programmer mistake.
@@ -529,6 +533,14 @@ mod tests {
         );
         assert_eq!(method, "get_address_info");
         assert_eq!(params["address"], "0x2000");
+    }
+
+    #[test]
+    fn list_idbs_needs_no_path_and_forwards_the_tenant() {
+        let (method, params) = build_rpc_params(&CliCommand::ListIdbs, None, Some("team-a"));
+        assert_eq!(method, "list_idbs");
+        assert!(params.get("path").is_none());
+        assert_eq!(params["tenant_id"], "team-a");
     }
 }
 

@@ -367,6 +367,32 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         aliases: &[],
     },
     ToolInfo {
+        name: "list_idbs",
+        category: ToolCategory::Core,
+        short_desc: "List open databases and the clients holding them",
+        full_desc: "List the databases the daemon currently holds open. \
+                    Per database: db_handle, the input path and the .i64 it was opened from, \
+                    an opaque id of the client that opened it, when it was opened, the worker \
+                    process, whether it is the active database, and which clients still hold \
+                    references (ref_count and per-client holders). \
+                    Use it before rebuilding or replacing an .i64 (for example with idat) to \
+                    confirm no other client has it open: an .i64 that appears here is still \
+                    held by the daemon, and idat fails on a database that is open elsewhere. \
+                    state is 'open', or 'opening' while an open request is still in flight. \
+                    Returns {\"count\": 0, \"idbs\": []} when nothing is open. \
+                    close_token values are never returned; client ids tell clients apart and \
+                    are not credentials. opened_by_caller and holders[].is_caller mark the \
+                    asking client's own entries. \
+                    CLI: ida-cli list-idbs. Requires the multi-database daemon (serve-http or serve).",
+        example: r#"{}"#,
+        default: true,
+        keywords: &[
+            "list", "open", "databases", "idb", "i64", "clients", "holders", "lock", "busy",
+            "rebuild", "in use",
+        ],
+        aliases: &[],
+    },
+    ToolInfo {
         name: "tool_catalog",
         category: ToolCategory::Core,
         short_desc: "Discover available tools by query or category",
@@ -1659,6 +1685,16 @@ mod tests {
         assert!(!results.is_empty());
         // Should find "get_callers" tool
         assert!(results.iter().any(|(t, _)| t.name == "get_callers"));
+    }
+
+    #[test]
+    fn test_list_idbs_is_a_default_core_tool_found_by_search() {
+        let tool = get_tool("list_idbs").expect("list_idbs is registered");
+        assert_eq!(tool.category, ToolCategory::Core);
+        assert!(tool.default);
+        assert!(tool.short_desc.len() < 100);
+        let results = search_tools("which databases are open", 5);
+        assert!(results.iter().any(|(t, _)| t.name == "list_idbs"));
     }
 
     #[test]
