@@ -120,6 +120,16 @@ cargo build --bin ida-cli
 ./target/debug/ida-cli --path /path/to/sample.bin raw '{"method":"get_xrefs_to","params":{"address":"0x140001000"}}'
 ```
 
+查看 daemon 当前打开了哪些数据库、由哪些客户端持有，用 `list-idbs`（MCP 工具：`list_idbs`）。
+重建或替换 `.i64`（例如用 `idat`）之前先跑一次：仍出现在列表里的库就是被 daemon 持有的，
+`idat` 对已在别处打开的库会失败。返回 `{"count": N, "idbs": [...]}`，每项包含 `db_handle`、
+输入文件与 `.i64` 路径、打开它的客户端的不可逆标识、打开时间、所在 worker、是否为活动库，
+以及仍持有引用的客户端。不会返回 `close_token`。
+
+```bash
+./target/debug/ida-cli list-idbs --json
+```
+
 第一个参数是服务端子命令（`serve` / `serve-http` / `serve-worker` / `probe-runtime`）时，进入服务端模式：
 
 ```bash

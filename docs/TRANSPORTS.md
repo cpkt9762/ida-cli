@@ -93,6 +93,26 @@ close_idb(token: "<close_token from open_idb>")
 
 Each `open_idb` response includes a `close_token` for secure closure.
 
+Listing what is open:
+
+```
+list_idbs()
+# Returns: { "count": 1, "idbs": [ { "db_handle": "abc123...",
+#   "state": "open", "input_path": "...", "idb_path": "...i64",
+#   "opened_by": { "client_id": "mcp-...", "kind": "mcp" },
+#   "opened_at": "2026-10-14T12:00:00Z", "worker": { "pid": 4242, ... },
+#   "active": true, "ref_count": 1, "holders": [ ... ] } ] }
+```
+
+`list_idbs` (CLI: `ida-cli list-idbs`) reports every database the daemon holds
+open, including one whose `open` is still in flight (`state: "opening"`), and
+`{"count": 0, "idbs": []}` when nothing is open. Use it before rebuilding or
+replacing an `.i64` (for example with `idat`) to confirm no other client has
+it open. Client ids are opaque hashes that tell clients apart; they are not
+credentials, and close tokens are never part of the answer.
+`opened_by_caller` and `holders[].is_caller` mark the asking client's own
+entries. Over stateless HTTP every request is its own client.
+
 Notes:
 
 - `open_dsc` (dyld_shared_cache) is not supported in multi-IDB mode.

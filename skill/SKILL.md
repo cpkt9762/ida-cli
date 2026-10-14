@@ -468,6 +468,9 @@ live in [vm-devirt.md](references/vm-devirt.md).
 4. serialise write-heavy work
 5. close cleanly with `close_idb` (HTTP/SSE requires the `close_token`
    returned by `open_idb`)
+6. before rebuilding or replacing an `.i64` (for example with `idat`), run
+   `list_idbs` (CLI: `ida-cli list-idbs`) and confirm the database is no
+   longer listed; a listed database is still held open by the daemon
 
 ### Workflow 7: Batch Annotation
 

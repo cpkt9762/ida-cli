@@ -68,8 +68,17 @@ ida-cli federation-heartbeat <name> <url> [--weight 1] \
 
 ida-cli --path <file> close
 ida-cli status
+ida-cli list-idbs [--tenant T]
 ida-cli shutdown
 ```
+
+`list-idbs` (MCP tool `list_idbs`) prints `{"count": N, "idbs": [...]}` for
+every database the daemon holds open: `db_handle`, `input_path`, `idb_path`,
+`state` (`open`, or `opening` while an open is in flight), `opened_by`
+(opaque client id and kind), `opened_at`, `worker` (pid, backend), `active`,
+`ref_count` and `holders`. It never prints close tokens. Run it before
+rebuilding an `.i64` with `idat`; a database listed here is still held by the
+daemon.
 
 ## Everything Else Goes Through `raw` or `pipe`
 

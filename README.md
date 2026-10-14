@@ -148,6 +148,20 @@ Streamable-HTTP server bound to a random port and writes
 ./target/debug/ida-cli --path /path/to/sample.bin raw '{"method":"get_xrefs_to","params":{"address":"0x140001000"}}'
 ```
 
+To see which databases the daemon currently holds open, and which clients
+hold them, run `list-idbs` (MCP tool: `list_idbs`). Run it before rebuilding
+or replacing an `.i64`, for example with `idat`: a database that is still
+listed is held open by the daemon, and `idat` fails on a database that is
+open elsewhere. The answer is `{"count": N, "idbs": [...]}`; each entry has
+the `db_handle`, the input path and the `.i64` path, an opaque id of the
+client that opened it, when it was opened, the worker process, whether it is
+the active database, and the clients that still hold references. Close
+tokens are never returned.
+
+```bash
+./target/debug/ida-cli list-idbs --json
+```
+
 Commands whose first argument is a service subcommand (`serve`,
 `serve-http`, `serve-worker`, `probe-runtime`) enter service mode instead:
 
