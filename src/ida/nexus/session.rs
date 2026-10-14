@@ -157,7 +157,7 @@ impl<C: Clock> NexusSessions<C> {
         let closing = self.sessions.values().any(|session| {
             session.lease.instance_id == lease.instance_id
                 && session.lease.generation == lease.generation
-                && session.phase == SessionPhase::ShutdownRequested
+                && session.pending_shutdown.is_some()
         });
         let error = if let Some(error) = &opening.failure {
             Some(error.clone())
@@ -474,7 +474,7 @@ impl<C: Clock> NexusSessions<C> {
             // erase an unresolved release attempt or permit silent replay.
             return Ok(());
         }
-        if phase == SessionPhase::ShutdownRequested {
+        if self.authorize(client, lease)?.pending_shutdown.is_some() {
             return Err(NexusError::new(
                 NexusErrorCode::CancelPending,
                 "shutdown is still pending confirmation",

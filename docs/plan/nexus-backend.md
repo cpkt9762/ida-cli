@@ -335,7 +335,7 @@ N1-F1 将调用者结果、native 停止证据和单次投递状态分开。`Del
 
 `delivery_acknowledged` 仅记录当前 attempt 的 ACK，不能释放执行槽位、lease 或确认 shutdown；ACK 后再报 NotSent 是矛盾事件，明确拒绝。首次失败后不让重复失败重写来源，迟到真实生命周期确认仍可协调当前 attempt。`complete` 仅接受真实执行调用已返回/停止的证据，迟到完成对 unknown 只补 execution_stopped；`open_failed` 是明确打开失败，仍保留有界墓碑，若随后出现成功 handle 则跟踪并释放。`opened` 拒绝的任何新且未注册 handle（错误身份、零 generation、重复 acquisition、旧代际等）仍归 N3 持有并清理；不能丢弃句柄或关闭其他 lease。同一已注册 lease 的重复消息只丢消息，不重复关闭该 handle。
 
-重复 cancel/expire 在相同 reason 的 Queued/Acknowledged 控制下不增发；失败后的显式调用才生成新 attempt。总 deadline 优先于 client reason，升级 deadline 也用新 attempt，旧 ACK/失败不能影响后继。停止或确证 owner 代际替换后不再发送旧控制；真实断连本身不是停止，当前代际的未知执行仍允许通过独立控制连接尝试停止。没有业务请求自动重放。释放确认和关闭拒绝/成功必须携带当前 attempt，不能仅凭 lease 或 task_id；旧失败不能恢复 Active，旧确认不能确认后继释放/关闭。
+重复 cancel/expire 在相同 reason 的 Queued/Acknowledged 控制下不增发；失败后的显式调用才生成新 attempt。总 deadline 优先于 client reason，升级 deadline 也用新 attempt，旧 ACK/失败不能影响后继。停止或确证 owner 代际替换后不再发送旧控制；真实断连本身不是停止，当前代际的未知执行仍允许通过独立控制连接尝试停止。pending_shutdown 独立于 phase 保留：Disconnected 下仍阻止该 lease 的 release，且迟到 open 仍为 ReleaseRequired，直到匹配关闭结果解除责任。没有业务请求自动重放。释放确认和关闭拒绝/成功必须携带当前 attempt，不能仅凭 lease 或 task_id；旧失败不能恢复 Active，旧确认不能确认后继释放/关闭。
 
 每个逻辑命令只保留最新 attempt：Open/Execute/Shutdown 各受 operation 保留容量约束，Cancel 每 operation 一条、Release 每 lease 一条。记录总数不超过三倍 coordinator capacity，重试替换记录；sequence 溢出明确 Busy，不复用 ID。N2/N3 负责有界 transport 本身及显式控制重试节奏，不能把 transport 结果当 native 已停止。
 

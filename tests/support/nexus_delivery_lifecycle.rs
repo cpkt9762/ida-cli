@@ -320,3 +320,69 @@ fn shutdown_failure_and_late_rejection_cannot_undo_real_disconnect() {
         .delivery_failed(&attempt, DispatchFailure::NotSent(transport_error("stale")))
         .unwrap());
 }
+
+#[test]
+fn pending_shutdown_blocks_release_after_real_disconnect() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("shutdown-retained", "instance", 1);
+    let attempt = shutdown(&mut rig, &lease, "shutdown-retained");
+    assert!(rig.sessions.disconnected(&lease.instance_id, 1));
+    let sent = rig.backend.controls.len();
+    assert_eq!(
+        rig.sessions
+            .release(&lease.client_id, &lease, &mut rig.backend)
+            .unwrap_err()
+            .code,
+        NexusErrorCode::CancelPending
+    );
+    assert_eq!(rig.backend.controls.len(), sent);
+    assert!(rig.sessions.shutdown_rejected(&attempt).unwrap());
+    assert_eq!(
+        rig.sessions.status(&lease.client_id, &lease).unwrap().phase,
+        SessionPhase::Disconnected
+    );
+    rig.sessions
+        .release(&lease.client_id, &lease, &mut rig.backend)
+        .unwrap();
+    assert!(rig.sessions.released(&rig.last_attempt()).unwrap());
+}
+
+#[test]
+fn pending_shutdown_rejects_late_open_after_real_disconnect() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("shutdown-open", "instance", 1);
+    let attempt = shutdown(&mut rig, &lease, "shutdown-open");
+    assert!(rig.sessions.disconnected(&lease.instance_id, 1));
+    let (open, late) = rig.begin_open("late-during-disconnect", "instance", 1, 120);
+    assert!(matches!(
+        rig.sessions
+            .opened(&open, late.clone(), capabilities())
+            .unwrap(),
+        OpenDisposition::ReleaseRequired {
+            error: NexusError {
+                code: NexusErrorCode::Busy,
+                ..
+            },
+            ..
+        }
+    ));
+    assert_eq!(
+        rig.sessions.status(&late.client_id, &late).unwrap().phase,
+        SessionPhase::ReleaseRequired
+    );
+    assert!(rig
+        .sessions
+        .delivery_failed(
+            &attempt,
+            DispatchFailure::NotSent(transport_error("shutdown never sent"))
+        )
+        .unwrap());
+    assert_eq!(
+        rig.sessions.status(&lease.client_id, &lease).unwrap().phase,
+        SessionPhase::Disconnected
+    );
+    rig.sessions
+        .release(&late.client_id, &late, &mut rig.backend)
+        .unwrap();
+    assert!(rig.sessions.released(&rig.last_attempt()).unwrap());
+}
