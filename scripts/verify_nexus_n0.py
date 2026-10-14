@@ -20,7 +20,7 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(REPO / "tests/support"))
-from nexus_env import Environment  # noqa: E402
+from nexus_env import Environment, identity, same_process  # noqa: E402
 
 
 def check(condition, message):
@@ -65,10 +65,14 @@ def dns_probe(env, original, fault):
 class LegacyWorker:
     def __init__(self, env, binary):
         self.log = (env.root / "logs/legacy-worker.log").open("w")
-        self.process = subprocess.Popen([str(binary), "serve-worker"], env=env.variables(),
-                                        cwd=env.root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=self.log, text=True, bufsize=1)
-        env.record(self.process, [str(binary), "serve-worker"])
+        command = [str(binary), "serve-worker"]
+        try:
+            self.process = env.spawn(lambda: subprocess.Popen(
+                command, env=env.variables(), cwd=env.root, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=self.log, text=True, bufsize=1), command)
+        except BaseException:
+            self.log.close()
+            raise
         self.sequence = 0
 
     def call(self, method, params=None):
@@ -135,6 +139,20 @@ def legacy_baseline(env, binary):
     (env.root / "legacy-baseline.json").write_text(json.dumps(result, indent=2) + "\n")
 
 
+def owned_nexus_spawn(env, spawner, *args, **kwargs):
+    """Register at Popen, including upstream errors after creation but before return."""
+    from ida_nexus import _resolver
+    proxy = types.SimpleNamespace(**vars(subprocess))
+
+    def owned_popen(command, **options):
+        return env.spawn(lambda: subprocess.Popen(command, **options), command)
+
+    proxy.Popen = owned_popen
+    # Replace only the resolver's module reference, never global Popen.
+    with patch.object(_resolver, "subprocess", proxy):
+        return spawner(*args, **kwargs)
+
+
 def nexus_baseline(env):
     import importlib.metadata
     import ida_nexus
@@ -154,9 +172,7 @@ def nexus_baseline(env):
     original_spawn = _resolver.spawn_worker
 
     def owned_spawn(*args, **kwargs):
-        process, log_path = original_spawn(*args, **kwargs)
-        env.record(process, process.args)
-        return process, log_path
+        return owned_nexus_spawn(env, original_spawn, *args, **kwargs)
 
     def open_owned(path):
         def resolve_owned(*args, **kwargs):
@@ -215,12 +231,18 @@ def startup_timeout(env, budget):
     check(not source.exists(), "startup fault fixture must be new")
     shutil.copyfile(env.root / "fixtures/mini", source)
     processes = []
+    stopped = []
+    result = {"status": "FAIL", "owned_workers": [], "stopped_workers": [], "clean": False}
 
     def stopped_spawn(*args, **kwargs):
-        process, log = _resolver.spawn_worker(*args, **kwargs)
+        process, log = owned_nexus_spawn(env, _resolver.spawn_worker, *args, **kwargs)
         processes.append(process)
-        env.record(process, process.args)
+        entry = next((e for e in env.entries() if e["pid"] == process.pid), None)
+        check(entry is not None and same_process(identity(process.pid), entry["identity"]),
+              "startup fault requires a confirmed, durably registered worker")
+        check(process.poll() is None, "startup fault worker exited before SIGSTOP")
         os.kill(process.pid, signal.SIGSTOP)
+        stopped.append(process.pid)
         return process, log
 
     def resolve_stopped(*args, **kwargs):
@@ -233,17 +255,31 @@ def startup_timeout(env, budget):
                     startup_timeout=budget, worker_env=env.variables(), worker_cwd=env.root))
             except (TimeoutError, WorkerStartError) as error:
                 check("timed out" in str(error), "startup must report its finite deadline")
-                print(json.dumps({"status": "EXPECTED_TIMEOUT", "error_type": type(error).__name__}))
+                check(processes and stopped == [p.pid for p in processes],
+                      "startup timed out before a registered worker was stopped; fault case not exercised")
+                result.update(status="EXPECTED_TIMEOUT", error_type=type(error).__name__)
             else:
                 handle.close(wait_for_database=True, timeout=5)
                 raise AssertionError("stopped worker unexpectedly became ready")
+    except BaseException as error:
+        result.update(status="FAIL", error_type=type(error).__name__)
+        raise
     finally:
-        killed = env.cleanup()
-        for process in processes:
-            process.wait(timeout=5)
-        env.assert_clean()
-        (env.root / "startup-timeout-cleanup.json").write_text(json.dumps(
-            {"signalled_owned_pids": killed, "owned_workers": [p.pid for p in processes], "clean": True}, indent=2) + "\n")
+        result.update(owned_workers=[p.pid for p in processes], stopped_workers=stopped)
+        try:
+            result["signalled_owned_pids"] = env.cleanup()
+            for process in processes:
+                process.wait(timeout=5)
+            env.assert_clean()
+            result["accounting_clean"] = True
+            result["clean"] = bool(processes and stopped == [p.pid for p in processes])
+            result["worker_returncodes"] = {str(p.pid): p.returncode for p in processes}
+        except BaseException as error:
+            result.update(status="FAIL", cleanup_error_type=type(error).__name__)
+            raise
+        finally:
+            (env.root / "startup-timeout-cleanup.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result))
 
 
 def main():

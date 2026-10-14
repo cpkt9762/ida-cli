@@ -149,10 +149,31 @@ The real baseline suite can take 180 seconds for repeated IDA starts and saves.
 It starts the fixed old executable directly as `serve-worker`, then uses Nexus
 public handles on separate sample copies. Both paths assert functions, saved
 annotations, closed packed backups, reopens, and unchanged backup hashes. It
-does not discover or start the user's CLI daemon. A `processes.jsonl` ledger
-records this test's PID, start identity and command before readiness. Cleanup
-signals only recorded PIDs with matching birth times, allowing normal exec argv
-changes while rejecting PID reuse; no global `pkill` is used. Execute
+does not discover or start the user's CLI daemon. Creation first fsyncs a
+`process-intents/` marker, then registers the returned `Popen` in memory and
+fsyncs its PID, precise birth and command in `processes.jsonl` before removing
+the marker. A registration failure stops and waits for the held child. Python
+SIGTERM/SIGINT exceptions are deferred through this window without blocking
+signals in the spawned child. Nexus registration wraps its actual `Popen`,
+including upstream failures after creation but before the spawner returns.
+
+Cleanup visits both memory children and every valid ledger entry, continues
+after ESRCH, and reports other errors together. macOS uses public libproc
+`proc_pidinfo(PROC_PIDTBSDINFO)` microsecond births plus `kern.bootsessionuuid`;
+Linux uses `/proc/<pid>/stat` field 22 plus `random/boot_id`. Births remain stable
+across exec. SDK structure size, offsets, full return size and query errors are
+checked; unknown identities never authorize signals. Historical second-level
+`ps lstart` ledgers remain evidence only and are rejected by this cleanup.
+The platform sources are Apple's SDK `sys/proc_info.h`/`libproc.h`,
+[XNU proc_info.c](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/proc_info.c),
+[XNU kern_sysctl.c](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sysctl.c),
+and [Linux proc documentation](https://www.kernel.org/doc/html/latest/filesystems/proc.html).
+
+SIGKILL cannot make process creation and filesystem registration atomic.
+An unfinished intent, malformed/unterminated ledger line, old identity or failed
+identity query prevents `CLEAN`, even if no live PID can be confirmed. Preserve
+that environment for review; cleanup still handles other confirmed entries but
+does not guess missing PIDs or clear uncertain evidence. No global `pkill` is used. Execute
 the separate cleanup command after success, failure, or an outer forced timeout.
 An environment lock rejects concurrent verification or cleanup in the same root;
 use separate freshly prepared roots for independent suites.
@@ -166,10 +187,18 @@ timeout 30s python3 scripts/verify_nexus_n0.py --root "$N0_ROOT" cleanup
 ```
 
 The startup-timeout case stops only its newly recorded disposable worker before
-readiness, requires an explicit finite timeout error, and confirms cleanup. Use
+readiness, requires an explicit finite timeout error, and confirms cleanup. It
+only prints `EXPECTED_TIMEOUT` after a nonempty set of workers was created,
+durably registered, successfully sent SIGSTOP and waited for during cleanup.
+A deadline consumed by discovery/locking before spawn fails the fault case;
+its report has `status=FAIL`, `owned_workers=[]` and `clean=false`. Use
 a fresh environment for each such case. For the outer interruption path, set
 `--startup-budget 20` with an outer `timeout --kill-after=10s 2s`; expect exit
 124 and require `startup-timeout-cleanup.json` plus independent cleanup success.
+Check that this report contains a created and stopped worker: exit 124 alone
+does not prove the interruption exercised worker cleanup. The support suite
+also injects TERM at creation/registration boundaries, registration write/fsync
+failures, corrupt ledgers, ESRCH, identity errors and PID generation changes.
 These are E00/E01 and baseline-support evidence, not E03–E29 acceptance.
 
 ### Subsequent concurrency test design
