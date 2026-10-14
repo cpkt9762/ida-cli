@@ -1,6 +1,6 @@
 # Nexus 唯一后端迁移与长任务治理计划
 
-状态：在独立 worktree `../ida-cli-nexus`、分支 `feat/nexus-backend` 执行。N0 经 N0-F1 修复后，已在 `aa33d973644fa6de4751c055cd7afef83179639c` 完成编排者独立复验和 reviewer 再审，环境阶段门禁通过，后续按 N1 推进。本文不表示整个后端迁移或后续 E2E 已完成。
+状态：在独立 worktree `../ida-cli-nexus`、分支 `feat/nexus-backend` 执行。N0 环境阶段已验收；N1 经 N1-F1 修复后，已在 `9148fba526bf403b9448b50131a3edc145c2229a` 完成编排者独立复验和原 reviewer 复审，纯契约阶段门禁通过，后续按 N2 推进。本文不表示整个后端迁移或真实链路 E2E 已完成。
 
 日期：2026-10-15。
 
@@ -277,8 +277,11 @@ N1/N2 在 bridge 尚未接通时先验收契约和模拟行为，这些结果不
 
 - N0/N0-F1：`aa33d973644fa6de4751c055cd7afef83179639c` 的 31 项支持测试、全新环境真实保存/备份副本重开、真实启动超时及外层中断清理经过编排者独立复跑；原 reviewer 确认 F1–F4 关闭、无新阻断问题。
 - 环境验收范围为 macOS arm64、IDA 9.5；Linux 进程身份分支仍只有模拟验证。SIGKILL 未完成意图保守失败及身份查询/发信号非原子的限制保持公开。
-- 旧 Rust fmt 和两项 Clippy 欠项不计为通过，安排在 N1 开头的独立维护提交处理；不能用 N0 环境门禁通过代替这些检查。
-- N1 首个维护提交 `7cda84aecb1bb278cfb52c9cc5d60826a4b13d54` 完成格式和两项库级 lint 清理；编排者独立复现后补充授权的四项 E2E harness lint 已在 `7e79f8ccd37eb42ba1313480b5a31ff3cbb47973` 等价修复，维护全 target Clippy 通过。N1 会话/任务契约实现和确定性测试见下文；阶段仍待编排者独立复验和 reviewer 审查，本记录不替代验收。
+- N0 留下的 Rust fmt 和 Clippy 欠项已在 N1 的独立维护提交处理；N0 环境门禁本身不作为这些检查通过的证据。
+- N1 首个维护提交 `7cda84aecb1bb278cfb52c9cc5d60826a4b13d54` 完成格式和两项库级 lint 清理；追加四项 E2E harness lint 已在 `7e79f8ccd37eb42ba1313480b5a31ff3cbb47973` 等价修复。维护等价性已通过独立审查，未降低 lint 或删改功能断言。
+- N1/N1-F1：契约实现 `dac4f9f40f9ac47f09e3bd9336dab512f29534c2` 的两项阻断经 `ac09810b32702568b3e7fec3fe899d104b617f40`、`9148fba526bf403b9448b50131a3edc145c2229a` 修复。编排者在最终 SHA 独立执行 fmt、check、全 target Clippy、库测试、契约测试、旧 E2E 编译和 diff 检查，全部退出码为 0；库测试 418 passed、2 原有 ignored，契约 53 passed、0 ignored。
+- 编排者原始两条未知活体取消/期限失败复现，在最终 SHA 重新运行通过；另外三条独立延后失败、释放重试和断连关闭组合测试通过。原 reviewer `4a0c4799-6261-453f-8111-459a3f92c172` 确认 F1/P1、F2/P2 关闭，无新阻断，13 文件哈希匹配且工作区干净。编排者据此验收 N1 纯契约门禁。
+- N1 验收证据为 `/tmp/ida-nexus-n1-fix1-parent-20261015.0v7ozadz/verification.md`、`acceptance.md` 和 `validation.jsonl`；实现报告为 `/tmp/ida-nexus-run-20261015.98rmfb/n1-fix1/report.md`。旧 `ida_e2e` 仅编译；真实 transport 背压、Nexus bridge、native 取消、主线程响应、公平调度和共享缓存仍须后续验证，不能由 N1 契约验收替代。
 
 ### N0：工作区、环境和证据基线
 
