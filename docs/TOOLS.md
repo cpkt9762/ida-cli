@@ -5,7 +5,7 @@
 
 ## Discovery Workflow
 
-- `tools/list` returns the full tool set (currently 83 tools)
+- `tools/list` returns the full tool set (currently 107 tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns full documentation and schema
 - Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires close_token from open_idb)
@@ -21,14 +21,15 @@ Database open/close and discovery tools
 | Tool | Description |
 |------|-------------|
 | `close_idb` | Close the current database (release locks) |
-| `dsc_add_dylib` | Load an additional dylib into an open DSC database |
+| `dsc_add_dylib` | Load an additional dylib into an open DSC database (light analysis only) |
+| `dsc_add_region` | Load a DSC memory region by address (data/GOT/stubs) |
 | `get_analysis_status` | Report auto-analysis status |
 | `get_database_info` | Get database metadata and summary |
 | `get_task_status` | Check status of a background task (e.g. DSC loading) |
+| `list_idbs` | List open databases and the clients holding them |
 | `load_debug_info` | Load external debug info (e.g., dSYM/DWARF) |
-| `open_dsc` | Open a dyld_shared_cache and load a single module |
+| `open_dsc` | Open a dyld_shared_cache and load one module; use dsc_add_dylib/dsc_add_region for more |
 | `open_idb` | Open an IDA database or raw binary |
-| `open_sbpf` | Open a Solana sBPF program (.so) for analysis |
 | `tool_catalog` | Discover available tools by query or category |
 | `tool_help` | Get full documentation for a tool |
 
@@ -172,6 +173,36 @@ Patching, renaming, and comment editing
 | `set_function_prototype` | Apply a C prototype declaration to a function |
 | `set_local_variable_type` | Set the type of a local variable in decompiled pseudocode |
 | `set_stack_variable_type` | Set the type of a stack frame variable |
+
+## Debug (`debug`)
+
+Debugger operations (headless unsupported)
+
+| Tool | Description |
+|------|-------------|
+| `dbg_add_breakpoint` | Set a breakpoint at an address |
+| `dbg_attach_process` | Attach the debugger to a running process by PID |
+| `dbg_continue` | Continue execution until the next debug event |
+| `dbg_del_breakpoint` | Delete a breakpoint at an address |
+| `dbg_detach_process` | Detach the debugger without killing the process |
+| `dbg_enable_breakpoint` | Enable or disable a breakpoint |
+| `dbg_exit_process` | Terminate the debugged process |
+| `dbg_get_memory_info` | List memory regions of the debugged process |
+| `dbg_get_registers` | Read register values from the suspended process |
+| `dbg_get_state` | Get current debugger and process state |
+| `dbg_list_breakpoints` | List all breakpoints in the database |
+| `dbg_list_threads` | List all threads in the debugged process |
+| `dbg_load_debugger` | Load a debugger module for the current binary |
+| `dbg_read_memory` | Read bytes from the debugged process memory |
+| `dbg_run_to` | Run to a specific address |
+| `dbg_select_thread` | Select a thread as the current debugging context |
+| `dbg_set_register` | Set a CPU register value in the suspended process |
+| `dbg_start_process` | Start the target process under the debugger |
+| `dbg_step_into` | Single-step into the next instruction (follows calls) |
+| `dbg_step_over` | Single-step over the next instruction (skips calls) |
+| `dbg_step_until_ret` | Step until the current function returns |
+| `dbg_wait_event` | Wait for the next debug event |
+| `dbg_write_memory` | Write bytes to the debugged process memory |
 
 ## Scripting (`scripting`)
 
