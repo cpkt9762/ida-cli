@@ -44,6 +44,20 @@ impl RpcRequest {
 }
 
 impl RpcResponse {
+    /// Add structured Nexus diagnostics inside the existing error envelope.
+    pub fn nexus_error(id: impl Into<String>, error: &crate::ida::nexus::NexusError) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id: id.into(),
+            result: None,
+            error: Some(RpcError {
+                code: error.rpc_code(),
+                message: error.to_string(),
+                data: Some(serde_json::json!({"nexus": error.details()})),
+            }),
+        }
+    }
+
     pub fn ok(id: impl Into<String>, result: Value) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),

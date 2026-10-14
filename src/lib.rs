@@ -94,6 +94,7 @@ pub mod server;
 pub mod tool_registry;
 
 pub use error::ToolError;
+pub use ida::nexus;
 pub use ida::{
     run_ida_loop, AddressInfo, BasicBlockInfo, BytesResult, DbInfo, EnqueuedRequest, ExportInfo,
     FunctionInfo, FunctionListResult, FunctionRangeInfo, IdaRequest, IdaWorker, ImportInfo,

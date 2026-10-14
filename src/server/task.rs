@@ -16,6 +16,31 @@ pub const TERMINAL_TASK_CAP: usize = 256;
 /// `0` communicates there is no minimum retention guarantee.
 pub const TASK_RETENTION_TTL_MS: u64 = 0;
 
+/// N2 can project Nexus operations without using TaskRegistry::cancel's legacy
+/// JoinHandle abort semantics. Queue/cancel-pending retain the old running value;
+/// richer state and stop confirmation are additive metadata.
+pub fn nexus_task_state_json(
+    snapshot: &crate::ida::nexus::OperationSnapshot,
+    created_at: &str,
+    updated_at: &str,
+) -> Result<Value, crate::ida::nexus::NexusError> {
+    let task_id = snapshot.identity.task_id.as_ref().ok_or_else(|| {
+        crate::ida::nexus::NexusError::new(
+            crate::ida::nexus::NexusErrorCode::InvalidIdentity,
+            "operation has no background task id",
+        )
+    })?;
+    Ok(serde_json::json!({
+        "task_id": task_id.as_str(),
+        "status": snapshot.status.legacy_status(),
+        "message": snapshot.error.as_ref().map(ToString::to_string).unwrap_or_else(|| format!("{:?}", snapshot.status)),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "meta": {"nexus": snapshot},
+        "result": snapshot.result,
+    }))
+}
+
 /// Task status in its lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStatus {

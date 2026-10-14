@@ -9,6 +9,9 @@ use thiserror::Error;
 /// Tool execution errors - returned with is_error: true in CallToolResult
 #[derive(Error, Debug)]
 pub enum ToolError {
+    #[error(transparent)]
+    Nexus(#[from] crate::ida::nexus::NexusError),
+
     #[error("No database is currently open")]
     NoDatabaseOpen,
 
@@ -71,7 +74,10 @@ impl ToolError {
             content: vec![Content::text(self.to_string())],
             is_error: Some(true),
             meta: None,
-            structured_content: None,
+            structured_content: match self {
+                Self::Nexus(error) => Some(serde_json::json!({"nexus": error.details()})),
+                _ => None,
+            },
         }
     }
 }

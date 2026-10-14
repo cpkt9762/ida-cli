@@ -278,7 +278,7 @@ N1/N2 在 bridge 尚未接通时先验收契约和模拟行为，这些结果不
 - N0/N0-F1：`aa33d973644fa6de4751c055cd7afef83179639c` 的 31 项支持测试、全新环境真实保存/备份副本重开、真实启动超时及外层中断清理经过编排者独立复跑；原 reviewer 确认 F1–F4 关闭、无新阻断问题。
 - 环境验收范围为 macOS arm64、IDA 9.5；Linux 进程身份分支仍只有模拟验证。SIGKILL 未完成意图保守失败及身份查询/发信号非原子的限制保持公开。
 - 旧 Rust fmt 和两项 Clippy 欠项不计为通过，安排在 N1 开头的独立维护提交处理；不能用 N0 环境门禁通过代替这些检查。
-- N1 维护提交 `7cda84aecb1bb278cfb52c9cc5d60826a4b13d54` 完成上述格式和两项库级 lint 清理，fmt/check 通过，库测试 418 passed、2 ignored；全 target Clippy 进一步暴露未改动的 `tests/ida_e2e.rs` 中四项既有问题。编排者已独立复现并将其最小等价修复纳入维护范围；契约实现尚未开始，N1 未验收。
+- N1 首个维护提交 `7cda84aecb1bb278cfb52c9cc5d60826a4b13d54` 完成格式和两项库级 lint 清理；编排者独立复现后补充授权的四项 E2E harness lint 已在 `7e79f8ccd37eb42ba1313480b5a31ff3cbb47973` 等价修复，维护全 target Clippy 通过。N1 会话/任务契约实现和确定性测试见下文；阶段仍待编排者独立复验和 reviewer 审查，本记录不替代验收。
 
 ### N0：工作区、环境和证据基线
 
@@ -299,6 +299,51 @@ N1/N2 在 bridge 尚未接通时先验收契约和模拟行为，这些结果不
 - 明确 request/operation/lease/instance 的关联与释放责任，覆盖任务终态竞争。
 - 所有 API 形状先做契约测试；保持现有 CLI 输出与 MCP 包装，新增状态需有兼容策略。
 - 验收：迁移期间保留可重复的旧版本对照，Nexus 尚未实现的方法明确拒绝；最终唯一后端的契约测试不得依赖旧后端常驻。
+
+#### N1 接口交付与 N2/N3 消费约定
+
+实现位于 `src/ida/nexus/`，从 `ida_mcp::nexus` 导出；确定性测试 target 是 `nexus_contract`。这是纯本地契约，没有 Python bridge、真实 Nexus transport 或新的后端选择开关。现有默认路径继续用于迁移期对照，N9 删除；契约通过不表示 N2/N3 或真实 E02/E14/E15 已完成。
+
+`NexusSessions<C: Clock>` 维护本 router 的 lease、代际、操作和终态身份记录。它与现有主要用于 init/open 的 `IdaBackend` 分离，也不建立多后端执行框架。`UnconnectedNexus` 明确返回 `BridgeUnavailable`；能力或运行时检查失败也不能调用旧执行器。
+
+| 边界 | N2/N3 的调用责任 |
+|---|---|
+| 接纳 | 在输入准备、hash、连接和排队之前调用 `AcceptedRequest::new`；保留同一对象，不在后续阶段重建期限。短请求可以没有 task_id；后台任务必须关联已有 task_id。 |
+| 打开 | `open` 发出带 `OpenIdentity` 和剩余预算的命令；N3 通过公共 `DatabaseHandle.open` 获取 handle，再用完整响应身份、`SessionLease`、该 handle 的实际能力调用 `opened`。 |
+| 打开后清理 | 迟到、已请求取消、结果未知或运行时不合要求的成功打开返回 `OpenDisposition::ReleaseRequired`；先保留真实 handle，再通过 `release/released` 完成清理，不补报旧请求成功。`opened` 校验错误时，新提供的 handle 仍由 N3 持有并清理。确定失败用 `open_failed`，不确定失败保留待协调记录。尚无 handle 时，`cancel_open` 只记录取消意向并保留有界 startup 跟踪，不能宣称 native/startup 已停止。 |
+| 执行 | `queue` 先核对会话所有权、代际和该 lease 的方法能力；`dispatch` 在调用执行器之前复查期限和同实例占用。bridge 必须只在已附加的 handle 上执行，不能按 params 的 path 另开库。 |
+| transport | `NexusBackend::send` 只做有界入队；`send_control` 使用独立控制容量，不能排在业务队列后。方法不得阻塞于 I/O、native 结果或远程状态。N2 保持本地锁的短临界区，网络等待在锁外。 |
+| 结果 | 真实操作返回/停止后才调用 `complete`。`Completion::ExecutionTimedOut` 表示操作已返回超时结果；客户端 HTTP 超时应按 uncertain/disconnected 处理，不能冒充此确认。 |
+| 取消 | `cancel/expire` 发出精确 operation identity 的控制命令。公共 `cancel_operation` 的 bool 仅表示请求 ACK，不能转成 `Completion::Cancelled`；确认需要原执行调用返回已取消。 |
+| 释放 | `release/released` 只释放本逻辑会话。活动、排队或取消未确认的操作保留 lease。warm 引用和每个 close_token 单独映射 lease，N3 不读取 Nexus 私有 lease/token 文件。 |
+| 显式关库 | `shutdown` 另用带期限和独立 operation identity 的 `ShutdownSpec`。只允许空闲、router 本地无其他引用的 managed owner；N3 仍必须调用公共 `shutdown_database` 的全局独占检查，不能把本地引用数当全局所有权。GUI 总是拒绝。拒绝响应使用完整 identity 调用 `shutdown_rejected`，旧响应不能恢复后继关闭请求。 |
+| 状态 | `status/operation_status` 仅读本地内存，不能同步询问可能持 GIL 的 owner。Nexus Tasks 不使用现有 `TaskRegistry::cancel` 的旧 JoinHandle abort 语义。 |
+
+身份中的 `ClientId` 来自已认证路由上下文，不能让请求体自行指定其他客户端；`LeaseId` 是本地 bridge handle 的非敏感 key，`InstanceId` 标识精确 owner。`generation` 非零，仅在确认 owner 被替换时推进，同 owner 多客户端共享相同代际。`request_id` 与 `operation_id` 在协调器生命周期内不可复用；task_id 可关联一个任务的多个分片操作，N2 必须以完整 operation identity 更新对应分片，再聚合任务，不能只按 task_id 接收迟到响应。重启时使用新的身份命名空间。
+
+协调器容量有界；达到保留上限返回 Busy，不为了继续执行而丢弃终态身份记录。终态结果与仍有 native 执行的生命周期跟踪不同：`unknown_outcome` 对请求已确定，但 `execution_stopped=false` 时仍保留占用。N2/N5 后续做生命周期/保留策略时，不得在未停止前丢记录，或让旧 ID 在同命名空间重新生效。
+
+期限使用 `Instant`；不序列化该时钟值。保留现有 `timeout_secs` 兼容策略：默认 120 秒，open 上限 3600，其他方法上限 600；超大 u64 截断到上限，负数、字符串、浮点和 null 沿用旧 router 的默认值，0 表示立即过期。跨进程 `remaining_ms` 必须在 1..=3600000 内，小于 1ms 保守按耗尽处理。N2 在 dispatch 入队时建立本地剩余预算，发送前扣除管道队列时间；N3 在接收时建立自己的单调预算，执行前继续扣除 bridge 队列时间。router 原总期限始终有效，负责到期控制请求。传输和 native 区间不能保证硬停止，等待期限过后仍须保留取消待确认/未知结果，不使用 Nexus 的执行 timeout 替代总 deadline。
+
+| 当前状态/事件 | 结果与占用 |
+|---|---|
+| queued，期限耗尽或本地取消 | 不发送 execute，确定 timed_out/QueueExpired 或 cancelled，无副作用 |
+| dispatch 成功入队 | running；包括已送往远端但仍在远端排队的情形，不承诺 native 已开始 |
+| running，取消/总期限到达 | cancel_requested，仍占用实例和 lease；控制 enqueue 成功不代表停止 |
+| 完成与取消确认竞争 | 首个有效确认决定唯一终态；请求取消期间仍可能先成功，取消不承诺回滚 |
+| 总期限后才收到成功 | timed_out/DeadlineExpired，已确认停止但可能已有修改，不能自动重放 |
+| 执行已发出后断线/不确定发送 | unknown_outcome，默认保留占用；迟到真实完成只可补停止证据，不覆写结果 |
+| 旧 operation/代际响应 | 完整身份不匹配则拒绝，旧代际确认不影响后继实例；已有确定结果不可改写 |
+
+错误分类见 `NexusErrorCode`，来源保存在 cause。所有错误均禁止自动重放；Busy、QueueExpired 允许显式新请求，尚未发出的 Disconnected 允许重新连接后新请求，CancelPending 要求观察原操作，其余默认 NeverReplay。已运行操作的失败统一包装 OperationFailed，保留底层原因，不把嵌套 Busy 误当成可重放写操作。
+
+现有 `RpcRequest/RpcResponse`、地址字符串、分页字段及旧错误 JSON 保持原样。`RpcResponse::nexus_error` 在现有 error 对象里加 `data.nexus`；非法参数用 -32602，能力不足用 -32601，其余服务错误用 -32000。`ToolError::Nexus` 保留 MCP content/isError 包装，并添加 structuredContent.nexus。
+
+例如：`{"jsonrpc":"2.0","id":"r2","error":{"code":-32000,"message":"Nexus UnknownOutcome: connection lost after write","data":{"nexus":{"code":"unknown_outcome","message":"connection lost after write","retry":"never_replay","automatic_replay":false,"cause":null}}}}`。
+
+`server::task::nexus_task_state_json` 保留 task_id/status/message/created_at/updated_at/meta/result 字段；没有 task_id 的短操作明确拒绝任务投影。queued/running/cancel_requested 映射旧 running，succeeded 映射 completed，cancelled 仅用于已确认停止，timed_out/unknown_outcome/failed 映射 failed。详细状态和 `execution_stopped` 位于 `meta.nexus`；failed 不能被解释为 native 已停止。成功结果不改形。
+
+N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、E15 的真实 bridge/IDA 验收仍属后续阶段。
 
 ### N2：router、IPC 和外部命令
 
