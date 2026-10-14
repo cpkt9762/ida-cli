@@ -30,6 +30,7 @@ impl<C: Clock> NexusSessions<C> {
                     status: OperationStatus::Queued,
                     execution_stopped: true,
                     cancel_reason: None,
+                    cancel_delivery: None,
                     error: None,
                     result: None,
                 },
@@ -68,7 +69,9 @@ impl<C: Clock> NexusSessions<C> {
         client: &ClientId,
         identity: &OperationIdentity,
     ) -> Result<OperationSnapshot, NexusError> {
-        Ok(self.operation(client, identity)?.snapshot.clone())
+        let mut snapshot = self.operation(client, identity)?.snapshot.clone();
+        snapshot.cancel_delivery = self.cancel_delivery(identity);
+        Ok(snapshot)
     }
 
     pub(super) fn occupied(&self, lease: &SessionLease) -> bool {
@@ -126,32 +129,34 @@ impl<C: Clock> NexusSessions<C> {
             effect: op.effect,
             remaining_ms,
         });
+        let attempt = self.begin_delivery(&command, None)?;
         if let Some(op) = self.operations.get_mut(&identity.operation_id) {
             op.snapshot.status = OperationStatus::Running;
             op.snapshot.execution_stopped = false;
         }
-        match backend.send(command) {
-            Ok(()) => Ok(()),
-            Err(DispatchFailure::NotSent(error)) => {
-                self.terminal(
-                    identity,
-                    OperationStatus::Failed,
-                    Some(error.clone()),
-                    None,
-                    true,
-                );
-                Err(error)
-            }
-            Err(DispatchFailure::Uncertain(error)) => {
-                let error = Self::unknown(error);
-                self.terminal(
-                    identity,
-                    OperationStatus::UnknownOutcome,
-                    Some(error.clone()),
-                    None,
-                    false,
-                );
-                Err(error)
+        self.send_delivery(command, attempt, backend)
+    }
+
+    pub(super) fn execute_delivery_failed(
+        &mut self,
+        identity: &OperationIdentity,
+        uncertain: bool,
+        error: NexusError,
+    ) {
+        if uncertain {
+            self.terminal(
+                identity,
+                OperationStatus::UnknownOutcome,
+                Some(Self::unknown(error)),
+                None,
+                false,
+            );
+        } else {
+            self.terminal(identity, OperationStatus::Failed, Some(error), None, true);
+            if let Some(op) = self.operations.get_mut(&identity.operation_id) {
+                // A later proof of non-delivery may stop retention after a
+                // connection event, without rewriting the caller's outcome.
+                op.snapshot.execution_stopped = true;
             }
         }
     }
@@ -163,21 +168,23 @@ impl<C: Clock> NexusSessions<C> {
         reason: CancelReason,
         backend: &mut impl NexusBackend,
     ) -> Result<OperationSnapshot, NexusError> {
-        self.active(client, &identity.lease)?;
-        if reason == CancelReason::Deadline
-            && !self
-                .operation(client, identity)?
-                .request
-                .deadline
-                .expired(self.clock.now())
-        {
+        self.current_owner(client, &identity.lease)?;
+        let op = self.operation(client, identity)?;
+        let expired = op.request.deadline.expired(self.clock.now());
+        if reason == CancelReason::Deadline && !expired {
             return Err(NexusError::new(
                 NexusErrorCode::InvalidTransition,
                 "total deadline has not expired",
             ));
         }
-        let status = self.operation(client, identity)?.snapshot.status;
-        if status.is_terminal() {
+        let reason = if expired || op.snapshot.cancel_reason == Some(CancelReason::Deadline) {
+            CancelReason::Deadline
+        } else {
+            reason
+        };
+        let status = op.snapshot.status;
+        // A caller terminal result is independent of native stop evidence.
+        if op.snapshot.execution_stopped && status != OperationStatus::Queued {
             return self.operation_status(client, identity);
         }
         if status == OperationStatus::Queued {
@@ -193,35 +200,39 @@ impl<C: Clock> NexusSessions<C> {
                 None,
                 true,
             );
-        } else {
-            if let Some(op) = self.operations.get_mut(&identity.operation_id) {
+            return self.operation_status(client, identity);
+        }
+        // Repeating the same pending/acknowledged request does not flood control
+        // capacity. Explicit calls retry failed attempts, including uncertainty;
+        // deadline escalation gets a new attempt and supersedes client intent.
+        if let Some(delivery) = self.cancel_delivery(identity) {
+            if matches!(delivery.attempt.target, DeliveryTarget::Cancel { reason: old, .. } if old == reason)
+                && matches!(
+                    delivery.state,
+                    DeliveryState::Queued | DeliveryState::Acknowledged
+                )
+            {
+                return self.operation_status(client, identity);
+            }
+        }
+        let command = SessionCommand::Cancel {
+            identity: identity.clone(),
+            reason,
+        };
+        let attempt = self.begin_delivery(&command, None)?;
+        if let Some(op) = self.operations.get_mut(&identity.operation_id) {
+            op.snapshot.cancel_reason = Some(reason);
+            if !op.snapshot.status.is_terminal() {
                 op.snapshot.status = OperationStatus::CancelRequested;
-                // Total deadline dominates a previous client cancellation.
-                if op.snapshot.cancel_reason != Some(CancelReason::Deadline) {
-                    op.snapshot.cancel_reason = Some(reason);
-                }
                 op.snapshot.error = Some(NexusError::new(
                     NexusErrorCode::CancelPending,
                     "cancellation requested; remote stop is not confirmed",
                 ));
             }
-            // Even a successful control enqueue is not a stop acknowledgment.
-            if let Err(DispatchFailure::NotSent(error) | DispatchFailure::Uncertain(error)) =
-                backend.send_control(SessionCommand::Cancel {
-                    identity: identity.clone(),
-                    reason,
-                })
-            {
-                if let Some(op) = self.operations.get_mut(&identity.operation_id) {
-                    op.snapshot.error = Some(NexusError::caused_by(
-                        NexusErrorCode::CancelPending,
-                        "cancellation delivery failed; remote stop is not confirmed",
-                        error.clone(),
-                    ));
-                }
-                return Err(error);
-            }
         }
+        // Transport failure is recorded separately and never overwrites an
+        // UnknownOutcome, its source cause, result or NeverReplay advice.
+        self.send_delivery(command, attempt, backend)?;
         self.operation_status(client, identity)
     }
 
@@ -231,6 +242,7 @@ impl<C: Clock> NexusSessions<C> {
         identity: &OperationIdentity,
         backend: &mut impl NexusBackend,
     ) -> Result<OperationSnapshot, NexusError> {
+        self.current_owner(client, &identity.lease)?;
         if !self
             .operation(client, identity)?
             .request
@@ -261,6 +273,13 @@ impl<C: Clock> NexusSessions<C> {
                     op.snapshot.execution_stopped = true;
                 }
             }
+            self.confirm_delivery(DeliveryTarget::Execute {
+                identity: identity.clone(),
+            });
+            self.confirm_delivery(DeliveryTarget::Cancel {
+                identity: identity.clone(),
+                reason: CancelReason::Client,
+            });
             return Ok(false);
         }
         if op.snapshot.status == OperationStatus::Queued {
@@ -337,6 +356,13 @@ impl<C: Clock> NexusSessions<C> {
             }
         };
         self.terminal(identity, status, error, result, true);
+        self.confirm_delivery(DeliveryTarget::Execute {
+            identity: identity.clone(),
+        });
+        self.confirm_delivery(DeliveryTarget::Cancel {
+            identity: identity.clone(),
+            reason: CancelReason::Client,
+        });
         Ok(true)
     }
 

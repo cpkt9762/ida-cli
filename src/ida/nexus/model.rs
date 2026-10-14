@@ -192,6 +192,8 @@ pub struct OperationSnapshot {
     /// stopped. Keep the slot and lease until stopped or a new owner generation.
     pub execution_stopped: bool,
     pub cancel_reason: Option<CancelReason>,
+    /// Transport state is independent of the immutable caller outcome.
+    pub cancel_delivery: Option<DeliverySnapshot>,
     pub error: Option<NexusError>,
     pub result: Option<Value>,
 }
@@ -213,6 +215,7 @@ pub struct SessionSnapshot {
     pub phase: SessionPhase,
     pub capabilities: NexusCapabilities,
     pub pending_shutdown: Option<OperationIdentity>,
+    pub control_delivery: Option<DeliverySnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,25 +264,39 @@ pub enum DispatchFailure {
 }
 
 /// Synchronous, bounded enqueue only. It must not perform remote I/O or wait
-/// for a result. N2 provides transport; N3 translates commands to public APIs.
+/// for a result. Ok proves local enqueue only: N2/N3 must retain the attempt
+/// and report later transport failures through delivery_failed. Only native
+/// lifecycle callbacks prove completion. No automatic replay is permitted.
 pub trait NexusBackend {
-    fn send(&mut self, command: SessionCommand) -> Result<(), DispatchFailure>;
+    fn send(
+        &mut self,
+        command: SessionCommand,
+        attempt: DeliveryAttempt,
+    ) -> Result<(), DispatchFailure>;
     /// Independent bounded control capacity; never queued behind business work.
-    fn send_control(&mut self, command: SessionCommand) -> Result<(), DispatchFailure>;
+    fn send_control(
+        &mut self,
+        command: SessionCommand,
+        attempt: DeliveryAttempt,
+    ) -> Result<(), DispatchFailure>;
 }
 
 /// Explicit failure until N3 installs a real bridge. No fallback exists here.
 pub struct UnconnectedNexus;
 
 impl NexusBackend for UnconnectedNexus {
-    fn send(&mut self, _: SessionCommand) -> Result<(), DispatchFailure> {
+    fn send(&mut self, _: SessionCommand, _: DeliveryAttempt) -> Result<(), DispatchFailure> {
         Err(DispatchFailure::NotSent(NexusError::new(
             NexusErrorCode::BridgeUnavailable,
             "Nexus bridge is not connected",
         )))
     }
-    fn send_control(&mut self, command: SessionCommand) -> Result<(), DispatchFailure> {
-        self.send(command)
+    fn send_control(
+        &mut self,
+        command: SessionCommand,
+        attempt: DeliveryAttempt,
+    ) -> Result<(), DispatchFailure> {
+        self.send(command, attempt)
     }
 }
 
@@ -313,4 +330,50 @@ pub enum OpenDisposition {
         lease: SessionLease,
         error: NexusError,
     },
+}
+
+/// Full authenticated identity plus a nonzero coordinator-local send sequence.
+/// N2/N3 echo this unchanged; restart requires a fresh identity namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryAttempt {
+    pub target: DeliveryTarget,
+    pub sequence: std::num::NonZeroU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeliveryTarget {
+    Open {
+        identity: OpenIdentity,
+    },
+    Execute {
+        identity: OperationIdentity,
+    },
+    Cancel {
+        identity: OperationIdentity,
+        reason: CancelReason,
+    },
+    Release {
+        lease: SessionLease,
+    },
+    Shutdown {
+        identity: OperationIdentity,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryState {
+    Queued,
+    Acknowledged,
+    NotSent,
+    Uncertain,
+    Confirmed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliverySnapshot {
+    pub attempt: DeliveryAttempt,
+    pub state: DeliveryState,
+    pub error: Option<NexusError>,
 }

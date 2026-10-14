@@ -12,8 +12,11 @@ impl TestClock {
         Self(Arc::new(Mutex::new(Instant::now())))
     }
     pub fn advance(&self, ms: u64) {
+        self.advance_duration(Duration::from_millis(ms));
+    }
+    pub fn advance_duration(&self, duration: Duration) {
         let mut now = self.0.lock().expect("test clock lock");
-        *now += Duration::from_millis(ms);
+        *now += duration;
     }
 }
 
@@ -26,6 +29,7 @@ impl Clock for TestClock {
 #[derive(Default)]
 pub struct RecordingBackend {
     pub business: Vec<SessionCommand>,
+    pub attempts: Vec<DeliveryAttempt>,
     pub controls: Vec<SessionCommand>,
     pub executed: Vec<ExecuteCommand>,
     pub writes: usize,
@@ -34,7 +38,12 @@ pub struct RecordingBackend {
 }
 
 impl NexusBackend for RecordingBackend {
-    fn send(&mut self, command: SessionCommand) -> Result<(), DispatchFailure> {
+    fn send(
+        &mut self,
+        command: SessionCommand,
+        attempt: DeliveryAttempt,
+    ) -> Result<(), DispatchFailure> {
+        self.attempts.push(attempt);
         self.business.push(command.clone());
         let failure = self.fail_business.take();
         if !matches!(failure, Some(DispatchFailure::NotSent(_))) {
@@ -47,7 +56,12 @@ impl NexusBackend for RecordingBackend {
         }
         failure.map_or(Ok(()), Err)
     }
-    fn send_control(&mut self, command: SessionCommand) -> Result<(), DispatchFailure> {
+    fn send_control(
+        &mut self,
+        command: SessionCommand,
+        attempt: DeliveryAttempt,
+    ) -> Result<(), DispatchFailure> {
+        self.attempts.push(attempt);
         self.controls.push(command);
         self.fail_control.take().map_or(Ok(()), Err)
     }
@@ -159,6 +173,13 @@ impl Rig {
         self.sessions
             .dispatch(&identity.lease.client_id, identity, &mut self.backend)
             .expect("dispatch request");
+    }
+    pub fn last_attempt(&self) -> DeliveryAttempt {
+        self.backend
+            .attempts
+            .last()
+            .expect("recorded send attempt")
+            .clone()
     }
     pub fn snapshot(&self, identity: &OperationIdentity) -> OperationSnapshot {
         self.sessions

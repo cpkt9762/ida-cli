@@ -375,7 +375,7 @@ fn e15_cancel_ack_is_not_stop_and_release_and_next_execution_wait() {
     rig.sessions
         .release(&a.client_id, &a, &mut rig.backend)
         .unwrap();
-    rig.sessions.released(&a).unwrap();
+    assert!(rig.sessions.released(&rig.last_attempt()).unwrap());
     assert_eq!(
         rig.sessions.status(&b.client_id, &b).unwrap().phase,
         SessionPhase::Active
@@ -721,3 +721,11 @@ fn completion_after_deadline_loses_even_without_timer_delivery() {
         RetryAdvice::NeverReplay
     );
 }
+
+#[path = "support/nexus_failures.rs"]
+mod failures;
+
+#[path = "support/nexus_delivery_lifecycle.rs"]
+mod delivery_lifecycle;
+#[path = "support/nexus_delivery_regression.rs"]
+mod delivery_regression;

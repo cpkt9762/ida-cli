@@ -6,6 +6,7 @@
 //! The legacy worker selection remains a development comparison until N9.
 
 mod deadline;
+mod delivery;
 mod error;
 mod model;
 mod operation;

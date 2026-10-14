@@ -68,7 +68,7 @@ impl Deadline {
     }
 
     pub fn expired(self, now: Instant) -> bool {
-        now >= self.0
+        self.0.saturating_duration_since(now).as_millis() == 0
     }
 
     pub fn remaining(self, now: Instant) -> Result<RemainingBudget, NexusError> {

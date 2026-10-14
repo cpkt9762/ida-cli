@@ -40,7 +40,7 @@ fn cancel_before_open_handle_keeps_tracking_and_releases_late_acquisition() {
     rig.sessions
         .release(&lease.client_id, &lease, &mut rig.backend)
         .unwrap();
-    rig.sessions.released(&lease).unwrap();
+    assert!(rig.sessions.released(&rig.last_attempt()).unwrap());
     assert_eq!(
         rig.sessions.status(&lease.client_id, &lease).unwrap().phase,
         SessionPhase::Released
@@ -66,7 +66,8 @@ fn shutdown_rejection_cannot_restore_a_successor_control_request() {
             .unwrap()
     };
     let first = begin("shutdown-first");
-    rig.sessions.shutdown_rejected(&first).unwrap();
+    let first_attempt = rig.last_attempt();
+    assert!(rig.sessions.shutdown_rejected(&first_attempt).unwrap());
     let second = rig
         .sessions
         .shutdown(
@@ -80,10 +81,11 @@ fn shutdown_rejection_cannot_restore_a_successor_control_request() {
             &mut rig.backend,
         )
         .unwrap();
-    assert_eq!(
-        rig.sessions.shutdown_rejected(&first).unwrap_err().code,
-        NexusErrorCode::InvalidTransition
+    assert!(
+        !rig.sessions.shutdown_rejected(&first_attempt).unwrap(),
+        "old rejection cannot restore the successor"
     );
+    assert_ne!(first, second);
     let status = rig.sessions.status(&lease.client_id, &lease).unwrap();
     assert_eq!(status.phase, SessionPhase::ShutdownRequested);
     assert_eq!(status.pending_shutdown, Some(second));
@@ -315,7 +317,7 @@ fn open_matching_late_lease_cleanup_and_release_are_separate_from_shutdown() {
     assert!(
         matches!(rig.backend.controls.last(),Some(SessionCommand::Release { lease:l }) if l==&lease)
     );
-    rig.sessions.released(&lease).unwrap();
+    assert!(rig.sessions.released(&rig.last_attempt()).unwrap());
     assert_eq!(
         rig.sessions.status(&lease.client_id, &lease).unwrap().phase,
         SessionPhase::Released
@@ -351,7 +353,7 @@ fn explicit_shutdown_requires_managed_local_exclusivity_and_remote_check() {
     rig.sessions
         .release(&b.client_id, &b, &mut rig.backend)
         .unwrap();
-    rig.sessions.released(&b).unwrap();
+    assert!(rig.sessions.released(&rig.last_attempt()).unwrap());
     let shutdown = rig
         .sessions
         .shutdown(
@@ -373,7 +375,14 @@ fn explicit_shutdown_requires_managed_local_exclusivity_and_remote_check() {
             ..
         })
     ));
-    rig.sessions.shutdown_rejected(&shutdown).unwrap();
+    assert_eq!(
+        rig.sessions
+            .status(&a.client_id, &a)
+            .unwrap()
+            .pending_shutdown,
+        Some(shutdown)
+    );
+    assert!(rig.sessions.shutdown_rejected(&rig.last_attempt()).unwrap());
     assert_eq!(
         rig.sessions.status(&a.client_id, &a).unwrap().phase,
         SessionPhase::Active

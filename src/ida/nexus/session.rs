@@ -8,11 +8,13 @@ pub(super) struct Operation {
     pub(super) effect: MethodEffect,
 }
 
-struct Opening {
+pub(super) struct Opening {
     identity: OpenIdentity,
     request: AcceptedRequest,
-    uncertain: bool,
+    pub(super) uncertain: bool,
     cancel_requested: bool,
+    pub(super) failure: Option<NexusError>,
+    acquired: Option<SessionLease>,
 }
 
 /// Pure local coordinator. All mutations are serialized by `&mut self`.
@@ -23,10 +25,12 @@ pub struct NexusSessions<C> {
     pub(super) clock: C,
     capabilities: Result<NexusCapabilities, NexusError>,
     capacity: usize,
-    sessions: HashMap<LeaseId, SessionSnapshot>,
+    pub(super) sessions: HashMap<LeaseId, SessionSnapshot>,
+    pub(super) deliveries: HashMap<super::delivery::DeliveryKey, super::delivery::DeliveryRecord>,
+    pub(super) send_sequence: u64,
     pub(super) generations: HashMap<InstanceId, u64>,
     pub(super) operations: HashMap<OperationId, Operation>,
-    openings: HashMap<OperationId, Opening>,
+    pub(super) openings: HashMap<OperationId, Opening>,
     requests: HashSet<RequestId>,
     used_operations: HashSet<OperationId>,
 }
@@ -44,6 +48,8 @@ impl<C: Clock> NexusSessions<C> {
             capabilities,
             capacity,
             sessions: HashMap::new(),
+            deliveries: HashMap::new(),
+            send_sequence: 0,
             generations: HashMap::new(),
             operations: HashMap::new(),
             openings: HashMap::new(),
@@ -108,6 +114,7 @@ impl<C: Clock> NexusSessions<C> {
             options: spec.options,
             remaining_ms,
         };
+        let attempt = self.begin_delivery(&command, None)?;
         self.openings.insert(
             identity.operation_id.clone(),
             Opening {
@@ -115,22 +122,11 @@ impl<C: Clock> NexusSessions<C> {
                 request,
                 uncertain: false,
                 cancel_requested: false,
+                failure: None,
+                acquired: None,
             },
         );
-        if let Err(failure) = backend.send(command) {
-            match failure {
-                DispatchFailure::NotSent(error) => {
-                    self.openings.remove(&identity.operation_id);
-                    return Err(error);
-                }
-                DispatchFailure::Uncertain(error) => {
-                    if let Some(opening) = self.openings.get_mut(&identity.operation_id) {
-                        opening.uncertain = true;
-                    }
-                    return Err(Self::unknown(error));
-                }
-            }
-        }
+        self.send_delivery(command, attempt, backend)?;
         Ok(identity)
     }
 
@@ -152,12 +148,20 @@ impl<C: Clock> NexusSessions<C> {
                 "open response identity/owner mismatch",
             ));
         }
+        if opening.acquired.is_some() {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "open already reconciled; adapter retains any new unregistered handle for cleanup",
+            ));
+        }
         let closing = self.sessions.values().any(|session| {
             session.lease.instance_id == lease.instance_id
                 && session.lease.generation == lease.generation
                 && session.phase == SessionPhase::ShutdownRequested
         });
-        let error = if opening.uncertain {
+        let error = if let Some(error) = &opening.failure {
+            Some(error.clone())
+        } else if opening.uncertain {
             Some(NexusError::new(
                 NexusErrorCode::UnknownOutcome,
                 "late uncertain open is reconciled for lease cleanup, not replayed as success",
@@ -181,7 +185,12 @@ impl<C: Clock> NexusSessions<C> {
             capabilities.runtime.validate().err()
         };
         self.register(lease.clone(), capabilities)?;
-        self.openings.remove(&identity.operation_id);
+        if let Some(opening) = self.openings.get_mut(&identity.operation_id) {
+            opening.acquired = Some(lease.clone());
+        }
+        self.confirm_delivery(DeliveryTarget::Open {
+            identity: identity.clone(),
+        });
         if error.is_some() {
             if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
                 session.phase = SessionPhase::ReleaseRequired;
@@ -194,8 +203,9 @@ impl<C: Clock> NexusSessions<C> {
         })
     }
 
-    /// Confirmed open failure; uncertainty must instead retain the opening for
-    /// reconciliation. IDs remain reserved and the request is never replayed.
+    /// Confirmed open failure retains a bounded identity tombstone. Even a
+    /// contradictory late acquisition must be reconciled for lease cleanup.
+    /// Existing unknown outcomes and their source errors are not rewritten.
     pub fn open_failed(&mut self, identity: &OpenIdentity) -> Result<(), NexusError> {
         let opening = self.openings.get(&identity.operation_id).ok_or_else(|| {
             NexusError::new(NexusErrorCode::InvalidIdentity, "unknown open operation")
@@ -206,7 +216,23 @@ impl<C: Clock> NexusSessions<C> {
                 "open failure identity mismatch",
             ));
         }
-        self.openings.remove(&identity.operation_id);
+        if opening.acquired.is_some() {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "open already acquired a tracked lease",
+            ));
+        }
+        if let Some(opening) = self.openings.get_mut(&identity.operation_id) {
+            if opening.failure.is_none() {
+                opening.failure = Some(NexusError::new(
+                    NexusErrorCode::OperationFailed,
+                    "open failed; any contradictory late acquisition requires cleanup",
+                ));
+            }
+        }
+        self.confirm_delivery(DeliveryTarget::Open {
+            identity: identity.clone(),
+        });
         Ok(())
     }
 
@@ -230,8 +256,20 @@ impl<C: Clock> NexusSessions<C> {
                 "open cancellation identity/owner mismatch",
             ));
         }
+        if opening.acquired.is_some() {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "open already reconciled; use the acquired session lifecycle",
+            ));
+        }
         opening.cancel_requested = true;
-        Ok(if opening.uncertain {
+        Ok(if let Some(error) = &opening.failure {
+            if error.code == NexusErrorCode::UnknownOutcome {
+                OperationStatus::UnknownOutcome
+            } else {
+                OperationStatus::Failed
+            }
+        } else if opening.uncertain {
             OperationStatus::UnknownOutcome
         } else {
             OperationStatus::CancelRequested
@@ -276,6 +314,13 @@ impl<C: Clock> NexusSessions<C> {
             }
             if lease.generation > generation {
                 self.disconnect_generation(&lease.instance_id, generation);
+                for operation in self.operations.values_mut() {
+                    if operation.snapshot.identity.lease.instance_id == lease.instance_id
+                        && operation.snapshot.identity.lease.generation == generation
+                    {
+                        operation.snapshot.execution_stopped = true;
+                    }
+                }
             }
         }
         self.generations
@@ -287,6 +332,7 @@ impl<C: Clock> NexusSessions<C> {
                 phase: SessionPhase::Active,
                 capabilities,
                 pending_shutdown: None,
+                control_delivery: None,
             },
         );
         Ok(())
@@ -311,17 +357,27 @@ impl<C: Clock> NexusSessions<C> {
     }
 
     pub(super) fn active(&self, client: &ClientId, lease: &SessionLease) -> Result<(), NexusError> {
+        self.current_owner(client, lease)?;
         let session = self.authorize(client, lease)?;
-        if self.generations.get(&lease.instance_id) != Some(&lease.generation) {
-            return Err(NexusError::new(
-                NexusErrorCode::StaleGeneration,
-                "owner was replaced",
-            ));
-        }
         if session.phase != SessionPhase::Active {
             return Err(NexusError::new(
                 NexusErrorCode::Disconnected,
                 "lease is releasing, released or disconnected",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn current_owner(
+        &self,
+        client: &ClientId,
+        lease: &SessionLease,
+    ) -> Result<(), NexusError> {
+        self.authorize(client, lease)?;
+        if self.generations.get(&lease.instance_id) != Some(&lease.generation) {
+            return Err(NexusError::new(
+                NexusErrorCode::StaleGeneration,
+                "owner was replaced",
             ));
         }
         Ok(())
@@ -332,7 +388,9 @@ impl<C: Clock> NexusSessions<C> {
         client: &ClientId,
         lease: &SessionLease,
     ) -> Result<SessionSnapshot, NexusError> {
-        self.authorize(client, lease).cloned()
+        let mut snapshot = self.authorize(client, lease)?.clone();
+        snapshot.control_delivery = self.control_delivery(lease);
+        Ok(snapshot)
     }
 
     /// Called only for an actual disconnect event from this exact owner.
@@ -405,6 +463,17 @@ impl<C: Clock> NexusSessions<C> {
         if phase == SessionPhase::Released || phase == SessionPhase::ReleaseRequested {
             return Ok(());
         }
+        if self.control_delivery(lease).is_some_and(|delivery| {
+            matches!(delivery.attempt.target, DeliveryTarget::Release { .. })
+                && matches!(
+                    delivery.state,
+                    DeliveryState::Queued | DeliveryState::Acknowledged | DeliveryState::Uncertain
+                )
+        }) {
+            // A genuine disconnect changes the session phase but does not
+            // erase an unresolved release attempt or permit silent replay.
+            return Ok(());
+        }
         if phase == SessionPhase::ShutdownRequested {
             return Err(NexusError::new(
                 NexusErrorCode::CancelPending,
@@ -417,37 +486,43 @@ impl<C: Clock> NexusSessions<C> {
                 "lease retained until queued work and stop confirmation resolve",
             ));
         }
-        self.control(
-            lease,
-            SessionPhase::ReleaseRequested,
-            SessionCommand::Release {
-                lease: lease.clone(),
-            },
-            backend,
-        )
+        let command = SessionCommand::Release {
+            lease: lease.clone(),
+        };
+        let attempt = self.begin_delivery(&command, Some(phase))?;
+        if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
+            session.phase = SessionPhase::ReleaseRequested;
+        }
+        self.send_delivery(command, attempt, backend)
     }
 
-    /// Confirmation concerns only this lease, not owner shutdown or GUI exit.
-    pub fn released(&mut self, lease: &SessionLease) -> Result<(), NexusError> {
-        self.authorize(&lease.client_id, lease)?;
-        if self.generations.get(&lease.instance_id) != Some(&lease.generation) {
+    /// Public handle release completed for this exact send attempt. A late
+    /// confirmation after real disconnect may release only this tracked lease.
+    pub fn released(&mut self, attempt: &DeliveryAttempt) -> Result<bool, NexusError> {
+        let DeliveryTarget::Release { lease } = &attempt.target else {
             return Err(NexusError::new(
-                NexusErrorCode::StaleGeneration,
-                "stale release confirmation",
+                NexusErrorCode::InvalidIdentity,
+                "not a release attempt",
             ));
+        };
+        self.current_owner(&lease.client_id, lease)?;
+        if !self.live_delivery(attempt)? {
+            return Ok(false);
         }
-        let session = self
-            .sessions
-            .get_mut(&lease.lease_id)
-            .ok_or_else(|| NexusError::new(NexusErrorCode::InvalidLease, "unknown lease"))?;
-        if session.phase != SessionPhase::ReleaseRequested {
-            return Err(NexusError::new(
-                NexusErrorCode::InvalidTransition,
-                "release was not requested",
-            ));
+        if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
+            if !matches!(
+                session.phase,
+                SessionPhase::ReleaseRequested | SessionPhase::Disconnected
+            ) {
+                return Err(NexusError::new(
+                    NexusErrorCode::InvalidTransition,
+                    "release was not requested",
+                ));
+            }
+            session.phase = SessionPhase::Released;
         }
-        session.phase = SessionPhase::Released;
-        Ok(())
+        self.confirm_delivery(attempt.target.clone());
+        Ok(true)
     }
 
     pub fn shutdown(
@@ -488,72 +563,69 @@ impl<C: Clock> NexusSessions<C> {
             operation_id: spec.operation_id,
             lease: lease.clone(),
         };
+        let command = SessionCommand::Shutdown {
+            identity: identity.clone(),
+            save: spec.save,
+            require_exclusive: true,
+            remaining_ms,
+        };
+        let attempt = self.begin_delivery(&command, Some(SessionPhase::Active))?;
         if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
             session.pending_shutdown = Some(identity.clone());
+            session.phase = SessionPhase::ShutdownRequested;
         }
-        self.control(
-            lease,
-            SessionPhase::ShutdownRequested,
-            SessionCommand::Shutdown {
-                identity: identity.clone(),
-                save: spec.save,
-                require_exclusive: true,
-                remaining_ms,
-            },
-            backend,
-        )?;
+        self.send_delivery(command, attempt, backend)?;
         Ok(identity)
     }
 
-    /// Public shutdown API explicitly rejected exclusivity or permissions. An
-    /// ambiguous disconnect is not a rejection and must not restore Active.
-    pub fn shutdown_rejected(&mut self, identity: &OperationIdentity) -> Result<(), NexusError> {
-        let lease = &identity.lease;
-        self.authorize(&lease.client_id, lease)?;
-        if self.generations.get(&lease.instance_id) != Some(&lease.generation) {
+    /// Public shutdown rejection must match the current exact send attempt.
+    /// Unlike uncertainty, a definitive rejection permits explicit new work.
+    pub fn shutdown_rejected(&mut self, attempt: &DeliveryAttempt) -> Result<bool, NexusError> {
+        self.finish_shutdown(attempt, false)
+    }
+
+    /// Only the public shutdown call's successful return proves owner shutdown.
+    pub fn shutdown_completed(&mut self, attempt: &DeliveryAttempt) -> Result<bool, NexusError> {
+        self.finish_shutdown(attempt, true)
+    }
+
+    fn finish_shutdown(
+        &mut self,
+        attempt: &DeliveryAttempt,
+        completed: bool,
+    ) -> Result<bool, NexusError> {
+        let DeliveryTarget::Shutdown { identity } = &attempt.target else {
             return Err(NexusError::new(
-                NexusErrorCode::StaleGeneration,
-                "stale shutdown rejection",
+                NexusErrorCode::InvalidIdentity,
+                "not a shutdown attempt",
             ));
+        };
+        let lease = &identity.lease;
+        self.current_owner(&lease.client_id, lease)?;
+        if !self.live_delivery(attempt)? {
+            return Ok(false);
         }
-        let session = self
-            .sessions
-            .get_mut(&lease.lease_id)
-            .ok_or_else(|| NexusError::new(NexusErrorCode::InvalidLease, "unknown lease"))?;
-        if session.phase != SessionPhase::ShutdownRequested
-            || session.pending_shutdown.as_ref() != Some(identity)
+        let session = self.sessions.get_mut(&lease.lease_id).ok_or_else(|| {
+            NexusError::new(NexusErrorCode::InvalidLease, "unknown shutdown lease")
+        })?;
+        if session.pending_shutdown.as_ref() != Some(identity)
+            || !matches!(
+                session.phase,
+                SessionPhase::ShutdownRequested | SessionPhase::Disconnected
+            )
         {
             return Err(NexusError::new(
                 NexusErrorCode::InvalidTransition,
                 "shutdown was not requested",
             ));
         }
-        session.phase = SessionPhase::Active;
+        if completed {
+            session.phase = SessionPhase::Released;
+        } else if session.phase != SessionPhase::Disconnected {
+            session.phase = SessionPhase::Active;
+        }
         session.pending_shutdown = None;
-        Ok(())
-    }
-
-    fn control(
-        &mut self,
-        lease: &SessionLease,
-        phase: SessionPhase,
-        command: SessionCommand,
-        backend: &mut impl NexusBackend,
-    ) -> Result<(), NexusError> {
-        let previous = self.authorize(&lease.client_id, lease)?.phase;
-        if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
-            session.phase = phase;
-        }
-        match backend.send_control(command) {
-            Ok(()) => Ok(()),
-            Err(DispatchFailure::NotSent(error)) => {
-                if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
-                    session.phase = previous;
-                    session.pending_shutdown = None;
-                }
-                Err(error)
-            }
-            Err(DispatchFailure::Uncertain(error)) => Err(Self::unknown(error)),
-        }
+        self.confirm_delivery(attempt.target.clone());
+        Ok(true)
     }
 }

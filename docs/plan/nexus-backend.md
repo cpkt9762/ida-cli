@@ -312,16 +312,32 @@ N1/N2 在 bridge 尚未接通时先验收契约和模拟行为，这些结果不
 | 打开 | `open` 发出带 `OpenIdentity` 和剩余预算的命令；N3 通过公共 `DatabaseHandle.open` 获取 handle，再用完整响应身份、`SessionLease`、该 handle 的实际能力调用 `opened`。 |
 | 打开后清理 | 迟到、已请求取消、结果未知或运行时不合要求的成功打开返回 `OpenDisposition::ReleaseRequired`；先保留真实 handle，再通过 `release/released` 完成清理，不补报旧请求成功。`opened` 校验错误时，新提供的 handle 仍由 N3 持有并清理。确定失败用 `open_failed`，不确定失败保留待协调记录。尚无 handle 时，`cancel_open` 只记录取消意向并保留有界 startup 跟踪，不能宣称 native/startup 已停止。 |
 | 执行 | `queue` 先核对会话所有权、代际和该 lease 的方法能力；`dispatch` 在调用执行器之前复查期限和同实例占用。bridge 必须只在已附加的 handle 上执行，不能按 params 的 path 另开库。 |
-| transport | `NexusBackend::send` 只做有界入队；`send_control` 使用独立控制容量，不能排在业务队列后。方法不得阻塞于 I/O、native 结果或远程状态。N2 保持本地锁的短临界区，网络等待在锁外。 |
-| 结果 | 真实操作返回/停止后才调用 `complete`。`Completion::ExecutionTimedOut` 表示操作已返回超时结果；客户端 HTTP 超时应按 uncertain/disconnected 处理，不能冒充此确认。 |
-| 取消 | `cancel/expire` 发出精确 operation identity 的控制命令。公共 `cancel_operation` 的 bool 仅表示请求 ACK，不能转成 `Completion::Cancelled`；确认需要原执行调用返回已取消。 |
-| 释放 | `release/released` 只释放本逻辑会话。活动、排队或取消未确认的操作保留 lease。warm 引用和每个 close_token 单独映射 lease，N3 不读取 Nexus 私有 lease/token 文件。 |
-| 显式关库 | `shutdown` 另用带期限和独立 operation identity 的 `ShutdownSpec`。只允许空闲、router 本地无其他引用的 managed owner；N3 仍必须调用公共 `shutdown_database` 的全局独占检查，不能把本地引用数当全局所有权。GUI 总是拒绝。拒绝响应使用完整 identity 调用 `shutdown_rejected`，旧响应不能恢复后继关闭请求。 |
+| transport | `NexusBackend::send(command, attempt)` 只做有界入队，Ok 不代表已发送；`send_control(command, attempt)` 使用独立控制容量，不能排在业务队列后。N2/N3 必须原样保留并回传完整 `DeliveryAttempt`；入队后的单请求失败用 `delivery_failed`，不能误用 `complete(Failed)` 或全实例 `disconnected`。方法不得阻塞于 I/O、native 结果或远程状态。N2 保持本地锁的短临界区，网络等待在锁外。 |
+| 结果 | 真实操作返回/停止后才调用 `complete`。`Completion::ExecutionTimedOut` 表示操作已返回超时结果；单请求 HTTP 超时用 `delivery_failed(attempt, Uncertain(...))`；只有真实 owner 连接断开才用 `disconnected`，不能冒充停止确认。 |
+| 取消 | `cancel/expire` 发出精确 operation identity 的控制命令。公共 `cancel_operation` 的 bool 仅表示请求 ACK，使用 `delivery_acknowledged(attempt)`，不能转成 `Completion::Cancelled`；确认需要原执行调用返回已取消。UnknownOutcome 且 execution_stopped=false 仍须执行该控制责任，原未知结果/cause/NeverReplay 保持不变。 |
+| 释放 | `release` 发出本 lease 的独立 attempt，公共 handle.close 确认后用 `released(attempt)`；只释放本逻辑会话。活动、排队或取消未确认的操作保留 lease。warm 引用和每个 close_token 单独映射 lease，N3 不读取 Nexus 私有 lease/token 文件。 |
+| 显式关库 | `shutdown` 另用带期限和独立 operation identity 的 `ShutdownSpec`。只允许空闲、router 本地无其他引用的 managed owner；N3 仍必须调用公共 `shutdown_database` 的全局独占检查，不能把本地引用数当全局所有权。GUI 总是拒绝。拒绝响应使用当前完整 attempt 调用 `shutdown_rejected`；公共 shutdown 成功才调用 `shutdown_completed`，旧响应不能恢复/关闭后继请求。 |
 | 状态 | `status/operation_status` 仅读本地内存，不能同步询问可能持 GIL 的 owner。Nexus Tasks 不使用现有 `TaskRegistry::cancel` 的旧 JoinHandle abort 语义。 |
 
 身份中的 `ClientId` 来自已认证路由上下文，不能让请求体自行指定其他客户端；`LeaseId` 是本地 bridge handle 的非敏感 key，`InstanceId` 标识精确 owner。`generation` 非零，仅在确认 owner 被替换时推进，同 owner 多客户端共享相同代际。`request_id` 与 `operation_id` 在协调器生命周期内不可复用；task_id 可关联一个任务的多个分片操作，N2 必须以完整 operation identity 更新对应分片，再聚合任务，不能只按 task_id 接收迟到响应。重启时使用新的身份命名空间。
 
 协调器容量有界；达到保留上限返回 Busy，不为了继续执行而丢弃终态身份记录。终态结果与仍有 native 执行的生命周期跟踪不同：`unknown_outcome` 对请求已确定，但 `execution_stopped=false` 时仍保留占用。N2/N5 后续做生命周期/保留策略时，不得在未停止前丢记录，或让旧 ID 在同命名空间重新生效。
+
+N1-F1 将调用者结果、native 停止证据和单次投递状态分开。`DeliveryAttempt` 包含命令类型、完整 open/operation/lease 身份以及非零、单调递增的 sequence；重启必须更换身份命名空间。transport 回调是可信 N2/N3 事件，不接受客户端直接构造。`delivery_failed` 返回 true 表示本次转换生效，旧代际/旧 attempt/重复回调返回 false，伪造当前完整身份返回错误。`delivery_status(client, attempt)`、operation snapshot 的 cancel_delivery 和 session snapshot 的 control_delivery 提供投递状态与来源；同步入队失败通过同一个 `delivery_failed` 转换，返回与投递 snapshot 相同的错误。仅入队成功不代表 native 已开始。
+
+| 命令的延后失败 | NotSent（必须证明该命令未到达） | Uncertain（可能已经执行） |
+|---|---|---|
+| Execute | failed，释放未执行占用，不自动重放；若真实断连已确定 unknown，只补未执行证据，不改旧结果 | unknown_outcome，保留占用和原 cause；同实例其他 lease 不变 |
+| Open | 保留失败身份墓碑；反常迟到 handle 也返回 ReleaseRequired | 保留未知结果与跟踪，迟到 handle 返回 ReleaseRequired |
+| Cancel | 保留原结果和占用，单独记录失败；调用者可显式重试新 attempt | 同样不代表停止；可显式再次请求精确 operation 的幂等停止控制 |
+| Release | 回到原阶段（尤其 ReleaseRequired），允许显式新 attempt；若已真实断连则保持 Disconnected | 仍待释放确认，不恢复 Active、不重放；真实断连后迟到 released 仍仅确认本 lease |
+| Shutdown | 恢复原阶段，清除 pending_shutdown；真实断连不能被恢复为 Active | 维持待确认；只有公共 API 的明确拒绝/成功可以解除未知关闭状态 |
+
+`delivery_acknowledged` 仅记录当前 attempt 的 ACK，不能释放执行槽位、lease 或确认 shutdown；ACK 后再报 NotSent 是矛盾事件，明确拒绝。首次失败后不让重复失败重写来源，迟到真实生命周期确认仍可协调当前 attempt。`complete` 仅接受真实执行调用已返回/停止的证据，迟到完成对 unknown 只补 execution_stopped；`open_failed` 是明确打开失败，仍保留有界墓碑，若随后出现成功 handle 则跟踪并释放。`opened` 拒绝的任何新且未注册 handle（错误身份、零 generation、重复 acquisition、旧代际等）仍归 N3 持有并清理；不能丢弃句柄或关闭其他 lease。同一已注册 lease 的重复消息只丢消息，不重复关闭该 handle。
+
+重复 cancel/expire 在相同 reason 的 Queued/Acknowledged 控制下不增发；失败后的显式调用才生成新 attempt。总 deadline 优先于 client reason，升级 deadline 也用新 attempt，旧 ACK/失败不能影响后继。停止或确证 owner 代际替换后不再发送旧控制；真实断连本身不是停止，当前代际的未知执行仍允许通过独立控制连接尝试停止。没有业务请求自动重放。释放确认和关闭拒绝/成功必须携带当前 attempt，不能仅凭 lease 或 task_id；旧失败不能恢复 Active，旧确认不能确认后继释放/关闭。
+
+每个逻辑命令只保留最新 attempt：Open/Execute/Shutdown 各受 operation 保留容量约束，Cancel 每 operation 一条、Release 每 lease 一条。记录总数不超过三倍 coordinator capacity，重试替换记录；sequence 溢出明确 Busy，不复用 ID。N2/N3 负责有界 transport 本身及显式控制重试节奏，不能把 transport 结果当 native 已停止。
 
 期限使用 `Instant`；不序列化该时钟值。保留现有 `timeout_secs` 兼容策略：默认 120 秒，open 上限 3600，其他方法上限 600；超大 u64 截断到上限，负数、字符串、浮点和 null 沿用旧 router 的默认值，0 表示立即过期。跨进程 `remaining_ms` 必须在 1..=3600000 内，小于 1ms 保守按耗尽处理。N2 在 dispatch 入队时建立本地剩余预算，发送前扣除管道队列时间；N3 在接收时建立自己的单调预算，执行前继续扣除 bridge 队列时间。router 原总期限始终有效，负责到期控制请求。传输和 native 区间不能保证硬停止，等待期限过后仍须保留取消待确认/未知结果，不使用 Nexus 的执行 timeout 替代总 deadline。
 
