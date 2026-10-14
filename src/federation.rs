@@ -3,8 +3,8 @@ use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationNodeConfig {
@@ -199,7 +199,10 @@ pub fn supports_request(
         None => true,
         Some(method) => {
             node.capabilities.is_empty()
-                || node.capabilities.iter().any(|cap| cap == "*" || cap == method)
+                || node
+                    .capabilities
+                    .iter()
+                    .any(|cap| cap == "*" || cap == method)
         }
     };
     tenant_ok && method_ok
@@ -354,7 +357,12 @@ pub fn probe_record(record: &FederationNodeRecord) -> FederationNodeStatus {
             .and_then(|v| v.as_array())
             .map(|items| items.len() as u64)
     });
-    let load_score = compute_load_score(worker_count, max_workers, route_queue_depth, prewarm_queue_depth);
+    let load_score = compute_load_score(
+        worker_count,
+        max_workers,
+        route_queue_depth,
+        prewarm_queue_depth,
+    );
 
     FederationNodeStatus {
         name: node.name.clone(),

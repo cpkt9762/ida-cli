@@ -240,11 +240,7 @@ async fn dispatch_cli_request(
                     Ok(value) => RpcResponse::ok(&req.id, value),
                     Err(err) => RpcResponse::err(&req.id, -32000, err.to_string()),
                 },
-                _ => RpcResponse::err(
-                    &req.id,
-                    -32001,
-                    "enqueue requires path and method",
-                ),
+                _ => RpcResponse::err(&req.id, -32001, "enqueue requires path and method"),
             };
             (resp, None)
         }
@@ -272,7 +268,11 @@ async fn dispatch_cli_request(
 
         "prewarm" => {
             let resp = if let Some(ref p) = path {
-                let queue = req.params.get("queue").and_then(|v| v.as_bool()).unwrap_or(false);
+                let queue = req
+                    .params
+                    .get("queue")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let keep_warm = req
                     .params
                     .get("keep_warm")
@@ -290,7 +290,9 @@ async fn dispatch_cli_request(
                     .map(ToOwned::to_owned);
 
                 let result = if queue {
-                    router.enqueue_prewarm(p, priority, keep_warm, tenant_id).await
+                    router
+                        .enqueue_prewarm(p, priority, keep_warm, tenant_id)
+                        .await
                 } else {
                     router
                         .prewarm_path_with_options(

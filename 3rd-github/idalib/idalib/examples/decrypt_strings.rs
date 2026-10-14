@@ -2,8 +2,8 @@
 // e8cdc0697748e702cf2916a2c5670325a891402ee38c98d91873a0f03e3f9025
 
 use idalib::idb::*;
-use idalib::insn::x86::{NN_lea, NN_mov};
 use idalib::insn::OperandType;
+use idalib::insn::x86::{NN_lea, NN_mov};
 use idalib::xref::{XRef, XRefQuery};
 
 const RCX: u16 = 1;
@@ -30,11 +30,7 @@ impl EncString {
 
     #[inline]
     fn shrink_byte(b: u8) -> u8 {
-        if b > 0x7F {
-            b - 0x60
-        } else {
-            b
-        }
+        if b > 0x7F { b - 0x60 } else { b }
     }
 
     fn decrypt(&self, idb: &IDB) -> Option<String> {

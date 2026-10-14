@@ -9,8 +9,8 @@ use crate::ffi::hexrays::{
     idalib_hexrays_cfunc_find_stmts_at, idalib_hexrays_cfunc_get_stmt_bounds,
     idalib_hexrays_cfunc_has_eamap, idalib_hexrays_cfunc_pseudocode, idalib_hexrays_cfuncptr_inner,
     idalib_hexrays_cinsn_ea, idalib_hexrays_cinsn_op, idalib_hexrays_cinsn_print,
-    idalib_hexrays_eamap_result_len, idalib_hexrays_eamap_result_next,
-    idalib_hexrays_rename_lvar, idalib_hexrays_set_decompiler_comment, idalib_hexrays_set_lvar_type,
+    idalib_hexrays_eamap_result_len, idalib_hexrays_eamap_result_next, idalib_hexrays_rename_lvar,
+    idalib_hexrays_set_decompiler_comment, idalib_hexrays_set_lvar_type,
 };
 use crate::idb::IDB;
 
@@ -248,7 +248,8 @@ pub fn set_lvar_type(
 ) -> Option<()> {
     let name = CString::new(lvar_name.as_ref()).ok()?;
     let ty = CString::new(type_str.as_ref()).ok()?;
-    unsafe { idalib_hexrays_set_lvar_type(func_ea.into(), name.as_ptr(), ty.as_ptr()) }.then_some(())
+    unsafe { idalib_hexrays_set_lvar_type(func_ea.into(), name.as_ptr(), ty.as_ptr()) }
+        .then_some(())
 }
 
 /// Set a comment in decompiled pseudocode. itp=69 (ITP_SEMI) for line-end comments.
@@ -260,6 +261,8 @@ pub fn set_decompiler_comment(
     comment: impl AsRef<str>,
 ) -> Option<()> {
     let cmt = CString::new(comment.as_ref()).ok()?;
-    unsafe { idalib_hexrays_set_decompiler_comment(func_ea.into(), addr.into(), itp.into(), cmt.as_ptr()) }
-        .then_some(())
+    unsafe {
+        idalib_hexrays_set_decompiler_comment(func_ea.into(), addr.into(), itp.into(), cmt.as_ptr())
+    }
+    .then_some(())
 }

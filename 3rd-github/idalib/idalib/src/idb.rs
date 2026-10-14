@@ -499,9 +499,8 @@ impl IDB {
         if !self.decompiler {
             return Err(IDAError::ffi_with("no decompiler available"));
         }
-        crate::decompiler::set_lvar_type(func_ea, lvar_name, type_str).ok_or_else(|| {
-            IDAError::ffi_with(format!("failed to set lvar type at {func_ea:#x}"))
-        })
+        crate::decompiler::set_lvar_type(func_ea, lvar_name, type_str)
+            .ok_or_else(|| IDAError::ffi_with(format!("failed to set lvar type at {func_ea:#x}")))
     }
 
     pub fn set_decompiler_comment(
@@ -518,7 +517,6 @@ impl IDB {
             IDAError::ffi_with(format!("failed to set decompiler comment at {addr:#x}"))
         })
     }
-
 
     pub fn set_name(&self, ea: Address, name: impl AsRef<str>) -> Result<(), IDAError> {
         self.set_name_with_flags(ea, name, 0)

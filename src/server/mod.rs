@@ -1,7 +1,7 @@
 //! MCP server implementation with IDA Pro tools.
 
-mod requests;
 pub mod mcp_socket;
+mod requests;
 pub mod response_cache;
 pub mod socket_listener;
 pub mod task;

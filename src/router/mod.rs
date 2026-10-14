@@ -1318,8 +1318,7 @@ impl RouterState {
         let expanded_path = crate::expand_path(path);
         let expanded_open = crate::expand_path(open_path);
         let canonical = std::fs::canonicalize(&expanded_path).unwrap_or(expanded_path);
-        let canonical_open =
-            std::fs::canonicalize(&expanded_open).unwrap_or(expanded_open);
+        let canonical_open = std::fs::canonicalize(&expanded_open).unwrap_or(expanded_open);
         let worker_key = Self::worker_key(canonical.clone(), &tenant_id);
 
         let handle = {
@@ -2176,9 +2175,7 @@ impl RouterState {
                                 // Tidy up pid / unix socket / discovery file
                                 // so the next client does not hit a stale
                                 // `~/.ida/server.sock` or `/tmp/ida-cli.socket`.
-                                let _ = std::fs::remove_file(
-                                    crate::idb_store::pid_path(),
-                                );
+                                let _ = std::fs::remove_file(crate::idb_store::pid_path());
                                 crate::server::socket_listener::cleanup_socket_files(
                                     &crate::idb_store::socket_path(),
                                 );
@@ -2377,14 +2374,11 @@ mod tests {
     #[tokio::test]
     async fn test_status_snapshot_with_empty_probe_cache_does_not_deadlock() {
         let router = RouterState::new().expect("RouterState should be created");
-        router.inner.lock().await.exe_path =
-            PathBuf::from("/nonexistent/ida-cli-for-probe-test");
-        let status = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            router.status_snapshot(),
-        )
-        .await
-        .expect("status_snapshot must not deadlock when the probe cache is empty");
+        router.inner.lock().await.exe_path = PathBuf::from("/nonexistent/ida-cli-for-probe-test");
+        let status =
+            tokio::time::timeout(std::time::Duration::from_secs(10), router.status_snapshot())
+                .await
+                .expect("status_snapshot must not deadlock when the probe cache is empty");
         assert!(status.runtime_probe.is_none());
         assert!(router.cached_probe.try_lock().is_ok());
     }

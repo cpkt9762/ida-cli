@@ -120,7 +120,9 @@ pub fn handle_open(
     let mut should_load_dsym = false;
     if !is_idb {
         let store = IdbStore::new();
-        let out_path = store.lookup(&expanded).unwrap_or_else(|| store.idb_path(&expanded));
+        let out_path = store
+            .lookup(&expanded)
+            .unwrap_or_else(|| store.idb_path(&expanded));
         should_load_dsym = !out_path.exists();
         if should_load_dsym {
             dsym_path = dsym_path_for_binary(&expanded);

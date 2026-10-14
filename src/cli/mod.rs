@@ -474,64 +474,6 @@ fn build_rpc_params(
     (method.to_string(), serde_json::Value::Object(params))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{build_rpc_params, CliCommand};
-
-    #[test]
-    fn build_rpc_params_for_cli_surface_methods() {
-        let (method, params) = build_rpc_params(
-            &CliCommand::ListImports {
-                limit: 5,
-                offset: 2,
-            },
-            Some("/tmp/a.bin"),
-            None,
-        );
-        assert_eq!(method, "list_imports");
-        assert_eq!(params["path"], "/tmp/a.bin");
-        assert_eq!(params["limit"], 5);
-        assert_eq!(params["offset"], 2);
-
-        let (method, params) = build_rpc_params(
-            &CliCommand::XrefsToString {
-                query: "malloc".to_string(),
-                limit: 4,
-                max_xrefs: 3,
-                exact: false,
-                case_insensitive: true,
-            },
-            Some("/tmp/a.bin"),
-            None,
-        );
-        assert_eq!(method, "get_xrefs_to_string");
-        assert_eq!(params["query"], "malloc");
-        assert_eq!(params["limit"], 4);
-        assert_eq!(params["max_xrefs"], 3);
-        assert_eq!(params["case_insensitive"], true);
-
-        let (method, params) = build_rpc_params(
-            &CliCommand::Callers {
-                addr: "0x1000".to_string(),
-            },
-            None,
-            None,
-        );
-        assert_eq!(method, "get_callers");
-        assert_eq!(params["address"], "0x1000");
-
-        let (method, params) = build_rpc_params(
-            &CliCommand::AddressInfo {
-                addr: "0x2000".to_string(),
-            },
-            None,
-            None,
-        );
-        assert_eq!(method, "get_address_info");
-        assert_eq!(params["address"], "0x2000");
-    }
-}
-
 fn admin_url(path: &str) -> String {
     let base =
         std::env::var("IDA_CLI_ADMIN_URL").unwrap_or_else(|_| "http://127.0.0.1:9876".to_string());
@@ -820,4 +762,62 @@ async fn run_pipe(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_rpc_params, CliCommand};
+
+    #[test]
+    fn build_rpc_params_for_cli_surface_methods() {
+        let (method, params) = build_rpc_params(
+            &CliCommand::ListImports {
+                limit: 5,
+                offset: 2,
+            },
+            Some("/tmp/a.bin"),
+            None,
+        );
+        assert_eq!(method, "list_imports");
+        assert_eq!(params["path"], "/tmp/a.bin");
+        assert_eq!(params["limit"], 5);
+        assert_eq!(params["offset"], 2);
+
+        let (method, params) = build_rpc_params(
+            &CliCommand::XrefsToString {
+                query: "malloc".to_string(),
+                limit: 4,
+                max_xrefs: 3,
+                exact: false,
+                case_insensitive: true,
+            },
+            Some("/tmp/a.bin"),
+            None,
+        );
+        assert_eq!(method, "get_xrefs_to_string");
+        assert_eq!(params["query"], "malloc");
+        assert_eq!(params["limit"], 4);
+        assert_eq!(params["max_xrefs"], 3);
+        assert_eq!(params["case_insensitive"], true);
+
+        let (method, params) = build_rpc_params(
+            &CliCommand::Callers {
+                addr: "0x1000".to_string(),
+            },
+            None,
+            None,
+        );
+        assert_eq!(method, "get_callers");
+        assert_eq!(params["address"], "0x1000");
+
+        let (method, params) = build_rpc_params(
+            &CliCommand::AddressInfo {
+                addr: "0x2000".to_string(),
+            },
+            None,
+            None,
+        );
+        assert_eq!(method, "get_address_info");
+        assert_eq!(params["address"], "0x2000");
+    }
 }

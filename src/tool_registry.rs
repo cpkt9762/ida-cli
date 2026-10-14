@@ -1630,7 +1630,7 @@ pub fn search_tools(query: &str, limit: usize) -> Vec<(&'static ToolInfo, Vec<&'
     }
 
     // Sort by score descending
-    results.sort_by(|a, b| b.2.cmp(&a.2));
+    results.sort_by_key(|item| std::cmp::Reverse(item.2));
 
     // Return top results
     results

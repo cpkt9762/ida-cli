@@ -196,8 +196,9 @@ where
                 }
                 if path == "/statusz" {
                     let status = router.status_snapshot_federated().await;
-                    let value = serde_json::to_value(status)
-                        .unwrap_or_else(|_| serde_json::json!({"error": "status serialization failed"}));
+                    let value = serde_json::to_value(status).unwrap_or_else(
+                        |_| serde_json::json!({"error": "status serialization failed"}),
+                    );
                     return Ok(json_response(StatusCode::OK, value));
                 }
                 if path == "/federationz" {
@@ -218,12 +219,16 @@ where
                         .into_iter()
                         .map(|state| ida_mcp::router::task_state_json(&state))
                         .collect();
-                    return Ok(json_response(StatusCode::OK, serde_json::json!({ "tasks": tasks })));
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({ "tasks": tasks }),
+                    ));
                 }
                 if let Some(task_id) = path.strip_prefix("/taskz/") {
                     let resp = match router.task_state(task_id) {
-                        Some(state) =>
-                            json_response(StatusCode::OK, ida_mcp::router::task_state_json(&state)),
+                        Some(state) => {
+                            json_response(StatusCode::OK, ida_mcp::router::task_state_json(&state))
+                        }
                         None => json_response(
                             StatusCode::NOT_FOUND,
                             serde_json::json!({"error": "unknown task_id"}),
@@ -276,10 +281,7 @@ where
 
                 let path = value.get("path").and_then(|v| v.as_str());
                 let method = value.get("method").and_then(|v| v.as_str());
-                let priority = value
-                    .get("priority")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u8;
+                let priority = value.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
                 let tenant_id = value
                     .get("tenant_id")
                     .and_then(|v| v.as_str())
@@ -299,7 +301,9 @@ where
 
                 let resp = match (path, method) {
                     (Some(path), Some(method)) if federate => match router
-                        .enqueue_federated_task(path, method, params, tenant_id, priority, dedupe_key)
+                        .enqueue_federated_task(
+                            path, method, params, tenant_id, priority, dedupe_key,
+                        )
                         .await
                     {
                         Ok(value) => json_response(StatusCode::OK, value),
@@ -336,16 +340,17 @@ where
                         ));
                     }
                 };
-                let node: crate::federation::FederationNodeConfig =
-                    match serde_json::from_slice(&body) {
-                        Ok(node) => node,
-                        Err(err) => {
-                            return Ok(json_response(
-                                StatusCode::BAD_REQUEST,
-                                serde_json::json!({"error": format!("invalid federation node json: {err}")}),
-                            ));
-                        }
-                    };
+                let node: crate::federation::FederationNodeConfig = match serde_json::from_slice(
+                    &body,
+                ) {
+                    Ok(node) => node,
+                    Err(err) => {
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            serde_json::json!({"error": format!("invalid federation node json: {err}")}),
+                        ));
+                    }
+                };
                 let value = router.register_federation_node(node).await;
                 return Ok(json_response(StatusCode::OK, value));
             }
@@ -411,7 +416,8 @@ fn json_response(
     status: StatusCode,
     value: serde_json::Value,
 ) -> Response<BoxBody<Bytes, std::convert::Infallible>> {
-    let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec());
+    let body = serde_json::to_vec(&value)
+        .unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec());
     Response::builder()
         .status(status)
         .header(hyper::http::header::CONTENT_TYPE, "application/json")
@@ -431,28 +437,35 @@ fn metrics_response(
     lines.push("# TYPE ida_cli_max_workers gauge".to_string());
     lines.push(format!("ida_cli_max_workers {}", status.max_workers));
 
-    lines.push("# HELP ida_cli_max_pending_per_worker Configured per-worker queue limit".to_string());
+    lines.push(
+        "# HELP ida_cli_max_pending_per_worker Configured per-worker queue limit".to_string(),
+    );
     lines.push("# TYPE ida_cli_max_pending_per_worker gauge".to_string());
     lines.push(format!(
         "ida_cli_max_pending_per_worker {}",
         status.max_pending_per_worker
     ));
 
-    lines.push("# HELP ida_cli_max_workers_per_tenant Configured per-tenant worker limit".to_string());
+    lines.push(
+        "# HELP ida_cli_max_workers_per_tenant Configured per-tenant worker limit".to_string(),
+    );
     lines.push("# TYPE ida_cli_max_workers_per_tenant gauge".to_string());
     lines.push(format!(
         "ida_cli_max_workers_per_tenant {}",
         status.max_workers_per_tenant
     ));
 
-    lines.push("# HELP ida_cli_max_pending_per_tenant Configured per-tenant pending limit".to_string());
+    lines.push(
+        "# HELP ida_cli_max_pending_per_tenant Configured per-tenant pending limit".to_string(),
+    );
     lines.push("# TYPE ida_cli_max_pending_per_tenant gauge".to_string());
     lines.push(format!(
         "ida_cli_max_pending_per_tenant {}",
         status.max_pending_per_tenant
     ));
 
-    lines.push("# HELP ida_cli_max_concurrent_spawns Configured concurrent spawn limit".to_string());
+    lines
+        .push("# HELP ida_cli_max_concurrent_spawns Configured concurrent spawn limit".to_string());
     lines.push("# TYPE ida_cli_max_concurrent_spawns gauge".to_string());
     lines.push(format!(
         "ida_cli_max_concurrent_spawns {}",
@@ -514,7 +527,10 @@ fn metrics_response(
 
     if let Some(runtime_probe) = &status.runtime_probe {
         let supported = if runtime_probe.supported { 1 } else { 0 };
-        let backend = runtime_probe.backend.map(|b| b.to_string()).unwrap_or_default();
+        let backend = runtime_probe
+            .backend
+            .map(|b| b.to_string())
+            .unwrap_or_default();
         let version = runtime_probe
             .runtime
             .as_ref()
@@ -529,7 +545,10 @@ fn metrics_response(
     let body = lines.join("\n") + "\n";
     Response::builder()
         .status(StatusCode::OK)
-        .header(hyper::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .header(
+            hyper::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )
         .body(Full::new(Bytes::from(body)).boxed())
         .expect("valid response")
 }
@@ -1041,14 +1060,11 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 .filter(|s| !s.is_empty())
                 .collect();
             let allowed_origins = Arc::new(allowed_origins);
-            let inflight_limit =
-                Arc::new(tokio::sync::Semaphore::new(args.max_inflight_requests.max(1)));
-            let service = GatewayService::new(
-                service,
-                allowed_origins,
-                router.clone(),
-                inflight_limit,
-            );
+            let inflight_limit = Arc::new(tokio::sync::Semaphore::new(
+                args.max_inflight_requests.max(1),
+            ));
+            let service =
+                GatewayService::new(service, allowed_origins, router.clone(), inflight_limit);
 
             let listener = tokio::net::TcpListener::bind(bind_addr)
                 .await
@@ -1097,13 +1113,12 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                         ServerMode::Router(router_for_mcp_socket.clone()),
                     ))
                 };
-                if let Err(e) =
-                    ida_mcp::server::mcp_socket::run_bound_mcp_socket_listener(
-                        mcp_socket,
-                        make_server,
-                        cancel_for_mcp_socket,
-                    )
-                    .await
+                if let Err(e) = ida_mcp::server::mcp_socket::run_bound_mcp_socket_listener(
+                    mcp_socket,
+                    make_server,
+                    cancel_for_mcp_socket,
+                )
+                .await
                 {
                     warn!("MCP socket listener failed: {e}");
                 }
@@ -1168,4 +1183,3 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     info!("Server stopped");
     Ok(())
 }
-
