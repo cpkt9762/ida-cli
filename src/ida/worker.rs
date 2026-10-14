@@ -312,6 +312,14 @@ impl IdaWorker {
         rx.await?
     }
 
+    /// Decompile a function and return each line with the addresses Hex-Rays
+    /// anchored to it.
+    pub async fn decompile_lines(&self, addr: u64) -> Result<DecompiledLines, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DecompileLines { addr, resp: tx })?;
+        rx.await?
+    }
+
     /// List all segments.
     pub async fn segments(&self) -> Result<Vec<SegmentInfo>, ToolError> {
         let (tx, rx) = oneshot::channel();
@@ -1351,6 +1359,10 @@ impl WorkerDispatch for IdaWorker {
 
     async fn decompile(&self, addr: u64) -> Result<String, ToolError> {
         self.decompile(addr).await
+    }
+
+    async fn decompile_lines(&self, addr: u64) -> Result<DecompiledLines, ToolError> {
+        self.decompile_lines(addr).await
     }
 
     async fn pseudocode_at(&self, addr: u64, end_addr: Option<u64>) -> Result<Value, ToolError> {

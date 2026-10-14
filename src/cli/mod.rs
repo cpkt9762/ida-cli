@@ -50,6 +50,9 @@ pub enum CliCommand {
     Decompile {
         #[arg(long)]
         addr: String,
+        /// Also return one {line, text, addresses} entry per pseudocode line
+        #[arg(long)]
+        line_addresses: bool,
     },
     Disasm {
         #[arg(long)]
@@ -377,8 +380,14 @@ fn build_rpc_params(
             }
             "list_functions"
         }
-        CliCommand::Decompile { addr } => {
+        CliCommand::Decompile {
+            addr,
+            line_addresses,
+        } => {
             params.insert("address".to_string(), serde_json::json!(addr));
+            if *line_addresses {
+                params.insert("line_addresses".to_string(), serde_json::json!(true));
+            }
             "decompile_function"
         }
         CliCommand::Disasm { addr, name, count } => {
@@ -480,7 +489,8 @@ fn build_rpc_params(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_rpc_params, CliCommand};
+    use super::{build_rpc_params, CliArgs, CliCommand};
+    use clap::Parser;
 
     #[test]
     fn build_rpc_params_for_cli_surface_methods() {
@@ -533,6 +543,55 @@ mod tests {
         );
         assert_eq!(method, "get_address_info");
         assert_eq!(params["address"], "0x2000");
+    }
+
+    #[test]
+    fn decompile_sends_line_addresses_only_when_asked() {
+        let (method, params) = build_rpc_params(
+            &CliCommand::Decompile {
+                addr: "0x1000".to_string(),
+                line_addresses: false,
+            },
+            Some("/tmp/a.bin"),
+            None,
+        );
+        assert_eq!(method, "decompile_function");
+        assert_eq!(params["address"], "0x1000");
+        assert!(params.get("line_addresses").is_none());
+
+        let (method, params) = build_rpc_params(
+            &CliCommand::Decompile {
+                addr: "0x1000".to_string(),
+                line_addresses: true,
+            },
+            Some("/tmp/a.bin"),
+            None,
+        );
+        assert_eq!(method, "decompile_function");
+        assert_eq!(params["line_addresses"], true);
+    }
+
+    #[test]
+    fn decompile_line_addresses_flag_parses() {
+        let plain =
+            CliArgs::try_parse_from(["ida-cli", "decompile", "--addr", "0x10"]).expect("parse");
+        assert!(matches!(
+            plain.command,
+            CliCommand::Decompile {
+                line_addresses: false,
+                ..
+            }
+        ));
+        let with =
+            CliArgs::try_parse_from(["ida-cli", "decompile", "--addr", "0x10", "--line-addresses"])
+                .expect("parse");
+        assert!(matches!(
+            with.command,
+            CliCommand::Decompile {
+                line_addresses: true,
+                ..
+            }
+        ));
     }
 
     #[test]

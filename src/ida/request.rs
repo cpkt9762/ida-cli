@@ -58,6 +58,10 @@ pub enum IdaRequest {
         addr: u64,
         resp: oneshot::Sender<Result<String, ToolError>>,
     },
+    DecompileLines {
+        addr: u64,
+        resp: oneshot::Sender<Result<DecompiledLines, ToolError>>,
+    },
     Segments {
         resp: oneshot::Sender<Result<Vec<SegmentInfo>, ToolError>>,
     },
@@ -467,6 +471,7 @@ impl_request_inspection!(
     DisasmByName,
     Disasm,
     Decompile,
+    DecompileLines,
     Segments,
     Strings,
     LocalTypes,

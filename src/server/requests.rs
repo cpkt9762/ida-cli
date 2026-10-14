@@ -221,6 +221,16 @@ pub struct DecompileRequest {
     #[schemars(description = "Address(es) of function to decompile (string/number or array)")]
     #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
     pub address: Value,
+    #[schemars(
+        description = "If true, return JSON with `code` and a `lines` array instead of plain text. \
+        Each entry is {line, text, addresses}: `line` is 1-based, `text` is the same line as in \
+        `code`, `addresses` are the IDA addresses of the ctree items Hex-Rays anchored on that \
+        line (hex strings, ascending, no duplicates). A line can map to several non-contiguous \
+        addresses; lines without an anchor, such as declarations and braces, have none. \
+        The rename hint for sub_ names is not added in this mode. Default: false"
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_addresses: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]

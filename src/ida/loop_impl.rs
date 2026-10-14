@@ -220,6 +220,25 @@ pub fn run_ida_loop(rx: mpsc::Receiver<EnqueuedRequest>) {
                 }
                 let _ = resp.send(result);
             }
+            IdaRequest::DecompileLines { addr, resp } => {
+                debug!(
+                    address = format!("{:#x}", addr),
+                    "Decompiling with line addresses"
+                );
+                let result = disasm::handle_decompile_lines(&idb, addr);
+                match &result {
+                    Ok(out) => debug!(
+                        lines = out.lines.len(),
+                        with_addresses =
+                            out.lines.iter().filter(|l| !l.addresses.is_empty()).count(),
+                        "Decompilation with line addresses complete"
+                    ),
+                    Err(e) => {
+                        warn!(address = format!("{:#x}", addr), error = %e, "Failed to decompile")
+                    }
+                }
+                let _ = resp.send(result);
+            }
             IdaRequest::Segments { resp } => {
                 debug!("Listing segments");
                 let result = segments::handle_segments(&idb);

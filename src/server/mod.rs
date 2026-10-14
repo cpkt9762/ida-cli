@@ -1470,20 +1470,29 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Decompile a function using Hex-Rays (if available)")]
+    #[tool(
+        description = "Decompile a function using Hex-Rays (if available). With \
+        line_addresses=true the answer is JSON {code, lines}: one {line, text, addresses} entry \
+        per pseudocode line, where addresses are the IDA addresses Hex-Rays anchored on that line"
+    )]
     #[instrument(skip(self), fields(address = %req.address))]
     async fn decompile_function(
         &self,
         Parameters(req): Parameters<DecompileRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: decompile_function");
+        let line_addresses = req.line_addresses == Some(true);
         if let ServerMode::Router(ref router) = self.mode {
+            let mut params = json!({"address": req.address});
+            if line_addresses {
+                params["line_addresses"] = json!(true);
+            }
             return self
                 .route_or_err(
                     router,
                     req.db_handle.as_deref(),
                     "decompile_function",
-                    json!({"address": req.address}),
+                    params,
                 )
                 .await;
         }
@@ -1491,6 +1500,17 @@ impl IdaMcpServer {
             Ok(a) => a,
             Err(e) => return Ok(e.to_tool_result()),
         };
+
+        if line_addresses {
+            return match crate::rpc_dispatch::decompile_with_line_addresses(&*self.worker, &addrs)
+                .await
+            {
+                Ok(value) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{value:?}")),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            };
+        }
 
         if addrs.len() == 1 {
             match self.worker.decompile(addrs[0]).await {

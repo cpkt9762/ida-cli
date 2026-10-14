@@ -123,6 +123,34 @@ fn parse_patch_bytes(v: &Value) -> Result<Vec<u8>, ToolError> {
     ))
 }
 
+/// `decompile_function` with `line_addresses`: the plain code plus one entry
+/// per pseudocode line. The sub_ rename hint is not added, so `code` and
+/// `lines` stay line for line the same.
+pub(crate) async fn decompile_with_line_addresses<W: WorkerDispatch>(
+    worker: &W,
+    addrs: &[u64],
+) -> Result<Value, ToolError> {
+    if let [addr] = addrs {
+        let out = worker.decompile_lines(*addr).await?;
+        return Ok(json!({"code": out.code, "lines": out.lines}));
+    }
+    let mut results = Vec::new();
+    for &addr in addrs {
+        match worker.decompile_lines(addr).await {
+            Ok(out) => results.push(json!({
+                "address": format!("{:#x}", addr),
+                "code": out.code,
+                "lines": out.lines
+            })),
+            Err(e) => results.push(json!({
+                "address": format!("{:#x}", addr),
+                "error": e.to_string()
+            })),
+        }
+    }
+    Ok(json!({"results": results}))
+}
+
 /// Dispatch a JSON-RPC request to the appropriate worker method.
 pub async fn dispatch_rpc<W: WorkerDispatch>(
     req: &RpcRequest,
@@ -273,6 +301,9 @@ pub async fn dispatch_rpc<W: WorkerDispatch>(
         "decompile_function" => {
             let req: DecompileRequest = parse_params(p)?;
             let addrs = parse_address_values(&req.address)?;
+            if req.line_addresses == Some(true) {
+                return decompile_with_line_addresses(worker, &addrs).await;
+            }
             if addrs.len() == 1 {
                 let r = worker.decompile(addrs[0]).await?;
                 let has_unknown_name = r
@@ -1073,6 +1104,28 @@ pub mod mock {
         }
     }
 
+    /// An address the mock refuses to decompile.
+    const MOCK_UNDECOMPILABLE: u64 = 0xdead;
+
+    /// The mock's answer for `decompile_lines`: a `sub_` function, so the
+    /// plain path would prepend the rename hint.
+    fn mock_decompiled_lines(addr: u64) -> DecompiledLines {
+        let line = |line: usize, text: &str, addresses: Vec<u64>| PseudocodeLine {
+            line,
+            text: text.to_string(),
+            addresses,
+        };
+        DecompiledLines {
+            code: "int sub_1000()\n{\n  return 1;\n}\n".to_string(),
+            lines: vec![
+                line(1, "int sub_1000()", vec![addr]),
+                line(2, "{", vec![]),
+                line(3, "  return 1;", vec![addr + 4, addr + 8]),
+                line(4, "}", vec![]),
+            ],
+        }
+    }
+
     // Helper: construct default return values for IDA types that don't derive Default.
 
     fn default_db_info() -> DbInfo {
@@ -1396,6 +1449,14 @@ pub mod mock {
         async fn decompile(&self, addr: u64) -> Result<String, ToolError> {
             self.record("decompile", json!({"addr": addr}));
             Ok(String::new())
+        }
+
+        async fn decompile_lines(&self, addr: u64) -> Result<DecompiledLines, ToolError> {
+            self.record("decompile_lines", json!({"addr": addr}));
+            if addr == MOCK_UNDECOMPILABLE {
+                return Err(ToolError::FunctionNotFound(addr));
+            }
+            Ok(mock_decompiled_lines(addr))
         }
 
         async fn pseudocode_at(
@@ -2466,6 +2527,96 @@ mod tests {
         assert_eq!(calls[0].0, "decompile");
         assert_eq!(calls[1].0, "decompile");
     }
+
+    async fn dispatch_with_calls(method: &str, params: Value) -> (Value, Vec<(String, Value)>) {
+        let mock = MockWorker::new();
+        let req = RpcRequest::new("1", method, params);
+        let result = dispatch_rpc(&req, &mock).await.expect("dispatch");
+        let calls = mock.calls.lock().unwrap().clone();
+        (result, calls)
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_decompile_function_line_addresses() {
+        let (result, calls) = dispatch_with_calls(
+            "decompile_function",
+            json!({"address": "0x1000", "line_addresses": true}),
+        )
+        .await;
+        assert_eq!(
+            calls,
+            vec![("decompile_lines".to_string(), json!({"addr": 0x1000u64}))]
+        );
+        assert_eq!(
+            result,
+            json!({
+                "code": "int sub_1000()\n{\n  return 1;\n}\n",
+                "lines": [
+                    {"line": 1, "text": "int sub_1000()", "addresses": ["0x1000"]},
+                    {"line": 2, "text": "{", "addresses": []},
+                    {"line": 3, "text": "  return 1;", "addresses": ["0x1004", "0x1008"]},
+                    {"line": 4, "text": "}", "addresses": []}
+                ]
+            })
+        );
+        // `code` has exactly the lines of `lines`: no rename hint in front.
+        let code = result["code"].as_str().expect("code");
+        let texts: Vec<&str> = result["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .map(|l| l["text"].as_str().expect("text"))
+            .collect();
+        assert_eq!(code.lines().collect::<Vec<_>>(), texts);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_decompile_function_line_addresses_off_is_plain() {
+        for params in [
+            json!({"address": "0x1000"}),
+            json!({"address": "0x1000", "line_addresses": false}),
+        ] {
+            let (result, calls) = dispatch_with_calls("decompile_function", params).await;
+            assert_eq!(
+                calls,
+                vec![("decompile".to_string(), json!({"addr": 0x1000u64}))]
+            );
+            assert_eq!(result, json!({"code": ""}));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_decompile_function_line_addresses_multiple() {
+        let (result, calls) = dispatch_with_calls(
+            "decompile_function",
+            json!({"address": ["0x2000", "0xdead"], "line_addresses": true}),
+        )
+        .await;
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|(method, _)| method == "decompile_lines"));
+        let results = result["results"].as_array().expect("results");
+        assert_eq!(results[0]["address"], json!("0x2000"));
+        assert_eq!(results[0]["lines"][0]["addresses"], json!(["0x2000"]));
+        assert_eq!(results[1]["address"], json!("0xdead"));
+        assert!(results[1].get("lines").is_none());
+        assert!(results[1]["error"]
+            .as_str()
+            .expect("error")
+            .contains("0xdead"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_decompile_function_line_addresses_error_is_returned() {
+        let mock = MockWorker::new();
+        let req = RpcRequest::new(
+            "1",
+            "decompile_function",
+            json!({"address": "0xdead", "line_addresses": true}),
+        );
+        let err = dispatch_rpc(&req, &mock).await.expect_err("error");
+        assert!(matches!(err, ToolError::FunctionNotFound(0xdead)), "{err}");
+    }
+
     single_call_test!(
         test_dispatch_get_pseudocode_at,
         "get_pseudocode_at",
