@@ -1,6 +1,6 @@
 //! Response types for IDA worker operations.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 /// Database info returned after opening
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,4 +352,28 @@ pub struct BytesResult {
     pub address: String,
     pub bytes: String,
     pub length: usize,
+}
+
+/// One line of pseudocode with the addresses Hex-Rays anchored to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PseudocodeLine {
+    /// 1-based position in the decompiler output.
+    pub line: usize,
+    /// The line without color tags, as in the plain `decompile_function` text.
+    pub text: String,
+    /// Addresses of the ctree items anchored on the line: sorted ascending,
+    /// no duplicates, never `BADADDR`. Empty when the line has no anchor.
+    #[serde(serialize_with = "serialize_hex")]
+    pub addresses: Vec<u64>,
+}
+
+/// A decompiled function: the plain text and its lines with addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DecompiledLines {
+    pub code: String,
+    pub lines: Vec<PseudocodeLine>,
+}
+
+fn serialize_hex<S: Serializer>(addresses: &[u64], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(addresses.iter().map(|ea| format!("{ea:#x}")))
 }

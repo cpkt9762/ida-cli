@@ -10,6 +10,7 @@ pub mod handlers;
 pub mod install;
 pub mod lock;
 mod loop_impl;
+pub mod pseudocode_lines;
 pub mod request;
 pub mod runtime;
 pub mod types;
