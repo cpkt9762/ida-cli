@@ -63,6 +63,15 @@ pub enum ToolError {
     #[error("Not supported: {0}")]
     NotSupported(String),
 
+    #[error("Operation timed out after {seconds} seconds; outcome unknown, execution_stopped=false; never replay")]
+    RequestOutcome { seconds: u64 },
+
+    #[error("Offline preparation: {message} (execution_stopped={execution_stopped})")]
+    Preparation {
+        message: String,
+        execution_stopped: bool,
+    },
+
     #[error("Worker channel closed")]
     WorkerClosed,
 }

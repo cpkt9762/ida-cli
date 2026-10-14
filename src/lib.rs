@@ -79,6 +79,7 @@
 use std::path::PathBuf;
 
 pub mod attach;
+pub mod blocking;
 pub mod cli;
 pub mod disasm;
 pub mod dsc;
@@ -87,6 +88,7 @@ pub mod federation;
 pub mod ida;
 pub mod idat_compat;
 pub mod idb_store;
+pub mod preprocess;
 pub mod router;
 pub mod rpc_dispatch;
 pub mod sbpf;

@@ -76,6 +76,8 @@ where
 struct DscBackgroundCtx {
     idat: std::path::PathBuf,
     idat_args: Vec<String>,
+    preparation: crate::preprocess::Preparation,
+    stage: crate::preprocess::StagedArtifact,
     script_path: std::path::PathBuf,
     log_path: Option<std::path::PathBuf>,
     out_i64: std::path::PathBuf,
@@ -406,82 +408,69 @@ impl IdaMcpServer {
         let DscBackgroundCtx {
             idat,
             idat_args,
+            preparation,
+            stage,
             script_path,
             log_path,
             out_i64,
             module,
             frameworks,
         } = ctx;
+        let _cancellation_guard = preparation.cancel_on_drop();
 
         // Phase 1: run idat subprocess
         info!(task_id = %task_id, "Background: running idat");
         registry.update_message(&task_id, "Running idat to create .i64...");
 
-        let idat_bin = idat;
-        let module_env = module.clone();
-        let out_i64_clone = out_i64.clone();
-        let log_path_clone = log_path.clone();
-
-        let spawn_result = tokio::task::spawn_blocking(move || {
-            let mut cmd = std::process::Command::new(&idat_bin);
-            cmd.args(&idat_args);
-            // Remove env vars that cause license conflicts when our
-            // process links idalib and also spawns idat.
-            cmd.env_remove("IDADIR");
-            cmd.env_remove("DYLD_LIBRARY_PATH");
-            cmd.env("IDA_DYLD_CACHE_MODULE", &module_env);
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
-
-            let output = cmd.output();
-
-            match output {
-                Ok(out) => {
-                    let code = out.status.code().unwrap_or(-1);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    (code, stderr.to_string(), out_i64_clone, log_path_clone)
+        let result =
+            crate::dsc::run_idat_offline(&idat, &idat_args, &module, preparation.clone()).await;
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                if preparation.cancel.is_cancelled()
+                    && matches!(
+                        error,
+                        ToolError::Preparation {
+                            execution_stopped: true,
+                            ..
+                        }
+                    )
+                {
+                    registry.cancellation_confirmed(&task_id);
+                } else {
+                    registry.fail(&task_id, &error.to_string());
                 }
-                Err(e) => (
-                    -1,
-                    format!("Failed to spawn idat: {e}"),
-                    out_i64_clone,
-                    log_path_clone,
-                ),
-            }
-        })
-        .await;
-
-        let (exit_code, stderr, out_path, log_out) = match spawn_result {
-            Ok(tuple) => tuple,
-            Err(e) => {
-                let _ = std::fs::remove_file(&script_path);
-                registry.fail(&task_id, &format!("idat task panicked: {e}"));
                 return;
             }
         };
-
-        // Clean up the temporary load script (idat is done with it).
-        let _ = std::fs::remove_file(&script_path);
-
-        if exit_code != 0 || !out_path.exists() {
-            let log_tail = log_out
-                .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| {
-                    let lines: Vec<&str> = s.lines().collect();
-                    let start = lines.len().saturating_sub(20);
-                    lines[start..].join("\n")
-                });
-
-            let mut msg = format!("idat exited with code {exit_code}.\nstderr: {stderr}");
-            if let Some(tail) = log_tail {
-                msg.push_str(&format!("\nlog (last 20 lines):\n{tail}"));
-            }
-            warn!(exit_code, task_id = %task_id, "idat failed");
-            registry.fail(&task_id, &msg);
+        if !output.status.success() {
+            registry.fail(
+                &task_id,
+                &format!(
+                    "idat exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            );
             return;
         }
-
+        let publish = preparation.clone();
+        let result = crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
+            stage.publish(&publish)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) | Err(error) => {
+                if preparation.cancel.is_cancelled() {
+                    registry.cancellation_confirmed(&task_id);
+                } else {
+                    registry.fail(&task_id, &error.to_string());
+                }
+                return;
+            }
+        }
+        let _ = (script_path, log_path);
         info!(task_id = %task_id, "idat completed, opening .i64");
         registry.update_message(&task_id, "Opening database with idalib...");
 
@@ -530,9 +519,18 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         // Multi-IDB guard is enforced in RouterState::route_request itself.
         match router.route_request(handle, method, params).await {
-            Ok(v) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&v).unwrap_or_else(|_| format!("{v:?}")),
-            )])),
+            Ok(v) => match crate::blocking::run(crate::blocking::WorkClass::Encode, move || {
+                serde_json::to_string_pretty(&v)
+            })
+            .await
+            {
+                Ok(Ok(encoded)) => Ok(CallToolResult::success(vec![Content::text(encoded)])),
+                Ok(Err(error)) => Ok(ToolError::IdaError(format!(
+                    "MCP response encoding: {error}"
+                ))
+                .to_tool_result()),
+                Err(error) => Ok(error.to_tool_result()),
+            },
             Err(e) => Ok(e.to_tool_result()),
         }
     }
@@ -588,16 +586,38 @@ impl IdaMcpServer {
         router: &crate::router::RouterState,
         req: &OpenIdbRequest,
     ) -> Result<CallToolResult, McpError> {
+        let preparation = crate::preprocess::Preparation::new(std::time::Duration::from_secs(120));
         let expanded = crate::expand_path(&req.path);
-        let is_sbpf = crate::router::is_sbpf_elf(&expanded);
+        let sbpf_input = expanded.clone();
+        let is_sbpf = match preparation
+            .wait(crate::blocking::run(
+                crate::blocking::WorkClass::Prepare,
+                move || crate::router::is_sbpf_elf(&sbpf_input),
+            ))
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let resolved = match crate::router::resolve_open_path(&req.path, preparation.clone()).await
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
 
-        let (db_handle, close_token) = match router.spawn_worker(&req.path, None).await {
+        let spawn = tokio::select! {biased;
+            _=preparation.cancel.cancelled()=>return Ok(ToolError::Preparation {message:"open cancelled during startup".into(),execution_stopped:false}.to_tool_result()),
+            _=tokio::time::sleep_until(preparation.deadline.into())=>return Ok(ToolError::Preparation {message:"open total deadline expired during startup".into(),execution_stopped:false}.to_tool_result()),
+            result=router.spawn_worker(&req.path,None)=>result,
+        };
+        let (db_handle, close_token) = match spawn {
             Ok(r) => r,
             Err(e) => return Ok(ToolError::OpenFailed(e.to_string()).to_tool_result()),
         };
 
         let params = json!({
-            "path": req.path,
+            "path": resolved.open_path.as_deref().unwrap_or(&req.path),
+            "idb_output_path": resolved.idb_output_path,
             "auto_analyse": true,
             "load_debug_info": req.load_debug_info.unwrap_or(false),
             "debug_info_path": req.debug_info_path,
@@ -606,7 +626,10 @@ impl IdaMcpServer {
             "file_type": req.file_type,
         });
 
-        let result = match router.route_request(Some(&db_handle), "open", params).await {
+        let result = match router
+            .route_request_prepared(Some(&db_handle), "open", params, preparation)
+            .await
+        {
             Ok(v) => v,
             Err(e) => return Ok(e.to_tool_result()),
         };
@@ -4080,6 +4103,7 @@ impl IdaMcpServer {
         Parameters(req): Parameters<OpenDscRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: open_dsc");
+        let preparation = crate::preprocess::Preparation::new(std::time::Duration::from_secs(3600));
 
         if !Self::validate_path(&req.path) {
             return Ok(ToolError::InvalidPath(req.path).to_tool_result());
@@ -4110,13 +4134,34 @@ impl IdaMcpServer {
         };
 
         let script = crate::dsc::dsc_load_script(&req.module, &frameworks);
-        let script_dir = dsc_path.parent().unwrap_or(std::path::Path::new("/tmp"));
-        let script_path = script_dir.join("ida_mcp_dsc_load.py");
-        if let Err(e) = std::fs::write(&script_path, &script) {
-            return Ok(
-                ToolError::InvalidParams(format!("Failed to write DSC load script: {e}"))
-                    .to_tool_result(),
-            );
+        let destination = out_i64.clone();
+        let stage = match preparation
+            .wait(crate::blocking::run(
+                crate::blocking::WorkClass::Prepare,
+                move || crate::preprocess::StagedArtifact::create(&destination),
+            ))
+            .await
+        {
+            Ok(Ok(stage)) => stage,
+            other => {
+                return Ok(ToolError::IdaError(format!("DSC staging: {other:?}")).to_tool_result())
+            }
+        };
+        let script_path = stage.directory.join("load.py");
+        let script_destination = script_path.clone();
+        match preparation
+            .wait(crate::blocking::run(
+                crate::blocking::WorkClass::Prepare,
+                move || std::fs::write(script_destination, script),
+            ))
+            .await
+        {
+            Ok(Ok(())) => {}
+            other => {
+                return Ok(
+                    ToolError::IdaError(format!("DSC script write: {other:?}")).to_tool_result()
+                )
+            }
         }
 
         let log_path = req.log_path.map(std::path::PathBuf::from);
@@ -4130,7 +4175,7 @@ impl IdaMcpServer {
         }
         let idat_args = crate::dsc::idat_dsc_args(
             dsc_path,
-            &out_i64,
+            &stage.output,
             &script_path,
             &file_type,
             log_path.as_deref(),
@@ -4170,9 +4215,13 @@ impl IdaMcpServer {
         let module = req.module.clone();
         let tid = task_id.clone();
 
+        self.task_registry
+            .set_cancellation(&task_id, preparation.cancel.clone());
         let ctx = DscBackgroundCtx {
             idat,
             idat_args,
+            preparation,
+            stage,
             script_path,
             log_path,
             out_i64,
@@ -4459,15 +4508,21 @@ impl IdaMcpServer {
                 if !Self::validate_path(&path) {
                     return Ok(ToolError::InvalidPath(path).to_tool_result());
                 }
-                match std::fs::read_to_string(&path) {
-                    Ok(contents) => contents,
-                    Err(e) => {
+                let source = path.clone();
+                match crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
+                    std::fs::read_to_string(source)
+                })
+                .await
+                {
+                    Ok(Ok(contents)) => contents,
+                    Ok(Err(e)) => {
                         return Ok(ToolError::InvalidPath(format!(
                             "Failed to read script file '{}': {}",
                             path, e
                         ))
                         .to_tool_result());
                     }
+                    Err(error) => return Ok(error.to_tool_result()),
                 }
             }
             (Some(_), Some(_)) => {

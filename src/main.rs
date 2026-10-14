@@ -494,14 +494,22 @@ fn metrics_response(
     lines.push("# TYPE ida_cli_idb_cache_bytes gauge".to_string());
     lines.push(format!(
         "ida_cli_idb_cache_bytes {}",
-        status.idb_cache.total_size_bytes
+        status
+            .idb_cache
+            .as_ref()
+            .map(|s| s.total_size_bytes.to_string())
+            .unwrap_or_else(|| "NaN".into())
     ));
 
     lines.push("# HELP ida_cli_response_cache_bytes Size of cached responses in bytes".to_string());
     lines.push("# TYPE ida_cli_response_cache_bytes gauge".to_string());
     lines.push(format!(
         "ida_cli_response_cache_bytes {}",
-        status.response_cache.total_size_bytes
+        status
+            .response_cache
+            .as_ref()
+            .map(|s| s.total_size_bytes.to_string())
+            .unwrap_or_else(|| "NaN".into())
     ));
 
     for (backend, count) in &status.backend_counts {
@@ -830,9 +838,6 @@ fn run_server_multi() -> anyhow::Result<()> {
 }
 
 fn run_serve_worker(args: ServeWorkerArgs) -> anyhow::Result<()> {
-    use ida_mcp::router::protocol::{RpcRequest, RpcResponse};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
     info!(backend = %args.backend, "Starting ida-cli worker");
 
     if matches!(args.backend, WorkerBackendKind::IdatCompat) {
@@ -858,9 +863,6 @@ fn run_serve_worker(args: ServeWorkerArgs) -> anyhow::Result<()> {
 
             let stdin = tokio::io::stdin();
             let stdout = tokio::io::stdout();
-            let mut reader = tokio::io::BufReader::new(stdin);
-            let mut writer = tokio::io::BufWriter::new(stdout);
-            let mut line_buf = String::new();
 
             // Orphan detection: monitor parent process liveness.
             // When the parent (router) is killed/crashed, getppid() changes
@@ -896,70 +898,14 @@ fn run_serve_worker(args: ServeWorkerArgs) -> anyhow::Result<()> {
                 });
             }
 
-            loop {
-                line_buf.clear();
-                match reader.read_line(&mut line_buf).await {
-                    Ok(0) => {
-                        // EOF — router closed the pipe
-                        info!("Worker stdin closed (EOF), shutting down");
-                        let _ = worker_for_rpc.shutdown().await;
-                        break;
-                    }
-                    Ok(_) => {
-                        let trimmed = line_buf.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-
-                        let req: RpcRequest = match serde_json::from_str(trimmed) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                let err_resp =
-                                    RpcResponse::err("null", -32700, format!("Parse error: {e}"));
-                                if let Ok(json) = serde_json::to_string(&err_resp) {
-                                    let _ = writer.write_all(json.as_bytes()).await;
-                                    let _ = writer.write_all(b"\n").await;
-                                    let _ = writer.flush().await;
-                                }
-                                continue;
-                            }
-                        };
-
-                        let id = req.id.clone();
-                        let is_shutdown = req.method == "shutdown";
-
-                        let result = rpc_dispatch::dispatch_rpc(&req, &worker_for_rpc).await;
-
-                        let response = match result {
-                            Ok(value) => RpcResponse::ok(&id, value),
-                            Err(e) => RpcResponse::err(&id, -32000, e.to_string()),
-                        };
-
-                        let json = match serde_json::to_string(&response) {
-                            Ok(j) => j,
-                            Err(e) => serde_json::to_string(&RpcResponse::err(
-                                &id,
-                                -32603,
-                                format!("Serialization error: {e}"),
-                            ))
-                            .unwrap_or_default(),
-                        };
-                        let _ = writer.write_all(json.as_bytes()).await;
-                        let _ = writer.write_all(b"\n").await;
-                        let _ = writer.flush().await;
-
-                        if is_shutdown {
-                            info!("Shutdown request processed, exiting RPC loop");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Worker stdin read error: {e}");
-                        let _ = worker_for_rpc.shutdown().await;
-                        break;
-                    }
-                }
-            }
+            let dispatcher = worker_for_rpc.clone();
+            let result = ida_mcp::router::worker_io::serve(stdin, stdout, move |request| {
+                let worker = dispatcher.clone();
+                async move { rpc_dispatch::dispatch_rpc(&request, &worker).await }
+            })
+            .await;
+            let _ = worker_for_rpc.shutdown().await;
+            result?;
             Ok::<_, anyhow::Error>(())
         })
     });

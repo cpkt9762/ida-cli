@@ -6,7 +6,7 @@
 //! directly — no intermediate dylib step required on the caller's side.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::process::Command;
 
 use crate::error::ToolError;
 
@@ -23,14 +23,11 @@ pub fn find_sbx() -> Result<PathBuf, ToolError> {
         )));
     }
 
-    if let Ok(output) = Command::new("which").arg("sbx").output() {
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !s.is_empty() {
-                let p = PathBuf::from(s);
-                if p.exists() {
-                    return Ok(p);
-                }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&paths) {
+            let candidate = directory.join("sbx");
+            if candidate.is_file() {
+                return Ok(candidate);
             }
         }
     }
@@ -56,66 +53,55 @@ pub struct SbxAotResult {
     pub i64_path: PathBuf,
 }
 
-pub fn run_sbx_aot_i64(input: &Path, output_i64: &Path) -> Result<SbxAotResult, ToolError> {
-    let bin = find_sbx()?;
-
-    tracing::info!(
-        input = %input.display(),
-        output = %output_i64.display(),
-        "Running sbx aot i64"
-    );
-
-    let abs_input = std::fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
-
-    if let Some(parent) = output_i64.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ToolError::InvalidParams(format!(
-                    "Failed to create output directory {}: {}",
-                    parent.display(),
-                    e
-                ))
-            })?;
-        }
-    }
-
-    let output = Command::new(&bin)
+pub async fn run_sbx_aot_i64(
+    input: &Path,
+    output_i64: &Path,
+    preparation: crate::preprocess::Preparation,
+) -> Result<SbxAotResult, ToolError> {
+    let mut cancellation_guard = preparation.cancel_on_drop();
+    preparation.check()?;
+    let input = input.to_path_buf();
+    let destination = output_i64.to_path_buf();
+    let (bin, abs_input, stage) = preparation
+        .wait(crate::blocking::run(
+            crate::blocking::WorkClass::Prepare,
+            move || {
+                let bin = find_sbx()?;
+                let abs_input = std::fs::canonicalize(&input).map_err(|e| {
+                    ToolError::InvalidParams(format!("sbx input {}: {e}", input.display()))
+                })?;
+                let stage = crate::preprocess::StagedArtifact::create(&destination)
+                    .map_err(|e| ToolError::IdaError(format!("sbx staging: {e}")))?;
+                Ok::<_, ToolError>((bin, abs_input, stage))
+            },
+        ))
+        .await??;
+    preparation.check()?;
+    let mut command = Command::new(&bin);
+    command
         .arg("aot")
         .arg("i64")
         .arg("--program")
         .arg(&abs_input)
         .arg("--output")
-        .arg(output_i64)
-        .output()
-        .map_err(|e| {
-            ToolError::InvalidParams(format!("Failed to spawn sbx ({}): {}", bin.display(), e))
-        })?;
-
+        .arg(&stage.output);
+    let output = crate::preprocess::run(command, preparation.clone()).await?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(ToolError::InvalidParams(format!(
             "sbx aot i64 failed (exit {})\nstderr: {}\nstdout: {}",
             output.status.code().unwrap_or(-1),
-            stderr.trim(),
-            stdout.trim()
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
         )));
     }
-
-    if !output_i64.exists() {
-        return Err(ToolError::InvalidParams(format!(
-            "sbx aot i64 succeeded but output not found: {}",
-            output_i64.display()
-        )));
-    }
-
-    tracing::info!(
-        output = %output_i64.display(),
-        "sbx aot i64 complete"
-    );
-
+    let publish = preparation.clone();
+    crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
+        stage.publish(&publish)
+    })
+    .await??;
+    cancellation_guard.disarm();
     Ok(SbxAotResult {
-        i64_path: output_i64.to_path_buf(),
+        i64_path: output_i64.into(),
     })
 }
 
@@ -135,13 +121,15 @@ mod tests {
         assert!(msg.contains("$SBX"), "expected $SBX in error: {msg}");
     }
 
-    #[test]
-    fn run_sbx_aot_i64_nonexistent_program() {
+    #[tokio::test]
+    async fn run_sbx_aot_i64_nonexistent_program() {
         let tmp = std::env::temp_dir().join(format!("sbx_test_{}", std::process::id()));
         let result = run_sbx_aot_i64(
             Path::new("/nonexistent_sbx_test_dir/program.so"),
             &tmp.join("out.i64"),
-        );
+            crate::preprocess::Preparation::new(std::time::Duration::from_secs(1)),
+        )
+        .await;
         assert!(result.is_err());
     }
 }

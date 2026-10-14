@@ -160,6 +160,48 @@ impl IdbStore {
         Self { root }
     }
 
+    /// Error-preserving streaming hash for asynchronous preparation consumers.
+    pub fn try_compute_hash(path: &Path) -> std::io::Result<String> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut bytes = [0; 64 * 1024];
+        loop {
+            let n = file.read(&mut bytes)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&bytes[..n]);
+        }
+        Ok(hasher.finalize().to_hex()[..12].into())
+    }
+
+    pub fn prepared_paths(
+        &self,
+        binary_path: &Path,
+    ) -> std::io::Result<(Option<PathBuf>, PathBuf)> {
+        let hash = Self::try_compute_hash(binary_path)?;
+        let basename = binary_path
+            .file_name()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "binary has no basename")
+            })?
+            .to_string_lossy();
+        let destination = self.root.join(format!("{basename}.{hash}.dylib.i64"));
+        let pattern = format!(".{hash}.");
+        let mut cached = None;
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains(&pattern) && name.ends_with(".i64") && entry.file_type()?.is_file() {
+                cached = Some(entry.path());
+                break;
+            }
+        }
+        Ok((cached, destination))
+    }
+
     /// Compute the blake3 hash of a file and return the first 12 hex characters.
     pub fn compute_hash(path: &Path) -> String {
         let data = std::fs::read(path).unwrap_or_default();
@@ -204,6 +246,45 @@ impl IdbStore {
             }
         }
         None
+    }
+
+    pub fn try_record(&self, binary_path: &Path) -> std::io::Result<()> {
+        static INDEX_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _write = INDEX_WRITE
+            .lock()
+            .map_err(|_| std::io::Error::other("IDB index writer poisoned"))?;
+        let hash = Self::try_compute_hash(binary_path)?;
+        let index_path = self.root.join("index.json");
+        let mut index: HashMap<String, IdbEntry> = match std::fs::read(&index_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => return Err(e),
+        };
+        let now = now_iso8601();
+        let created = index
+            .get(&hash)
+            .map(|e| e.created_at.clone())
+            .unwrap_or_else(|| now.clone());
+        index.insert(
+            hash.clone(),
+            IdbEntry {
+                hash,
+                original_path: binary_path.display().to_string(),
+                binary_type: if binary_path.extension().is_some_and(|e| e == "so") {
+                    "sbpf".into()
+                } else {
+                    "native".into()
+                },
+                size: std::fs::metadata(binary_path)?.len(),
+                created_at: created,
+                last_accessed: now,
+            },
+        );
+        let temporary = self
+            .root
+            .join(format!(".index-n2-{}.tmp", std::process::id()));
+        std::fs::write(&temporary, serde_json::to_vec(&index)?)?;
+        std::fs::rename(temporary, index_path)
     }
 
     /// Record (or update) an entry in `index.json`.
@@ -258,6 +339,29 @@ impl IdbStore {
             .and_then(|s| serde_json::from_str::<HashMap<String, IdbEntry>>(&s).ok())
             .map(|m| m.into_values().collect())
             .unwrap_or_default()
+    }
+
+    pub fn try_stats(&self) -> std::io::Result<IdbStoreStats> {
+        let mut file_count = 0;
+        let mut total_size_bytes = 0u64;
+        for entry in std::fs::read_dir(&self.root)? {
+            let meta = entry?.metadata()?;
+            if meta.is_file() {
+                file_count += 1;
+                total_size_bytes = total_size_bytes.saturating_add(meta.len());
+            }
+        }
+        let entry_count = match std::fs::read(self.root.join("index.json")) {
+            Ok(bytes) => serde_json::from_slice::<HashMap<String, IdbEntry>>(&bytes)?.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
+        Ok(IdbStoreStats {
+            root: self.root.display().to_string(),
+            file_count,
+            entry_count,
+            total_size_bytes,
+        })
     }
 
     pub fn stats(&self) -> IdbStoreStats {

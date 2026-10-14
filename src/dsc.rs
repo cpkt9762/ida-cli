@@ -58,6 +58,22 @@ pub fn find_idat() -> Result<PathBuf, ToolError> {
     ))
 }
 
+/// Task-owned offline DSC preparation; never targets a shared Nexus owner.
+pub async fn run_idat_offline(
+    idat: &Path,
+    args: &[String],
+    module: &str,
+    preparation: crate::preprocess::Preparation,
+) -> Result<crate::preprocess::ProcessOutput, ToolError> {
+    let mut command = tokio::process::Command::new(idat);
+    command
+        .args(args)
+        .env_remove("IDADIR")
+        .env_remove("DYLD_LIBRARY_PATH")
+        .env("IDA_DYLD_CACHE_MODULE", module);
+    crate::preprocess::run(command, preparation).await
+}
+
 /// Build the `idat` command-line arguments for DSC module loading.
 ///
 /// Produces arguments matching the working invocation pattern:

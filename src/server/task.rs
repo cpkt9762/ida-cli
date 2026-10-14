@@ -72,6 +72,7 @@ pub struct TaskState {
 struct TaskEntry {
     state: TaskState,
     handle: Option<JoinHandle<()>>,
+    cancellation: Option<crate::preprocess::PreparationCancellation>,
 }
 
 /// Thread-safe registry of background tasks.
@@ -134,6 +135,7 @@ impl TaskRegistry {
             TaskEntry {
                 state,
                 handle: None,
+                cancellation: None,
             },
         );
         prune_terminal_tasks(&mut entries);
@@ -178,6 +180,33 @@ impl TaskRegistry {
         if let Some(entry) = entries.get_mut(id) {
             entry.handle = Some(handle);
         }
+    }
+
+    pub fn set_cancellation(
+        &self,
+        id: &str,
+        cancellation: crate::preprocess::PreparationCancellation,
+    ) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(id)
+        {
+            entry.cancellation = Some(cancellation);
+        }
+    }
+    /// Only the offline supervisor calls this after cleanup has returned evidence.
+    pub fn cancellation_confirmed(&self, id: &str) {
+        let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = entries.get_mut(id) {
+            entry.state.status = TaskStatus::Cancelled;
+            entry.state.message = "Cancelled after owned process cleanup".into();
+            entry.state.meta = Some(serde_json::json!({"execution_stopped":true}));
+            entry.handle = None;
+            refresh_updated(&mut entry.state);
+        }
+        prune_terminal_tasks(&mut entries);
     }
 
     /// Get a cloneable snapshot of a task's current state.
@@ -247,6 +276,21 @@ impl TaskRegistry {
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(id) {
             if entry.state.status == TaskStatus::Running {
+                if let Some(token) = &entry.cancellation {
+                    if token.is_cancelled() {
+                        return false;
+                    }
+                    if !token.cancel() {
+                        return false;
+                    }
+                    entry.state.message =
+                        "Cancellation requested; waiting for cleanup evidence".into();
+                    entry.state.meta = Some(
+                        serde_json::json!({"cancel_requested":true,"execution_stopped":false}),
+                    );
+                    refresh_updated(&mut entry.state);
+                    return true;
+                }
                 if let Some(handle) = entry.handle.take() {
                     handle.abort();
                 }
@@ -285,6 +329,7 @@ impl TaskRegistry {
             TaskEntry {
                 state,
                 handle: None,
+                cancellation: None,
             },
         );
         prune_terminal_tasks(&mut entries);

@@ -2,7 +2,7 @@ use crate::router::protocol::{RpcRequest, RpcResponse};
 use crate::router::RouterState;
 use crate::tool_registry::primary_name_for;
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -24,6 +24,9 @@ pub async fn run_socket_listener(
 
     let discovery_path = crate::idb_store::discovery_path();
     std::fs::write(&discovery_path, socket_path.to_string_lossy().as_bytes())?;
+    let input_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
+    let business_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+    let control_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
 
     loop {
         tokio::select! {
@@ -33,10 +36,20 @@ pub async fn run_socket_listener(
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
+                let input_permit=match input_gate.clone().try_acquire_owned() {
+                    Ok(permit)=>permit,
+                    Err(_)=>{
+                        // Nonblocking refusal; a stopped peer cannot hold the accept loop.
+                        let _=stream.try_write(b"{\"jsonrpc\":\"2.0\",\"id\":\"null\",\"error\":{\"code\":-32000,\"message\":\"Busy: CLI input capacity full\"}}\n");
+                        continue;
+                    }
+                };
                 let router = router.clone();
                 let shutdown = shutdown.clone();
+                let business_gate=business_gate.clone();
+                let control_gate=control_gate.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_cli_connection(stream, &router, &shutdown).await {
+                    if let Err(e) = handle_cli_connection(stream, &router, &shutdown, input_permit, business_gate, control_gate).await {
                         debug!("CLI connection ended: {}", e);
                     }
                 });
@@ -56,26 +69,55 @@ async fn handle_cli_connection(
     stream: tokio::net::UnixStream,
     router: &RouterState,
     shutdown: &CancellationToken,
+    input_permit: tokio::sync::OwnedSemaphorePermit,
+    business_gate: std::sync::Arc<tokio::sync::Semaphore>,
+    control_gate: std::sync::Arc<tokio::sync::Semaphore>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
-    let mut line = String::new();
-
-    reader.read_line(&mut line).await?;
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
+    let mut bytes = Vec::new();
+    let exists = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::router::transport::read_frame(&mut reader, &mut bytes),
+    )
+    .await??;
+    if !exists {
         return Ok(());
     }
-
-    let resp = match serde_json::from_str::<RpcRequest>(trimmed) {
+    // Small control frames can be classified without entering a busy business pool.
+    let parsed = if bytes.len() <= 64 * 1024 {
+        serde_json::from_slice::<RpcRequest>(&bytes)
+    } else {
+        crate::blocking::run(crate::blocking::WorkClass::Encode, move || {
+            serde_json::from_slice::<RpcRequest>(&bytes)
+        })
+        .await?
+    };
+    let control = parsed.as_ref().is_ok_and(|request| {
+        matches!(
+            primary_name_for(&request.method),
+            "status" | "list_tasks" | "task_status" | "cancel_task"
+        )
+    });
+    let gate = if control { control_gate } else { business_gate };
+    let execution_permit = gate.try_acquire_owned();
+    let resp = match parsed {
+        Ok(req) if execution_permit.is_err() => {
+            RpcResponse::err(&req.id, -32000, "Busy: CLI lane capacity full")
+        }
         Ok(req) => {
+            drop(input_permit); // Classified work now owns its independent lane capacity.
             let (mut response, ref_guard) = dispatch_cli_request(&req, router, shutdown).await;
-            if let Some(result) = response.result.take() {
-                response.result = Some(super::response_cache::guard_response_size(
-                    &req.method,
-                    result,
-                ));
+            if !control {
+                if let Some(result) = response.result.take() {
+                    match super::response_cache::guard_response_size(&req.method, result).await {
+                        Ok(result) => response.result = Some(result),
+                        Err(error) => {
+                            response = RpcResponse::err(&req.id, -32000, error.to_string())
+                        }
+                    }
+                }
             }
             let _ = ref_guard;
             response
@@ -83,10 +125,18 @@ async fn handle_cli_connection(
         Err(e) => RpcResponse::err("null", -32700, format!("Parse error: {e}")),
     };
 
-    let json = serde_json::to_string(&resp)?;
-    writer.write_all(json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
+    let class = if control {
+        crate::blocking::WorkClass::Control
+    } else {
+        crate::blocking::WorkClass::Encode
+    };
+    let json = crate::blocking::run(class, move || serde_json::to_vec(&resp)).await??;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        writer.write_all(&json).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await
+    })
+    .await??;
     Ok(())
 }
 
@@ -314,9 +364,18 @@ async fn dispatch_cli_request(
         }
 
         _ => {
+            let maximum = if method == "open" { 3600 } else { 600 };
+            let seconds = req
+                .params
+                .get("timeout_secs")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(120)
+                .min(maximum);
+            let preparation =
+                crate::preprocess::Preparation::new(std::time::Duration::from_secs(seconds));
             let resolve_result = if let Some(ref p) = path {
                 router
-                    .ensure_worker_with_ref(p, tenant_id.as_deref())
+                    .ensure_worker_prepared(p, None, tenant_id.as_deref(), preparation.clone())
                     .await
                     .map(|(h, token)| (h, Some(token)))
             } else {
@@ -337,7 +396,12 @@ async fn dispatch_cli_request(
                         token,
                     });
                     match router
-                        .route_request(Some(&handle), method, req.params.clone())
+                        .route_request_prepared(
+                            Some(&handle),
+                            method,
+                            req.params.clone(),
+                            preparation,
+                        )
                         .await
                     {
                         Ok(v) => (RpcResponse::ok(&req.id, v), ref_guard),
@@ -347,5 +411,51 @@ async fn dispatch_cli_request(
                 Err(e) => (RpcResponse::err(&req.id, -32000, e.to_string()), None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod n2_tests {
+    use super::*;
+    use tokio::io::AsyncBufReadExt;
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_control_has_capacity_while_cli_business_lane_is_full() {
+        let router = RouterState::new().expect("isolated router");
+        let business = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let _blocked_business = business.clone().acquire_owned().await.unwrap();
+        let control = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let input = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let task = tokio::spawn(async move {
+            handle_cli_connection(
+                server,
+                &router,
+                &CancellationToken::new(),
+                input.acquire_owned().await.unwrap(),
+                business,
+                control,
+            )
+            .await
+        });
+        let (reader, mut writer) = client.into_split();
+        writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":\"control\",\"method\":\"status\",\"params\":{}}\n",
+            )
+            .await
+            .unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            BufReader::new(reader).read_line(&mut line),
+        )
+        .await
+        .expect("independent control deadline")
+        .unwrap();
+        let response: RpcResponse = serde_json::from_str(&line).unwrap();
+        assert_eq!(response.id, "control");
+        assert!(response.error.is_none());
+        assert_eq!(response.result.unwrap()["worker_count"], 0);
+        task.await.unwrap().unwrap();
     }
 }

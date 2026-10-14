@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -296,43 +295,29 @@ impl CompatWorker {
 }
 
 pub fn run_worker() -> anyhow::Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut writer = BufWriter::new(stdout.lock());
-    let mut worker = CompatWorker::default();
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            break;
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let req: RpcRequest = match serde_json::from_str(trimmed) {
-            Ok(req) => req,
-            Err(err) => {
-                let resp = RpcResponse::err("null", -32700, format!("Parse error: {err}"));
-                write_response(&mut writer, &resp)?;
-                continue;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let worker = std::sync::Arc::new(std::sync::Mutex::new(CompatWorker::default()));
+    runtime.block_on(crate::router::worker_io::serve_responses(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        move |request| {
+            let worker = worker.clone();
+            async move {
+                let id = request.id.clone();
+                match crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
+                    let mut worker = worker.lock().unwrap_or_else(|e| e.into_inner());
+                    dispatch_request(&mut worker, &request)
+                })
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => RpcResponse::err(id, -32000, error.to_string()),
+                }
             }
-        };
-
-        let response = dispatch_request(&mut worker, &req);
-        write_response(&mut writer, &response)?;
-
-        if req.method == "shutdown" {
-            break;
-        }
-    }
-
-    Ok(())
+        },
+    ))
 }
 
 fn dispatch_request(worker: &mut CompatWorker, req: &RpcRequest) -> RpcResponse {
@@ -642,17 +627,6 @@ fn dispatch_request(worker: &mut CompatWorker, req: &RpcRequest) -> RpcResponse 
         Ok(value) => RpcResponse::ok(&req.id, value),
         Err(err) => RpcResponse::err(&req.id, -32000, err.to_string()),
     }
-}
-
-fn write_response(
-    writer: &mut BufWriter<std::io::StdoutLock<'_>>,
-    resp: &RpcResponse,
-) -> anyhow::Result<()> {
-    let json = serde_json::to_string(resp)?;
-    writer.write_all(json.as_bytes())?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-    Ok(())
 }
 
 fn to_json_value<T: serde::Serialize>(value: T) -> Result<Value, ToolError> {

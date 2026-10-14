@@ -17,21 +17,34 @@ pub struct ResponseCacheEvictionStats {
     pub remaining_bytes: u64,
 }
 
-pub fn guard_response_size(method: &str, result: Value) -> Value {
+pub async fn guard_response_size(
+    method: &str,
+    result: Value,
+) -> Result<Value, crate::error::ToolError> {
+    let method = method.to_string();
+    crate::blocking::run(crate::blocking::WorkClass::Encode, move || {
+        guard_response_size_sync(&method, result)
+    })
+    .await?
+}
+
+fn guard_response_size_sync(method: &str, result: Value) -> Result<Value, crate::error::ToolError> {
     let max_bytes = std::env::var("IDA_MCP_MAX_INLINE_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_INLINE_BYTES);
 
-    let json_str = serde_json::to_string(&result).unwrap_or_default();
+    let json_str = serde_json::to_string(&result)
+        .map_err(|e| crate::error::ToolError::IdaError(format!("response encoding: {e}")))?;
     let size = json_str.len();
 
     if size <= max_bytes {
-        return result;
+        return Ok(result);
     }
 
     let cache_dir = crate::idb_store::response_cache_dir();
-    let _ = std::fs::create_dir_all(&cache_dir);
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| crate::error::ToolError::IdaError(format!("response cache directory: {e}")))?;
 
     let hash = {
         use std::hash::{Hash, Hasher};
@@ -39,13 +52,26 @@ pub fn guard_response_size(method: &str, result: Value) -> Value {
         json_str.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
     };
-    let filename = format!("{}-{}.json", method, hash);
+    let safe_method: String = method
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect();
+    let filename = format!("{}-{}.json", safe_method, hash);
     let file_path = cache_dir.join(&filename);
 
-    if let Err(e) = std::fs::write(&file_path, &json_str) {
-        tracing::warn!("Failed to cache response to {:?}: {}", file_path, e);
-        return result;
-    }
+    std::fs::write(&file_path, &json_str).map_err(|e| {
+        crate::error::ToolError::IdaError(format!(
+            "response cache write {}: {e}",
+            file_path.display()
+        ))
+    })?;
 
     let item_count = count_items(&result);
     let summary = format!(
@@ -62,13 +88,13 @@ pub fn guard_response_size(method: &str, result: Value) -> Value {
         file_path.display(),
     );
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "cached": true,
         "file": file_path.to_string_lossy(),
         "size_bytes": size,
         "item_count": item_count,
         "summary": summary,
-    })
+    }))
 }
 
 fn count_items(v: &Value) -> Option<usize> {
@@ -93,6 +119,31 @@ fn count_items(v: &Value) -> Option<usize> {
         return Some(arr.len());
     }
     None
+}
+
+pub fn try_stats() -> std::io::Result<ResponseCacheStats> {
+    let path = crate::idb_store::response_cache_dir();
+    let mut file_count = 0;
+    let mut total_size_bytes = 0u64;
+    let entries = match std::fs::read_dir(&path) {
+        Ok(entries) => Some(entries),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    if let Some(entries) = entries {
+        for entry in entries {
+            let meta = entry?.metadata()?;
+            if meta.is_file() {
+                file_count += 1;
+                total_size_bytes = total_size_bytes.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(ResponseCacheStats {
+        dir: path.display().to_string(),
+        file_count,
+        total_size_bytes,
+    })
 }
 
 pub fn stats() -> ResponseCacheStats {

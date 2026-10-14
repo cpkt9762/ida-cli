@@ -5,10 +5,13 @@
 //! - Requests are routed to workers via JSON-RPC over stdin/stdout
 //! - Router maintains an "active" handle for backward compatibility
 
+pub mod nexus_transport;
 pub mod protocol;
+pub mod transport;
+pub mod worker_io;
 
 use crate::ida::{RuntimeProbeResult, WorkerBackendKind};
-use crate::router::protocol::{RpcRequest, RpcResponse};
+use crate::router::protocol::RpcRequest;
 use crate::server::task::{TaskRegistry, TaskState, TaskStatus};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -16,11 +19,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+#[cfg(test)]
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Child;
 use tokio::process::Command;
-use tokio::process::{Child, ChildStdin};
-use tokio::sync::{oneshot, Mutex, Semaphore};
-use tracing::{debug, error, info, warn};
+use tokio::sync::{Mutex, Semaphore};
+use tracing::{info, warn};
 
 pub type DbHandle = String;
 pub type ReqId = String;
@@ -35,8 +39,7 @@ pub struct WorkerProcess {
     pub backend: WorkerBackendKind,
     pub tenant_id: String,
     pub child: Child,
-    pub writer: BufWriter<ChildStdin>,
-    pub pending: HashMap<ReqId, oneshot::Sender<Result<serde_json::Value, String>>>,
+    pub connection: transport::RpcConnection,
     pub close_token: Option<String>,
     pub open_path: Option<PathBuf>,
     pub last_active: Instant,
@@ -206,6 +209,7 @@ struct ActivePrewarmTask {
 
 #[derive(Debug, Clone)]
 struct QueuedRouteTask {
+    preparation: crate::preprocess::Preparation,
     task_id: String,
     path: String,
     method: String,
@@ -308,8 +312,10 @@ pub struct RouterStatus {
     pub route_queue: Vec<RouteTaskStatus>,
     pub route_active: Vec<RouteTaskStatus>,
     pub recent_tasks: Vec<serde_json::Value>,
-    pub idb_cache: crate::idb_store::IdbStoreStats,
-    pub response_cache: crate::server::response_cache::ResponseCacheStats,
+    pub idb_cache: Option<crate::idb_store::IdbStoreStats>,
+    pub response_cache: Option<crate::server::response_cache::ResponseCacheStats>,
+    pub cache_statistics_error: Option<String>,
+    pub cache_statistics_refreshing: bool,
     pub federation_nodes: Vec<crate::federation::FederationNodeStatus>,
 }
 
@@ -325,11 +331,18 @@ pub struct DaemonMetadata {
     pub supported_tools: Vec<String>,
 }
 
+type CacheSnapshot = (
+    Option<crate::idb_store::IdbStoreStats>,
+    Option<crate::server::response_cache::ResponseCacheStats>,
+    Option<String>,
+);
+
 #[derive(Clone)]
 pub struct RouterState {
     inner: Arc<Mutex<RouterInner>>,
     config: Arc<RouterConfig>,
     spawn_gate: Arc<Semaphore>,
+    nexus: Arc<std::sync::Mutex<(nexus_transport::NexusEndpoint, bool)>>,
     cached_probe: Arc<Mutex<Option<RuntimeProbeResult>>>,
     warm_pool: Arc<Mutex<HashMap<PathBuf, WarmLease>>>,
     prewarm_queue: Arc<Mutex<PrewarmQueueState>>,
@@ -338,6 +351,8 @@ pub struct RouterState {
     federation_nodes: Arc<Mutex<HashMap<String, crate::federation::FederationNodeRecord>>>,
     http_address: Arc<Mutex<Option<String>>>,
     maintenance_started: Arc<AtomicBool>,
+    metadata_refreshing: Arc<AtomicBool>,
+    cache_stats: Arc<Mutex<CacheSnapshot>>,
 }
 
 impl std::fmt::Debug for RouterState {
@@ -388,6 +403,10 @@ impl RouterState {
             })),
             config: config.clone(),
             spawn_gate: Arc::new(Semaphore::new(config.max_concurrent_spawns)),
+            nexus: Arc::new(std::sync::Mutex::new((
+                nexus_transport::NexusEndpoint::new(config.max_pending_per_tenant),
+                false,
+            ))),
             cached_probe: Arc::new(Mutex::new(None)),
             warm_pool: Arc::new(Mutex::new(HashMap::new())),
             prewarm_queue: Arc::new(Mutex::new(PrewarmQueueState::default())),
@@ -396,7 +415,38 @@ impl RouterState {
             federation_nodes: Arc::new(Mutex::new(crate::federation::load_node_map_from_env())),
             http_address: Arc::new(Mutex::new(None)),
             maintenance_started: Arc::new(AtomicBool::new(false)),
+            metadata_refreshing: Arc::new(AtomicBool::new(false)),
+            cache_stats: Arc::new(Mutex::new((None, None, None))),
         })
+    }
+
+    pub fn nexus_endpoint(&self) -> nexus_transport::NexusEndpoint {
+        self.nexus
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .clone()
+    }
+    pub fn install_nexus_capabilities(
+        &self,
+        capabilities: crate::nexus::NexusCapabilities,
+    ) -> Result<(), crate::nexus::NexusError> {
+        capabilities.runtime.validate()?;
+        let mut endpoint = self.nexus.lock().unwrap_or_else(|e| e.into_inner());
+        if endpoint.1 {
+            return Err(crate::nexus::NexusError::new(
+                crate::nexus::NexusErrorCode::Busy,
+                "Nexus endpoint already installed",
+            ));
+        }
+        *endpoint = (
+            nexus_transport::NexusEndpoint::with_capabilities(
+                self.config.max_pending_per_tenant,
+                Ok(capabilities),
+            ),
+            true,
+        );
+        Ok(())
     }
 
     pub async fn set_http_address(&self, address: Option<String>) {
@@ -477,13 +527,16 @@ impl RouterState {
         cmd.arg("probe-runtime")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
         Self::apply_worker_env(&mut cmd);
 
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to run probe-runtime: {e}"))?;
+        let output = crate::preprocess::run(
+            cmd,
+            crate::preprocess::Preparation::new(Duration::from_secs(5)),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("runtime probe: {e}"))?;
 
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -537,7 +590,10 @@ impl RouterState {
         // Expand `~/...` before canonicalising; see ensure_worker_with_ref_idb
         // for the detailed rationale.
         let expanded = crate::expand_path(path);
-        let canonical_path = std::fs::canonicalize(&expanded).unwrap_or(expanded);
+        let canonical_path = crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
+            std::fs::canonicalize(&expanded)
+        })
+        .await??;
         let tenant_id = Self::normalize_tenant(tenant_id);
         let worker_key = Self::worker_key(canonical_path.clone(), &tenant_id);
 
@@ -616,7 +672,7 @@ impl RouterState {
                                 .map(|set| set.len())
                                 .unwrap_or(0);
                             ref_count == 0
-                                && worker.pending.is_empty()
+                                && worker.connection.pending_len() == 0
                                 && inner.active.as_deref() != Some(handle.as_str())
                         })
                         .min_by_key(|(_, worker)| worker.last_active)
@@ -698,6 +754,7 @@ impl RouterState {
             inner.req_counter += 1;
             t ^ (pid << 32) ^ counter
         });
+        drop(inner);
         info!(
             "Spawning worker {} for path {:?} using backend {} (runtime {})",
             handle, canonical_path, backend, runtime
@@ -726,148 +783,44 @@ impl RouterState {
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to get worker stdout"))?;
 
-        let writer = BufWriter::new(stdin);
+        let connection =
+            transport::RpcConnection::start(stdout, stdin, self.config.max_pending_per_worker);
 
-        let close_token = {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let pid = std::process::id();
-            let nonce = inner.req_counter;
-            format!("{now:x}-{pid:x}-{nonce:x}")
-        };
+        let close_token = format!("ref-{handle}");
 
         let worker = WorkerProcess {
             backend,
             tenant_id: tenant_id.clone(),
             child,
-            writer,
-            pending: HashMap::new(),
+            connection,
             close_token: Some(close_token.clone()),
             open_path: Some(canonical_path.clone()),
             last_active: Instant::now(),
         };
 
-        let handle_for_reader = handle.clone();
-        let inner_arc = self.inner.clone();
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            let mut line_buf = String::new();
-            loop {
-                line_buf.clear();
-                match reader.read_line(&mut line_buf).await {
-                    Ok(0) => {
-                        warn!(
-                            "Worker {} stdout closed (process exited)",
-                            handle_for_reader
-                        );
-                        let mut inner = inner_arc.lock().await;
-                        // Drain pending requests, notify callers
-                        if let Some(worker) = inner.workers.get_mut(&handle_for_reader) {
-                            for (id, sender) in worker.pending.drain() {
-                                let _ = sender.send(Err(format!(
-                                    "Worker {} exited unexpectedly",
-                                    handle_for_reader
-                                )));
-                                debug!("Cancelled pending request {} due to worker exit", id);
-                            }
-                        }
-                        // Crash detection: remove dead worker from all maps so the
-                        // handle is not reachable for future requests. This is a no-op
-                        // when the worker was already removed by close_worker().
-                        // Only emit the WARN if the worker was still in the registry
-                        // (truly unexpected exit). If already removed by close_worker(),
-                        // the process exit was expected — no warning needed.
-                        if let Some(dead) = inner.workers.remove(&handle_for_reader) {
-                            if let Some(path) = &dead.open_path {
-                                inner
-                                    .path_to_handle
-                                    .remove(&Self::worker_key(path.clone(), &dead.tenant_id));
-                            }
-                            // dead.child drops here; kill_on_drop=true handles cleanup
-                            if let Some(tokens) = inner.ref_tokens.remove(&handle_for_reader) {
-                                for t in &tokens {
-                                    inner.token_to_handle.remove(t);
-                                }
-                            }
-                            if inner.active.as_deref() == Some(handle_for_reader.as_str()) {
-                                inner.active = inner.workers.keys().next().cloned();
-                            }
-                            warn!(
-                                "Worker {} removed from registry after unexpected exit",
-                                handle_for_reader
-                            );
-                        }
-                        break;
-                    }
-                    Ok(_) => {
-                        let trimmed = line_buf.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        match serde_json::from_str::<RpcResponse>(trimmed) {
-                            Ok(resp) => {
-                                let mut inner = inner_arc.lock().await;
-                                if let Some(worker) = inner.workers.get_mut(&handle_for_reader) {
-                                    if let Some(sender) = worker.pending.remove(&resp.id) {
-                                        let result = if let Some(result) = resp.result {
-                                            Ok(result)
-                                        } else if let Some(err) = resp.error {
-                                            Err(err.message)
-                                        } else {
-                                            Ok(serde_json::Value::Null)
-                                        };
-                                        let _ = sender.send(result);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Worker {} sent non-JSON line: {} (error: {})",
-                                    handle_for_reader, trimmed, e
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Worker {} stdout read error: {}", handle_for_reader, e);
-                        let mut inner = inner_arc.lock().await;
-                        if let Some(worker) = inner.workers.get_mut(&handle_for_reader) {
-                            for (id, sender) in worker.pending.drain() {
-                                let _ = sender.send(Err(format!(
-                                    "Worker {} I/O error: {}",
-                                    handle_for_reader, e
-                                )));
-                                debug!("Cancelled pending request {} due to I/O error", id);
-                            }
-                        }
-                        if let Some(dead) = inner.workers.remove(&handle_for_reader) {
-                            if let Some(path) = &dead.open_path {
-                                inner
-                                    .path_to_handle
-                                    .remove(&Self::worker_key(path.clone(), &dead.tenant_id));
-                            }
-                        }
-                        if let Some(tokens) = inner.ref_tokens.remove(&handle_for_reader) {
-                            for t in &tokens {
-                                inner.token_to_handle.remove(t);
-                            }
-                        }
-                        if inner.active.as_deref() == Some(handle_for_reader.as_str()) {
-                            inner.active = inner.workers.keys().next().cloned();
-                        }
-                        warn!(
-                            "Worker {} removed from registry after I/O error",
-                            handle_for_reader
-                        );
-                        break;
-                    }
-                }
-            }
-        });
-
+        let mut inner = self.inner.lock().await;
+        if inner.workers.len() >= self.config.max_workers
+            || inner
+                .workers
+                .values()
+                .filter(|w| w.tenant_id == tenant_id)
+                .count()
+                >= self.config.max_workers_per_tenant
+        {
+            drop(inner);
+            worker.connection.close();
+            let mut child = worker.child;
+            child.kill().await?;
+            return Err(anyhow::anyhow!("worker limit reached during spawn"));
+        }
+        if let Some(existing) = inner.path_to_handle.get(&worker_key).cloned() {
+            drop(inner);
+            worker.connection.close();
+            let mut child = worker.child;
+            child.kill().await?;
+            let token = self.issue_ref_for_handle(&existing).await;
+            return Ok((existing, Some(token)));
+        }
         inner.path_to_handle.insert(worker_key, handle.clone());
         inner
             .token_to_handle
@@ -875,8 +828,18 @@ impl RouterState {
         let mut init_refs = HashSet::new();
         init_refs.insert(close_token.clone());
         inner.ref_tokens.insert(handle.clone(), init_refs);
+        let connection = worker.connection.clone();
         inner.workers.insert(handle.clone(), worker);
         inner.active = Some(handle.clone());
+        drop(inner);
+        let router = self.clone();
+        let watched_handle = handle.clone();
+        tokio::spawn(async move {
+            connection.closed().await;
+            if let Err(e) = router.close_worker(&watched_handle).await {
+                warn!(error=%e,"closed connection worker cleanup failed");
+            }
+        });
 
         Ok((handle, Some(close_token)))
     }
@@ -889,131 +852,119 @@ impl RouterState {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, crate::error::ToolError> {
-        use crate::error::ToolError;
-
-        let target_handle = {
-            let inner = self.inner.lock().await;
-            if let Some(h) = handle {
-                if !inner.workers.contains_key(h) {
-                    return Err(ToolError::InvalidParams(format!("Unknown db_handle: {h}")));
-                }
-                h.to_string()
-            } else {
-                if inner.workers.len() > 1 {
-                    return Err(ToolError::InvalidParams(
-                        "db_handle is required when multiple databases are open. \
-                         Provide the db_handle returned by open_idb."
-                            .to_string(),
-                    ));
-                }
-                inner.active.clone().ok_or(ToolError::NoDatabaseOpen)?
-            }
-        };
-
-        let req_id = {
-            let mut inner = self.inner.lock().await;
-            let id = format!("r{}", inner.req_counter);
-            inner.req_counter += 1;
-            id
-        };
-
-        let max_timeout = if method == "open" { 3600 } else { 600 };
+        let maximum = if method == "open" { 3600 } else { 600 };
         let timeout_secs = params
             .get("timeout_secs")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(120)
-            .min(max_timeout);
+            .min(maximum);
+        let preparation = crate::preprocess::Preparation::new(Duration::from_secs(timeout_secs));
+        self.route_request_prepared(handle, method, params, preparation)
+            .await
+    }
 
-        let (tx, rx) = oneshot::channel::<Result<serde_json::Value, String>>();
-
-        {
+    pub async fn route_request_prepared(
+        &self,
+        handle: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+        preparation: crate::preprocess::Preparation,
+    ) -> Result<serde_json::Value, crate::error::ToolError> {
+        use crate::error::ToolError;
+        preparation.check()?;
+        let maximum = if method == "open" { 3600 } else { 600 };
+        let timeout_secs = params
+            .get("timeout_secs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(120)
+            .min(maximum);
+        let deadline = preparation.deadline;
+        let (target_handle, req_id) = {
             let mut inner = self.inner.lock().await;
-            let tenant_id = inner
+            let target = match handle {
+                Some(h) => h.to_string(),
+                None if inner.workers.len() > 1 => {
+                    return Err(ToolError::InvalidParams(
+                        "db_handle is required when multiple databases are open".into(),
+                    ))
+                }
+                None => inner.active.clone().ok_or(ToolError::NoDatabaseOpen)?,
+            };
+            let counter = inner.req_counter;
+            inner.req_counter = counter.checked_add(1).ok_or(ToolError::Busy)?;
+            (target, format!("r{counter}"))
+        };
+        let bytes = preparation
+            .wait(transport::RpcConnection::encode(RpcRequest::new(
+                &req_id, method, params,
+            )))
+            .await?;
+        let waiting = {
+            let mut inner = self.inner.lock().await;
+            let tenant = inner
                 .workers
                 .get(&target_handle)
-                .map(|worker| worker.tenant_id.clone())
                 .ok_or_else(|| {
-                    ToolError::InvalidParams(format!("Worker {} not found", target_handle))
-                })?;
-            let tenant_pending = inner
+                    ToolError::InvalidParams(format!("Unknown db_handle: {target_handle}"))
+                })?
+                .tenant_id
+                .clone();
+            let count: usize = inner
                 .workers
                 .values()
-                .filter(|candidate| candidate.tenant_id == tenant_id)
-                .map(|candidate| candidate.pending.len())
-                .sum::<usize>();
-            if tenant_pending >= self.config.max_pending_per_tenant {
+                .filter(|w| w.tenant_id == tenant)
+                .map(|w| w.connection.pending_len())
+                .sum();
+            if count >= self.config.max_pending_per_tenant {
                 return Err(ToolError::Busy);
             }
-
-            let worker = inner.workers.get_mut(&target_handle).ok_or_else(|| {
-                ToolError::InvalidParams(format!("Worker {} not found", target_handle))
-            })?;
-            if worker.pending.len() >= self.config.max_pending_per_worker {
-                return Err(ToolError::Busy);
-            }
-
-            let req = RpcRequest::new(&req_id, method, params);
-            let json = serde_json::to_string(&req)
-                .map_err(|e| ToolError::InvalidParams(format!("Serialize error: {e}")))?;
-
-            worker
-                .writer
-                .write_all(json.as_bytes())
-                .await
-                .map_err(|_| ToolError::WorkerClosed)?;
-            worker
-                .writer
-                .write_all(b"\n")
-                .await
-                .map_err(|_| ToolError::WorkerClosed)?;
-            worker
-                .writer
-                .flush()
-                .await
-                .map_err(|_| ToolError::WorkerClosed)?;
-
-            worker.pending.insert(req_id.clone(), tx);
+            let worker = inner
+                .workers
+                .get_mut(&target_handle)
+                .ok_or(ToolError::WorkerClosed)?;
+            let waiting = worker.connection.enqueue(req_id, bytes, deadline)?;
             worker.last_active = Instant::now();
-        }
-
-        let timeout = std::time::Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(e))) => Err(ToolError::IdaError(e)),
-            Ok(Err(_)) => Err(ToolError::WorkerClosed),
-            Err(_) => Err(ToolError::Timeout(timeout_secs)),
-        }
+            waiting
+        };
+        waiting
+            .wait_prepared(timeout_secs, &preparation.cancel)
+            .await
     }
 
     pub async fn close_worker(&self, handle: &str) -> Result<(), crate::error::ToolError> {
-        let mut inner = self.inner.lock().await;
         self.warm_pool
             .lock()
             .await
             .retain(|_, lease| lease.handle != handle);
-
-        if let Some(mut worker) = inner.workers.remove(handle) {
-            if let Some(path) = &worker.open_path {
-                inner
-                    .path_to_handle
-                    .remove(&Self::worker_key(path.clone(), &worker.tenant_id));
-            }
-            if let Some(tokens) = inner.ref_tokens.remove(handle) {
-                for token in &tokens {
-                    inner.token_to_handle.remove(token);
+        let worker = {
+            let mut inner = self.inner.lock().await;
+            let worker = inner.workers.remove(handle);
+            if let Some(worker) = &worker {
+                if let Some(path) = &worker.open_path {
+                    inner
+                        .path_to_handle
+                        .remove(&Self::worker_key(path.clone(), &worker.tenant_id));
+                }
+                if let Some(tokens) = inner.ref_tokens.remove(handle) {
+                    for token in tokens {
+                        inner.token_to_handle.remove(&token);
+                    }
+                }
+                if inner.active.as_deref() == Some(handle) {
+                    inner.active = inner.workers.keys().next().cloned();
                 }
             }
-            if inner.active.as_deref() == Some(handle) {
-                inner.active = inner.workers.keys().next().cloned();
-            }
-            for (id, sender) in worker.pending.drain() {
-                let _ = sender.send(Err(format!("Worker {handle} closed")));
-                debug!("Cancelled pending request {id} due to close_worker");
-            }
-            drop(worker);
+            worker
+        };
+        if let Some(mut worker) = worker {
+            worker.connection.close();
+            worker
+                .child
+                .kill()
+                .await
+                .map_err(|e| crate::error::ToolError::IdaError(format!("worker cleanup: {e}")))?;
             info!("Closed worker {}", handle);
         }
-
         Ok(())
     }
 
@@ -1054,20 +1005,9 @@ impl RouterState {
     }
 
     async fn status_snapshot_inner(&self, include_federation: bool) -> RouterStatus {
-        // Release the cache lock before probing: a guard held in the match
-        // scrutinee lives through the arms, and probe_worker_backend locks
-        // the same (non-reentrant) mutex, which deadlocked a fresh daemon.
-        let cached_probe = self.cached_probe.lock().await.clone();
-        let runtime_probe = match cached_probe {
-            Some(probe) => Some(probe),
-            None => {
-                let exe_path = {
-                    let inner = self.inner.lock().await;
-                    inner.exe_path.clone()
-                };
-                self.probe_worker_backend(&exe_path).await.ok()
-            }
-        };
+        let runtime_probe = self.cached_probe.lock().await.clone();
+        self.refresh_metadata();
+        let cache_stats = self.cache_stats.lock().await.clone();
         let (backend, ida_version, supported_methods, supported_tools) =
             match runtime_probe.as_ref().and_then(|probe| probe.backend) {
                 Some(backend) => (
@@ -1109,20 +1049,24 @@ impl RouterState {
                     .or_default() += 1;
                 *tenant_pending_counts
                     .entry(worker.tenant_id.clone())
-                    .or_default() += worker.pending.len();
+                    .or_default() += worker.connection.pending_len();
                 WorkerStatus {
                     handle: handle.clone(),
                     backend: backend_name,
                     tenant_id: worker.tenant_id.clone(),
                     pid: worker.child.id(),
                     open_path: worker.open_path.as_ref().map(|p| p.display().to_string()),
-                    pending_requests: worker.pending.len(),
+                    pending_requests: worker.connection.pending_len(),
                     ref_count: inner.ref_tokens.get(handle).map(|s| s.len()).unwrap_or(0),
                     idle_secs: worker.last_active.elapsed().as_secs(),
                     active: inner.active.as_deref() == Some(handle.as_str()),
                 }
             })
             .collect();
+
+        let worker_count = inner.workers.len();
+        let active_handle = inner.active.clone();
+        drop(inner);
 
         let warm_pool = self
             .warm_pool
@@ -1210,8 +1154,8 @@ impl RouterState {
 
         RouterStatus {
             metadata,
-            worker_count: inner.workers.len(),
-            active_handle: inner.active.clone(),
+            worker_count,
+            active_handle,
             max_workers: self.config.max_workers,
             max_workers_per_tenant: self.config.max_workers_per_tenant,
             max_pending_per_worker: self.config.max_pending_per_worker,
@@ -1239,14 +1183,63 @@ impl RouterState {
             route_queue: queued_route_tasks,
             route_active: active_route_tasks,
             recent_tasks,
-            idb_cache: crate::idb_store::IdbStore::new().stats(),
-            response_cache: crate::server::response_cache::stats(),
+            idb_cache: cache_stats.0,
+            response_cache: cache_stats.1,
+            cache_statistics_error: cache_stats.2,
+            cache_statistics_refreshing: self.metadata_refreshing.load(Ordering::SeqCst),
             federation_nodes: if include_federation {
-                crate::federation::probe_nodes(&self.federation_nodes_snapshot().await)
+                {
+                    let nodes = self.federation_nodes_snapshot().await;
+                    crate::blocking::run(crate::blocking::WorkClass::Metadata, move || {
+                        crate::federation::probe_nodes(&nodes)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, "federation probe unavailable");
+                        Vec::new()
+                    })
+                }
             } else {
                 Vec::new()
             },
         }
+    }
+
+    fn refresh_metadata(&self) {
+        if self
+            .metadata_refreshing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let router = self.clone();
+        tokio::spawn(async move {
+            let exe = router.inner.lock().await.exe_path.clone();
+            if router.cached_probe.lock().await.is_none() {
+                if let Err(e) =
+                    tokio::time::timeout(Duration::from_secs(5), router.probe_worker_backend(&exe))
+                        .await
+                {
+                    warn!(error = %e, "background runtime probe expired");
+                }
+            }
+            match crate::blocking::run(crate::blocking::WorkClass::Metadata, || {
+                Ok::<_, std::io::Error>((
+                    crate::idb_store::IdbStore::new().try_stats()?,
+                    crate::server::response_cache::try_stats()?,
+                ))
+            })
+            .await
+            {
+                Ok(Ok((idb, response))) => {
+                    *router.cache_stats.lock().await = (Some(idb), Some(response), None)
+                }
+                Ok(Err(e)) => router.cache_stats.lock().await.2 = Some(e.to_string()),
+                Err(e) => router.cache_stats.lock().await.2 = Some(e.to_string()),
+            }
+            router.metadata_refreshing.store(false, Ordering::SeqCst);
+        });
     }
 
     pub async fn status_snapshot(&self) -> RouterStatus {
@@ -1304,11 +1297,26 @@ impl RouterState {
         explicit_idb_output: Option<&str>,
         tenant_id: Option<&str>,
     ) -> Result<(DbHandle, String), crate::error::ToolError> {
+        self.ensure_worker_prepared(
+            path,
+            explicit_idb_output,
+            tenant_id,
+            crate::preprocess::Preparation::new(Duration::from_secs(3600)),
+        )
+        .await
+    }
+
+    pub async fn ensure_worker_prepared(
+        &self,
+        path: &str,
+        explicit_idb_output: Option<&str>,
+        tenant_id: Option<&str>,
+        preparation: crate::preprocess::Preparation,
+    ) -> Result<(DbHandle, String), crate::error::ToolError> {
         use crate::error::ToolError;
         let tenant_id = Self::normalize_tenant(tenant_id);
-
-        // Resolve sBPF .so → host-native dylib/i64 path for IDA.
-        let resolved = resolve_open_path(path);
+        preparation.check()?;
+        let resolved = resolve_open_path(path, preparation.clone()).await?;
         let open_path = resolved.open_path.as_deref().unwrap_or(path);
 
         // Expand `~/...` before canonicalising — `std::fs::canonicalize`
@@ -1317,8 +1325,21 @@ impl RouterState {
         // and a broken worker registry.
         let expanded_path = crate::expand_path(path);
         let expanded_open = crate::expand_path(open_path);
-        let canonical = std::fs::canonicalize(&expanded_path).unwrap_or(expanded_path);
-        let canonical_open = std::fs::canonicalize(&expanded_open).unwrap_or(expanded_open);
+        let (canonical, canonical_open) = preparation
+            .wait(crate::blocking::run(
+                crate::blocking::WorkClass::Prepare,
+                move || {
+                    Ok::<_, ToolError>((
+                        std::fs::canonicalize(&expanded_path).map_err(|e| {
+                            ToolError::InvalidPath(format!("{}: {e}", expanded_path.display()))
+                        })?,
+                        std::fs::canonicalize(&expanded_open).map_err(|e| {
+                            ToolError::InvalidPath(format!("{}: {e}", expanded_open.display()))
+                        })?,
+                    ))
+                },
+            ))
+            .await??;
         let worker_key = Self::worker_key(canonical.clone(), &tenant_id);
 
         let handle = {
@@ -1336,10 +1357,13 @@ impl RouterState {
         let handle = if let Some(h) = handle {
             h
         } else {
-            let (h, initial_token) = self
-                .spawn_worker(path, Some(&tenant_id))
-                .await
-                .map_err(|e| ToolError::IdaError(format!("spawn_worker failed: {e}")))?;
+            let spawned = tokio::select! {biased;
+                _=preparation.cancel.cancelled()=>return Err(ToolError::Preparation {message:"cancelled before worker startup completed".into(),execution_stopped:false}),
+                _=tokio::time::sleep_until(preparation.deadline.into())=>return Err(ToolError::Preparation {message:"total deadline expired during worker startup".into(),execution_stopped:false}),
+                result=self.spawn_worker(path,Some(&tenant_id))=>result,
+            };
+            let (h, initial_token) =
+                spawned.map_err(|e| ToolError::IdaError(format!("spawn_worker failed: {e}")))?;
 
             if let Some(token) = initial_token {
                 self.release_ref_token(&token).await;
@@ -1354,11 +1378,25 @@ impl RouterState {
                 "auto_analyse": true,
                 "timeout_secs": 3600,
             });
-            match self.route_request(Some(&h), "open", open_params).await {
+            match self
+                .route_request_prepared(Some(&h), "open", open_params, preparation.clone())
+                .await
+            {
                 Ok(_) => {
                     if let Some(ref idb_out) = effective_idb_output {
-                        let store = crate::idb_store::IdbStore::new();
-                        store.record(&canonical, &std::path::PathBuf::from(idb_out));
+                        let binary = canonical.clone();
+                        let destination = PathBuf::from(idb_out);
+                        crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
+                            let _ = destination;
+                            crate::idb_store::IdbStore::new()
+                                .try_record(&binary)
+                                .map_err(|e| {
+                                    crate::error::ToolError::IdaError(format!(
+                                        "IDB index record: {e}"
+                                    ))
+                                })
+                        })
+                        .await??;
                     }
                     if is_sbpf_elf(&canonical) {
                         self.detect_and_rename_sbpf_entry(&h).await;
@@ -1515,7 +1553,11 @@ impl RouterState {
             )));
         }
 
-        let canonical = std::fs::canonicalize(&expanded).unwrap_or_else(|_| expanded.clone());
+        let canonical = crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
+            std::fs::canonicalize(&expanded)
+        })
+        .await?
+        .map_err(|e| ToolError::InvalidPath(e.to_string()))?;
         let tenant_id = Self::normalize_tenant(Some(tenant_id));
         let already_open = {
             let inner = self.inner.lock().await;
@@ -1524,8 +1566,14 @@ impl RouterState {
                 .contains_key(&Self::worker_key(canonical.clone(), &tenant_id))
         };
 
-        let store = crate::idb_store::IdbStore::new();
-        let cached_before = store.lookup(&canonical).map(|p| p.display().to_string());
+        let before = canonical.clone();
+        let cached_before = crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
+            crate::idb_store::IdbStore::new().prepared_paths(&before)
+        })
+        .await?
+        .map_err(|e| ToolError::IdaError(e.to_string()))?
+        .0
+        .map(|p| p.display().to_string());
 
         let (handle, ref_token) = self.ensure_worker_with_ref(path, Some(&tenant_id)).await?;
         let backend = {
@@ -1542,7 +1590,14 @@ impl RouterState {
             .await
             .ok();
 
-        let cached_after = store.lookup(&canonical).map(|p| p.display().to_string());
+        let after = canonical.clone();
+        let cached_after = crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
+            crate::idb_store::IdbStore::new().prepared_paths(&after)
+        })
+        .await?
+        .map_err(|e| ToolError::IdaError(e.to_string()))?
+        .0
+        .map(|p| p.display().to_string());
 
         let mut closed_worker = false;
         let mut kept_warm = false;
@@ -1615,7 +1670,8 @@ impl RouterState {
     }
 
     async fn release_warm_lease(&self, path: &PathBuf) -> Result<(), crate::error::ToolError> {
-        if let Some(lease) = self.warm_pool.lock().await.remove(path) {
+        let lease = self.warm_pool.lock().await.remove(path);
+        if let Some(lease) = lease {
             if let Some((handle, remaining)) = self.release_ref_token(&lease.token).await {
                 if remaining == 0 {
                     self.close_worker(&handle).await?;
@@ -1715,6 +1771,19 @@ impl RouterState {
                 task_id: task_id.clone(),
                 path: path.to_string(),
                 method: method.to_string(),
+                preparation: {
+                    let maximum = if method == "open" { 3600 } else { 600 };
+                    let seconds = params
+                        .get("timeout_secs")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(120)
+                        .min(maximum);
+                    let preparation =
+                        crate::preprocess::Preparation::new(Duration::from_secs(seconds));
+                    self.task_registry
+                        .set_cancellation(&task_id, preparation.cancel.clone());
+                    preparation
+                },
                 params,
                 tenant_id: tenant_id.clone(),
                 priority,
@@ -1933,18 +2002,20 @@ impl RouterState {
     }
 
     pub async fn cancel_task(&self, task_id: &str) -> bool {
-        if self.task_registry.cancel(task_id) {
+        let queued = {
+            let mut queue = self.route_queue.lock().await;
+            queue
+                .queued
+                .iter()
+                .position(|task| task.task_id == task_id)
+                .map(|position| queue.queued.remove(position))
+        };
+        if let Some(task) = queued {
+            let _ = task.preparation.cancel.cancel();
+            self.task_registry.cancellation_confirmed(task_id);
             return true;
         }
-
-        let mut queue = self.route_queue.lock().await;
-        if let Some(idx) = queue.queued.iter().position(|task| task.task_id == task_id) {
-            queue.queued.remove(idx);
-            self.task_registry
-                .fail(task_id, "Cancelled before execution");
-            return true;
-        }
-        false
+        self.task_registry.cancel(task_id)
     }
 
     async fn drive_prewarm_queue(&self) {
@@ -2070,13 +2141,23 @@ impl RouterState {
             tokio::spawn(async move {
                 let result = async {
                     let (handle, token) = state
-                        .ensure_worker_with_ref(&task.path, Some(&task.tenant_id))
+                        .ensure_worker_prepared(
+                            &task.path,
+                            None,
+                            Some(&task.tenant_id),
+                            task.preparation.clone(),
+                        )
                         .await?;
-                    let value = state
-                        .route_request(Some(&handle), &task.method, task.params.clone())
-                        .await?;
+                    let result = state
+                        .route_request_prepared(
+                            Some(&handle),
+                            &task.method,
+                            task.params.clone(),
+                            task.preparation.clone(),
+                        )
+                        .await;
                     state.release_ref_token(&token).await;
-                    Ok::<serde_json::Value, crate::error::ToolError>(value)
+                    result
                 }
                 .await;
 
@@ -2091,8 +2172,28 @@ impl RouterState {
                 drop(queue);
 
                 match result {
-                    Ok(value) => state.task_registry.complete(&task.task_id, value),
-                    Err(err) => state.task_registry.fail(&task.task_id, &err.to_string()),
+                    Ok(value) => {
+                        if task.preparation.cancel.is_cancelled() {
+                            state.task_registry.cancellation_confirmed(&task.task_id);
+                        } else {
+                            state.task_registry.complete(&task.task_id, value);
+                        }
+                    }
+                    Err(err) => {
+                        if task.preparation.cancel.is_cancelled()
+                            && matches!(
+                                err,
+                                crate::error::ToolError::Preparation {
+                                    execution_stopped: true,
+                                    ..
+                                }
+                            )
+                        {
+                            state.task_registry.cancellation_confirmed(&task.task_id);
+                        } else {
+                            state.task_registry.fail(&task.task_id, &err.to_string());
+                        }
+                    }
                 }
             });
         }
@@ -2107,9 +2208,16 @@ impl RouterState {
             .collect();
         drop(warm_pool);
 
-        let _ = crate::idb_store::IdbStore::new()
-            .evict_to_limit(self.config.max_idb_cache_bytes, &pinned_groups);
-        let _ = crate::server::response_cache::prune_to_limit(self.config.max_response_cache_bytes);
+        let idb_limit = self.config.max_idb_cache_bytes;
+        let response_limit = self.config.max_response_cache_bytes;
+        if let Err(e) = crate::blocking::run(crate::blocking::WorkClass::Metadata, move || {
+            let _ = crate::idb_store::IdbStore::new().evict_to_limit(idb_limit, &pinned_groups);
+            let _ = crate::server::response_cache::prune_to_limit(response_limit);
+        })
+        .await
+        {
+            warn!(error = %e, "cache maintenance unavailable");
+        }
     }
 
     /// `auto_exit_grace`: `Some(duration)` → exit when no workers remain for that
@@ -2144,7 +2252,7 @@ impl RouterState {
                             let ref_count =
                                 inner.ref_tokens.get(*h).map(|set| set.len()).unwrap_or(0);
                             ref_count == 0
-                                && w.pending.is_empty()
+                                && w.connection.pending_len() == 0
                                 && w.last_active.elapsed() > idle_timeout
                         })
                         .map(|(h, _)| h.clone())
@@ -2253,95 +2361,86 @@ pub fn is_sbpf_elf(path: &std::path::Path) -> bool {
     machine == EM_BPF || machine == EM_SBF
 }
 
-struct ResolvedPath {
+pub(crate) struct ResolvedPath {
     /// Path to pass to IDA for opening (may be .i64, .dylib, or the original binary)
-    open_path: Option<String>,
+    pub(crate) open_path: Option<String>,
     /// Where the .i64 should be saved (centralized path, only when not already cached)
-    idb_output_path: Option<String>,
+    pub(crate) idb_output_path: Option<String>,
 }
 
-fn resolve_open_path(path: &str) -> ResolvedPath {
+pub(crate) async fn resolve_open_path(
+    path: &str,
+    preparation: crate::preprocess::Preparation,
+) -> Result<ResolvedPath, crate::error::ToolError> {
     let input = crate::expand_path(path);
-    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-    // Already an IDA database — open directly
-    if ext == "i64" || ext == "idb" {
-        return ResolvedPath {
-            open_path: None,
-            idb_output_path: None,
-        };
+    let original = input.clone();
+    let prepared = preparation
+        .wait(crate::blocking::run(
+            crate::blocking::WorkClass::Prepare,
+            move || {
+                let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext == "i64" || ext == "idb" {
+                    return Ok((
+                        ResolvedPath {
+                            open_path: None,
+                            idb_output_path: None,
+                        },
+                        None,
+                    ));
+                }
+                let store = crate::idb_store::IdbStore::new();
+                let (cached, destination) = store.prepared_paths(&input).map_err(|e| {
+                    crate::error::ToolError::IdaError(format!(
+                        "prepare input {}: {e}",
+                        input.display()
+                    ))
+                })?;
+                if let Some(cached) = cached {
+                    return Ok((
+                        ResolvedPath {
+                            open_path: Some(cached.display().to_string()),
+                            idb_output_path: None,
+                        },
+                        None,
+                    ));
+                }
+                if is_sbpf_elf(&input) {
+                    return Ok((
+                        ResolvedPath {
+                            open_path: Some(destination.display().to_string()),
+                            idb_output_path: None,
+                        },
+                        Some(destination),
+                    ));
+                }
+                let i64 = input.with_extension("i64");
+                let open_path = if i64.exists() {
+                    Some(i64.display().to_string())
+                } else {
+                    None
+                };
+                let idb_output_path = if open_path.is_some() || input.with_extension("id0").exists()
+                {
+                    None
+                } else {
+                    Some(destination.display().to_string())
+                };
+                Ok::<_, crate::error::ToolError>((
+                    ResolvedPath {
+                        open_path,
+                        idb_output_path,
+                    },
+                    None,
+                ))
+            },
+        ))
+        .await??;
+    preparation.check()?;
+    if let Some(destination) = prepared.1 {
+        crate::sbpf::run_sbx_aot_i64(&original, &destination, preparation.clone()).await?;
     }
-
-    let store = crate::idb_store::IdbStore::new();
-
-    // Check centralized IDB store first
-    if let Some(cached) = store.lookup(&input) {
-        info!(path = %cached.display(), "IDB store hit for {}", input.display());
-        return ResolvedPath {
-            open_path: Some(cached.display().to_string()),
-            idb_output_path: None,
-        };
-    }
-
-    // sBPF ELF handling
-    if is_sbpf_elf(&input) {
-        let i64_path = store.idb_path(&input);
-        if let Some(open_path) = resolve_sbpf_path(&input, &i64_path) {
-            return ResolvedPath {
-                open_path: Some(open_path),
-                idb_output_path: None,
-            };
-        }
-        return ResolvedPath {
-            open_path: None,
-            idb_output_path: None,
-        };
-    }
-
-    // Native binary — check for existing .i64 beside it (legacy location)
-    let i64_path = input.with_extension("i64");
-    let id0_path = input.with_extension("id0");
-    if i64_path.exists() {
-        info!(path = %i64_path.display(), "Fast-path: existing .i64 for raw binary");
-        return ResolvedPath {
-            open_path: Some(i64_path.display().to_string()),
-            idb_output_path: None,
-        };
-    }
-    if id0_path.exists() {
-        info!(path = %input.display(), "Fast-path: existing unpacked .id0 for raw binary");
-        return ResolvedPath {
-            open_path: Some(input.display().to_string()),
-            idb_output_path: None,
-        };
-    }
-
-    // No existing IDB — will be newly analyzed, store in centralized location
-    let idb_output = store.idb_path(&input).display().to_string();
-    ResolvedPath {
-        open_path: None,
-        idb_output_path: Some(idb_output),
-    }
-}
-
-fn resolve_sbpf_path(input: &std::path::Path, i64_path: &std::path::Path) -> Option<String> {
-    info!(path = %input.display(), "Detected sBPF ELF, running sbx aot i64");
-
-    if i64_path.exists() {
-        info!(path = %i64_path.display(), "sBPF fast-path: existing .i64");
-        return Some(i64_path.display().to_string());
-    }
-
-    match crate::sbpf::run_sbx_aot_i64(input, i64_path) {
-        Ok(result) => {
-            info!(i64 = %result.i64_path.display(), "sbx aot i64 succeeded");
-            Some(result.i64_path.display().to_string())
-        }
-        Err(e) => {
-            warn!(error = %e, "sbx aot i64 failed; cannot open sBPF program");
-            None
-        }
-    }
+    preparation.check()?;
+    Ok(prepared.0)
 }
 
 #[cfg(test)]
@@ -2369,6 +2468,117 @@ mod tests {
         assert_eq!(router.worker_count().await, 0);
         assert!(router.active_handle().await.is_none());
         assert!(router.all_handles().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn n2_red_blocked_pipe_does_not_hold_global_state() {
+        let router = RouterState::new().expect("router");
+        let mut child = Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                "import signal; print('started', flush=True); signal.pause()",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("fixture child");
+        let stdin = child.stdin.take().expect("fixture stdin");
+        let mut reader = BufReader::new(child.stdout.take().expect("fixture stdout"));
+        let mut started = String::new();
+        reader
+            .read_line(&mut started)
+            .await
+            .expect("started barrier");
+        assert_eq!(started.trim(), "started");
+        router.inner.lock().await.workers.insert(
+            "blocked".into(),
+            WorkerProcess {
+                backend: WorkerBackendKind::NativeLinked,
+                tenant_id: "fixture".into(),
+                child,
+                connection: transport::RpcConnection::start(reader, stdin, 2),
+                close_token: None,
+                open_path: None,
+                last_active: Instant::now(),
+            },
+        );
+        let cloned = router.clone();
+        let call = tokio::spawn(async move {
+            cloned
+                .route_request(
+                    Some("blocked"),
+                    "fixture",
+                    serde_json::json!({"padding": "x".repeat(4 * 1024 * 1024)}),
+                )
+                .await
+        });
+        let connection = router
+            .inner
+            .lock()
+            .await
+            .workers
+            .get("blocked")
+            .expect("fixture worker")
+            .connection
+            .clone();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !connection.has_written_bytes() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical A write started barrier");
+        tokio::time::timeout(Duration::from_millis(200), router.worker_count())
+            .await
+            .expect("blocked connection must not hold router inner");
+        let preparation = crate::preprocess::Preparation::new(Duration::from_secs(5));
+        let cancel = preparation.cancel.clone();
+        let queued_router = router.clone();
+        let queued = tokio::spawn(async move {
+            queued_router
+                .route_request_prepared(
+                    Some("blocked"),
+                    "queued",
+                    serde_json::json!({}),
+                    preparation,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while connection.pending_len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second request admitted behind blocked frame");
+        assert!(cancel.cancel());
+        let error = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::error::ToolError::Preparation {
+                    execution_stopped: true,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            connection.pending_len(),
+            1,
+            "cancelled queued request must release pending identity"
+        );
+        call.abort();
+        assert!(call.await.expect_err("cancel waiter").is_cancelled());
+        router
+            .close_worker("blocked")
+            .await
+            .expect("reap disposable fixture worker");
     }
 
     #[tokio::test]
