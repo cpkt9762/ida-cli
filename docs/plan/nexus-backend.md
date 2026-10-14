@@ -119,7 +119,7 @@
 
 开发、测试、修复以及本文规定的独立审查均使用这组模型配置，职责通过委托单区分。执行前再次发现 provider/model，缺失时报告阻塞，不静默换模型或推理档位。
 
-现有 `sol-dev` profile 使用其他模型，且其角色卡面向 Solana 套利仓库。本任务按用户明确指定使用上述配置，不修改全局 profile、schedule 或 daemon 配置，不把其他仓库的生产流程强加到 ida-cli。`full-access` 不是部署、推送或操作真实数据库的授权。
+创建本计划时，`sol-dev` profile 的配置与本任务不匹配，且其角色卡面向 Solana 套利仓库；后续 profile 可能变化，每次委托均重新发现并核对。本任务按用户已确认的上述固定配置执行，不修改全局 profile、schedule 或 daemon 配置，不把其他仓库的生产流程强加到 ida-cli。`full-access` 不是部署、推送或操作真实数据库的授权。
 
 ### 3.2 编排者和 worker 分工
 
@@ -278,6 +278,7 @@ N1/N2 在 bridge 尚未接通时先验收契约和模拟行为，这些结果不
 - N0/N0-F1：`aa33d973644fa6de4751c055cd7afef83179639c` 的 31 项支持测试、全新环境真实保存/备份副本重开、真实启动超时及外层中断清理经过编排者独立复跑；原 reviewer 确认 F1–F4 关闭、无新阻断问题。
 - 环境验收范围为 macOS arm64、IDA 9.5；Linux 进程身份分支仍只有模拟验证。SIGKILL 未完成意图保守失败及身份查询/发信号非原子的限制保持公开。
 - 旧 Rust fmt 和两项 Clippy 欠项不计为通过，安排在 N1 开头的独立维护提交处理；不能用 N0 环境门禁通过代替这些检查。
+- N1 维护提交 `7cda84aecb1bb278cfb52c9cc5d60826a4b13d54` 完成上述格式和两项库级 lint 清理，fmt/check 通过，库测试 418 passed、2 ignored；全 target Clippy 进一步暴露未改动的 `tests/ida_e2e.rs` 中四项既有问题。编排者已独立复现并将其最小等价修复纳入维护范围；契约实现尚未开始，N1 未验收。
 
 ### N0：工作区、环境和证据基线
 
@@ -291,7 +292,8 @@ N1/N2 在 bridge 尚未接通时先验收契约和模拟行为，这些结果不
 
 ### N1：Nexus 会话与任务契约
 
-- 开工先用独立维护提交清理 N0 已记录的格式差异，以及 `src/tool_registry.rs` 的 `unnecessary_sort_by` 和 `src/cli/mod.rs` 的 `items_after_test_module`。仅做格式/等价结构调整，保留全部功能和断言，不降低 lint 要求；通过后再单独提交契约实现。
+- 开工先用独立维护提交清理 N0 已记录的格式差异，以及 `src/tool_registry.rs` 的 `unnecessary_sort_by` 和 `src/cli/mod.rs` 的 `items_after_test_module`。追加维护范围包括 `tests/ida_e2e.rs` 的两处 `type_complexity`、一处 `await_holding_lock` 和一处 `expect_fun_call`：采用等价类型别名、明确释放 guard 的词法块和保留路径/底层错误的惰性诊断。保持 pending 登记先于发送、发送和 await 前释放锁，不替换锁原语或改变测试串行策略。
+- 维护改动仅做格式/等价结构调整，保留全部功能、测试和断言，不降低 lint 要求；追加修复单独提交，全 target lint 通过后继续单独提交契约实现，不停留在维护阶段。
 - 建立 Nexus 会话执行入口，列出方法能力与版本要求；如迁移期需要临时后端选择，将其标记为 N9 必删项，不作为最终用户功能。
 - 定义执行返回值、错误、数据库断连、busy、排队超时和运行中取消的映射。
 - 明确 request/operation/lease/instance 的关联与释放责任，覆盖任务终态竞争。
