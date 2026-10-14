@@ -9,6 +9,7 @@ just test-script  # IDAPython script execution test
 just test-dsc /path/to/dyld_shared_cache_arm64e  # DSC loading test
 just cargo-test   # Unit tests (no IDA required)
 just test-list-idbs  # list_idbs against a real, isolated daemon
+just test-decompile-line-addresses  # decompile_function line_addresses, same setup
 ```
 
 All integration tests require IDA Pro with a valid license. Run
@@ -53,6 +54,20 @@ binary as a worker subprocess.
 - Needs `IDA_TEST=1`, an IDA runtime and a C compiler; `IDA_CLI_E2E_BIN`
   tests another build (for example the release binary) and
   `LIST_IDBS_E2E_OUT` writes the transcript of every answer
+
+**decompile line_addresses test** (`just test-decompile-line-addresses`,
+`tests/decompile_line_addresses_e2e.rs`)
+
+- Starts a temporary `serve-http` daemon under an isolated `IDA_CLI_HOME`,
+  opens a small compiled fixture over MCP and decompiles one function with
+  and without `line_addresses`, over MCP and over `ida-cli decompile`
+- Checks that the default answer is still only `{code}`, that `lines` has one
+  entry per pseudocode line with the same text as `code`, that addresses are
+  ascending, unique and inside the function, and that every address on a line
+  is one the decompiler maps to a statement (`get_pseudocode_at`)
+- Needs `IDA_TEST=1`, an IDA runtime with Hex-Rays and a C compiler;
+  `IDA_CLI_E2E_BIN` tests another build and `DECOMPILE_LINES_E2E_OUT` writes
+  the answers
 
 **Script test** (`just test-script`)
 
