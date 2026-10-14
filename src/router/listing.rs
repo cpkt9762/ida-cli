@@ -6,7 +6,7 @@
 //! credentials: nothing in here stores or serializes one.
 
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -104,8 +104,8 @@ pub enum DbState {
 /// What happened to an `open` request, as seen by the router.
 #[derive(Debug, Clone)]
 pub enum OpenOutcome {
-    /// The worker answered; `idb_path` is the database path it reported.
-    Opened { idb_path: Option<PathBuf> },
+    /// The worker answered; `reported_path` is the `path` of its answer.
+    Opened { reported_path: Option<PathBuf> },
     /// The worker answered with an error or exited.
     Failed,
     /// The router stopped waiting; the worker may still finish opening.
@@ -139,16 +139,25 @@ impl DbRecord {
         }
     }
 
-    /// Fold in the result of an `open` request.
-    pub fn finish_open(&mut self, outcome: OpenOutcome, now: SystemTime) {
+    /// Fold in the result of an `open` request for `input`, the path the
+    /// worker was asked to open.
+    ///
+    /// The first answer that confirms the open names the database file and
+    /// later ones never replace it: a worker that is asked again to open a
+    /// database it already holds reports the original input file, which for a
+    /// raw binary is not the database. For the same reason a raw binary that
+    /// is reported as itself is not taken for the database file.
+    pub fn finish_open(&mut self, outcome: OpenOutcome, input: Option<&Path>, now: SystemTime) {
         match outcome {
-            OpenOutcome::Opened { idb_path } => {
+            OpenOutcome::Opened { reported_path } => {
                 if self.state != DbState::Open {
                     self.state = DbState::Open;
                     self.opened_at = Some(now);
                 }
-                if idb_path.is_some() {
-                    self.idb_path = idb_path;
+                if self.idb_path.is_none() {
+                    self.idb_path = reported_path.filter(|reported| {
+                        is_database_file(reported) || Some(reported.as_path()) != input
+                    });
                 }
             }
             OpenOutcome::Failed => {
@@ -165,6 +174,17 @@ impl DbRecord {
     pub fn is_listed(&self) -> bool {
         matches!(self.state, DbState::Opening | DbState::Open)
     }
+}
+
+/// Whether `path` names an IDA database rather than a binary to analyse.
+fn is_database_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["i64", "idb", "id0"]
+                .iter()
+                .any(|database| ext.eq_ignore_ascii_case(database))
+        })
 }
 
 impl Default for DbRecord {
@@ -285,52 +305,68 @@ mod tests {
         assert!(record.opened_at.is_none());
     }
 
+    fn opened(path: &str) -> OpenOutcome {
+        OpenOutcome::Opened {
+            reported_path: Some(PathBuf::from(path)),
+        }
+    }
+
     #[test]
     fn successful_open_records_path_and_time() {
         let mut record = DbRecord::new();
         record.begin_open();
-        record.finish_open(
-            OpenOutcome::Opened {
-                idb_path: Some(PathBuf::from("/db/a.i64")),
-            },
-            at(100),
-        );
+        record.finish_open(opened("/db/a.i64"), Some(Path::new("/in/a")), at(100));
         assert_eq!(record.state, DbState::Open);
         assert_eq!(record.idb_path, Some(PathBuf::from("/db/a.i64")));
         assert_eq!(record.opened_at, Some(at(100)));
     }
 
     #[test]
-    fn repeated_open_keeps_first_open_time() {
+    fn repeated_open_keeps_first_open_time_and_database_path() {
         let mut record = DbRecord::new();
-        record.finish_open(
-            OpenOutcome::Opened {
-                idb_path: Some(PathBuf::from("/db/a.i64")),
-            },
-            at(100),
-        );
+        let input = Some(Path::new("/in/a"));
+        record.finish_open(opened("/db/a.i64"), input, at(100));
         record.begin_open();
         assert_eq!(record.state, DbState::Open);
-        record.finish_open(
-            OpenOutcome::Opened {
-                idb_path: Some(PathBuf::from("/db/a.i64")),
-            },
-            at(500),
-        );
+        // Asked again, the worker names the original input, not the database.
+        record.finish_open(opened("/in/a"), input, at(500));
         assert_eq!(record.opened_at, Some(at(100)));
+        assert_eq!(record.idb_path, Some(PathBuf::from("/db/a.i64")));
+    }
+
+    #[test]
+    fn a_raw_binary_reported_as_itself_is_not_a_database_path() {
+        let mut record = DbRecord::new();
+        record.finish_open(opened("/in/a"), Some(Path::new("/in/a")), at(1));
+        assert_eq!(record.state, DbState::Open);
+        assert!(record.idb_path.is_none());
+    }
+
+    #[test]
+    fn a_database_opened_directly_is_its_own_database_path() {
+        let mut record = DbRecord::new();
+        let input = Some(Path::new("/db/a.I64"));
+        record.finish_open(opened("/db/a.I64"), input, at(1));
+        assert_eq!(record.idb_path, Some(PathBuf::from("/db/a.I64")));
     }
 
     #[test]
     fn failed_open_is_not_listed_but_failed_reopen_keeps_open_db() {
         let mut record = DbRecord::new();
-        record.finish_open(OpenOutcome::Failed, at(1));
+        record.finish_open(OpenOutcome::Failed, None, at(1));
         assert_eq!(record.state, DbState::Failed);
         assert!(!record.is_listed());
 
         let mut open = DbRecord::new();
-        open.finish_open(OpenOutcome::Opened { idb_path: None }, at(1));
+        open.finish_open(
+            OpenOutcome::Opened {
+                reported_path: None,
+            },
+            None,
+            at(1),
+        );
         open.begin_open();
-        open.finish_open(OpenOutcome::Failed, at(2));
+        open.finish_open(OpenOutcome::Failed, None, at(2));
         assert_eq!(open.state, DbState::Open);
         assert!(open.is_listed());
     }
@@ -339,7 +375,7 @@ mod tests {
     fn timed_out_open_stays_opening() {
         let mut record = DbRecord::new();
         record.begin_open();
-        record.finish_open(OpenOutcome::TimedOut, at(1));
+        record.finish_open(OpenOutcome::TimedOut, None, at(1));
         assert_eq!(record.state, DbState::Opening);
         assert!(record.is_listed());
     }
@@ -347,10 +383,16 @@ mod tests {
     #[test]
     fn failed_worker_can_recover_on_a_later_open() {
         let mut record = DbRecord::new();
-        record.finish_open(OpenOutcome::Failed, at(1));
+        record.finish_open(OpenOutcome::Failed, None, at(1));
         record.begin_open();
         assert_eq!(record.state, DbState::Opening);
-        record.finish_open(OpenOutcome::Opened { idb_path: None }, at(9));
+        record.finish_open(
+            OpenOutcome::Opened {
+                reported_path: None,
+            },
+            None,
+            at(9),
+        );
         assert_eq!(record.state, DbState::Open);
         assert_eq!(record.opened_at, Some(at(9)));
     }

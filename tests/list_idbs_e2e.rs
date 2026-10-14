@@ -480,6 +480,10 @@ fn list_idbs_follows_two_clients_through_a_real_daemon() {
     assert_eq!(shared["count"], 1);
     let shared_entry = entry(&shared, &handle_b);
     assert_eq!(shared_entry["ref_count"], 2);
+    // A second open of the same input must not change what is reported.
+    assert_eq!(shared_entry["idb_path"], beta_entry["idb_path"]);
+    assert_eq!(shared_entry["input_path"], json!(beta));
+    assert_eq!(shared_entry["opened_at"], beta_entry["opened_at"]);
     assert_eq!(
         shared_entry["opened_by"]["client_id"],
         beta_entry["opened_by"]["client_id"]

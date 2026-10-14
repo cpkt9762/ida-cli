@@ -1035,7 +1035,7 @@ impl RouterState {
 
         let outcome = match outcome {
             Ok(value) => OpenOutcome::Opened {
-                idb_path: value
+                reported_path: value
                     .get("path")
                     .and_then(|path| path.as_str())
                     .map(|path| {
@@ -1048,7 +1048,10 @@ impl RouterState {
         };
         let mut inner = self.inner.lock().await;
         if let Some(worker) = inner.workers.get_mut(handle) {
-            worker.db.finish_open(outcome, SystemTime::now());
+            let input = worker.open_path.clone();
+            worker
+                .db
+                .finish_open(outcome, input.as_deref(), SystemTime::now());
         }
     }
 
@@ -2691,6 +2694,34 @@ mod tests {
         assert!(!second.opened_by_caller);
         assert!(second.active);
         assert_ne!(first.opened_by.client_id, second.opened_by.client_id);
+    }
+
+    #[tokio::test]
+    async fn test_opening_the_same_database_again_keeps_its_database_path() {
+        let router = RouterState::new().expect("router");
+        let alice = ClientIdentity::mcp_session();
+        let bob = ClientIdentity::mcp_session();
+        let (handle, _) = router.register_test_worker("/in/sample.so", &alice).await;
+        router
+            .record_open_outcome(&handle, &Ok(serde_json::json!({"path": "/db/sample.i64"})))
+            .await;
+        let opened_at = by_handle(&router.list_idbs(None).await, &handle)
+            .opened_at
+            .clone();
+
+        // A second client opens the same input; the worker answers from its
+        // open session and names the input file, not the database.
+        router.issue_ref_for_handle(&handle, &bob).await;
+        router
+            .record_open_outcome(&handle, &Ok(serde_json::json!({"path": "/in/sample.so"})))
+            .await;
+
+        let listing = router.list_idbs(None).await;
+        let entry = by_handle(&listing, &handle);
+        assert_eq!(entry.idb_path.as_deref(), Some("/db/sample.i64"));
+        assert_eq!(entry.input_path.as_deref(), Some("/in/sample.so"));
+        assert_eq!(entry.opened_at, opened_at);
+        assert_eq!(entry.ref_count, 2);
     }
 
     #[tokio::test]
