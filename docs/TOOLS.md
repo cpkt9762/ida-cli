@@ -224,6 +224,7 @@ Execute Python scripts via IDAPython
   A line can map to several non-contiguous addresses, and the list is not every instruction of the
   statement. The function signature and local declarations have none; `{`, `}`, `else` and blank
   lines can carry the address of the block or `if` that owns them (the function entry for the
-  outermost braces). The `sub_` rename hint is not added in this mode, and the idat backend answers
-  NotSupported. Without the flag the answer is unchanged.
+  outermost braces). The `sub_` rename hint is not added in this mode. Hex-Rays can print a very large
+  function differently from one call to the next, so use `code` and `lines` from the same answer only.
+  The idat backend answers NotSupported. Without the flag the answer is unchanged.
 - Raw binaries are auto-analyzed on first open; `.i64` is saved alongside the input

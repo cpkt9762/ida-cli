@@ -155,11 +155,15 @@ fn main() {
     );
     let _ = writeln!(
         out,
-        "  outermost braces). The `sub_` rename hint is not added in this mode, and the idat backend answers"
+        "  outermost braces). The `sub_` rename hint is not added in this mode. Hex-Rays can print a very large"
     );
     let _ = writeln!(
         out,
-        "  NotSupported. Without the flag the answer is unchanged."
+        "  function differently from one call to the next, so use `code` and `lines` from the same answer only."
+    );
+    let _ = writeln!(
+        out,
+        "  The idat backend answers NotSupported. Without the flag the answer is unchanged."
     );
     let _ = writeln!(
         out,

@@ -172,8 +172,10 @@ line. A line can map to several non-contiguous addresses, and the list is not
 every instruction of the statement. The signature and local declarations have
 none; `{`, `}`, `else` and blank lines can carry the address of the block or
 `if` that owns them (the function entry for the outermost braces). The `sub_`
-rename hint is not added in this mode. Only the native-linked backend can do
-this; the idat backend answers `NotSupported`. Over the CLI socket a large
+rename hint is not added in this mode. Hex-Rays can print a very large function
+differently from one call to the next, so use `code` and `lines` from the same
+answer only. Only the native-linked backend can do this; the idat backend
+answers `NotSupported`. Over the CLI socket a large
 answer is stored in the response cache like any other (`IDA_MCP_MAX_INLINE_BYTES`).
 
 ```json

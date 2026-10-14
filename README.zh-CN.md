@@ -135,7 +135,8 @@ cargo build --bin ida-cli
 `{"line", "text", "addresses"}`。`line` 从 1 开始，`text` 是 `code` 里的同一行，`addresses` 是 Hex-Rays
 挂在这一行上的 ctree 项的 IDA 地址（十六进制字符串，升序、去重）。一行可能对应多个不连续的地址，
 列表也不是该语句的全部指令；函数签名和局部变量声明没有地址；`{`、`}`、`else` 和空行可能带着所属块或
-`if` 的地址（最外层大括号是函数入口）。该模式不加 `sub_` 改名提示。只有 native-linked 后端支持，
+`if` 的地址（最外层大括号是函数入口）。该模式不加 `sub_` 改名提示。Hex-Rays 对很大的函数，
+两次调用打印出的文本可能不同，所以 `code` 与 `lines` 只能取自同一次应答。只有 native-linked 后端支持，
 idat 后端返回 `NotSupported`。经 CLI socket 时，大结果与其他命令一样落到响应缓存
 （`IDA_MCP_MAX_INLINE_BYTES`）。
 

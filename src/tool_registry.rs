@@ -564,8 +564,10 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     function signature and local declarations have none; `{`, `}`, `else` and \
                     blank lines can carry the address of the block or `if` that owns them (the \
                     function entry for the outermost braces). The sub_ rename hint is not added in \
-                    this mode. Needs the native-linked backend (the idat backend answers \
-                    NotSupported). Default is off and the answer is unchanged.",
+                    this mode. Hex-Rays can print a very large function differently from one call \
+                    to the next, so use `code` and `lines` from the same answer only. Needs the \
+                    native-linked backend (the idat backend answers NotSupported). Default is off \
+                    and the answer is unchanged.",
         example: r#"{"address": "0x1000", "line_addresses": true}"#,
         default: false,
         keywords: &["decompile", "pseudocode", "c", "source", "hex-rays"],
