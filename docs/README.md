@@ -23,6 +23,7 @@ and an auto-managed local runtime.
 - [TESTING.md](TESTING.md) — running integration and unit tests
 - [MULTI_IDB.md](MULTI_IDB.md) — multi-IDB router notes
 - [UPGRADE_PLAN.md](UPGRADE_PLAN.md) — upgrade plan for larger deployments
+- [Nexus migration plan](plan/nexus-backend.md) — migration to a sole Nexus backend, Codex delegation, isolated worktree, and E2E acceptance
 
 The skill sits under [`../skill/`](../skill/). Its main entrypoint is
 [`SKILL.md`](../skill/SKILL.md), and the most actionable quick reference is
