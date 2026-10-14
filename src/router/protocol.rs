@@ -106,11 +106,12 @@ pub(crate) fn take_deadline(
     let expiry = value.as_u64().ok_or_else(|| {
         crate::error::ToolError::InvalidParams("invalid internal deadline".into())
     })?;
+    // Sample the local clock first: conversion may shorten, never regrant the
+    // interval between the two clock reads.
+    let local_now = std::time::Instant::now();
     let now = super::nexus_transport::monotonic_ns()
         .map_err(|e| crate::error::ToolError::IdaError(e.to_string()))?;
-    Ok(fallback.min(
-        std::time::Instant::now() + std::time::Duration::from_nanos(expiry.saturating_sub(now)),
-    ))
+    Ok(fallback.min(local_now + std::time::Duration::from_nanos(expiry.saturating_sub(now))))
 }
 
 #[cfg(test)]
