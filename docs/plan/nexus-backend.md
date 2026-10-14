@@ -372,6 +372,20 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 - 大文件 hash、同步文件处理及重型编码移出事件循环；限制后台工作并发，不能制造无限线程池排队。
 - 验收：模拟一个 pipe 停止消费或构建命令阻塞时，router 和其他数据库仍可响应。
 
+#### N2 接口交付与 N3 消费约定
+
+- 生产 `route_request_prepared`、CLI path/open/route、MCP routed open、`serve-worker` 两个旧兼容入口已接连接自有 transport 或受限准备工作。旧 `RpcRequest/RpcResponse` 的外部 JSON 保留；旧执行器到 N9 删除，不新增长期多后端选择。`router::nexus_transport` 是 N3 的单一 Nexus 接入边界，当前未安装能力时明确 `BridgeUnavailable`。
+- `RouterState::install_nexus_capabilities` 仅安装一次已验证的能力；`nexus_endpoint().take_lanes()` 仅交付一次业务/控制 receiver。`transition` 只做短的 N1 本地状态转换，禁止在 closure 中做远端等待、编码或阻塞 I/O。consumer drop 与延后失败调用 N1 `delivery_failed`；在 N1 锁内发生的 drop 暂存失败并保留 lane permit，由本次/下次 `transition` 刷新，数量不超过 lane 容量。
+- Nexus 业务 lane 的容量是 router `max_pending_per_worker`，控制 lane 是 8；已交付但未丢弃的 `Delivery` 也持有许可。`send/send_control` 只做本地 `try_reserve`，饱和明确 Busy。控制必须由 N3 接独立物理连接或独立公共 Nexus API 调度入口，不能把两个 receiver 合并回一条堵塞的 pipe。N3 必须持续消费两条 lane，轮询本地 transition，并接入真实断连及停止证据。
+- `Delivery::begin` 扣除队列时间并检查取消/期限，再交给公共 API adapter；拿到 command 即可能投递，drop 保守 Uncertain。若使用内部 `Delivery::write`，wire 是 `nexus_frame:1`、`attempt`、`payload` 的 JSON 行，含换行最多 16 MiB；它不由旧 RPC parser 消费。编码和写共用总 deadline；无写字节证明时 NotSent，部分写或调用者在 write 中离开时 Uncertain，禁止自动重放。部分写后 N3 必须丢弃该物理流。write 成功只证明完整写入，N3 仍负责精确 attempt 的 ACK、opened/complete/released/shutdown 回调；ACK 不等于停止。真实 API adapter 须把编码/网络时间继续扣入总期限，不能重新发完整业务预算。
+- 旧连接在 pending 登记后才暴露发送；router 全局单调 request ID 在同一进程内不复用，连接对象隔离代际，迟到响应不能作用后继连接。每连接 pending/写队列都受配置上限约束，tenant admission 在短 inner 锁中累计；已可能发送的 waiter 退出后保留 pending 占用直到响应/EOF。零发送的排队取消释放 pending；部分帧失败封闭流。旧 worker 持续读取、64 项业务队列、单业务 executor、32 项响应队列；`__transport_status` 是本地状态，`__cancel` 明确不支持 native 抢占。共享物理输出堵塞时不承诺控制可送达。
+- CLI 接入最多 128 个未分类输入、64 个业务连接、8 个本地状态/取消连接；输入/输出等待各有 5 秒上限，16 MiB 帧上限。已分类业务不占控制 lane。重工作先获取许可再启动：Prepare 4、Encode 2、Metadata 1；运行中的 blocking closure 自持许可，丢弃 waiter 不会释放它。CLI 控制编码有独立 2 项许可和独立 OS 线程，不排入业务 blocking pool。
+- `status_snapshot` 只读本地内存；冷 probe 与缓存统计在受限后台刷新，未知能力不伪造 READY。冷缓存统计为 `null`，新增 `cache_statistics_refreshing/cache_statistics_error`，已有统计保留到新快照成功；对应 metrics 未知值为 `NaN`。显式 federation probe 仍是单独的远端查询，不属于本地状态保证。
+- `preprocess::Preparation` 从接纳起计总 deadline；离线子进程 admission 8、活动进程 4。`sbpf::run_sbx_aot_i64`、`dsc::run_idat_offline` 及 DSC TaskRegistry 实际消费异步 supervisor。stdout/stderr 各保留最多 64 KiB 并持续排空；取消/超时/父 future drop 由 supervisor 发本任务自有 process group 信号、等待/回收并验证管道关闭。未回收 leader 锚定 PID/PGID，最后一次破坏信号后才回收；之后只读探测。runtime/supervisor 退出使用有限 emergency reaper，保留容量直到自有 group 消失，不在 runtime 线程同步 waitpid。
+- 保证限定在未逃离自有 process group 的后代；未知/权限/管道不闭合等情况明确失败，不能报告 CLEAN 或 native 停止，不扫描名称或杀共享 Nexus owner。Darwin 的全 zombie group 可能向 kill 返回 EPERM，只有对锚定自有 group 的 libproc SZOMB 证据才接受无需继续发信号；EPERM 本身不是清理成功。Linux 分支未在本轮真实 OS 验证。
+- sbx/DSC 在唯一 sibling staging 中生成，取消与 hard-link 发布以原子状态仲裁；取消先赢则不得发布，发布 commit point 先赢则后续取消明确返回 false。发布不覆盖已有缓存/用户文件。不可中断文件工作自持许可和 stage 到实际结束；超期如实标记后台未证实停止。缓存索引只提供本进程写入互斥与原子替换，不替代 N7 的跨客户端占用/GC 协调。
+- 专用 `nexus_transport` 覆盖 E08/E18 的 started barrier、真实 UnixStream/pipe 背压、独立 lane、快速/乱序/迟到 ID、零写/部分写/EOF/drop 和 N1 延后失败；`nexus_preprocess` 覆盖 E19 的一次性 sbx/idat 替代进程、后代、管道饱和、队列/运行取消、总期限、父 future/runtime 退出及发布保护。证据只属于协议/模拟和真实 OS fixture，E08/E18/E19 须在 N3 后补真实 Nexus 链路。本阶段未验收或启动 N3。
+
 ### N3：常驻 Python bridge 和 Nexus 生命周期
 
 - 通过公共 Nexus API 建立数据库句柄，注册断连事件，管理 lease 和输出路径。
