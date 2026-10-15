@@ -1,6 +1,6 @@
 # Nexus 唯一后端迁移与长任务治理计划
 
-状态：在独立 worktree `../ida-cli-nexus`、分支 `feat/nexus-backend` 执行。N0 环境阶段已验收；N1 经 N1-F1 修复后，已在 `9148fba526bf403b9448b50131a3edc145c2229a` 完成编排者独立复验和原 reviewer 复审，纯契约阶段门禁通过。N2 经 F1–F5 修复后，已在 `a1cc1e527e237949e70c3c4b5b333a9f3478260a` 完成编排者独立复验和原 reviewer 复审，协议/模拟及真实 OS fixture 范围的门禁通过。N3 经 F1–F2 修复后，已在 `86a35fa68749eb20f12856c92e20f9ca3b391449` 完成编排者独立复验和原 reviewer 复审，常驻 bridge 与生命周期的真实 IDA E2E（E02 bridge 部分、E03、E05、E06、E07）通过。N4 经 F1–F3 修复后，已在 `b650ac0aa657cbe10e722f9c2551a6442721a04f` 完成编排者独立复验和原 reviewer 复审，首批工具在开发选择入口下经 Nexus 执行，E04、E16、E17、E22 真实 IDA E2E 通过，形成首个可用里程碑，后续按 N5 推进。本文不表示整个后端迁移或全部真实链路 E2E 已完成。
+状态：在独立 worktree `../ida-cli-nexus`、分支 `feat/nexus-backend` 执行。N0 环境阶段已验收；N1 经 N1-F1 修复后，已在 `9148fba526bf403b9448b50131a3edc145c2229a` 完成编排者独立复验和原 reviewer 复审，纯契约阶段门禁通过。N2 经 F1–F5 修复后，已在 `a1cc1e527e237949e70c3c4b5b333a9f3478260a` 完成编排者独立复验和原 reviewer 复审，协议/模拟及真实 OS fixture 范围的门禁通过。N3 经 F1–F2 修复后，已在 `86a35fa68749eb20f12856c92e20f9ca3b391449` 完成编排者独立复验和原 reviewer 复审，常驻 bridge 与生命周期的真实 IDA E2E（E02 bridge 部分、E03、E05、E06、E07）通过。N4 经 F1–F3 修复后，已在 `b650ac0aa657cbe10e722f9c2551a6442721a04f` 完成编排者独立复验和原 reviewer 复审，首批工具在开发选择入口下经 Nexus 执行，E04、E16、E17、E22 真实 IDA E2E 通过，形成首个可用里程碑。N5 经 F1–F2 修复后，已在 `d9cefe79d9dacd6a85666eb769c6ea15c9ed4b80` 完成编排者独立复验和原 reviewer 复审，长任务分片、公平调度、总期限、取消与一致性检测的真实 IDA E2E（E08–E15、E18、E26）通过，后续按 N6 推进。本文不表示整个后端迁移或全部真实链路 E2E 已完成。
 
 日期：2026-10-15。
 
@@ -296,6 +296,10 @@ N1/N2 在 bridge 尚未接通时先验收契约和模拟行为，这些结果不
 - N4 编排者方针与已知限制，不阻断：processor 长名称只在已验证的 IDA 9.5 ABI 上精确读取，其他版本回退公开短名称并 warn，open 不依赖该字段；Nexus 模式暂停旧 IDB 自动淘汰，N7 实现协调 GC 前不删除无法证明无人使用的库；`run_script` 在同一 owner 内共享 `__main__`，仅适用于受信任脚本；E22 最终哈希核对到 open 非原子，本地 path gate 不覆盖外部 opener，留给 N7；开发选择入口 `IDA_CLI_NEXUS_DEV` 及相关配置为 N9 必删项。外部高负载下部分时序测试（含 E04 驱动）会超时，已在测试中区分启动与响应预算，但不保证任意负载下满足实时预算。
 - 本机准备环境时在线下载可能超过 30 秒；编排者复验使用仓库外的离线包装，仅替换依赖下载为本地 wheels（保留 `--require-hashes`）与 Nexus clone 为本地源码（脚本仍核验固定 SHA）。
 - N4 验收证据为 `/tmp/ida-nexus-n4f3-parent-20261016.FYopPl/verification.md` 和 `validation.jsonl`，前几轮复验在 `/tmp/ida-nexus-n4*-parent-20261016.*`；实现报告为 `/tmp/ida-nexus-run-20261015.98rmfb/n4*/report.md`。
+- N5/N5-F1–F2：输入 `f2075ac73769482ca41f1ac0f055c60d13e01d46`。首轮 `306623c` 报告公开一致性接口缺口：IDA `database_change_count` 不覆盖重命名与注释，Nexus 事件订阅没有与分片读取同步的修订水位；编排者批准通过公开 `execute_python` 安装公开 IDAPython `IDB_Hooks` 维护同步计数（比较上一片结束与下一片开始的计数）。第二轮 `228aae8` 报告同进程 `unhook()` 不可检测；编排者划定承诺边界：安装失败、owner 重启或代际变化、私有命名空间对象或安装标识缺失或不一致、计数读取失败、重连均 fail-closed；同 owner 内受信任代码的篡改、未订阅通知的修改、native 绕过通知列为已知限制。实现 `bda449890df865b1948f47862974b3f0ca675212`；F1 `2f4021d77899b093ae9c32b1572b87b292ec5533`（批量 JSON 标量与地址解析兼容、E18 真实消费端背压、lifetime socket 文件残留、`_n5_cleanup` 与旧 attempt 回调回归）；F2 `d9cefe79d9dacd6a85666eb769c6ea15c9ed4b80`（数组字符串按旧 serde 规则解码、单请求编码失败只结束该请求、按 N1 attempt 序号过滤 dispatch 到 pending 窗口内的旧回调、启动取消由 StartupGuard 清理子进程与 socket）。只读 reviewer `23be3899-2381-48dc-bcf8-35a436f9f694` 的全部问题均已关闭，无新阻断。
+- 编排者在最终 SHA 独立执行（load 1.1～1.9）：`env -i` 干净 shell 12 项标准门禁全部退出码为 0（库测试 486 passed、2 原有 ignored，连续三轮；contract 65）；第 13 项 14 passed；全新环境补丁红绿对照成立；N0 支持 37、bridge pytest 30；真实 IDA E2E：concurrency 套件两次各 14/14（E08–E15、E18、E26 及批量对照、hook 与重连场景），lifecycle 9/9，contract 4/4（E04 38/38）；七个环境 cleanup CLEAN，登记 402 个进程全部退出，所有 IPC 根目录 socket 零残留。编排者据此验收 N5。
+- N5 已知限制，不阻断：分片一致性不是事务快照，hook 承诺边界如上；单个 native 调用不可抢占，native 永不返回时不承诺有限时间收敛；E26 只证明人工 PyDLL 持 GIL 的边界；E18 结论限于测试 relay 构造的背压场景；raw CLI 保留原有响应递归上限（127 层嵌套对照经 MCP 入口）；请求编码失败时副作用可能已经发生，不自动重放；物理 I/O 失败仍会断开对应连接。
+- N5 验收证据为 `/tmp/ida-nexus-n5f2-parent-20261016.n7yBd2/verification.md`、`validation.jsonl` 与 `logs/root-verify.out`，前两轮复验在 `/tmp/ida-nexus-n5-parent-20261016.GNh5wP/`、`/tmp/ida-nexus-n5f1-parent-20261016.14rQcY/`；实现报告为 `/tmp/ida-nexus-run-20261015.98rmfb/n5*/report*.md`。
 
 ### N0：工作区、环境和证据基线
 
