@@ -33,6 +33,41 @@ impl PreparedOpen {
     pub fn handed_off(&mut self) {
         self.verification_handed_off = true;
     }
+    /// Called only after opened confirms legacy SHA256 verification and probe
+    /// closure. Retain that exact input snapshot before exposing the lease, so
+    /// another open need not copy a packed IDB owned by a running instance.
+    pub async fn publish_verified_input(&self, preparation: &Preparation) -> Result<(), ToolError> {
+        let Some(directory) = self.verification.clone() else {
+            return Ok(());
+        };
+        let destination = self.path.with_extension("");
+        let preparing = preparation.clone();
+        preparation
+            .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+                anyhow::ensure!(
+                    directory.join("closed").is_file(),
+                    "legacy verification close unconfirmed"
+                );
+                let snapshot = directory.join("input");
+                let stage = StagedArtifact::create(&destination)?;
+                std::fs::hard_link(&snapshot, &stage.output)?;
+                if let Err(error) = stage.publish(&preparing) {
+                    preparing.check()?;
+                    if !destination.exists()
+                        || digest(&destination, &preparing)? != digest(&snapshot, &preparing)?
+                    {
+                        return Err(error.into());
+                    }
+                    // An identical independently published snapshot is safe; never
+                    // replace a collision or touch the packed database itself.
+                }
+                Ok::<_, anyhow::Error>(())
+            }))
+            .await?
+            .map_err(|error| {
+                ToolError::IdaError(format!("Nexus verified input publication: {error:#}"))
+            })
+    }
     fn plain(path: PathBuf) -> Self {
         Self {
             path,
@@ -263,6 +298,66 @@ mod f1_regressions {
                 std::fs::remove_dir_all(directory).expect("remove synthetic retained probe");
             }
         }
+    }
+    #[tokio::test]
+    async fn verified_legacy_input_survives_owner_save_without_reprobing_packed_idb() {
+        let root = root("verified-input");
+        let input = root.join("raw");
+        let cache = root.join("idb");
+        std::fs::write(&input, b"input snapshot").unwrap();
+        std::fs::create_dir(&cache).unwrap();
+        let hash = blake3::hash(b"input snapshot").to_hex()[..12].to_string();
+        let idb = cache.join(format!("raw.{hash}.dylib.i64"));
+        std::fs::write(&idb, b"packed before first verified open").unwrap();
+        let p = Preparation::new(Duration::from_secs(10));
+        let mut first = prepare_impl(input.clone(), cache.clone(), &p, true).unwrap();
+        first.handed_off();
+        std::fs::write(first.verification.as_ref().unwrap().join("closed"), b"").unwrap();
+        // Caller has received opened only after the bridge verifies IDB SHA256.
+        first.publish_verified_input(&p).await.unwrap();
+        drop(first);
+        std::fs::write(&idb, b"packed saved by active owner").unwrap();
+        let second = prepare_impl(input, cache, &p, true).unwrap();
+        assert!(
+            second.verification.is_none(),
+            "warm open must not copy the live packed IDB again"
+        );
+        assert_eq!(
+            std::fs::read(idb.with_extension("")).unwrap(),
+            b"input snapshot"
+        );
+        assert_eq!(
+            std::fs::read(&idb).unwrap(),
+            b"packed saved by active owner"
+        );
+        assert_eq!(second.path, idb);
+    }
+    #[tokio::test]
+    async fn verified_input_publication_refuses_unclosed_cancelled_and_conflicting_proof() {
+        let root = root("proof-safety");
+        let input = root.join("raw");
+        let cache = root.join("idb");
+        std::fs::write(&input, b"input snapshot").unwrap();
+        std::fs::create_dir(&cache).unwrap();
+        let hash = blake3::hash(b"input snapshot").to_hex()[..12].to_string();
+        let idb = cache.join(format!("raw.{hash}.dylib.i64"));
+        std::fs::write(&idb, b"original IDB").unwrap();
+        let p = Preparation::new(Duration::from_secs(10));
+        let prepared = prepare_impl(input, cache, &p, true).unwrap();
+        let destination = idb.with_extension("");
+        assert!(prepared.publish_verified_input(&p).await.is_err());
+        assert!(!destination.exists(), "unclosed proof cannot publish");
+        std::fs::write(prepared.verification.as_ref().unwrap().join("closed"), b"").unwrap();
+        let cancelled = Preparation::new(Duration::from_secs(10));
+        cancelled.cancel.cancel();
+        assert!(prepared.publish_verified_input(&cancelled).await.is_err());
+        assert!(!destination.exists(), "cancelled proof cannot publish");
+        std::fs::write(&destination, b"conflict").unwrap();
+        assert!(prepared.publish_verified_input(&p).await.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"conflict");
+        std::fs::write(&destination, b"input snapshot").unwrap();
+        prepared.publish_verified_input(&p).await.unwrap();
+        assert_eq!(std::fs::read(&idb).unwrap(), b"original IDB");
     }
     struct TestRoot(PathBuf);
     impl std::ops::Deref for TestRoot {

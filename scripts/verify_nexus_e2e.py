@@ -25,7 +25,10 @@ def main():
     parser.add_argument("--cleanup", action="store_true")
     parser.add_argument("--suite", choices=("lifecycle", "contract"), default="lifecycle")
     parser.add_argument("--baseline", type=Path, help="fixed independently hashed N0 binary for N4")
+    parser.add_argument("--case", choices=("E22",), help="run only E22 in a fresh contract environment")
     args = parser.parse_args()
+    if args.case and args.suite != "contract":
+        parser.error("--case requires --suite contract")
     try:
         env = Environment(args.root)
     except (OSError, ValueError) as error:
@@ -62,6 +65,8 @@ def main():
         Path(variables["N3_IPC_ROOT"]).mkdir(mode=0o700, exist_ok=True)
         (env.root / "rust-env.json").write_text(json.dumps(variables, indent=2) + "\n")
         command = ["timeout", "180s", str(cargo), "test", "--locked", "--test", f"nexus_{args.suite}_e2e", "--", "--test-threads=1"]
+        if args.case:
+            command.insert(command.index("--"), "e22_old_cache_proof_preserves_edits_and_warm_lease")
         result = {"status":"FAIL", "command":command, "client_cancel_patch":patch_status}
         def interrupted(sig, _frame):
             raise InterruptedError(f"suite interrupted by signal {sig}")
@@ -76,14 +81,14 @@ def main():
             if child.returncode and re.search(r"license.*(?:invalid|failed|not found|unavailable|expired)|no valid license", text, re.IGNORECASE):
                 result["status"] = "BLOCKED"
             assert child.returncode == 0, f"{result['status']}: lifecycle command failed: {child.returncode}"
-            count = 9 if args.suite == "lifecycle" else 4
+            count = 1 if args.case else (9 if args.suite == "lifecycle" else 4)
             assert summary == [(str(count), "0", "0")], f"wrong actual test count: {summary}"
             if args.suite == "lifecycle":
                 events = [json.loads(line) for line in (env.root / "rust-evidence.jsonl").read_text().splitlines()]
                 cases = [event["case"] for event in events if event.get("status") == "PASS"]
                 expected = ["E02", "E03", "E05", "E06-client", "E06-bridge", "E07-packed", "E07-unpacked", "E05-concurrent-open", "E06-lease-fault"]
             else:
-                expected = ["E04", "E16", "E17", "E22"]
+                expected = [args.case] if args.case else ["E04", "E16", "E17", "E22"]
                 events = [json.loads((env.root/f"{case}-result.json").read_text()) for case in expected]
                 cases = [event["case"] for event in events if event["status"] == "PASS"]
             assert sorted(cases) == sorted(expected), f"wrong scenario evidence: {cases}"

@@ -427,6 +427,7 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 - N4-F1：open 使用按身份注册的有界单次响应，不依赖可落后的诊断 broadcast；取消与 opened 竞态仍由 supervisor 接收并释放 lease。操作轮询只读无结果元数据，最终 JSON move 出 N1 锁；原快照 API 保留。E04 比较递归区分所有 JSON 类型，新增 NUL/截断与有效函数反编译失败的对照。
 - N4-F2：open supervisor 同时核对 N1 的权威结果并受 Preparation 总期限约束；零字节失败、grant 拒绝、not_sent/remote_error 不再遗失回复槽。未交付或迟到的 lease 由 guard 登记为 ReleaseRequired，bridge 保持释放责任；控制 lane Busy/NotSent 后按 N1 状态重试，未知结果不重放，也不宣称已停止。容量与 path gate 不因漏通知永久占用。
 - N4-F2：独立测试维护提交分离 marker/fixture 启动和响应预算，保留大响应连接不被断开及完整送达、escaped pipe 容量保留等断言。MCP owner lock 已有 CLOEXEC，但 fork 到 exec 的窗口仍可继承同一文件描述符引用；guard Drop 显式解锁并验证子进程 exec 后无锁继承。该修复不扩大生产容量。
+- N4-F3：旧缓存首次成功核对 SHA256、关闭 probe 并收到 opened 后，在交付 lease 前按 N2 无覆盖发布已验证的输入快照；取消/发布冲突保持拒绝与 lease 回收责任。后续 prewarm 使用该输入证明，不再复制已由活动 owner 保存的 packed IDB；缺失或不匹配证明仍不发布、不改原库。open 错误日志记录类别、原因和 operation，不记录 close token。P25 等待失败时用 RAII 释放 Control barrier。
 - 已知限制：run_script 使用进程级 __main__，同 owner 的不同 lease/客户端共享脚本全局变量，关闭 lease 不清除；与旧 per-IDB worker 共享全局变量语义相同，仅适用于受信任脚本，不承诺客户端隔离。E22 最后核对原库 hash 与最终 open 之间不是原子操作，本地 path gate 不覆盖外部 opener，留给 N7 协调机制。
 - 旧缓存先复制到隔离 verification IDB，通过 Nexus 读取其中记录的 SHA256；副本关闭确认后才判断匹配，且核对原 packed 文件未变。匹配后附加原库并关闭 autoanalysis；拒绝时不发布输入、不打开或覆盖原库。预热采用独立 lease，业务 opener 关闭不会释放 warm 引用。验证副本交付后须凭关闭确认才清理；启动或 close 结果未知时保留 staging 和 bridge 跟踪，不把未知状态当成停止。
 - 真实验收 target 为 `tests/nexus_contract_e2e.rs`，对照脚本仅依赖固定 N0 二进制与隔离测试支持，不依赖旧实现源码。E04 只允许把已核验输入 SHA256 相同的 `input_file_path` 规范化；结构、地址、类型、错误和反编译文本均严格比较。N4 原交付开发对照 33 项，N4-F1 扩展为 38 项并启用严格类型检查；正式套件及最终证据见 N4-F1 报告，N4 是否验收由编排者裁定。

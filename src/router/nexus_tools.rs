@@ -194,6 +194,17 @@ impl Tools {
                 Some(task_id) => CURRENT_TASK_ID.scope(task_id, work).await,
                 None => work.await,
             };
+            if let Err(error) = &result {
+                let category = match error {
+                    ToolError::Nexus(_) => "nexus",
+                    ToolError::Preparation { .. } => "preparation",
+                    ToolError::Timeout(_) | ToolError::RequestOutcome { .. } => "deadline",
+                    ToolError::Busy => "busy",
+                    ToolError::InvalidPath(_) => "invalid_path",
+                    _ => "open_failed",
+                };
+                tracing::warn!(category, reason = %error, "Nexus open supervisor failed");
+            }
             let reference = result
                 .as_ref()
                 .ok()
@@ -310,6 +321,8 @@ impl Tools {
                             if cancelled || preparation.check().is_err() {
                                 return Err(diagnostic("open cancelled/expired; acquired lease transferred to bridge cleanup"));
                             }
+                            prepared.publish_verified_input(&preparation).await?;
+                            preparation.check()?;
                             let handle = id();
                             let token = id();
                             let idb = match event["idb_path"].as_str() {

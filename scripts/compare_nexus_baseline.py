@@ -461,8 +461,19 @@ def legacy_cache(env,baseline,binary):
                 assert names[0]["name"]=="N4_USER_EDIT",names
                 comment=client.call("run_script",{"code":"import ida_bytes, ida_funcs; print(ida_bytes.get_cmt(ida_funcs.getn_func(0).start_ea,False))"})["result"]
                 assert comment["stdout"]=="N4 preserved comment\n",comment
-                warm=client.direct("prewarm",{"keep_warm":True})["result"]
+                snapshot=client.seed.with_suffix("")
+                assert snapshot.is_file() and digest(snapshot)==digest(sample), "verified input snapshot not retained"
+                # The active owner may legitimately save different packed bytes.
+                # A warm open must use the retained proof, without copying that
+                # live packed file into a second verification database.
+                saved=client.call("run_script",{"code":"import ida_loader; assert ida_loader.save_database(ida_loader.get_path(ida_loader.PATH_TYPE_IDB), 0)"})["result"]
+                assert saved["success"],saved
+                warm_reply=client.direct("prewarm",{"keep_warm":True})
+                assert "result" in warm_reply,warm_reply
+                warm=warm_reply["result"]
                 assert warm["kept_warm"] and warm["database_info"]["function_count"]==2,warm
+                if (env.root/"e22-reverify-save.inject").exists():
+                    assert not (env.root/"e22-reverify-save.observed").exists(), "warm open re-entered packed verification"
                 closed=client.mcp("close_idb",{"close_token":client.opened["close_token"]})
                 assert "still active" in closed["result"],closed
                 client.opened=None
@@ -479,7 +490,7 @@ def legacy_cache(env,baseline,binary):
         finally:
             client.stop()
         assert not list((client.home/"idb").glob(".nexus-*")),"staging/verification residue"
-    return {"legacy_cases":results,"warm_lease_released":True}
+    return {"legacy_cases":results,"warm_lease_released":True,"verified_snapshot_retained":True}
 
 
 def main():

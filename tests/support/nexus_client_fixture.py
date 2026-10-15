@@ -101,5 +101,27 @@ else:
             with (env.root / "task-identities.jsonl").open("a") as output:
                 output.write(json.dumps(identity) + "\n")
         return invoke(self, channel, attempt, command, deadline, public_started)
+    if (env.root / "e22-reverify-save.inject").exists():
+        close_verification = runtime["Bridge"].close_verification
+        def save_active_original(self, verification, probe, deadline):
+            close_verification(self, verification, probe, deadline)
+            # Force the real owner to save between the probe and final hash.
+            # Only the second verification has an already-owned original.
+            original = Path(verification).parents[1]
+            with self.lock:
+                handles = [handle for _, handle in self.handles.values()
+                           if Path(handle.instance.idb_path).parent == original]
+            if handles:
+                handle = handles[0]
+                before = Path(handle.instance.idb_path).read_bytes()
+                result = handle.execute_python(
+                    "import ida_bytes, ida_funcs, ida_loader\n"
+                    "assert ida_bytes.set_cmt(ida_funcs.getn_func(0).start_ea, 'F3 concurrent save', True)\n"
+                    "assert ida_loader.save_database(ida_loader.get_path(ida_loader.PATH_TYPE_IDB), 0)\n"
+                    "result = True", timeout=10)
+                assert result["result"] is True
+                assert Path(handle.instance.idb_path).read_bytes() != before, "real save must change packed bytes"
+                (env.root / "e22-reverify-save.observed").write_text(str(handle.instance.idb_path))
+        runtime["Bridge"].close_verification = save_active_original
     runtime["Bridge"].invoke = record_task
     runtime["main"]()

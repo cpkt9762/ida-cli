@@ -60,6 +60,14 @@ impl State {
     }
     fn emit(&self, event: Value) {
         tracing::debug!(event = event["event"].as_str(), attempt = ?event.get("attempt"), lease = ?event.get("lease"), "Nexus bridge lifecycle");
+        if event["attempt"]["target"]["kind"] == "open" && event.get("error").is_some() {
+            tracing::warn!(
+                category = event["error"]["code"].as_str(),
+                reason = event["error"]["message"].as_str(),
+                operation = event["attempt"]["target"]["identity"]["operation_id"].as_str(),
+                "Nexus open failed"
+            );
+        }
         // Open transfers lease responsibility: diagnostic broadcast may lag,
         // but a registered supervisor must receive its exact terminal outcome.
         if matches!(
