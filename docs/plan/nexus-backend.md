@@ -1,6 +1,6 @@
 # Nexus 唯一后端迁移与长任务治理计划
 
-状态：在独立 worktree `../ida-cli-nexus`、分支 `feat/nexus-backend` 执行。N0 环境阶段已验收；N1 经 N1-F1 修复后，已在 `9148fba526bf403b9448b50131a3edc145c2229a` 完成编排者独立复验和原 reviewer 复审，纯契约阶段门禁通过。N2 经 F1–F5 修复后，已在 `a1cc1e527e237949e70c3c4b5b333a9f3478260a` 完成编排者独立复验和原 reviewer 复审，协议/模拟及真实 OS fixture 范围的门禁通过。N3 经 F1–F2 修复后，已在 `86a35fa68749eb20f12856c92e20f9ca3b391449` 完成编排者独立复验和原 reviewer 复审，常驻 bridge 与生命周期的真实 IDA E2E（E02 bridge 部分、E03、E05、E06、E07）通过，后续按 N4 推进。本文不表示整个后端迁移或全部真实链路 E2E 已完成。
+状态：在独立 worktree `../ida-cli-nexus`、分支 `feat/nexus-backend` 执行。N0 环境阶段已验收；N1 经 N1-F1 修复后，已在 `9148fba526bf403b9448b50131a3edc145c2229a` 完成编排者独立复验和原 reviewer 复审，纯契约阶段门禁通过。N2 经 F1–F5 修复后，已在 `a1cc1e527e237949e70c3c4b5b333a9f3478260a` 完成编排者独立复验和原 reviewer 复审，协议/模拟及真实 OS fixture 范围的门禁通过。N3 经 F1–F2 修复后，已在 `86a35fa68749eb20f12856c92e20f9ca3b391449` 完成编排者独立复验和原 reviewer 复审，常驻 bridge 与生命周期的真实 IDA E2E（E02 bridge 部分、E03、E05、E06、E07）通过。N4 经 F1–F3 修复后，已在 `b650ac0aa657cbe10e722f9c2551a6442721a04f` 完成编排者独立复验和原 reviewer 复审，首批工具在开发选择入口下经 Nexus 执行，E04、E16、E17、E22 真实 IDA E2E 通过，形成首个可用里程碑，后续按 N5 推进。本文不表示整个后端迁移或全部真实链路 E2E 已完成。
 
 日期：2026-10-15。
 
@@ -291,6 +291,11 @@ N1/N2 在 bridge 尚未接通时先验收契约和模拟行为，这些结果不
 - N3 已知限制，不阻断：本地补丁 `scripts/nexus/client-cancel-unknown.patch` 需持续维护，只有上游等价修复通过两类 probe 和 N0/N3 重验后才能去除，N9 打包必须携带；E08/E18/E19 的完整真实链路、native 硬停止、GUI/跨平台和 Linux 未验证；缓存准备会完整复制并哈希输入，大型 DSC 的开销留待 N7；当前对无输入副本的旧缓存 IDB 一律拒绝，N4 必须按 E22 方针实现兼容。
 - N2 遗留测试缺陷（测试代码，非生产缺陷），列为 N4 开工的第一个维护提交，修复需附先失败后通过的证据：T1，`tests/support/n2_f1_server.rs` 的 C1 回归对所有场景统一使用 700ms 超时，error 场景没有阻塞点，负载下会误触发 expect；T2，N2-F4 的 prewarm 测试把 Unix socket 建在 TMPDIR 下，TMPDIR 较长时超过 macOS 的 SUN_LEN，门禁结果依赖路径长度。
 - N3 验收证据为 `/tmp/ida-nexus-n3f2-parent-20261016.yjPNYw/verification.md` 和 `validation.jsonl`，前两轮复验在 `/tmp/ida-nexus-n3-parent-20261015.9BMEyf/` 与 `/tmp/ida-nexus-n3f1-parent-20261015.oEP8Oq/`；实现报告为 `/tmp/ida-nexus-run-20261015.98rmfb/n3*/report.md`。
+- N4/N4-F1–F3：输入 `973d562e37f6b26db3405529db6da860aceefb0e`。维护 `c49a1bf`（T1/T2）；实现 `9388a7b618d95639270c2be327e62bf862a7fda9`；F1 `59ec108cd2436230ca40c7bf3e6c319cac0e1cb2`（旧 GC 在 Nexus 模式暂停、Busy shutdown、open 订阅落后、enqueue 接纳与 task_id、反编译数组、run_script 截断与 NUL、严格类型比较器、全局锁内深复制、P12 乱序事件；F1 首次派发因委托单按文件限定范围而阻塞，改为按问题划界）；F2 `9ca9a67`（P2-9、T3、T4 测试预算）、`58ccfd0`（open 终态交付与期限兜底、lease 回收责任；T5 根因为 fork→exec 窗口共享锁文件描述，Drop 显式 LOCK_UN）；F3 `a6bc784`（P25 barrier RAII）、`b650ac0`（E22 owner 保存导致重复验证失败：首次验证后保留已验证输入快照，补 open 失败原因日志）。只读 reviewer `f0a94e7e-e847-48a8-8392-fd92685e05da` 的全部问题均已关闭，无新阻断。
+- 编排者在最终 SHA 独立执行（外部负载低时段，load 1.6～7.6）：`env -i` 干净 shell 12 项标准门禁全部退出码为 0（库测试 485 passed、2 原有 ignored，连续三轮；contract 61）；第 13 项 13 passed；全新环境补丁红绿对照成立；N0 支持 33、bridge pytest 22；真实 IDA E2E：contract 套件在三个全新环境各 4/4（E04 严格对照 38/38、E16、E17、E22），lifecycle 9/9；七个环境 cleanup CLEAN，登记进程全部退出。早一轮复验在 E22 观察到一次失败，由 F3 复现并关闭。编排者据此验收 N4。
+- N4 编排者方针与已知限制，不阻断：processor 长名称只在已验证的 IDA 9.5 ABI 上精确读取，其他版本回退公开短名称并 warn，open 不依赖该字段；Nexus 模式暂停旧 IDB 自动淘汰，N7 实现协调 GC 前不删除无法证明无人使用的库；`run_script` 在同一 owner 内共享 `__main__`，仅适用于受信任脚本；E22 最终哈希核对到 open 非原子，本地 path gate 不覆盖外部 opener，留给 N7；开发选择入口 `IDA_CLI_NEXUS_DEV` 及相关配置为 N9 必删项。外部高负载下部分时序测试（含 E04 驱动）会超时，已在测试中区分启动与响应预算，但不保证任意负载下满足实时预算。
+- 本机准备环境时在线下载可能超过 30 秒；编排者复验使用仓库外的离线包装，仅替换依赖下载为本地 wheels（保留 `--require-hashes`）与 Nexus clone 为本地源码（脚本仍核验固定 SHA）。
+- N4 验收证据为 `/tmp/ida-nexus-n4f3-parent-20261016.FYopPl/verification.md` 和 `validation.jsonl`，前几轮复验在 `/tmp/ida-nexus-n4*-parent-20261016.*`；实现报告为 `/tmp/ida-nexus-run-20261015.98rmfb/n4*/report.md`。
 
 ### N0：工作区、环境和证据基线
 
