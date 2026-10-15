@@ -1,5 +1,13 @@
 # Testing
 
+N6 的全部迁移方法对照尚未执行，当前停在固定 N0 调用图顺序的预检裁定。
+见 [完整输入能力盘点](plan/nexus-n6-capabilities.md) 和计划 N6 小节。
+`build_callgraph.nodes` 在旧产物中来自随机顺序的 `HashMap`，同库重复调用
+也可能不通过当前逐位置的严格数组比较。不能通过重试、忽略该工具或无记录排序
+制造 E04 通过；任何逐方法比较例外须先记录并由编排者裁定。本轮原始响应及
+清理证据位于委托的外部 `n6/dev/preflight-result.json`；历史 N4/N5 通过记录
+不能替代 N6 当前改动后的验证。
+
 ## Run tests
 
 ```bash
