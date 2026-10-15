@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 
-HANDLE_SHA = "441ab56d01fbfba4faf602e36feccf4da4269272c571fa4f18b6ffe7b96f8ea5"
+HANDLE_SHA = "5d60799c1ac7fe6728a5e95ca2b91e421e172bba059a0ff846d6a37fd0819b05"
 METHODS = {"execute_python": "may_write", "database_info": "read_only",
            "rename_address": "may_write", "read_name": "read_only"}
 
@@ -202,8 +202,11 @@ class Bridge:
                         self.executing.pop(operation_id, None)
             gate.release()
 
-    def disconnected(self, lease, reason):
-        self.control.send({"event": "disconnected", "lease": lease, "reason": reason})
+    def disconnected(self, lease, reason, attempt):
+        # The callback may be replayed synchronously by set_disconnect_callback,
+        # before N1 knows this lease. Keep its bounded open correlation intact.
+        self.control.send({"event": "disconnected", "lease": lease, "reason": reason,
+                           "attempt": attempt})
 
     def invoke(self, channel, attempt, command, deadline, public_started):
         from ida_nexus import discover_databases
@@ -230,15 +233,19 @@ class Bridge:
                          "instance_id": instance.record_id, "generation": generation,
                          "owner": "gui" if instance.backend == "gui" else "managed"}
                 self.handles[lease["lease_id"]] = (lease, handle)
-            handle.set_disconnect_callback(lambda _handle, reason: self.disconnected(lease, reason))
             # Verify actual owner runtime without importing IDA in this process.
             try:
+                handle.set_disconnect_callback(lambda _handle, reason: self.disconnected(lease, reason, attempt))
                 actual = handle.execute_python("import ida_kernwin\nresult = ida_kernwin.get_kernel_version()", timeout=None)
-            except Exception:
+            except Exception as exc:
                 handle.close(wait_for_database=True, timeout=5)
                 with self.lock:
                     self.handles.pop(lease["lease_id"], None)
-                raise
+                # Close confirmed this unannounced lease is gone. If close
+                # itself fails, run() retains the uncertain open outcome.
+                channel.send({"event": "failed", "attempt": attempt,
+                              "error": error("disconnected", f"open runtime check failed: {type(exc).__name__}")})
+                return
             caps = readiness()["capabilities"]
             ida = [int(x) for x in actual["result"].split(".")[:3]]
             caps["runtime"]["ida"] = ida + [0] * (3 - len(ida))
@@ -277,14 +284,14 @@ class Bridge:
             public_started[0] = True
             operation_id = command["identity"]["operation_id"]
             outcome = handle.cancel_operation_outcome(operation_id)
-            channel.send({"event": "cancel_ack", "attempt": attempt,
-                          "accepted": outcome["status"] == "cancelled", "outcome": outcome})
             with self.lock:
                 record = self.executing.get(operation_id)
                 if record is not None:
                     record["cancel_requested"] = True
                     if outcome["execution_stopped"]:
                         record["stop_proof"] = outcome
+            channel.send({"event": "cancel_ack", "attempt": attempt,
+                          "accepted": outcome["status"] == "cancelled", "outcome": outcome})
             self.proof_wakeup.set()
         elif kind == "release":
             public_started[0] = True
@@ -311,29 +318,42 @@ class Bridge:
             self.proof_wakeup.wait(0.02)
             self.proof_wakeup.clear()
             expired = []
+            proven = []
             with self.lock:
                 for operation_id, record in self.executing.items():
-                    if not record["unknown"] or not record["cancel_requested"] or record["proving"] or record["expired"]:
+                    if not record["unknown"] or not record["cancel_requested"] or record["proving"]:
                         continue
-                    if time.monotonic() >= record["deadline"]:
+                    # A deadline limits new public probes, never consumption of
+                    # authoritative evidence already acquired on another path.
+                    if record.get("stop_proof"):
+                        record["proving"] = True
+                        proven.append((operation_id, record, record["stop_proof"]))
+                    elif record["expired"]:
+                        continue
+                    elif time.monotonic() >= record["deadline"]:
                         record["expired"] = True
                         expired.append(record["attempt"])
                     elif time.monotonic() >= record["next"] and self.proof_gate.acquire(blocking=False):
                         record["proving"] = True
                         self.proof_pool.submit(self.confirm_stop, operation_id, record)
+            for operation_id, record, outcome in proven:
+                self.publish_stop(operation_id, record, outcome)
             for attempt in expired:
                 self.control.send({"event": "stop_unconfirmed", "attempt": attempt,
                                    "error": error("cancel_pending", "stop proof deadline expired; outcome remains unknown")})
+
+    def publish_stop(self, operation_id, record, outcome):
+        self.control.send({"event": "stopped", "attempt": record["attempt"],
+                           "proof": "causal_cancel_not_pending", "outcome": outcome})
+        with self.lock:
+            self.unknown.pop(operation_id, None)
+            self.executing.pop(operation_id, None)
 
     def confirm_stop(self, operation_id, record):
         try:
             outcome = record.get("stop_proof") or record["handle"].cancel_operation_outcome(operation_id)
             if outcome["execution_stopped"]:
-                self.control.send({"event": "stopped", "attempt": record["attempt"],
-                    "proof": "causal_cancel_not_pending", "outcome": outcome})
-                with self.lock:
-                    self.unknown.pop(operation_id, None)
-                    self.executing.pop(operation_id, None)
+                self.publish_stop(operation_id, record, outcome)
             elif outcome["status"] == "failed":
                 self.control.send({"event": "stop_unconfirmed", "attempt": record["attempt"],
                     "error": error("cancel_pending", outcome["failure"])})

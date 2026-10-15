@@ -139,3 +139,23 @@ def test_control_response_close_failure_is_not_authoritative_absence(client, mon
     assert outcome["status"] == "failed" and outcome["failure"] == "transport"
     assert not outcome["execution_stopped"]
     assert "unknown" in client._uncertain_operations
+
+
+def test_control_connection_close_failure_preserves_authoritative_stop(client, monkeypatch):
+    fail_request(client, monkeypatch, "unknown")
+    ack = Connection({"result": {"cancelled": True}})
+    monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: ack)
+    assert client.cancel_operation("unknown")
+    class ConnectionCloseFailure(Connection):
+        def getresponse(self):
+            # Distinct objects: HTTPResponse.close succeeds, HTTPConnection.close fails.
+            return Connection({"result": {"cancelled": False}})
+
+        def close(self):
+            raise OSError("control connection close failed after parsed result")
+    monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: ConnectionCloseFailure())
+    outcome = client.cancel_operation_outcome("unknown")
+    assert outcome["status"] == "not_pending" and outcome["execution_stopped"]
+    assert outcome["attempt_sequence"] > outcome["ack_cutoff"]
+    assert outcome["cleanup_failure"] == "transport"
+    assert "unknown" not in client._uncertain_operations

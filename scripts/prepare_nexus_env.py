@@ -13,7 +13,7 @@ import sys
 
 REPO = Path(__file__).resolve().parents[1]
 NEXUS_SHA = "d60ff582fde90c59726336c0dbdf3e8286e9df7a"
-PATCHED_HANDLE_SHA256 = "441ab56d01fbfba4faf602e36feccf4da4269272c571fa4f18b6ffe7b96f8ea5"
+PATCHED_HANDLE_SHA256 = "5d60799c1ac7fe6728a5e95ca2b91e421e172bba059a0ff846d6a37fd0819b05"
 
 
 def accepted_eula_entries(data: bytes) -> list[str]:

@@ -14,6 +14,8 @@ exact cancellation prohibits queued cancelled operations from later executing.
 Probes: scripts/nexus/probe_cancel_after_disconnect.py,
         scripts/nexus/probe_cancel_proof_ambiguity.py; tests/nexus_bridge/.
 Removal: pinned upstream equivalent must pass probes and N0/N3 revalidation.
+N3-F2: final connection cleanup cannot invalidate an already parsed outcome;
+cleanup_failure reports transport teardown failure without credentials.
 N9 packaging MUST carry this patch until then.
 
 --- a/ida_nexus/handle.py
@@ -116,7 +118,7 @@ N9 packaging MUST carry this patch until then.
                  headers={
                      "Accept": "application/json",
                      "Content-Type": "application/json",
-@@ -826,22 +856,35 @@
+@@ -826,24 +856,42 @@
              response = connection.getresponse()
              try:
                  payload = json.loads(response.read())
@@ -164,9 +166,17 @@ N9 packaging MUST carry this patch until then.
 +            outcome["failure"] = "transport"
 +            return outcome
          finally:
-             connection.close()
+-            connection.close()
++            try:
++                connection.close()
++            except (TimeoutError, OSError, http.client.HTTPException):
++                # A parsed authoritative response is still valid. Preserve its
++                # causal evidence and return a bounded, token-free diagnostic.
++                outcome["cleanup_failure"] = "transport"
 
-@@ -941,6 +984,8 @@
+     def cancel_active(self, timeout: float = 2.0) -> bool:
+         """Cancel this handle's in-flight operation over a control connection."""
+@@ -941,6 +989,8 @@
              return
          self._closed.set()
          with self._lock:

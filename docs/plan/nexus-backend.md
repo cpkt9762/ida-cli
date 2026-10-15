@@ -402,6 +402,8 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 - 补丁在执行连接异常后保留本 handle 的精确 operation ID（最多 64 项，满时拒绝新执行），取消继续走原有独立控制连接；不读取 token、不恢复私有字段、不重放。正常完成/明确错误不进入未知集合；`cancel_active` 恢复官方 active-only 选择，bridge 始终按精确 operation_id 调用新方法。
 - 官方 `_server._run_operation` 在释放 backend lock 之后才移除精确 pending key，取消过的排队操作会在取得锁前被拒绝。补丁删除“后继成功即清理”：第一次 true ACK 记录当时所有已发取消请求的序号上界；只有此后才发出的另一次取消得到 HTTP 200、`cancelled=false`，才能移除未知 ID并证明停止。先发后到的 false、晚解析的成功响应及任何控制失败均不作数；handle close 清空记账。
 - bridge 独立停止证明池保留 2 槽，失败轮转重试，容量满时保留待办；ACK 先于执行断流仍补安排证明，到原操作期限保留 UnknownOutcome/原 cause，不伪造停止。控制 `stopped` 早于业务 `uncertain` 时先缓冲，再经 N1 `execution_stopped` 仅补停止证据，绝不改变业务结果为成功。N1 `lease_disconnected` 仅影响精确 lease；整桥 EOF 才按 owner/generation 标记断连。Rust 控制解码使用独立等待式单槽，不争用 CLI 的 Control try许可；lane 容量不变。
+- N3-F2 收紧三个边界：断连回调携带原 open attempt，Rust 在每个有界 pending open 内暂存至多一个完整 lease，opened 与回放断连在同一回调顺序锁内应用；注册回调前已断连且 runtime 查询失败时，公共 close 确认清理后仅使该 open 失败，清理不确定仍保留未知结果，不能影响健康 sibling。期限只停止新的证明探测，已经取得的权威停止证据必须消费；cancel_ack 直接补 N1 停止证据或缓冲到业务 uncertain，supervisor 即使已 expired 仍发布 stored proof 并清理 unknown。客户端最终 connection.close 失败不作废已解析的权威响应，以 `cleanup_failure=transport` 留诊断；response.close 失败仍保守视为控制失败。
+- 标准十二项门禁不得依赖 F1_ROOT/F1_PYTHON；缓存库测试在 TMPDIR 自建并清理临时目录。新增第十三项 `timeout 30s cargo test --locked --test nexus_bridge_regressions -- --test-threads=1`：必须设置 F1_PYTHON 为全新 prepare 环境当前补丁的绝对 venv/bin/python；F1_ROOT 可指定短外置证据目录，未设置时用 TMPDIR。缺 Python 时明确报准备方式并失败，不 skip。该 target 十项贯通回归包含两种早到 open 断连与到期后证明；bridge pytest 另覆盖 HTTPConnection.close（与 HTTPResponse.close 独立）。旧 F1 check-env.sh 指向 baseline-env，仅为基线配置；F1 最终命令显式覆盖为 probe-final-root（早期 probe-v2-root）对应新补丁 venv，F2 重新准备环境，不复用旧脚本作为最终证明。
 - `nexus_bridge/bridge.py` 作为独立可打包 Python 客户端目录，只加载 Nexus 公共客户端。每 router 复用一个进程，stdout 只写 readiness，诊断写 stderr；业务、控制使用两个 Unix socket，各自持续读取/写入。业务池 4，接纳容量沿用 N2 tenant 上限；控制接纳 8，取消池 4、释放池 2；停止确认另有容量 2 的独立线程池，不占取消处理容量。本地状态直接读内存，发现 owner 独立后台刷新。
 - `src/router/nexus_bridge.rs` 消费 N2 的两条 lane，完整回传 DeliveryAttempt。Python executor 就绪后回传原 wire frame，Rust 在实际 grant 前调用 `NexusWireFrame::consume()` 并复核发送资格；最终小 grant 仅传剩余时长。总期限由 Rust 触发控制取消，执行 HTTP 连接使用 timeout=None 并等待真实结果。真实连接丢失进入 UnknownOutcome，桥接进程 EOF/异常使 N1 断连，不强杀共享 owner。
 - readiness 校验 Nexus 0.13.4、Domain 0.5.1、补丁后 handle 哈希、Python 与 IDA 最低版本；每 router 能力只安装一次。open 后从实际 owner 查询 IDA 版本。公共 open/attach 获取真实 handle，lease key 为本地非敏感 UUID，instance_id 使用公共 record_id；其身份不可变，generation 在该 instance 命名空间为 1，替换 owner 有新的 record_id。
@@ -412,6 +414,7 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N4：首批方法与输出兼容
 
+- 旧缓存兼容是硬性要求（E22）：已有缓存 IDB 没有输入副本时，通过 Nexus 读取该 IDB 自身记录的 input file SHA256，与当前输入 SHA256 比较；一致才接受复用。无法验证或不一致时明确拒绝，不重新分析，也不覆盖用户原库。N4 必须验证匹配复用保留用户修改、无法验证和不匹配均保留原文件；不得沿用 N3 对无副本 IDB 一律拒绝的暂定策略作为迁移完成证据。本条仅制定 N4 方针，N3-F2 不实现。
 - 接通数据库信息、分析状态、函数列表/定位、xrefs、反汇编、单函数反编译及 `run_script`。
 - 统一现有参数、分页、地址表示、stdout/stderr、错误和大响应落盘行为。
 - 原有 IDAPython 实现可复用业务逻辑，执行入口必须改为已附加的 Nexus 数据库，不能另开 idat 同库。

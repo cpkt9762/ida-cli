@@ -96,7 +96,11 @@ all cancellation sequences already issued. Only a later-issued authoritative
 `not_pending` proves stopping; delayed older false, transport/parse failure and
 successful execution responses cannot retire an unknown ID. The bridge uses
 this public API with exact IDs, an independent two-slot proof queue and bounded
-retry until the original deadline. It never replays. Stop evidence preserves
+retry until the original deadline. Expiry limits new probes; authoritative evidence
+already acquired, including a later explicit or deadline cancellation, is always
+consumed by both cancel ACK handling and the supervisor. Final control connection
+cleanup failure is returned as `cleanup_failure=transport` without discarding a
+parsed authoritative result. It never replays. Stop evidence preserves
 UnknownOutcome and its cause; early control evidence waits for the business
 outcome. `cancel_active` remains active-only. Close clears identities.
 
@@ -111,8 +115,23 @@ timeout 30s "$N0_ROOT/venv/bin/python" scripts/nexus/probe_cancel_proof_ambiguit
 `nexus_bridge_regressions` uses the installed client, persistent bridge, two real
 Unix sockets and Rust/N1, with file barriers for ACK-before-stream-loss,
 stopped-before-uncertain, delayed success/false, lease isolation, CLI control
-saturation and stale unknown cancellation. Set `F1_PYTHON` to the prepared Python
-and `F1_ROOT` to a short isolated directory, then run with a 30-second timeout.
+saturation, stale unknown cancellation, both early-open disconnect orderings and
+proof acquired after expiry. This is **gate 13**, in addition to the twelve standard
+gates. Set `F1_PYTHON` to the absolute `venv/bin/python` of a freshly prepared N0
+environment with the current client patch. Missing or invalid `F1_PYTHON` is a
+hard failure with preparation instructions, never a skip. `F1_ROOT` optionally
+selects a short external evidence directory; otherwise it uses TMPDIR. No bridge
+regression variable is needed for the twelve standard gates; cache lib tests create
+and remove their own private directories under TMPDIR.
+
+```bash
+F1_PYTHON="$N0_ROOT/venv/bin/python" F1_ROOT="$N3_ROOT/r" timeout 30s cargo test --locked --test nexus_bridge_regressions -- --test-threads=1
+```
+
+Early disconnect callbacks carry the originating open attempt. Rust buffers at
+most one exact lease per pending open until `opened`; a confirmed cleanup fails
+only that open, and a late callback after failure/release has no registered lease
+to invalidate. Healthy sibling leases and their operations retain their state.
 No bridge code accesses authentication tokens or reconstructs private protocols.
 
 The protocol suite uses fake public handles and two real local sockets. Set a
@@ -304,13 +323,13 @@ insufficient evidence. N0 does not claim these scenarios passed for ida-cli's
 future Nexus bridge.
 
 
-### N3-F1 阻塞诊断与基线红例
+### N3-F1 历史阻塞诊断与基线红例
 
-`3c05a51` 的停止证明仍有缺陷，新增回归目前应失败，不能作为 N3 验收通过证据。使用本轮全新 N0 venv（旧客户端补丁），设置 `F1_PYTHON` 为该 venv 的绝对 Python 路径、`F1_ROOT` 为独立测试目录，并沿用 N1 的 target 与 SDK 环境。`tests/nexus_bridge_regressions.rs` 使用真实常驻 bridge、两条 Unix socket 和 Rust/N1；公共客户端底层传输由测试 fixture 注入，未启动真实 IDA。缓存 barrier 只在 `cfg(test)` 生效。
+以下记录 `3c05a51` 的历史红例，不能作为当前实现失败或通过的证据。重现旧实现时使用全新 N0 venv（对应旧客户端补丁），设置 `F1_PYTHON` 为该 venv 的绝对 Python 路径、`F1_ROOT` 为独立测试目录，并沿用 N1 的 target 与 SDK 环境。`tests/nexus_bridge_regressions.rs` 使用真实常驻 bridge、两条 Unix socket 和 Rust/N1；公共客户端底层传输由测试 fixture 注入，未启动真实 IDA。缓存 barrier 只在 `cfg(test)` 生效。
 
 - `timeout 30s "$F1_PYTHON" scripts/nexus/probe_cancel_proof_ambiguity.py --evidence "$F1_ROOT/ambiguity.json"`：应 exit 2，实际 3 种控制结果的公开观察相同；不读取生产 token，也不修改安装。
 - `timeout 30s "$F1_PYTHON" -m pytest tests/nexus_bridge/test_causal_patch.py -q`：3 条基线失败，覆盖迟到成功、迟到旧 false、陈旧 unknown 不应干预 cancel_active。
 - `timeout 30s cargo test --locked --test nexus_bridge_regressions -- --test-threads=1`：4 条基线失败，覆盖 ACK 早于断流、停止先于 uncertain、单 lease 断连、CLI 控制容量耗尽。
 - `timeout 30s cargo test --locked --lib router::nexus_bridge::cache::f1_regressions -- --test-threads=1`：3 条基线失败，覆盖取消赢得发布、路径/内容快照不一致、已有 IDB 无输入证明。
 
-这些红例没有通过跳过或删除断言转绿。P1-1/P2-6 目前仅有 Python 客户端 barrier 回归；完整双通道贯通及修复后绿例仍待后续授权实施。遇到公共 API 缺口后，本轮未扩展补丁接口，也未重跑真实 IDA E2E。
+后续 F1 获授权增加结构化公开取消结果，补齐 P1-1/P2-6 双通道贯通回归；F2 再覆盖早到 open 断连和到期后停止证明。当前预期为上文 gate 13 的十项全部通过。旧 `n3-fix1/check-env.sh` 的 `F1_PYTHON` 指向旧补丁 baseline-env，仅用于基线诊断；F1 最终验证命令显式覆盖为 continuation/probe-final-root 指向的新补丁 venv（早期绿例为 probe-v2-root）。F2 重新 prepare 新环境，不能直接 source 旧脚本充当最终验证。

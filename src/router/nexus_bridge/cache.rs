@@ -147,11 +147,32 @@ fn hook(phase: &str) {
 mod f1_regressions {
     use super::*;
     use std::time::Duration;
-    fn root(label: &str) -> PathBuf {
-        let root = PathBuf::from(std::env::var_os("F1_ROOT").expect("external evidence root"))
-            .join(format!("cache-{}-{label}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    struct TestRoot(PathBuf);
+    impl std::ops::Deref for TestRoot {
+        type Target = std::path::Path;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).expect("remove private cache test directory");
+        }
+    }
+    fn root(label: &str) -> TestRoot {
+        static IDS: AtomicU64 = AtomicU64::new(1);
+        loop {
+            let root = std::env::temp_dir().join(format!(
+                "nexus-cache-{}-{label}-{}",
+                std::process::id(),
+                IDS.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&root) {
+                Ok(()) => return TestRoot(root),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create private cache test directory: {e}"),
+            }
+        }
     }
     #[test]
     fn p27_cancel_winning_publication_arbitration_does_not_publish() {

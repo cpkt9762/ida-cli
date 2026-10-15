@@ -27,6 +27,7 @@ struct Pending {
     granted: bool,
     uncertain: bool,
     stopped: bool,
+    open_disconnected: Option<SessionLease>,
 }
 struct State {
     endpoint: NexusEndpoint,
@@ -274,6 +275,7 @@ async fn pump(mut lane: tokio::sync::mpsc::Receiver<Delivery>, writer: Writer, s
                     granted: false,
                     uncertain: false,
                     stopped: false,
+                    open_disconnected: None,
                 },
             );
         let mut stream = writer.lock().await;
@@ -483,9 +485,40 @@ async fn event_received(
 fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
     if event["event"] == "disconnected" {
         let lease: SessionLease = serde_json::from_value(event["lease"].clone())?;
-        state
-            .endpoint
-            .transition(|s, _| s.lease_disconnected(&lease))?;
+        let _ordered = state.callbacks.lock().unwrap_or_else(|e| e.into_inner());
+        let registered = state
+            .leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&lease.lease_id)
+            .cloned();
+        if registered.is_some() {
+            state
+                .endpoint
+                .transition(|s, _| s.lease_disconnected(&lease))?;
+        } else {
+            let attempt: DeliveryAttempt = decode(event["attempt"].clone())?;
+            let DeliveryTarget::Open { identity } = &attempt.target else {
+                return Err(invalid("disconnect open correlation missing").into());
+            };
+            if identity.client_id != lease.client_id {
+                return Err(invalid("disconnect client mismatch").into());
+            }
+            let mut pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(open) = pending.get_mut(&attempt.sequence.get()) {
+                if open.attempt != attempt
+                    || open
+                        .open_disconnected
+                        .as_ref()
+                        .is_some_and(|old| old != &lease)
+                {
+                    return Err(invalid("disconnect open attempt mismatch").into());
+                }
+                open.open_disconnected = Some(lease);
+            }
+            // No pending open and no registered lease means cleanup/failure
+            // already won. A late callback cannot invalidate sibling sessions.
+        }
         state.emit(event);
         return Ok(());
     }
@@ -547,6 +580,16 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
                         s.release(&lease.client_id.clone(), &lease, t)?;
                     }
                 }
+                let pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(disconnected) = pending
+                    .get(&sequence)
+                    .and_then(|p| p.open_disconnected.as_ref())
+                {
+                    if disconnected != &lease {
+                        return Err(invalid("opened lease differs from buffered disconnect"));
+                    }
+                    s.lease_disconnected(&lease)?;
+                }
             }
             "completed" => {
                 let DeliveryTarget::Execute { identity } = &attempt.target else {
@@ -577,6 +620,24 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
                             "public cancellation returned false; no stop confirmation",
                         )),
                     )?;
+                }
+                if event["outcome"]["execution_stopped"] == true {
+                    let DeliveryTarget::Cancel { identity, .. } = &attempt.target else {
+                        return Err(invalid("cancel proof target mismatch"));
+                    };
+                    let mut pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+                    let execution = pending.values_mut().find(|p| {
+                        matches!(&p.attempt.target,
+                        DeliveryTarget::Execute { identity: original } if original == identity)
+                    });
+                    if let Some(execution) = execution {
+                        execution.stopped = true;
+                        if execution.uncertain {
+                            s.execution_stopped(identity)?;
+                        }
+                    } else {
+                        s.execution_stopped(identity)?;
+                    }
                 }
             }
             "released" => {

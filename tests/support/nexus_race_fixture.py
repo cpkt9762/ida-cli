@@ -40,6 +40,13 @@ original_send = bridge.Channel.send
 def send(self, event):
     if event.get("event") == "uncertain" and os.environ.get("F1_SCENARIO") == "early-proof":
         barrier("uncertain")
+    if event.get("event") == "opened" and SCENARIO == "open-early-event" and len(handles) == 2:
+        handles[-1]._mark_disconnected("fixture disconnect before opened delivery")
+        barrier("opened")
+    if event.get("event") in {"failed", "uncertain"} and SCENARIO == "open-pre-disconnected":
+        barrier("open-failed")
+    if event.get("event") == "stopped" and SCENARIO == "expired-proof":
+        barrier("stopped")
     original_send(self, event)
 bridge.Channel.send = send
 
@@ -118,6 +125,10 @@ original_invoke = bridge.Bridge.invoke
 
 def invoke(self, channel, attempt, command, deadline, public_started):
     instance_bridge[0] = self
+    if command["command"] == "execute" and SCENARIO == "expired-proof":
+        # Only the Python probe admission deadline is shortened. N1 retains its
+        # real deadline and sends the later escalation through the control lane.
+        deadline = 0
     if command["command"] == "execute" and SCENARIO in {"late-success", "stale-false", "active-fairness"}:
         handle = self.handles[command["identity"]["lease"]["lease_id"]][1]
         operation = command["identity"]["operation_id"]
@@ -157,6 +168,24 @@ def invoke(self, channel, attempt, command, deadline, public_started):
             threading.Thread(target=active, name="active-check", daemon=True).start()
     return original_invoke(self, channel, attempt, command, deadline, public_started)
 bridge.Bridge.invoke = invoke
+def proof_verdict(self, operation_id):
+    if SCENARIO == "expired-proof":
+        with self.lock:
+            retained = operation_id in self.unknown
+        outcome_event(unknown_retained=retained)
+if hasattr(bridge.Bridge, "publish_stop"):
+    original_publish_stop = bridge.Bridge.publish_stop
+    def publish_stop(self, operation_id, record, outcome):
+        original_publish_stop(self, operation_id, record, outcome)
+        proof_verdict(self, operation_id)
+    bridge.Bridge.publish_stop = publish_stop
+else:
+    # Keep the regression runnable on f56d116 without a missing hook failure.
+    original_confirm_stop = bridge.Bridge.confirm_stop
+    def confirm_stop(self, operation_id, record):
+        original_confirm_stop(self, operation_id, record)
+        proof_verdict(self, operation_id)
+    bridge.Bridge.confirm_stop = confirm_stop
 cancelled_ids = []
 handle_module.http.client.HTTPConnection = lambda *_a, **_k: Connection(control=True)
 DatabaseHandle._rpc_connection_for = lambda *_: Connection()
@@ -166,6 +195,8 @@ def opened(path, **_options):
                                backend="idalib", managed=True, port=1, _token=os.urandom(16).hex())
     result = DatabaseHandle(path, instance)
     handles.append(result)
+    if SCENARIO == "open-pre-disconnected" and len(handles) == 2:
+        result._mark_disconnected("fixture disconnect before callback registration")
     return result
 DatabaseHandle.open = opened
 ida_nexus.discover_databases = lambda **_k: []

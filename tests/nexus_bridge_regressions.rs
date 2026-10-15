@@ -34,11 +34,19 @@ struct Rig {
 }
 impl Rig {
     async fn new(scenario: &str) -> Self {
-        let root = PathBuf::from(std::env::var_os("F1_ROOT").expect("isolated F1_ROOT")).join(id());
+        let python = PathBuf::from(std::env::var_os("F1_PYTHON").expect(
+            "F1_PYTHON is required for gate 13: prepare a fresh environment with timeout 180s python3 scripts/prepare_nexus_env.py --root <new-root> --ida-dir <IDA-MacOS> --eula-registry <test-ida.reg>, then set F1_PYTHON=<new-root>/venv/bin/python; see docs/TESTING.md"
+        ));
+        assert!(
+            python.is_absolute() && python.is_file(),
+            "F1_PYTHON must name the prepared environment's absolute venv/bin/python path"
+        );
+        let root = std::env::var_os("F1_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(id());
         std::fs::create_dir_all(&root).unwrap();
         let router = RouterState::new().unwrap();
-        let python =
-            PathBuf::from(std::env::var_os("F1_PYTHON").expect("fresh environment Python"));
         let mut environment = BTreeMap::new();
         environment.insert(
             "PATH".into(),
@@ -99,7 +107,7 @@ impl Rig {
     fn release_marker(&self, name: &str) {
         std::fs::write(self.root.join(name), b"").unwrap();
     }
-    async fn open(&mut self) -> SessionLease {
+    fn submit_open(&self) {
         self.bridge
             .endpoint()
             .transition(|s, t| {
@@ -122,9 +130,20 @@ impl Rig {
                 )
             })
             .unwrap();
+    }
+    async fn open(&mut self) -> SessionLease {
+        self.submit_open();
         serde_json::from_value(self.event("opened").await["lease"].clone()).unwrap()
     }
     fn begin(&self, lease: &SessionLease, code: &str) -> OperationIdentity {
+        self.begin_with_timeout(lease, code, 8)
+    }
+    fn begin_with_timeout(
+        &self,
+        lease: &SessionLease,
+        code: &str,
+        timeout: u64,
+    ) -> OperationIdentity {
         self.bridge
             .endpoint()
             .transition(|s, t| {
@@ -136,7 +155,7 @@ impl Rig {
                         RequestId::new(id()).unwrap(),
                         None,
                         "execute_python",
-                        json!({"code":code,"timeout_secs":8}),
+                        json!({"code":code,"timeout_secs":timeout}),
                     )
                     .unwrap(),
                     OperationId::new(id()).unwrap(),
@@ -161,6 +180,86 @@ impl Rig {
     async fn close(self) {
         self.bridge.shutdown().await.unwrap();
     }
+}
+
+async fn early_open_disconnect(scenario: &str) {
+    let mut r = Rig::new(scenario).await;
+    let healthy = r.open().await;
+    r.submit_open();
+    r.event("disconnected").await;
+    assert_eq!(
+        r.bridge
+            .endpoint()
+            .transition(|s, _| s.status(&r.client, &healthy))
+            .unwrap()
+            .phase,
+        SessionPhase::Active,
+        "early open callback must not poison a sibling lease"
+    );
+    if scenario == "open-pre-disconnected" {
+        r.marker("open-failed.arrived").await;
+        r.release_marker("open-failed.release");
+        r.event("failed").await;
+    } else {
+        r.marker("opened.arrived").await;
+        r.release_marker("opened.release");
+        let opened = r.event("opened").await;
+        let lease: SessionLease = serde_json::from_value(opened["lease"].clone()).unwrap();
+        assert_eq!(
+            r.bridge
+                .endpoint()
+                .transition(|s, _| s.status(&r.client, &lease))
+                .unwrap()
+                .phase,
+            SessionPhase::Disconnected,
+            "buffered disconnect must apply atomically with opened"
+        );
+    }
+    let op = r.begin(&healthy, "still-healthy");
+    r.event("completed").await;
+    assert_eq!(r.snapshot(&op).status, OperationStatus::Succeeded);
+    r.close().await;
+}
+
+#[tokio::test]
+async fn f2_open_disconnected_before_callback_registration_is_isolated() {
+    early_open_disconnect("open-pre-disconnected").await;
+}
+
+#[tokio::test]
+async fn f2_open_control_disconnect_arrives_before_business_opened_is_isolated() {
+    early_open_disconnect("open-early-event").await;
+}
+
+#[tokio::test]
+async fn f2_expired_proof_consumed_by_cancel_ack_and_supervisor() {
+    let mut r = Rig::new("expired-proof").await;
+    let lease = r.open().await;
+    let op = r.begin_with_timeout(&lease, "unknown", 1);
+    r.event("uncertain").await;
+    r.cancel(&op);
+    assert_eq!(r.event("cancel_ack").await["accepted"], true);
+    r.event("stop_unconfirmed").await;
+    // N1's actual deadline poll escalates the acknowledged client cancellation.
+    let ack = r.event("cancel_ack").await;
+    assert_eq!(ack["outcome"]["execution_stopped"], true);
+    let at_ack = r.snapshot(&op);
+    r.marker("stopped.arrived").await;
+    r.release_marker("stopped.release");
+    r.event("stopped").await;
+    let cleanup = r.event("local_status").await;
+    let after = r.snapshot(&op);
+    r.close().await;
+    assert!(
+        at_ack.execution_stopped,
+        "cancel_ack must consume authoritative proof before supervisor publication"
+    );
+    assert_eq!(after.status, OperationStatus::UnknownOutcome);
+    assert!(after.execution_stopped);
+    assert_eq!(
+        cleanup["unknown_retained"], false,
+        "expired supervisor must retire proven unknown"
+    );
 }
 #[tokio::test]
 async fn p12_ack_before_response_loss_still_schedules_stop_proof() {
