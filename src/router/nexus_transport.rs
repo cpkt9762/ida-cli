@@ -263,10 +263,13 @@ impl Delivery {
                     self.possible = true;
                 }
                 result => {
-                    let error = NexusError::new(
-                        NexusErrorCode::Disconnected,
-                        format!("Nexus pipe write: {result:?}"),
-                    );
+                    let error = match result {
+                        Err(error) => error,
+                        Ok(_) => NexusError::new(
+                            NexusErrorCode::Disconnected,
+                            "Nexus pipe zero write / broken pipe",
+                        ),
+                    };
                     self.report(if offset == 0 {
                         DispatchFailure::NotSent(error.clone())
                     } else {

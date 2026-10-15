@@ -40,66 +40,75 @@ async fn first_open_fixture(
 
 #[tokio::test(flavor = "current_thread")]
 async fn sbpf_first_open_keeps_handle_on_ordinary_post_open_error() {
-    for phase in ["get_function_by_name", "build_callgraph", "rename_symbol"] {
-        let directory =
-            std::env::temp_dir().join(format!("n2-f2-open-{}-{phase}", std::process::id()));
-        std::fs::create_dir(&directory).unwrap();
-        let (router, path) = first_open_fixture(&directory, phase, None).await;
-        let result = router
-            .ensure_worker_prepared(
-                &path,
-                None,
-                None,
-                crate::preprocess::Preparation::new(Duration::from_secs(3)),
-            )
-            .await;
-        let handles: Vec<_> = router.inner.lock().await.workers.keys().cloned().collect();
-        for handle in &handles {
-            let pid = router.inner.lock().await.workers[handle]
-                .child
-                .id()
-                .unwrap();
-            crate::preprocess::record_owned_fixture(pid, false, "f2-first-open");
-        }
-        let reused = if result.is_ok() {
-            Some(
-                router
+    isolated_f3_case(
+        "sbpf_first_open_keeps_handle_on_ordinary_post_open_error",
+        async {
+            for phase in ["get_function_by_name", "build_callgraph", "rename_symbol"] {
+                let directory =
+                    std::env::temp_dir().join(format!("n2-f2-open-{}-{phase}", std::process::id()));
+                std::fs::create_dir(&directory).unwrap();
+                let (router, path) = first_open_fixture(&directory, phase, None).await;
+                let result = router
                     .ensure_worker_prepared(
                         &path,
                         None,
                         None,
                         crate::preprocess::Preparation::new(Duration::from_secs(3)),
                     )
-                    .await
-                    .unwrap()
-                    .0,
-            )
-        } else {
-            None
-        };
-        for handle in handles {
-            router.close_worker(&handle).await.unwrap();
-        }
-        let methods = std::fs::read_to_string(directory.join("methods.log")).unwrap();
-        std::fs::remove_dir_all(directory).unwrap();
-        let (handle, _) =
-            result.expect("ordinary sBPF post-open failure must preserve successful first open");
-        assert_eq!(
-            Some(handle),
-            reused,
-            "same path safely reuses the open worker"
-        );
-        assert_eq!(
-            methods.lines().filter(|method| *method == "open").count(),
-            1
-        );
-        assert!(methods.lines().any(|method| method == phase));
-    }
+                    .await;
+                let handles: Vec<_> = router.inner.lock().await.workers.keys().cloned().collect();
+                for handle in &handles {
+                    let pid = router.inner.lock().await.workers[handle]
+                        .child
+                        .id()
+                        .unwrap();
+                    crate::preprocess::record_owned_fixture(pid, false, "f2-first-open");
+                }
+                let reused = if result.is_ok() {
+                    Some(
+                        router
+                            .ensure_worker_prepared(
+                                &path,
+                                None,
+                                None,
+                                crate::preprocess::Preparation::new(Duration::from_secs(3)),
+                            )
+                            .await
+                            .unwrap()
+                            .0,
+                    )
+                } else {
+                    None
+                };
+                for handle in handles {
+                    router.close_worker(&handle).await.unwrap();
+                }
+                let methods = std::fs::read_to_string(directory.join("methods.log")).unwrap();
+                std::fs::remove_dir_all(directory).unwrap();
+                let (handle, _) = result
+                    .expect("ordinary sBPF post-open failure must preserve successful first open");
+                assert_eq!(
+                    Some(handle),
+                    reused,
+                    "same path safely reuses the open worker"
+                );
+                assert_eq!(
+                    methods.lines().filter(|method| *method == "open").count(),
+                    1
+                );
+                assert!(methods.lines().any(|method| method == phase));
+            }
+        },
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn sbpf_first_open_transport_error_strings_are_not_optional_business_failures() {
-    for (index, message) in [
+    isolated_f3_case(
+        "sbpf_first_open_transport_error_strings_are_not_optional_business_failures",
+        async {
+            for (index, message) in [
         "UnknownOutcome (execution_stopped=false; never replay): response EOF / read failure",
         "NotSent: writer stopped",
         "Worker channel closed",
@@ -141,77 +150,89 @@ async fn sbpf_first_open_transport_error_strings_are_not_optional_business_failu
             "propagated transport error cleans failed-open worker"
         );
     }
+        },
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn sbpf_first_open_cancellation_propagates_and_cleans_worker() {
-    let directory = std::env::temp_dir().join(format!("n2-f2-cancel-open-{}", std::process::id()));
-    std::fs::create_dir(&directory).unwrap();
-    let listener = tokio::net::UnixListener::bind(directory.join("ready.sock")).unwrap();
-    let (router, path) = first_open_fixture(&directory, "none", Some("get_function_by_name")).await;
-    let preparation = crate::preprocess::Preparation::new(Duration::from_secs(3));
-    let cancel = preparation.cancel.clone();
-    let owned = router.clone();
-    let call = tokio::spawn(async move {
-        owned
-            .ensure_worker_prepared(&path, None, None, preparation)
-            .await
-    });
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    let mut stream = BufReader::new(stream);
-    let mut line = String::new();
-    stream.read_line(&mut line).await.unwrap();
-    assert_eq!(line, "started\n");
-    let handles: Vec<_> = router.inner.lock().await.workers.keys().cloned().collect();
-    for handle in &handles {
-        crate::preprocess::record_owned_fixture(
-            router.inner.lock().await.workers[handle]
-                .child
-                .id()
-                .unwrap(),
-            false,
-            "f2-cancel-open",
-        );
-    }
-    assert!(cancel.cancel());
-    // Keep the native simulation blocked until the caller has classified it.
-    let result = tokio::time::timeout(Duration::from_secs(2), call)
-        .await
-        .unwrap()
-        .unwrap();
-    let empty = {
-        let inner = router.inner.lock().await;
-        inner.workers.is_empty()
-            && inner.path_to_handle.is_empty()
-            && inner.ref_tokens.is_empty()
-            && inner.token_to_handle.is_empty()
-    };
-    for handle in handles {
-        router.close_worker(&handle).await.unwrap();
-    }
-    drop(stream);
-    std::fs::remove_dir_all(directory).unwrap();
-    assert!(
-        matches!(
-            result,
-            Err(crate::error::ToolError::Preparation {
-                execution_stopped: false,
-                ..
-            })
-        ),
-        "{result:?}"
-    );
-    assert!(
-        empty,
-        "failed first-open follow-up must remove worker/path ownership"
-    );
+    isolated_f3_case(
+        "sbpf_first_open_cancellation_propagates_and_cleans_worker",
+        async {
+            let directory =
+                std::env::temp_dir().join(format!("n2-f2-cancel-open-{}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let listener = tokio::net::UnixListener::bind(directory.join("ready.sock")).unwrap();
+            let (router, path) =
+                first_open_fixture(&directory, "none", Some("get_function_by_name")).await;
+            let preparation = crate::preprocess::Preparation::new(Duration::from_secs(3));
+            let cancel = preparation.cancel.clone();
+            let owned = router.clone();
+            let call = tokio::spawn(async move {
+                owned
+                    .ensure_worker_prepared(&path, None, None, preparation)
+                    .await
+            });
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "started\n");
+            let handles: Vec<_> = router.inner.lock().await.workers.keys().cloned().collect();
+            for handle in &handles {
+                crate::preprocess::record_owned_fixture(
+                    router.inner.lock().await.workers[handle]
+                        .child
+                        .id()
+                        .unwrap(),
+                    false,
+                    "f2-cancel-open",
+                );
+            }
+            assert!(cancel.cancel());
+            // Keep the native simulation blocked until the caller has classified it.
+            let result = tokio::time::timeout(Duration::from_secs(2), call)
+                .await
+                .unwrap()
+                .unwrap();
+            let empty = {
+                let inner = router.inner.lock().await;
+                inner.workers.is_empty()
+                    && inner.path_to_handle.is_empty()
+                    && inner.ref_tokens.is_empty()
+                    && inner.token_to_handle.is_empty()
+            };
+            for handle in handles {
+                router.close_worker(&handle).await.unwrap();
+            }
+            drop(stream);
+            std::fs::remove_dir_all(directory).unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::error::ToolError::Preparation {
+                        execution_stopped: false,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+            assert!(
+                empty,
+                "failed first-open follow-up must remove worker/path ownership"
+            );
+        },
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn sbpf_post_open_queries_and_rename_share_preparation_cancellation() {
+    isolated_f3_case("sbpf_post_open_queries_and_rename_share_preparation_cancellation", async {
     for phase in ["get_function_by_name", "build_callgraph"] {
         let router = RouterState::new().unwrap();
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
@@ -312,4 +333,380 @@ async fn sbpf_post_open_queries_and_rename_share_preparation_cancellation() {
         );
         assert_eq!(connection.pending_len(), 0);
     }
+
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn f3_corrupt_index_preserves_successful_open_and_original_bytes() {
+    isolated_f3_case(
+        "f3_corrupt_index_preserves_successful_open_and_original_bytes",
+        async {
+            let directory =
+                std::env::temp_dir().join(format!("n2-f3-index-{}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let (router, path) = first_open_fixture(&directory, "none", None).await;
+            let index = crate::idb_store::idb_root().join("index.json");
+            std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+            let original = std::fs::read(&index).ok();
+            let corrupt = b"{ diagnostic: invalid index JSON }\n";
+            std::fs::write(&index, corrupt).unwrap();
+            let output = directory.join("output.i64");
+            let result = router
+                .ensure_worker_prepared(
+                    &path,
+                    Some(output.to_str().unwrap()),
+                    None,
+                    crate::preprocess::Preparation::new(Duration::from_secs(3)),
+                )
+                .await;
+            let unchanged = std::fs::read(&index).unwrap() == corrupt;
+            let handles: Vec<_> = router.inner.lock().await.workers.keys().cloned().collect();
+            let alive = !handles.is_empty();
+            for handle in handles {
+                router.close_worker(&handle).await.unwrap();
+            }
+            match original {
+                Some(bytes) => std::fs::write(&index, bytes).unwrap(),
+                None => std::fs::remove_file(&index).unwrap(),
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+            assert!(unchanged, "corrupt index must remain byte-for-byte intact");
+            assert!(
+                result.is_ok(),
+                "successful open must survive ordinary index error: {result:?}"
+            );
+            assert!(alive, "successful open worker must remain registered");
+        },
+    )
+    .await;
+}
+
+async fn f3_post_open_busy(phase: &str, class: crate::blocking::WorkClass, count: usize) {
+    let directory = std::env::temp_dir().join(format!("n2-f3-busy-{}-{phase}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let listener = tokio::net::UnixListener::bind(directory.join("ready.sock")).unwrap();
+    let (router, path) = first_open_fixture(&directory, "none", Some(phase)).await;
+    let owned = router.clone();
+    let output = directory.join("out.i64");
+    let call = tokio::spawn(async move {
+        owned
+            .ensure_worker_prepared(
+                &path,
+                Some(output.to_str().unwrap()),
+                None,
+                crate::preprocess::Preparation::new(Duration::from_secs(4)),
+            )
+            .await
+    });
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stream = BufReader::new(stream);
+    let mut line = String::new();
+    stream.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "started\n");
+    let mut releases = Vec::new();
+    let mut jobs = Vec::new();
+    for _ in 0..count {
+        let (release, released) = std::sync::mpsc::channel();
+        let (start, started) = tokio::sync::oneshot::channel();
+        jobs.push(tokio::spawn(crate::blocking::run(class, move || {
+            start.send(()).unwrap();
+            released.recv().unwrap();
+        })));
+        started.await.unwrap();
+        releases.push(release);
+    }
+    stream.get_mut().write_all(b"x").await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), call).await;
+    // Always release running jobs before assertions/runtime teardown.
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    for job in jobs {
+        job.await.unwrap().unwrap();
+    }
+    let handles: Vec<_> = router.inner.lock().await.workers.keys().cloned().collect();
+    let mut alive = false;
+    for handle in &handles {
+        alive |= router
+            .inner
+            .lock()
+            .await
+            .workers
+            .get_mut(handle)
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none();
+    }
+    for handle in handles {
+        router.close_worker(&handle).await.unwrap();
+    }
+    let methods = std::fs::read_to_string(directory.join("methods.log")).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+    let result = result.unwrap().unwrap();
+    assert!(
+        result.is_ok(),
+        "optional post-open {phase} capacity cannot invalidate open: {result:?}"
+    );
+    assert!(
+        alive,
+        "already-open worker must survive optional capacity rejection"
+    );
+    if phase == "open" {
+        assert_eq!(
+            methods.trim(),
+            "open",
+            "both optional Prepare steps skipped while capacity remained full"
+        );
+    }
+    if phase == "get_function_by_name" {
+        assert!(
+            !methods.lines().any(|method| method == "build_callgraph"),
+            "Busy query was provably not sent"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn f3_post_open_prepare_busy_keeps_worker() {
+    isolated_f3_case("f3_post_open_prepare_busy_keeps_worker", async {
+        f3_post_open_busy("open", crate::blocking::WorkClass::Prepare, 4).await;
+    })
+    .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn f3_post_open_query_busy_keeps_worker() {
+    isolated_f3_case("f3_post_open_query_busy_keeps_worker", async {
+        f3_post_open_busy(
+            "get_function_by_name",
+            crate::blocking::WorkClass::Encode,
+            2,
+        )
+        .await;
+    })
+    .await;
+}
+
+#[test]
+fn optional_sbpf_error_classification_covers_legacy_failure_producers() {
+    use crate::error::ToolError;
+    assert!(optional_sbpf_failure(&ToolError::Busy));
+    assert!(optional_sbpf_failure(&ToolError::IdaError(
+        "Function not found: entrypoint".into()
+    )));
+    // fail_one: queue expiry, zero write, partial write. fail_all: close, EOF.
+    for message in [
+        "NotSent: expired or dropped in queue",
+        "NotSent: zero write / broken pipe",
+        "UnknownOutcome (execution_stopped=false; never replay): pipe write: fixture",
+        "NotSent: connection closed",
+        "UnknownOutcome (execution_stopped=false; never replay): response EOF / read failure",
+        "Worker channel closed",
+    ] {
+        assert!(
+            !optional_sbpf_failure(&ToolError::IdaError(message.into())),
+            "{message}"
+        );
+    }
+    // wait_inner: sender drop, deadline (zero/possible), cancellation (zero/possible).
+    for error in [
+        ToolError::WorkerClosed,
+        ToolError::Timeout(0),
+        ToolError::RequestOutcome { seconds: 1 },
+        ToolError::Preparation {
+            message: "NotSent: total deadline expired in transport queue".into(),
+            execution_stopped: true,
+        },
+        ToolError::Preparation {
+            message: "NotSent: cancelled in transport queue".into(),
+            execution_stopped: true,
+        },
+        ToolError::Preparation {
+            message: "UnknownOutcome: cancelled waiter after possible send; never replay".into(),
+            execution_stopped: false,
+        },
+    ] {
+        assert!(!optional_sbpf_failure(&error), "{error}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn f3_pre_open_capacity_still_rejects_busy_without_spawning_worker() {
+    isolated_f3_case(
+        "f3_pre_open_capacity_still_rejects_busy_without_spawning_worker",
+        async {
+            let directory =
+                std::env::temp_dir().join(format!("n2-f3-admit-{}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let (router, path) = first_open_fixture(&directory, "none", None).await;
+            let mut releases = Vec::new();
+            let mut jobs = Vec::new();
+            for _ in 0..4 {
+                let (release, released) = std::sync::mpsc::channel();
+                let (start, started) = tokio::sync::oneshot::channel();
+                jobs.push(tokio::spawn(crate::blocking::run(
+                    crate::blocking::WorkClass::Prepare,
+                    move || {
+                        start.send(()).unwrap();
+                        released.recv().unwrap();
+                    },
+                )));
+                started.await.unwrap();
+                releases.push(release);
+            }
+            let result = router
+                .ensure_worker_prepared(
+                    &path,
+                    None,
+                    None,
+                    crate::preprocess::Preparation::new(Duration::from_secs(2)),
+                )
+                .await;
+            for release in releases {
+                release.send(()).unwrap();
+            }
+            for job in jobs {
+                job.await.unwrap().unwrap();
+            }
+            assert!(
+                matches!(result, Err(crate::error::ToolError::Busy)),
+                "{result:?}"
+            );
+            assert!(router.inner.lock().await.workers.is_empty());
+            assert!(!directory.join("methods.log").exists());
+            std::fs::remove_dir_all(directory).unwrap();
+        },
+    )
+    .await;
+}
+
+// Open fixtures and fault injection need deterministic Prepare/Encode admission.
+// Each case runs in a disposable libtest process, retaining all behavior assertions
+// without consuming the global permits of unrelated concurrently running tests.
+async fn isolated_f3_case(name: &str, work: impl std::future::Future<Output = ()>) {
+    if std::env::var("IDA_N2_F3_CASE").as_deref() == Ok(name) {
+        work.await;
+    } else {
+        let directory =
+            std::env::temp_dir().join(format!("n2-f3-harness-{}-{name}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(format!("router::n2_f1_regressions::{name}"))
+            .arg("--nocapture")
+            .env("IDA_N2_F3_CASE", name)
+            .env("IDA_CLI_HOME", &directory)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        crate::preprocess::record_owned_fixture(child.id().unwrap(), false, "f3-isolated-libtest");
+        let output = child.wait_with_output().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("running 1 test") && stdout.contains("1 passed"),
+            "exact child case must run its assertions: {stdout}"
+        );
+        assert!(
+            output.status.success(),
+            "isolated {name}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn f3_index_cancellation_retains_pending_input_evidence() {
+    isolated_f3_case(
+        "f3_index_cancellation_retains_pending_input_evidence",
+        async {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let directory =
+                std::env::temp_dir().join(format!("n2-f3-index-cancel-{}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let (router, path) = first_open_fixture(&directory, "none", None).await;
+            let index = crate::idb_store::idb_root().join("index.json");
+            std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+            let cpath = std::ffi::CString::new(index.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: a private fixture path in this child process's isolated home.
+            assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+            let preparation = crate::preprocess::Preparation::new(Duration::from_secs(4));
+            let tracked = preparation.clone();
+            let owned = router.clone();
+            let output = directory.join("out.i64");
+            let call = tokio::spawn(async move {
+                owned
+                    .ensure_worker_prepared(
+                        &path,
+                        Some(output.to_str().unwrap()),
+                        None,
+                        preparation,
+                    )
+                    .await
+            });
+            // O_NONBLOCK writer succeeds only when the real index reader is open.
+            let mut writer = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&index)
+                    {
+                        Ok(writer) => break writer,
+                        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                            tokio::task::yield_now().await
+                        }
+                        Err(error) => panic!("FIFO handshake: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(tracked.active_input_jobs() > 0);
+            assert!(tracked.cancel.cancel());
+            let result = tokio::time::timeout(Duration::from_secs(1), call).await;
+            let retained = tracked.active_input_jobs() > 0;
+            // Release the real blocking read before any result assertion.
+            writer.write_all(b"invalid fixture index").unwrap();
+            drop(writer);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while tracked.active_input_jobs() > 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let remaining: Vec<_> = router.inner.lock().await.workers.keys().cloned().collect();
+            for handle in remaining {
+                router.close_worker(&handle).await.unwrap();
+            }
+            std::fs::remove_file(index).unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
+            let result = result.unwrap().unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::error::ToolError::Preparation {
+                        execution_stopped: false,
+                        ..
+                    })
+                ),
+                "must preserve bounded-input cancellation evidence: {result:?}"
+            );
+            assert!(
+                retained,
+                "cancelled waiter must retain blocking input tracking until actual FIFO EOF"
+            );
+        },
+    )
+    .await;
 }

@@ -21,11 +21,47 @@ pub async fn guard_response_size(
     method: &str,
     result: Value,
 ) -> Result<Value, crate::error::ToolError> {
-    let method = method.to_string();
-    crate::blocking::response(move || guard_response_size_sync(&method, result)).await?
+    Ok(cache_or_inline(method, result).await)
 }
 
-fn guard_response_size_sync(method: &str, result: Value) -> Result<Value, crate::error::ToolError> {
+// Cache failure must never turn an already successful database operation into
+// an RPC failure. Retain the value outside the job, including failed thread spawn.
+pub(crate) async fn cache_or_inline(method: &str, result: Value) -> Value {
+    cache_with(method, result, crate::blocking::response).await
+}
+
+type CacheJob = Box<dyn FnOnce() -> Result<Option<Value>, crate::error::ToolError> + Send>;
+async fn cache_with<F>(method: &str, result: Value, launch: impl FnOnce(CacheJob) -> F) -> Value
+where
+    F: std::future::Future<
+        Output = Result<Result<Option<Value>, crate::error::ToolError>, crate::error::ToolError>,
+    >,
+{
+    let method = method.to_string();
+    let original = std::sync::Arc::new(std::sync::Mutex::new(result));
+    let borrowed = original.clone();
+    let cached = launch(Box::new(move || {
+        let value = borrowed.lock().unwrap_or_else(|e| e.into_inner());
+        guard_response_size_sync(&method, &value)
+    }))
+    .await;
+    match cached {
+        Ok(Ok(Some(summary))) => summary,
+        other => {
+            if let Ok(Err(error)) | Err(error) = other {
+                tracing::warn!(%error, "response cache unavailable; returning complete inline result");
+            }
+            // The job has returned (or was dropped on spawn failure); no I/O
+            // holds this lock now. No clone/encoding of a large Value here.
+            std::mem::take(&mut *original.lock().unwrap_or_else(|e| e.into_inner()))
+        }
+    }
+}
+
+fn guard_response_size_sync(
+    method: &str,
+    result: &Value,
+) -> Result<Option<Value>, crate::error::ToolError> {
     let max_bytes = std::env::var("IDA_MCP_MAX_INLINE_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -36,7 +72,7 @@ fn guard_response_size_sync(method: &str, result: Value) -> Result<Value, crate:
     let size = json_str.len();
 
     if size <= max_bytes {
-        return Ok(result);
+        return Ok(None);
     }
 
     let cache_dir = crate::idb_store::response_cache_dir();
@@ -70,7 +106,7 @@ fn guard_response_size_sync(method: &str, result: Value) -> Result<Value, crate:
         ))
     })?;
 
-    let item_count = count_items(&result);
+    let item_count = count_items(result);
     let summary = format!(
         "Response too large for inline display ({:.1}KB{}). \
          Full output saved to: {}\n\
@@ -85,13 +121,13 @@ fn guard_response_size_sync(method: &str, result: Value) -> Result<Value, crate:
         file_path.display(),
     );
 
-    Ok(serde_json::json!({
+    Ok(Some(serde_json::json!({
         "cached": true,
         "file": file_path.to_string_lossy(),
         "size_bytes": size,
         "item_count": item_count,
         "summary": summary,
-    }))
+    })))
 }
 
 fn count_items(v: &Value) -> Option<usize> {
@@ -211,5 +247,22 @@ pub fn prune_to_limit(max_bytes: u64) -> ResponseCacheEvictionStats {
         evicted_files,
         evicted_bytes,
         remaining_bytes: total_size,
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_worker_launch_failure_preserves_original_success_without_cloning() {
+        let value = serde_json::json!({"stdout":"输出".repeat(1000), "result":{"saved":true}});
+        let result = cache_with("run_script", value.clone(), |job| async move {
+            drop(job); // std::thread::Builder::spawn failure drops its closure.
+            Err(crate::error::ToolError::IdaError(
+                "ida-response-encode spawn: injected failure".into(),
+            ))
+        })
+        .await;
+        assert_eq!(result, value);
     }
 }

@@ -70,6 +70,7 @@ struct ReadyWriter {
     ready: Arc<AtomicBool>,
     bytes: Arc<Mutex<Vec<u8>>>,
     prefix: usize,
+    entered: Option<Arc<AtomicBool>>,
 }
 impl AsyncWrite for ReadyWriter {
     fn poll_write(
@@ -77,6 +78,9 @@ impl AsyncWrite for ReadyWriter {
         _: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        if let Some(entered) = &self.entered {
+            entered.store(true, Ordering::SeqCst);
+        }
         if self.prefix > 0 {
             let length = self.prefix.min(bytes.len());
             self.prefix = 0;
@@ -171,6 +175,7 @@ async fn expired_control(kind: &str, prefix: usize) {
         ready: ready.clone(),
         bytes: bytes.clone(),
         prefix,
+        entered: None,
     };
     let mut writing = Box::pin(delivery.write(&mut writer));
     let pending =
@@ -189,7 +194,24 @@ async fn expired_control(kind: &str, prefix: usize) {
         length, prefix,
         "expired {kind} must not write any additional bytes"
     );
-    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.code, NexusErrorCode::QueueExpired);
+    assert_eq!(error.retry_advice(), RetryAdvice::NewRequest);
+    let snapshot = endpoint
+        .transition(|s, _| s.delivery_status(&lease.client_id, &attempt))
+        .unwrap();
+    let recorded = snapshot.error.as_ref().unwrap();
+    if prefix > 0 && kind != "cancel" {
+        assert_eq!(recorded.code, NexusErrorCode::UnknownOutcome);
+        assert_eq!(recorded.retry_advice(), RetryAdvice::NeverReplay);
+        assert_eq!(
+            recorded.cause.as_ref().unwrap().code,
+            NexusErrorCode::QueueExpired
+        );
+    } else {
+        assert_eq!(recorded.code, NexusErrorCode::QueueExpired);
+        assert_eq!(recorded.retry_advice(), RetryAdvice::NewRequest);
+    }
     let state = endpoint
         .transition(|s, _| s.delivery_status(&lease.client_id, &attempt))
         .unwrap()
@@ -229,5 +251,109 @@ async fn expired_release_and_shutdown_are_not_sent() {
 async fn partial_control_frames_expire_uncertain_without_more_bytes() {
     for kind in ["cancel", "release", "shutdown"] {
         expired_control(kind, 3).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lifecycle_rejection_after_pending_write_keeps_cancelled_code_and_no_bytes() {
+    let endpoint = NexusEndpoint::with_capabilities(8, Ok(caps()));
+    let mut lanes = endpoint.take_lanes().unwrap();
+    let client = ClientId::new("cancel-opening-client").unwrap();
+    let identity = endpoint
+        .transition(|s, b| {
+            s.open(
+                &client,
+                AcceptedRequest::new(
+                    &SystemClock,
+                    RequestId::new("cancel-opening-r").unwrap(),
+                    None,
+                    "open",
+                    json!({}),
+                )
+                .unwrap(),
+                OpenSpec {
+                    operation_id: OperationId::new("cancel-opening-o").unwrap(),
+                    path: "/fixture.i64".into(),
+                    options: json!({}),
+                },
+                b,
+            )
+        })
+        .unwrap();
+    let delivery = lanes.business.recv().await.unwrap();
+    let attempt = delivery.attempt.clone();
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let ready = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let mut writer = ReadyWriter {
+        ready: ready.clone(),
+        bytes: bytes.clone(),
+        prefix: 0,
+        entered: Some(entered.clone()),
+    };
+    let mut writing = Box::pin(delivery.write(&mut writer));
+    std::future::poll_fn(|cx| match writing.as_mut().poll(cx) {
+        Poll::Pending if entered.load(Ordering::SeqCst) => Poll::Ready(()),
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(result) => panic!("must reach actual pending writer poll: {result:?}"),
+    })
+    .await;
+    endpoint
+        .transition(|s, _| s.cancel_open(&client, &identity))
+        .unwrap();
+    ready.store(true, Ordering::SeqCst);
+    let error = writing.await.unwrap_err();
+    assert_eq!(error.code, NexusErrorCode::Cancelled);
+    assert_eq!(error.retry_advice(), RetryAdvice::NeverReplay);
+    assert!(bytes.lock().unwrap().is_empty());
+    let status = endpoint
+        .transition(|s, _| s.delivery_status(&client, &attempt))
+        .unwrap();
+    assert_eq!(status.state, DeliveryState::NotSent);
+    assert_eq!(status.error.unwrap(), error);
+}
+
+struct BrokenWriter(bool);
+impl AsyncWrite for BrokenWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(if self.0 {
+            Ok(0)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "fixture",
+            ))
+        })
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn actual_io_error_and_zero_write_remain_disconnected_not_sent() {
+    for zero in [false, true] {
+        let endpoint = NexusEndpoint::with_capabilities(8, Ok(caps()));
+        let mut lanes = endpoint.take_lanes().unwrap();
+        let lease = open(&endpoint, &mut lanes).await;
+        endpoint
+            .transition(|s, b| s.release(&lease.client_id, &lease, b))
+            .unwrap();
+        let delivery = lanes.control.recv().await.unwrap();
+        let attempt = delivery.attempt.clone();
+        let error = delivery.write(&mut BrokenWriter(zero)).await.unwrap_err();
+        assert_eq!(error.code, NexusErrorCode::Disconnected);
+        assert_eq!(error.retry_advice(), RetryAdvice::ReconnectThenNewRequest);
+        let status = endpoint
+            .transition(|s, _| s.delivery_status(&lease.client_id, &attempt))
+            .unwrap();
+        assert_eq!(status.state, DeliveryState::NotSent);
+        assert_eq!(status.error.unwrap(), error);
     }
 }

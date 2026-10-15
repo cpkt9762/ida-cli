@@ -109,12 +109,8 @@ async fn handle_cli_connection(
             let (mut response, ref_guard) = dispatch_cli_request(&req, router, shutdown).await;
             if !control {
                 if let Some(result) = response.result.take() {
-                    match super::response_cache::guard_response_size(&req.method, result).await {
-                        Ok(result) => response.result = Some(result),
-                        Err(error) => {
-                            response = RpcResponse::err(&req.id, -32000, error.to_string())
-                        }
-                    }
+                    response.result =
+                        Some(super::response_cache::cache_or_inline(&req.method, result).await);
                 }
             }
             let _ = ref_guard;

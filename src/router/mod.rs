@@ -1383,33 +1383,51 @@ impl RouterState {
             let opened = async {
                 self.route_request_prepared(Some(&h), "open", open_params, preparation.clone())
                     .await?;
-                if let Some(ref idb_out) = effective_idb_output {
+                if effective_idb_output.is_some() {
                     let binary = canonical.clone();
-                    let destination = PathBuf::from(idb_out);
-                    preparation
+                    let recorded = preparation
                         .wait(crate::blocking::run(
                             crate::blocking::WorkClass::Prepare,
                             move || {
-                                let _ = destination;
                                 crate::idb_store::IdbStore::new()
                                     .try_record(&binary)
-                                    .map_err(|e| {
-                                        crate::error::ToolError::IdaError(format!(
-                                            "IDB index record: {e}"
-                                        ))
-                                    })
                             },
                         ))
-                        .await??;
+                        .await;
+                    match recorded {
+                        Ok(recorded) => {
+                            preparation.check()?;
+                            if let Err(error) = recorded {
+                                warn!(binary = %canonical.display(), index = %crate::idb_store::idb_root().join("index.json").display(), %error, "optional post-open index record failed");
+                            }
+                        }
+                        Err(ToolError::Busy) => {
+                            preparation.check()?;
+                            warn!(handle = %h, "optional post-open index record skipped: local capacity full");
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 let binary = canonical.clone();
-                if preparation
+                let sbpf = preparation
                     .wait(crate::blocking::run(
                         crate::blocking::WorkClass::Prepare,
                         move || is_sbpf_elf(&binary),
                     ))
-                    .await?
-                {
+                    .await;
+                let sbpf = match sbpf {
+                    Ok(value) => {
+                        preparation.check()?;
+                        value
+                    }
+                    Err(ToolError::Busy) => {
+                        preparation.check()?;
+                        warn!(handle = %h, "optional post-open sBPF detection skipped: local capacity full");
+                        false
+                    }
+                    Err(error) => return Err(error),
+                };
+                if sbpf {
                     self.detect_and_rename_sbpf_entry(&h, preparation.clone())
                         .await?;
                 }
@@ -1454,16 +1472,9 @@ impl RouterState {
                     preparation.check()?;
                     Ok(Some(value))
                 }
-                Err(crate::error::ToolError::IdaError(message))
-                    if !message.starts_with("NotSent")
-                        && !message.starts_with("UnknownOutcome")
-                        && !message.contains("execution_stopped=false")
-                        && !message.contains("never replay")
-                        // Legacy worker errors arrive as display strings too.
-                        && message != "Worker channel closed" =>
-                {
+                Err(error) if optional_sbpf_failure(&error) => {
                     preparation.check()?;
-                    warn!(%handle, %method, error = %message, "optional sBPF post-open query failed");
+                    warn!(%handle, %method, %error, "optional sBPF post-open query failed");
                     Ok(None)
                 }
                 Err(error) => Err(error),
@@ -2422,6 +2433,22 @@ pub fn task_state_json(state: &TaskState) -> serde_json::Value {
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const EM_BPF: u16 = 247;
 const EM_SBF: u16 = 263;
+
+// Legacy RPC carries worker business errors and transport failures as strings.
+// Keep this compatibility boundary centralized until N9 removes the old wire.
+fn optional_sbpf_failure(error: &crate::error::ToolError) -> bool {
+    match error {
+        crate::error::ToolError::Busy => true, // local admission proved zero send
+        crate::error::ToolError::IdaError(message) => {
+            !message.starts_with("NotSent")
+                && !message.starts_with("UnknownOutcome")
+                && !message.contains("execution_stopped=false")
+                && !message.contains("never replay")
+                && message != "Worker channel closed"
+        }
+        _ => false,
+    }
+}
 
 pub fn is_sbpf_elf(path: &std::path::Path) -> bool {
     let Ok(mut f) = std::fs::File::open(path) else {
