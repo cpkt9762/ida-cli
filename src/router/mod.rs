@@ -6,6 +6,7 @@
 //! - Router maintains an "active" handle for backward compatibility
 
 pub mod nexus_bridge;
+pub mod nexus_tools;
 pub mod nexus_transport;
 pub mod protocol;
 pub mod transport;
@@ -346,6 +347,7 @@ pub struct RouterState {
     spawn_gate: Arc<Semaphore>,
     nexus: Arc<std::sync::Mutex<(nexus_transport::NexusEndpoint, bool)>>,
     nexus_bridge: Arc<tokio::sync::OnceCell<Arc<nexus_bridge::NexusBridge>>>,
+    nexus_tools: Arc<nexus_tools::Tools>,
     cached_probe: Arc<Mutex<Option<RuntimeProbeResult>>>,
     warm_pool: Arc<Mutex<HashMap<PathBuf, WarmLease>>>,
     prewarm_queue: Arc<Mutex<PrewarmQueueState>>,
@@ -397,6 +399,7 @@ impl ReferenceTokens {
 pub(crate) struct ScopedRefToken {
     references: Arc<std::sync::Mutex<ReferenceTokens>>,
     token: Option<String>,
+    nexus_router: Option<RouterState>,
 }
 impl ScopedRefToken {
     pub(crate) fn token(&self) -> Option<&str> {
@@ -410,6 +413,10 @@ impl ScopedRefToken {
 
     fn release(&mut self) -> Option<(DbHandle, usize)> {
         self.token.take().and_then(|token| {
+            if let Some(router) = &self.nexus_router {
+                nexus_tools::Tools::abandon(router.clone(), token);
+                return None;
+            }
             self.references
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -459,6 +466,7 @@ impl RouterState {
                 false,
             ))),
             nexus_bridge: Arc::new(tokio::sync::OnceCell::new()),
+            nexus_tools: Arc::new(nexus_tools::Tools::new(config.max_pending_per_tenant)?),
             cached_probe: Arc::new(Mutex::new(None)),
             warm_pool: Arc::new(Mutex::new(HashMap::new())),
             prewarm_queue: Arc::new(Mutex::new(PrewarmQueueState::default())),
@@ -478,6 +486,24 @@ impl RouterState {
             .unwrap_or_else(|e| e.into_inner())
             .0
             .clone()
+    }
+    pub fn uses_nexus(&self) -> bool {
+        self.nexus_tools.selected()
+    }
+    pub async fn nexus_close_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<(String, usize)>, crate::error::ToolError> {
+        self.nexus_tools.close_token(self, token).await
+    }
+    pub async fn nexus_open_details(
+        &self,
+        handle: &str,
+        preparation: crate::preprocess::Preparation,
+    ) -> Result<serde_json::Value, crate::error::ToolError> {
+        self.nexus_tools
+            .open_details(self, handle, preparation)
+            .await
     }
     /// Internal N3 connection point; public CLI/MCP tools are switched in N4.
     pub async fn connect_nexus(
@@ -948,6 +974,12 @@ impl RouterState {
         preparation: crate::preprocess::Preparation,
     ) -> Result<serde_json::Value, crate::error::ToolError> {
         use crate::error::ToolError;
+        if self.uses_nexus() {
+            return self
+                .nexus_tools
+                .execute(self, handle, method, params, preparation)
+                .await;
+        }
         preparation.check()?;
         let maximum = if method == "open" { 3600 } else { 600 };
         let timeout_secs = params
@@ -1095,6 +1127,7 @@ impl RouterState {
         ScopedRefToken {
             references: self.references.clone(),
             token: Some(token),
+            nexus_router: self.uses_nexus().then(|| self.clone()),
         }
     }
 
@@ -1125,6 +1158,15 @@ impl RouterState {
     /// `remaining == 0` means last reference released (caller should close the worker).
     /// Returns `None` if the token was not found (invalid or already released).
     pub async fn release_ref_token(&self, token: &str) -> Option<(DbHandle, usize)> {
+        if self.uses_nexus() {
+            return match self.nexus_close_token(token).await {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(%error,"Nexus reference release unconfirmed; tracking retained");
+                    None
+                }
+            };
+        }
         self.references
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1132,6 +1174,9 @@ impl RouterState {
     }
 
     pub async fn handle_for_token(&self, token: &str) -> Option<DbHandle> {
+        if self.uses_nexus() {
+            return self.nexus_tools.handle_for_token(token);
+        }
         self.references
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1141,16 +1186,25 @@ impl RouterState {
     }
 
     pub async fn active_handle(&self) -> Option<DbHandle> {
+        if self.uses_nexus() {
+            return self.nexus_tools.active();
+        }
         let inner = self.inner.lock().await;
         inner.active.clone()
     }
 
     pub async fn all_handles(&self) -> Vec<DbHandle> {
+        if self.uses_nexus() {
+            return self.nexus_tools.handles();
+        }
         let inner = self.inner.lock().await;
         inner.workers.keys().cloned().collect()
     }
 
     pub async fn worker_count(&self) -> usize {
+        if self.uses_nexus() {
+            return self.nexus_tools.workers(self).len();
+        }
         let inner = self.inner.lock().await;
         inner.workers.len()
     }
@@ -1310,7 +1364,7 @@ impl RouterState {
             .map(|task| task_state_json(&task))
             .collect();
 
-        RouterStatus {
+        let mut status = RouterStatus {
             metadata,
             worker_count,
             active_handle,
@@ -1360,7 +1414,23 @@ impl RouterState {
             } else {
                 Vec::new()
             },
+        };
+        if self.uses_nexus() {
+            status.runtime_probe = None;
+            status.metadata.backend = Some("nexus".into());
+            status.metadata.ida_version = Some("9.5".into());
+            status.metadata.supported_methods = nexus_tools::METHODS
+                .iter()
+                .map(|name| (*name).into())
+                .collect();
+            status.metadata.supported_tools = status.metadata.supported_methods.clone();
+            status.workers = self.nexus_tools.workers(self);
+            status.worker_count = status.workers.len();
+            status.active_handle = self.nexus_tools.active();
+            status.backend_counts = HashMap::from([("nexus".into(), status.worker_count)]);
+            status.tenant_worker_counts = HashMap::from([("default".into(), status.worker_count)]);
         }
+        status
     }
 
     fn refresh_metadata(&self) {
@@ -1374,7 +1444,7 @@ impl RouterState {
         let router = self.clone();
         tokio::spawn(async move {
             let exe = router.inner.lock().await.exe_path.clone();
-            if router.cached_probe.lock().await.is_none() {
+            if !router.uses_nexus() && router.cached_probe.lock().await.is_none() {
                 if let Err(e) =
                     tokio::time::timeout(Duration::from_secs(5), router.probe_worker_backend(&exe))
                         .await
@@ -1409,6 +1479,13 @@ impl RouterState {
     }
 
     pub async fn shutdown_all(&self) {
+        if self.uses_nexus() {
+            self.warm_pool.lock().await.clear();
+            if let Err(error) = self.nexus_tools.shutdown(self).await {
+                warn!(%error,"Nexus shutdown incomplete");
+            }
+            return;
+        }
         let handles: Vec<DbHandle> = {
             let inner = self.inner.lock().await;
             inner.workers.keys().cloned().collect()
@@ -1477,6 +1554,14 @@ impl RouterState {
         preparation: crate::preprocess::Preparation,
     ) -> Result<(DbHandle, String), crate::error::ToolError> {
         use crate::error::ToolError;
+        if self.uses_nexus() {
+            if explicit_idb_output.is_some() || tenant_id.is_some_and(|t| t != "default") {
+                return Err(ToolError::NotSupported(
+                    "Nexus N4 custom outputs and tenant overrides are not implemented".into(),
+                ));
+            }
+            return self.nexus_tools.open(self, path, preparation).await;
+        }
         let tenant_id = Self::normalize_tenant(tenant_id);
         preparation.check()?;
         let resolved = resolve_open_path(path, preparation.clone()).await?;
@@ -1755,6 +1840,9 @@ impl RouterState {
         path: &std::path::Path,
         tenant_id: Option<&str>,
     ) -> Result<(), crate::error::ToolError> {
+        if self.uses_nexus() {
+            return self.nexus_tools.close_path(self, path).await;
+        }
         let tenant_id = Self::normalize_tenant(tenant_id);
         let handle = {
             let inner = self.inner.lock().await;
@@ -1792,6 +1880,11 @@ impl RouterState {
         use crate::error::ToolError;
         let preparation = crate::preprocess::current()
             .unwrap_or_else(|| crate::preprocess::Preparation::new(Duration::from_secs(3600)));
+        if self.uses_nexus() {
+            return self
+                .prewarm_nexus(path, keep_warm, tenant_id, preparation)
+                .await;
+        }
         preparation.check()?;
 
         let expanded = crate::expand_path(path);
@@ -1919,6 +2012,107 @@ impl RouterState {
             "kept_warm": kept_warm,
             "worker_closed_after_prewarm": closed_worker,
         }))
+    }
+
+    async fn prewarm_nexus(
+        &self,
+        path: &str,
+        keep_warm: bool,
+        tenant: &str,
+        preparation: crate::preprocess::Preparation,
+    ) -> Result<serde_json::Value, crate::error::ToolError> {
+        use crate::error::ToolError;
+        if keep_warm && self.config.max_warm_workers == 0 {
+            return Err(ToolError::Busy);
+        }
+        let expanded = crate::expand_path(path);
+        let canonical = preparation
+            .wait(crate::blocking::run(
+                crate::blocking::WorkClass::Prepare,
+                move || {
+                    expanded
+                        .canonicalize()
+                        .map_err(|e| ToolError::InvalidPath(e.to_string()))
+                },
+            ))
+            .await??;
+        let already_open = self
+            .nexus_tools
+            .workers(self)
+            .iter()
+            .any(|w| w.open_path.as_deref() == canonical.to_str());
+        let before = canonical.clone();
+        let cached_before = preparation
+            .wait(crate::blocking::run(
+                crate::blocking::WorkClass::Prepare,
+                move || {
+                    crate::idb_store::IdbStore::new()
+                        .prepared_paths(&before)
+                        .map_err(|e| ToolError::IdaError(e.to_string()))
+                },
+            ))
+            .await??
+            .0
+            .is_some();
+        let (handle, token) = self
+            .ensure_worker_prepared(path, None, Some(tenant), preparation.clone())
+            .await?;
+        let mut reference = nexus_tools::ReferenceGuard::new(self.clone(), token.clone());
+        let details = self
+            .nexus_open_details(&handle, preparation.clone())
+            .await?;
+        let info = self
+            .route_request_prepared(
+                Some(&handle),
+                "get_database_info",
+                serde_json::json!({}),
+                preparation.clone(),
+            )
+            .await?;
+        let idb = details["path"]
+            .as_str()
+            .ok_or_else(|| ToolError::IdaError("Nexus open missing cache path".into()))?
+            .to_string();
+        if keep_warm {
+            loop {
+                preparation.check()?;
+                let mut pool = self.warm_pool.lock().await;
+                if pool.contains_key(&canonical) || pool.len() < self.config.max_warm_workers {
+                    let previous = pool.insert(
+                        canonical.clone(),
+                        WarmLease {
+                            handle,
+                            token: token.clone(),
+                            path: canonical.clone(),
+                            cache_path: Some(PathBuf::from(&idb)),
+                            tenant_id: "default".into(),
+                            pinned_at: Instant::now(),
+                            last_hit: Instant::now(),
+                        },
+                    );
+                    reference.transfer();
+                    drop(pool);
+                    if let Some(previous) = previous {
+                        self.nexus_close_token(&previous.token).await?;
+                    }
+                    break;
+                }
+                let oldest = pool
+                    .values()
+                    .min_by_key(|lease| lease.last_hit)
+                    .map(|lease| lease.path.clone());
+                drop(pool);
+                if let Some(oldest) = oldest {
+                    self.release_warm_lease(&oldest).await?;
+                }
+            }
+        } else {
+            self.nexus_close_token(&token).await?;
+            reference.transfer();
+        }
+        Ok(
+            serde_json::json!({"path":canonical.display().to_string(),"backend":"nexus","cached_before":cached_before,"cached_after":true,"cache_path":idb,"database_info":info,"already_open":already_open,"kept_warm":keep_warm,"worker_closed_after_prewarm":!keep_warm && !already_open}),
+        )
     }
 
     async fn install_warm_lease(

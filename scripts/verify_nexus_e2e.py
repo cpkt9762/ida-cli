@@ -23,6 +23,8 @@ def main():
     parser.add_argument("--sdk", type=Path, required=True)
     parser.add_argument("--ipc-root", type=Path, help="short private directory for per-router Unix sockets")
     parser.add_argument("--cleanup", action="store_true")
+    parser.add_argument("--suite", choices=("lifecycle", "contract"), default="lifecycle")
+    parser.add_argument("--baseline", type=Path, help="fixed independently hashed N0 binary for N4")
     args = parser.parse_args()
     try:
         env = Environment(args.root)
@@ -53,36 +55,46 @@ def main():
                           "CARGO_TARGET_DIR": str(args.target.resolve(strict=True)),
                           "IDA_TEST": "1", "RUSTC_WRAPPER": "", "N3_ENV_ROOT": str(env.root),
                           "N3_IPC_ROOT": str(ipc_root)})
+        if args.suite == "contract":
+            if args.baseline is None or not args.baseline.is_file():
+                parser.error("contract suite requires --baseline")
+            variables["N4_BASELINE"] = str(args.baseline.resolve(strict=True))
         Path(variables["N3_IPC_ROOT"]).mkdir(mode=0o700, exist_ok=True)
         (env.root / "rust-env.json").write_text(json.dumps(variables, indent=2) + "\n")
-        command = ["timeout", "180s", str(cargo), "test", "--locked", "--test", "nexus_lifecycle_e2e", "--", "--test-threads=1"]
+        command = ["timeout", "180s", str(cargo), "test", "--locked", "--test", f"nexus_{args.suite}_e2e", "--", "--test-threads=1"]
         result = {"status":"FAIL", "command":command, "client_cancel_patch":patch_status}
         def interrupted(sig, _frame):
             raise InterruptedError(f"suite interrupted by signal {sig}")
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, interrupted)
         try:
-            with (env.root / "lifecycle.log").open("w") as output:
+            with (env.root / f"{args.suite}.log").open("w") as output:
                 child = env.spawn(lambda: subprocess.Popen(command, cwd=REPO, env=variables, stdout=output, stderr=subprocess.STDOUT), command)
                 result["exit"] = child.wait()
-            text = (env.root / "lifecycle.log").read_text()
+            text = (env.root / f"{args.suite}.log").read_text()
             summary = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", text)
             if child.returncode and re.search(r"license.*(?:invalid|failed|not found|unavailable|expired)|no valid license", text, re.IGNORECASE):
                 result["status"] = "BLOCKED"
             assert child.returncode == 0, f"{result['status']}: lifecycle command failed: {child.returncode}"
-            assert summary == [("9", "0", "0")], f"wrong actual test count: {summary}"
-            events = [json.loads(line) for line in (env.root / "rust-evidence.jsonl").read_text().splitlines()]
-            cases = [event["case"] for event in events if event.get("status") == "PASS"]
-            expected = ["E02", "E03", "E05", "E06-client", "E06-bridge", "E07-packed", "E07-unpacked", "E05-concurrent-open", "E06-lease-fault"]
+            count = 9 if args.suite == "lifecycle" else 4
+            assert summary == [(str(count), "0", "0")], f"wrong actual test count: {summary}"
+            if args.suite == "lifecycle":
+                events = [json.loads(line) for line in (env.root / "rust-evidence.jsonl").read_text().splitlines()]
+                cases = [event["case"] for event in events if event.get("status") == "PASS"]
+                expected = ["E02", "E03", "E05", "E06-client", "E06-bridge", "E07-packed", "E07-unpacked", "E05-concurrent-open", "E06-lease-fault"]
+            else:
+                expected = ["E04", "E16", "E17", "E22"]
+                events = [json.loads((env.root/f"{case}-result.json").read_text()) for case in expected]
+                cases = [event["case"] for event in events if event["status"] == "PASS"]
             assert sorted(cases) == sorted(expected), f"wrong scenario evidence: {cases}"
             env.assert_clean()
             assert not list((env.root / "state/instances").glob("*.json")), "Nexus registrations remain"
-            result.update({"status":"PASS", "actual_tests":9, "cases":cases})
+            result.update({"status":"PASS", "actual_tests":count, "cases":cases})
         finally:
             result["cleanup_signalled_pids"] = env.cleanup()
             env.assert_clean()
             result["owned_processes"] = len(env.entries())
-            (env.root / "lifecycle-result.json").write_text(json.dumps(result, indent=2) + "\n")
+            (env.root / f"{args.suite}-result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result))
         return 0
 

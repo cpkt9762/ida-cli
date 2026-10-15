@@ -13,9 +13,15 @@ import threading
 import time
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tools import METHODS as TOOL_METHODS
+
 HANDLE_SHA = "4cd1a9c27e969504eed4ae55d7cbd0e2b4b5a6ba67f0c2529ccb6006a8d67b76"
 METHODS = {"execute_python": "may_write", "database_info": "read_only",
            "rename_address": "may_write", "read_name": "read_only"}
+METHODS.update({method: "may_write" if method == "run_script" else "read_only"
+                for method in TOOL_METHODS})
+TOOL_SOURCE = Path(__file__).with_name("tools.py").read_text(encoding="utf-8")
 
 
 def error(code, message):
@@ -92,6 +98,7 @@ class Bridge:
         self.Options = DatabaseOpenOptions
         self.lock = threading.Lock()
         self.handles = {}
+        self.verification_probes = {}
         self.grants = {}
         self.generations = {}
         self.unknown = {}
@@ -142,8 +149,9 @@ class Bridge:
                          "pid": item[1].instance.pid, "idb_path": item[1].instance.idb_path}
                         for item in self.handles.values()]
                 owners = list(self.owners)
+                verifications = list(self.verification_probes)
             channel.send({"event": "local_status", "id": message["local_status"],
-                          "held": held, "owners": owners})
+                          "held": held, "owners": owners, "verification_probes": verifications})
             return
         frame = message
         command = frame["payload"]["command"]
@@ -208,15 +216,59 @@ class Bridge:
         self.control.send({"event": "disconnected", "lease": lease, "reason": reason,
                            "attempt": attempt})
 
+    def close_verification(self, path, probe, deadline):
+        from ida_nexus import wait_database_released
+        probe.close(wait_for_database=True, timeout=max(0.001, deadline - time.monotonic()))
+        # close() is idempotent after it starts, even if its first call raised.
+        # Only the public lifetime-lock observation proves the copy is unused.
+        if not wait_database_released(probe.instance, timeout=max(0, deadline - time.monotonic())):
+            raise TimeoutError("verification owner release unconfirmed; staging retained")
+        Path(path).with_name("closed").touch()
+        with self.lock:
+            self.verification_probes.pop(path, None)
+
     def invoke(self, channel, attempt, command, deadline, public_started):
         from ida_nexus import discover_databases
         kind = command["command"]
         if kind == "open":
             options = dict(command["options"])
+            wait_analysis = options.pop("wait_analysis", False)
+            verification = options.pop("verification_idb", None)
+            snapshot = options.pop("verify_input_snapshot", None)
             attach = options.pop("attach_instance", None)
             options["startup_timeout"] = max(0.001, deadline - time.monotonic())
             options["worker_env"] = dict(os.environ)
             options["worker_cwd"] = os.environ["IDA_CLI_HOME"]
+            if verification is not None:
+                original = Path(command["path"])
+                copy_hash = hashlib.sha256(Path(verification).read_bytes()).digest()
+                if hashlib.sha256(original.read_bytes()).digest() != copy_hash:
+                    raise ValueError("legacy cache changed during verification copy; refusing reuse")
+                expected = hashlib.sha256(Path(snapshot).read_bytes()).hexdigest()
+                with self.lock:
+                    self.verification_probes[verification] = None
+                public_started[0] = True
+                probe = self.Handle.open(str(verification), options=self.Options(
+                    startup_timeout=max(0.001, deadline - time.monotonic()), auto_analysis=False,
+                    worker_env=dict(os.environ), worker_cwd=os.environ["IDA_CLI_HOME"]))
+                with self.lock:
+                    self.verification_probes[verification] = probe
+                try:
+                    proof = probe.execute_python(
+                        "import ida_nalt\nsha = ida_nalt.retrieve_input_file_sha256()\nresult = sha.hex() if sha else None",
+                        timeout=max(0.001, deadline - time.monotonic()))["result"]
+                finally:
+                    self.close_verification(verification, probe, deadline)
+                # A confirmed closed probe has no lease or operation left.
+                # The following verification rejections are certain failures.
+                public_started[0] = False
+                if not isinstance(proof, str) or len(proof) != 64 or proof == "0" * 64:
+                    raise ValueError("legacy cache input SHA256 is unavailable; refusing reuse without changing original")
+                if proof != expected:
+                    raise ValueError("legacy cache input SHA256 mismatch; refusing reuse without changing original")
+                if hashlib.sha256(original.read_bytes()).digest() != copy_hash:
+                    raise ValueError("legacy cache changed during Nexus verification; refusing reuse")
+                options["startup_timeout"] = max(0.001, deadline - time.monotonic())
             if attach:
                 instances = [x.instance for x in discover_databases() if x.instance.record_id == attach]
                 if len(instances) != 1:
@@ -237,6 +289,8 @@ class Bridge:
             try:
                 handle.set_disconnect_callback(lambda _handle, reason: self.disconnected(lease, reason, attempt))
                 actual = handle.execute_python("import ida_kernwin\nresult = ida_kernwin.get_kernel_version()", timeout=None)
+                if wait_analysis:
+                    handle.wait_autoanalysis(timeout=max(0.001, deadline - time.monotonic()))
             except Exception as exc:
                 handle.close(wait_for_database=True, timeout=5)
                 with self.lock:
@@ -269,6 +323,8 @@ class Bridge:
                 code = f"import ida_name\nresult = ida_name.get_name({int(params['address'])})"
             elif method == "rename_address":
                 code = f"import ida_name\nresult = ida_name.set_name({int(params['address'])}, {str(params['name'])!r}, ida_name.SN_CHECK)"
+            elif method in TOOL_METHODS:
+                code = TOOL_SOURCE + f"\nresult = invoke({method!r}, {params!r})\n"
             else:
                 raise ValueError("unsupported bridge method")
             operation_id = command["identity"]["operation_id"]
@@ -376,6 +432,7 @@ class Bridge:
         self.proof_wakeup.set()
         with self.lock:
             handles = list(self.handles.values())
+            verifications = list(self.verification_probes.items())
             operations = list(self.executing.items())
         for operation_id, record in operations:
             try:
@@ -387,6 +444,14 @@ class Bridge:
                 handle.close(wait_for_database=True, timeout=5)
             except Exception as exc:
                 print(f"lease cleanup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        for path, handle in verifications:
+            if handle is None:
+                print(f"verification startup unconfirmed; staging retained: {path}", file=sys.stderr)
+                continue
+            try:
+                self.close_verification(path, handle, time.monotonic() + 5)
+            except Exception as exc:
+                print(f"verification cleanup unconfirmed; staging retained: {path}: {type(exc).__name__}", file=sys.stderr)
         for channel in (self.business, self.control):
             channel.socket.close()
         for pool in (self.business_pool, self.cancel_pool, self.release_pool, self.proof_pool):

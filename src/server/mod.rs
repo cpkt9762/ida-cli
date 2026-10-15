@@ -50,13 +50,6 @@ where
         Self { call_router }
     }
 
-    async fn call(
-        &self,
-        context: ToolCallContext<'_, S>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.call_router.call(context).await
-    }
-
     fn list_all(&self) -> Vec<Tool> {
         let mut tools = Vec::new();
         for info in tool_registry::all_tools() {
@@ -69,6 +62,29 @@ where
 
     fn get(&self, name: &str) -> Option<&Tool> {
         self.call_router.map.get(name).map(|route| &route.attr)
+    }
+}
+
+impl ToolMux<IdaMcpServer> {
+    async fn call(
+        &self,
+        context: ToolCallContext<'_, IdaMcpServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let ServerMode::Router(router) = &context.service.mode {
+            if router.uses_nexus()
+                && !matches!(
+                    context.name.as_ref(),
+                    "open_idb" | "close_idb" | "tool_catalog" | "tool_help"
+                )
+            {
+                if let Err(error) = crate::router::nexus_tools::Tools::require(
+                    tool_registry::primary_name_for(&context.name),
+                ) {
+                    return Ok(error.to_tool_result());
+                }
+            }
+        }
+        self.call_router.call(context).await
     }
 }
 
@@ -612,6 +628,9 @@ impl IdaMcpServer {
         router: &crate::router::RouterState,
         req: &OpenIdbRequest,
     ) -> Result<CallToolResult, McpError> {
+        if router.uses_nexus() {
+            return self.open_idb_nexus(router, req).await;
+        }
         let limit = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut preparation = crate::preprocess::current().unwrap_or_else(|| {
             crate::preprocess::Preparation::new(std::time::Duration::from_secs(120))
@@ -722,6 +741,57 @@ impl IdaMcpServer {
             }
         }
         Ok(response)
+    }
+
+    async fn open_idb_nexus(
+        &self,
+        router: &crate::router::RouterState,
+        req: &OpenIdbRequest,
+    ) -> Result<CallToolResult, McpError> {
+        if req.load_debug_info == Some(true)
+            || req.debug_info_path.is_some()
+            || req.force == Some(true)
+            || req.file_type.is_some()
+        {
+            return Ok(ToolError::NotSupported(
+                "Nexus N4 debug-info, force and custom loader options are not implemented".into(),
+            )
+            .to_tool_result());
+        }
+        let preparation = crate::preprocess::current().unwrap_or_else(|| {
+            crate::preprocess::Preparation::new(std::time::Duration::from_secs(120))
+        });
+        let (handle, token) = match router
+            .ensure_worker_prepared(&req.path, None, None, preparation.clone())
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let mut reference =
+            crate::router::nexus_tools::ReferenceGuard::new(router.clone(), token.clone());
+        let mut value = match router.nexus_open_details(&handle, preparation).await {
+            Ok(value) => value,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        value["db_handle"] = json!(handle);
+        value["close_token"] = json!(token);
+        value["close_hint"] = json!(self.close_hint());
+        value["quick_tools"] = json!([
+            "list_functions",
+            "get_function_by_name",
+            "disassemble_function",
+            "decompile_function",
+            "get_xrefs_to",
+            "list_strings",
+            "close_idb"
+        ]);
+        let encoded = match serde_json::to_string_pretty(&value) {
+            Ok(encoded) => encoded,
+            Err(error) => return Ok(ToolError::IdaError(error.to_string()).to_tool_result()),
+        };
+        reference.transfer();
+        Ok(CallToolResult::success(vec![Content::text(encoded)]))
     }
 
     async fn detect_sbpf_entry(
@@ -843,6 +913,20 @@ impl IdaMcpServer {
         router: &crate::router::RouterState,
         req: &CloseIdbRequest,
     ) -> Result<CallToolResult, McpError> {
+        if router.uses_nexus() {
+            let Some(token) = req.token.as_deref() else {
+                return Ok(ToolError::InvalidParams(
+                    "close_idb requires close_token in Nexus mode".into(),
+                )
+                .to_tool_result());
+            };
+            return match router.nexus_close_token(token).await {
+                Ok(None) => Ok(CallToolResult::success(vec![Content::text("close_idb ignored: invalid close_token")])),
+                Ok(Some((_,remaining))) if remaining > 0 => Ok(CallToolResult::success(vec![Content::text(format!("Reference released ({remaining} client(s) still active, database remains open)"))])),
+                Ok(Some(_)) => Ok(CallToolResult::success(vec![Content::text("Database closed")])),
+                Err(error) => Ok(error.to_tool_result()),
+            };
+        }
         let token = match req.token.as_deref() {
             Some(t) => t,
             None => {

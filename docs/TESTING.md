@@ -171,12 +171,41 @@ Nexus output is the central cache IDB; custom output without a packed base is
 not automatically recoverable upstream. Public tool migration is N4;
 E08/E18/E19 full real-chain coverage remains later work.
 
+## Nexus N4 output contract
+
+N4 adds `tests/nexus_contract_e2e.rs`. Prepare a separate fresh patched environment
+and use the fixed N0 binary recorded below; the verifier rejects a missing baseline
+and the comparison driver verifies its SHA256. No installed CLI or old source is
+used. Run from this worktree, with the same explicit target and SDK as N3:
+
+```bash
+timeout 210s "$N4_ROOT/venv/bin/python" scripts/verify_nexus_e2e.py \
+  --root "$N4_ROOT" --target "$CARGO_TARGET_DIR" --sdk "$IDASDKDIR" \
+  --ipc-root /tmp/n4-contract --suite contract --baseline "$N0_BASELINE"
+```
+
+The suite has four actual tests and four distinct PASS records: E04 compares 33
+cases across all twelve initial methods; E16 exercises the shared runtime/error
+cases through CLI, stdio MCP and HTTP MCP, including independent HTTP close tokens;
+E17 checks Unicode, separate streams, script errors, concurrent response identity,
+deadline cancellation and abandoned CLI lease release; E22 uses three databases
+saved by N0, preserving user names/comments on a SHA256 match and preserving original
+bytes when the recorded hash is missing or different. Warm references are independent
+and must release before reopening. E22 has a 90-second inner driver timeout because
+it builds three native baseline databases; other drivers have 30 seconds. The whole
+suite remains bounded at 180 seconds, with the 210-second outer cleanup supervisor.
+`contract.log`, `contract-result.json`, `E*-result.json`, `comparison.json`, per-client
+logs and the process ledger provide evidence. The baseline error presentation and
+cache envelopes remain transport-specific: CLI writes large JSON to its cache, while
+MCP retains its existing inline response. Only input path spelling is normalized,
+after verifying identical SHA256; output structure and text are compared exactly.
+
 ## Nexus N0 isolation and baseline
 
 N0 prepares and verifies the dependency environment only. Business handlers
-still use the existing backend. The N3 lifecycle target is implemented; the other
-`nexus_*_e2e` targets in the migration plan remain future work and cannot be counted
-as executed tests.
+use their selected development path. N3 lifecycle and N4 contract targets are
+implemented; other planned `nexus_*_e2e` targets remain future work and cannot be
+counted as executed tests.
 
 Use a new worktree and an external, nonexistent environment directory. Install
 GNU `timeout` first. Select an IDA 9.4+ installation with its existing legal

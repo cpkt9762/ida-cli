@@ -419,6 +419,12 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N4：首批方法与输出兼容
 
+- N4 开发接线使用临时环境选择 `IDA_CLI_NEXUS_DEV=1`，默认保持旧路径；此入口及 `nexus_tools` 中相关配置分支是 **N9 必删项**，不是最终用户功能。未实现的方法在 CLI 接纳和 MCP 工具分发阶段明确拒绝，无逐方法 fallback。
+- 首批 12 个方法经 `NexusSessions::queue/dispatch` 的 Execute 进入常驻 bridge：数据库信息、分析状态、函数列表/定位、xrefs、三种反汇编、单函数反编译和 `run_script`。保留原请求结构、typed 参数解析、分页末页字段省略、地址及错误文本；大响应沿用已有 CLI response cache，MCP 保持原内联包装。
+- `run_script` 保留全局命名空间、独立输出流、每流 1 MiB UTF-8 截断，以及 N0 的空异常字符串和 SystemExit/KeyboardInterrupt 包装语义；Nexus 内部取消中断继续向外传播，不吞掉停止证明。
+- IDA 9.5 的 Python 绑定没有 processor 长名称访问器。业务代码通过公开 SDK `get_ph()` / `processor_t.psnames,plnames` 读取，限制 runtime 9.5、接口 900、64 位指针，并核对公开字段及当前 subtype；失败明确报错，不换用短名称。其他 SDK/runtime 的长名称适配尚未验证。
+- 旧缓存先复制到隔离 verification IDB，通过 Nexus 读取其中记录的 SHA256；副本关闭确认后才判断匹配，且核对原 packed 文件未变。匹配后附加原库并关闭 autoanalysis；拒绝时不发布输入、不打开或覆盖原库。预热采用独立 lease，业务 opener 关闭不会释放 warm 引用。验证副本交付后须凭关闭确认才清理；启动或 close 结果未知时保留 staging 和 bridge 跟踪，不把未知状态当成停止。
+- 真实验收 target 为 `tests/nexus_contract_e2e.rs`，对照脚本仅依赖固定 N0 二进制与隔离测试支持，不依赖旧实现源码。E04 只允许把已核验输入 SHA256 相同的 `input_file_path` 规范化；结构、地址、类型、错误和反编译文本均严格比较。开发对照 33 项已通过；正式套件及最终证据见 N4 报告，N4 是否验收由编排者裁定。
 - 旧缓存兼容是硬性要求（E22）：已有缓存 IDB 没有输入副本时，通过 Nexus 读取该 IDB 自身记录的 input file SHA256，与当前输入 SHA256 比较；一致才接受复用。无法验证或不一致时明确拒绝，不重新分析，也不覆盖用户原库。N4 必须验证匹配复用保留用户修改、无法验证和不匹配均保留原文件；不得沿用 N3 对无副本 IDB 一律拒绝的暂定策略作为迁移完成证据。本条仅制定 N4 方针，N3-F2 不实现。
 - 接通数据库信息、分析状态、函数列表/定位、xrefs、反汇编、单函数反编译及 `run_script`。
 - 统一现有参数、分页、地址表示、stdout/stderr、错误和大响应落盘行为。

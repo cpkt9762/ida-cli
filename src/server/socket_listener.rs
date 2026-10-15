@@ -98,6 +98,10 @@ async fn handle_cli_connection(
             "status" | "list_tasks" | "task_status" | "cancel_task"
         )
     });
+    let nexus_shutdown = router.uses_nexus()
+        && parsed
+            .as_ref()
+            .is_ok_and(|req| primary_name_for(&req.method) == "shutdown");
     let gate = if control { control_gate } else { business_gate };
     let execution_permit = gate.try_acquire_owned();
     let resp = match parsed {
@@ -133,6 +137,9 @@ async fn handle_cli_connection(
         writer.flush().await
     })
     .await??;
+    if nexus_shutdown {
+        shutdown.cancel();
+    }
     Ok(())
 }
 
@@ -145,6 +152,10 @@ impl Drop for CliRefGuard {
     fn drop(&mut self) {
         let router = self.router.clone();
         let token = self.token.clone();
+        if router.uses_nexus() {
+            crate::router::nexus_tools::Tools::abandon(router, token);
+            return;
+        }
         tokio::spawn(async move {
             router.release_ref_token(&token).await;
         });
@@ -192,7 +203,9 @@ async fn dispatch_cli_request(
             router.shutdown_all().await;
             // Trip the service-wide cancel token so the outer transport loop
             // (stdio or HTTP) also exits instead of leaving a zombie server.
-            shutdown.cancel();
+            if !router.uses_nexus() {
+                shutdown.cancel();
+            }
             let resp = RpcResponse::ok(
                 &req.id,
                 serde_json::json!({"ok": true, "message": "server shutting down"}),
@@ -360,6 +373,11 @@ async fn dispatch_cli_request(
         }
 
         _ => {
+            if router.uses_nexus() {
+                if let Err(error) = crate::router::nexus_tools::Tools::require(method) {
+                    return (RpcResponse::err(&req.id, -32000, error.to_string()), None);
+                }
+            }
             let maximum = if method == "open" { 3600 } else { 600 };
             let seconds = req
                 .params

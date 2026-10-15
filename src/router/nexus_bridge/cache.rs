@@ -10,6 +10,52 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub struct PreparedOpen {
+    pub path: PathBuf,
+    pub options: serde_json::Value,
+    verification: Option<PathBuf>,
+    verification_handed_off: bool,
+}
+impl Drop for PreparedOpen {
+    fn drop(&mut self) {
+        if let Some(path) = &self.verification {
+            if self.verification_handed_off && !path.join("closed").is_file() {
+                tracing::warn!(path = %path.display(), "Nexus verification close unconfirmed; staging retained");
+                return;
+            }
+            if let Err(error) = std::fs::remove_dir_all(path) {
+                tracing::warn!(%error,"Nexus cache verification copy cleanup failed");
+            }
+        }
+    }
+}
+impl PreparedOpen {
+    pub fn handed_off(&mut self) {
+        self.verification_handed_off = true;
+    }
+    fn plain(path: PathBuf) -> Self {
+        Self {
+            path,
+            options: serde_json::json!({"wait_analysis":true}),
+            verification: None,
+            verification_handed_off: false,
+        }
+    }
+}
+pub async fn prepare_n4_open(
+    path: PathBuf,
+    cache: PathBuf,
+    preparation: &Preparation,
+) -> Result<PreparedOpen, ToolError> {
+    let preparing = preparation.clone();
+    preparation
+        .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+            prepare_impl(path, cache, &preparing, true)
+        }))
+        .await?
+        .map_err(|error| ToolError::IdaError(format!("Nexus cache preparation: {error:#}")))
+}
+
 /// Existing IDBs retain their canonical identity. Raw input is published without
 /// replacement beside the content-addressed IDB, so its default Nexus output is
 /// the central cache destination, including recovery without a packed base.
@@ -43,10 +89,21 @@ fn digest(path: &std::path::Path, preparation: &Preparation) -> anyhow::Result<b
 }
 
 fn prepare(path: PathBuf, cache: PathBuf, preparation: &Preparation) -> anyhow::Result<PathBuf> {
+    Ok(prepare_impl(path, cache, preparation, false)?.path.clone())
+}
+
+fn prepare_impl(
+    path: PathBuf,
+    cache: PathBuf,
+    preparation: &Preparation,
+    allow_legacy: bool,
+) -> anyhow::Result<PreparedOpen> {
     preparation.check()?;
     let path = path.canonicalize()?;
     if path.extension().is_some_and(|x| x == "i64" || x == "idb") {
-        return Ok(path);
+        let mut prepared = PreparedOpen::plain(path);
+        prepared.options = serde_json::json!({"auto_analysis":false});
+        return Ok(prepared);
     }
     std::fs::create_dir_all(&cache)?;
     static IDS: AtomicU64 = AtomicU64::new(1);
@@ -109,9 +166,36 @@ fn prepare(path: PathBuf, cache: PathBuf, preparation: &Preparation) -> anyhow::
         if digest(&input, preparation)? != hash {
             anyhow::bail!("central cache input collision; refusing replacement");
         }
-        return Ok(input);
+        if allow_legacy && idb.exists() {
+            let mut prepared = PreparedOpen::plain(idb);
+            prepared.options = serde_json::json!({"auto_analysis":false});
+            return Ok(prepared);
+        }
+        return Ok(PreparedOpen::plain(input));
     }
     if idb.exists() {
+        if allow_legacy {
+            // Rejecting verification must never open/save the user's original.
+            // Nexus inspects a packed copy with autoanalysis disabled first.
+            let directory = cache.join(format!(
+                ".nexus-verify-{}-{}",
+                std::process::id(),
+                IDS.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&directory)?;
+            let prepared = PreparedOpen {
+                path: idb.clone(),
+                options: serde_json::json!({"verification_idb":directory.join("probe.i64"),
+                    "verify_input_snapshot":directory.join("input"),"auto_analysis":false}),
+                verification: Some(directory.clone()),
+                verification_handed_off: false,
+            };
+            std::fs::copy(&idb, directory.join("probe.i64"))?;
+            std::fs::rename(&staging, directory.join("input"))?;
+            drop(remove);
+            preparation.check()?;
+            return Ok(prepared);
+        }
         anyhow::bail!(
             "existing central IDB has no input snapshot proving its hash; refusing reuse"
         );
@@ -128,7 +212,7 @@ fn prepare(path: PathBuf, cache: PathBuf, preparation: &Preparation) -> anyhow::
         }
         // Another opener published the identical snapshot. Never overwrite it.
     }
-    Ok(input)
+    Ok(PreparedOpen::plain(input))
 }
 
 #[cfg(test)]
@@ -147,6 +231,39 @@ fn hook(phase: &str) {
 mod f1_regressions {
     use super::*;
     use std::time::Duration;
+    #[test]
+    fn legacy_verification_staging_requires_confirmed_close_after_handoff() {
+        let root = root("verification-close");
+        let input = root.join("raw");
+        let cache = root.join("idb");
+        std::fs::write(&input, b"test input").unwrap();
+        std::fs::create_dir(&cache).unwrap();
+        let short = blake3::hash(b"test input").to_hex()[..12].to_string();
+        let idb = cache.join(format!("raw.{short}.dylib.i64"));
+        std::fs::write(&idb, b"synthetic packed IDB").unwrap();
+        for (handed_off, closed) in [(false, false), (true, false), (true, true)] {
+            let mut prepared = prepare_impl(
+                input.clone(),
+                cache.clone(),
+                &Preparation::new(Duration::from_secs(10)),
+                true,
+            )
+            .expect("prepare a legacy verification copy");
+            let directory = prepared.verification.clone().unwrap();
+            if handed_off {
+                prepared.handed_off();
+            }
+            if closed {
+                std::fs::write(directory.join("closed"), b"").unwrap();
+            }
+            drop(prepared);
+            assert_eq!(directory.exists(), handed_off && !closed);
+            assert_eq!(std::fs::read(&idb).unwrap(), b"synthetic packed IDB");
+            if directory.exists() {
+                std::fs::remove_dir_all(directory).expect("remove synthetic retained probe");
+            }
+        }
+    }
     struct TestRoot(PathBuf);
     impl std::ops::Deref for TestRoot {
         type Target = std::path::Path;
