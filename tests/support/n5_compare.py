@@ -42,19 +42,39 @@ def main():
         ("batch_decompile",{"addresses":[ea,other,ea]}),
         ("search_pseudocode",{"pattern":"return","limit":100}),
         ("run_script",{"code":"assert N5_FAULT.unhook(); del N5_FAULT"})]
+    # P2-1/P2-2: preserve scalar JSON strings and the exact Rust u64 grammar.
+    scalars = ["4096", "null", '"0x1000"', "true", "-1", "[]", "{}", "1.0"]
+    addresses = ["0x10_00", "１２３", "0x 1000", "-0", "-1", "+0", "+4096",
+        "0x+1000", "0X1000", "0x1000", "1000", "01000", "0b1000", "0o1000",
+        "0x", "0X", "", " ", "0x-0", "0x1_0", "1_000", "0xＦＦ", "0x١٠",
+        "18446744073709551615", "18446744073709551616", "0xffffffffffffffff",
+        "0x10000000000000000", "\t4096\r\n", "\u00854096\u00a0", "\u001c4096\u001f",
+        True, None, -1, 0, 18446744073709551615]
+    matrix += [("batch_decompile", {"addresses": value}) for value in scalars]
+    matrix += [("batch_decompile", {"addresses": addresses})]
+    # N4 methods resolve their address inside tools.py, independently of slices.
+    matrix += [("get_function_at_address", {"address": value}) for value in addresses[:30]]
     observations=[]
+    mismatches=[]
     try:
         for method,params in matrix:
             expected=old.rpc(method,params);expected.pop("jsonrpc",None);expected.pop("id",None)
             actual=new.direct(method,params)
-            assert json_equal(normalized(expected,sample),normalized(actual,new_sample)),(method,params,expected,actual)
+            if "error" in expected:
+                # Same exact CLI presentation rule as N4's strict comparator.
+                equal = actual.get("exit") == 1 and actual.get("error") == "Error: " + expected["error"]["message"]
+            else:
+                equal = json_equal(normalized(expected,sample),normalized(actual,new_sample))
+            if not equal:
+                mismatches.append({"method":method,"params":params,"baseline":expected,"nexus":actual})
             if method=="batch_decompile" and params.get("addresses")==[ea,other,ea] and len(observations)>11:
                 assert expected["result"][0]["success"] is False
                 assert expected["result"][1]["success"] is True
-            observations.append({"method":method,"params":params,"baseline":expected,"nexus":actual,"status":"PASS"})
+            observations.append({"method":method,"params":params,"baseline":expected,"nexus":actual,"status":"PASS" if equal else "FAIL"})
     finally:
-        (env.root/"n5-comparison.json").write_text(json.dumps({"baseline_sha256":digest(baseline),"observations":observations},ensure_ascii=False,indent=2)+"\n")
+        (env.root/"n5-comparison.json").write_text(json.dumps({"baseline_sha256":digest(baseline),"observations":observations,"mismatches":mismatches},ensure_ascii=False,indent=2)+"\n")
         old.rpc("close");old.rpc("shutdown");old.wait();new.stop()
-    assert len(observations)==15
+    assert not mismatches, f"strict comparison mismatches: {len(mismatches)}; see n5-comparison.json"
+    assert len(observations)==54
     (env.root/"N5-compare-result.json").write_text(json.dumps({"status":"PASS","case":"N5-compare","comparisons":len(observations)}))
 if __name__=="__main__":main()

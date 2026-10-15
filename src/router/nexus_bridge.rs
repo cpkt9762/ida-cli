@@ -199,6 +199,7 @@ impl NexusBridge {
                 child.wait().await?;
                 std::fs::remove_file(&business_path)?;
                 std::fs::remove_file(&control_path)?;
+                remove_lifetime_socket(&config.directory)?;
                 return Err(match other {
                     Ok(Err(error)) => error,
                     _ => anyhow::anyhow!("bridge readiness deadline expired"),
@@ -313,11 +314,13 @@ impl NexusBridge {
             Err(_) => {
                 child.kill().await?;
                 child.wait().await?;
+                remove_lifetime_socket(&self.directory)?;
                 anyhow::bail!(
                     "bridge cleanup deadline expired; own bridge killed, owner stop unconfirmed"
                 );
             }
         }
+        remove_lifetime_socket(&self.directory)?;
         self.state.fail("bridge stopped");
         Ok(())
     }
@@ -326,6 +329,7 @@ impl NexusBridge {
         let mut child = self.child.lock().await;
         child.kill().await?;
         child.wait().await?;
+        remove_lifetime_socket(&self.directory)?;
         self.state.fail("bridge terminated");
         Ok(())
     }
@@ -333,6 +337,9 @@ impl NexusBridge {
 impl Drop for NexusBridge {
     fn drop(&mut self) {
         self.state.fail("bridge owner dropped");
+        if let Err(error) = remove_lifetime_socket(&self.directory) {
+            tracing::warn!(%error, "bridge lifetime socket cleanup");
+        }
         for name in ["b", "c"] {
             if let Err(error) = std::fs::remove_file(self.directory.join(name)) {
                 if error.kind() != std::io::ErrorKind::NotFound {
@@ -340,6 +347,23 @@ impl Drop for NexusBridge {
                 }
             }
         }
+    }
+}
+// R-sock: the child owns l inside this parent's fresh 0700 directory. Also
+// remove it after waitpid/SIGKILL, when Python cannot run its finally block.
+fn remove_lifetime_socket(directory: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let path = directory.join("l");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {}
+        Ok(_) => return Err(std::io::Error::other("lifetime socket was replaced")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 async fn send(writer: &Writer, value: &Value) -> anyhow::Result<()> {
@@ -646,23 +670,49 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
     let _ordered = state.callbacks.lock().unwrap_or_else(|e| e.into_inner());
     let attempt: DeliveryAttempt = serde_json::from_value(event["attempt"].clone())?;
     let sequence = attempt.sequence.get();
-    {
+    let (known, superseded) = {
         let pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if pending.get(&sequence).is_none_or(|p| p.attempt != attempt) {
-            if event["event"] == "stopped" && !pending.contains_key(&sequence) {
-                state.endpoint.transition(|s, _| {
-                    let DeliveryTarget::Execute { identity } = &attempt.target else {
-                        return Err(invalid("stop target mismatch"));
-                    };
-                    s.delivery_status(&identity.lease.client_id, &attempt)?;
-                    s.execution_stopped(identity)?;
-                    Ok::<_, NexusError>(())
-                })?;
-                state.emit(event);
-                return Ok(());
-            }
-            anyhow::bail!("unknown or mismatched bridge attempt");
+        (
+            pending.get(&sequence).is_some_and(|p| p.attempt == attempt),
+            pending
+                .values()
+                .any(|p| p.attempt.target == attempt.target && p.attempt.sequence.get() > sequence),
+        )
+    };
+    if !known {
+        // A confirmed slice may have been delivered again, or already ended.
+        // Its old callbacks must not invalidate the shared physical connection.
+        let stopped_boundary = if let DeliveryTarget::Execute { identity } = &attempt.target {
+            state
+                .endpoint
+                .transition(|s, _| {
+                    s.operation_progress(&identity.lease.client_id, identity)
+                        .map(|progress| {
+                            progress.execution_stopped
+                                && (progress.status == OperationStatus::Queued
+                                    || progress.status.is_terminal())
+                        })
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if superseded || stopped_boundary {
+            return Ok(());
         }
+        if event["event"] == "stopped" {
+            state.endpoint.transition(|s, _| {
+                let DeliveryTarget::Execute { identity } = &attempt.target else {
+                    return Err(invalid("stop target mismatch"));
+                };
+                s.delivery_status(&identity.lease.client_id, &attempt)?;
+                s.execution_stopped(identity)?;
+                Ok::<_, NexusError>(())
+            })?;
+            state.emit(event);
+            return Ok(());
+        }
+        anyhow::bail!("unknown or mismatched bridge attempt");
     }
     let result = state.endpoint.transition(|s, _| -> Result<(), NexusError> {
         match name {

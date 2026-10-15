@@ -8,6 +8,7 @@ import re
 import shutil
 import signal
 import subprocess
+import stat
 import sys
 
 REPO = Path(__file__).resolve().parents[1]
@@ -68,6 +69,7 @@ def main():
                 parser.error("contract suite requires --baseline")
             variables["N4_BASELINE"] = str(args.baseline.resolve(strict=True))
         Path(variables["N3_IPC_ROOT"]).mkdir(mode=0o700, exist_ok=True)
+        (env.root / "ipc-root.json").write_text(json.dumps(str(ipc_root)))
         (env.root / "rust-env.json").write_text(json.dumps(variables, indent=2) + "\n")
         command = ["timeout", "180s", str(cargo), "test", "--locked", "--test", f"nexus_{args.suite}_e2e", "--", "--test-threads=1"]
         if args.case:
@@ -118,7 +120,10 @@ def main():
             result["cleanup_signalled_pids"] = env.cleanup()
             env.assert_clean()
             result["owned_processes"] = len(env.entries())
+            sockets = [str(path) for path in ipc_root.rglob("*") if stat.S_ISSOCK(path.lstat().st_mode)]
+            result["residual_sockets"] = sockets
             (env.root / f"{args.suite}-result.json").write_text(json.dumps(result, indent=2) + "\n")
+            assert not sockets, f"owned IPC socket files remain: {sockets}"
         print(json.dumps(result))
         return 0
 

@@ -94,11 +94,19 @@ else:
         original_version = importlib.metadata.version
         importlib.metadata.version = lambda name: "0.13.3" if name == "ida-nexus" else original_version(name)
     runtime = runpy.run_path(str(REPO / "nexus_bridge/bridge.py"), run_name="n4_fixture")
+    bridge_init = runtime["Bridge"].__init__
+    def registered_init(self, business, control, capacity):
+        bridge_init(self, business, control, capacity)
+        for path, pid in ((business, os.getppid()), (control, os.getppid()),
+                          (self.lifetime_path, os.getpid())):
+            env.record_socket(path, pid)
+    runtime["Bridge"].__init__ = registered_init
     send = runtime["Channel"].send
     def boundary_send(self, message):
         arm = env.root / "n5-boundary.arm"
         if message.get("event") == "yielded" and arm.exists():
             arm.unlink()
+            (env.root / "n5-boundary.identity").write_text(json.dumps(message["attempt"]["target"]["identity"]))
             (env.root / "n5-boundary.observed").touch()
             import time
             end = time.monotonic() + 15
@@ -108,33 +116,81 @@ else:
                 threading.Event().wait(0.005)
         return send(self, message)
     runtime["Channel"].send = boundary_send
+    # P2-3: a real socketpair relay stops consuming bytes, while the reverse
+    # grant/read lane and the separate control socket remain fully operational.
+    import socket
+    import time
     channel_write = runtime["Channel"].write
     def stalled_write(self):
         original_socket = self.socket
-        class StallSocket:
+        if not original_socket.getpeername().endswith('/b'):
+            return channel_write(self)
+        sender, consumer = socket.socketpair()
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        def armed():
+            arm = env.root / "n5-backpressure.arm"
+            return arm.exists() and arm.read_text() == str(os.getpid())
+        inflight = [0]
+        delivered = [0]
+        def relay():
+            try:
+                while not self.stopped.is_set():
+                    if armed():
+                        (env.root / "n5-backpressure.consumer-paused").touch()
+                        end = time.monotonic() + 15
+                        while not (env.root / "n5-backpressure.release").exists():
+                            if time.monotonic() >= end:
+                                raise TimeoutError("real consumer release missing")
+                            threading.Event().wait(.005)
+                    raw = consumer.recv(65536)
+                    if not raw:
+                        return
+                    original_socket.sendall(raw)
+                    delivered[0] += len(raw)
+            finally:
+                consumer.close()
+        threading.Thread(target=relay, daemon=True).start()
+        class RelaySocket:
             def __getattr__(self, name):
                 return getattr(original_socket, name)
             def sendall(self, raw):
-                if (original_socket.getpeername().endswith('/b')
-                        and (env.root / "n5-backpressure.arm").exists()
-                        and (env.root / "n5-backpressure.arm").read_text() == str(os.getpid())):
-                    (env.root / "n5-backpressure.observed").write_text(json.dumps({
-                        "capacity": self_channel.output.maxsize,
-                        "queued": self_channel.output.qsize()}))
-                    import time
-                    end = time.monotonic() + 15
-                    while not (env.root / "n5-backpressure.release").exists():
-                        if time.monotonic() >= end:
-                            raise TimeoutError("test pipe consumer release missing")
-                        threading.Event().wait(0.005)
-                return original_socket.sendall(raw)
-        self_channel = self
-        self.socket = StallSocket()
+                inflight[0] = len(raw)
+                sender.sendall(raw)  # Actual kernel write, blocked by full OS buffer.
+                inflight[0] = 0
+            def close(self):
+                sender.close()
+                original_socket.close()
+        def fill():
+            while not (armed() and inflight[0] > 1000000
+                       and (env.root / "n5-backpressure.consumer-paused").exists()):
+                if self.stopped.wait(.005):
+                    return
+            # Fill the actual unchanged production output queue behind the
+            # blocked large public Nexus result, plus one producer blocked in put.
+            for index in range(self.output.maxsize):
+                send(self, {"event":"local_status", "id":"n5-pressure", "index":index})
+            pending = threading.Event()
+            returned = threading.Event()
+            def extra():
+                pending.set()
+                send(self, {"event":"local_status", "id":"n5-pressure", "index":self.output.maxsize})
+                returned.set()
+            threading.Thread(target=extra, daemon=True).start()
+            assert pending.wait(1)
+            assert self.output.full() and not returned.is_set()
+            (env.root / "n5-backpressure.observed").write_text(json.dumps({
+                "capacity":self.output.maxsize, "queued":self.output.qsize(),
+                "blocked_send_bytes":inflight[0], "producer_returned":returned.is_set(),
+                "consumer_paused":True, "delivered_before_pause":delivered[0]}))
+        threading.Thread(target=fill, daemon=True).start()
+        self.socket = RelaySocket()
         return channel_write(self)
     runtime["Channel"].write = stalled_write
     invoke = runtime["Bridge"].invoke
     subscriptions = {}
     def record_task(self, channel, attempt, command, deadline, public_started):
+        if command.get("method") == "_n5_cleanup":
+            (env.root / "n5-cleanup-executed").write_text(json.dumps(command["params"]))
         action = command.get("params", {}).get("n5_subscription")
         if action:
             lease = command["identity"]["lease"]

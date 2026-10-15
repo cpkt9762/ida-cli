@@ -122,6 +122,7 @@ class Bridge:
         self.lifetime_path = str(Path(business).with_name("l"))
         self.lifetime_socket = socket.socket(socket.AF_UNIX)
         self.lifetime_socket.bind(self.lifetime_path)
+        self.lifetime_inode = Path(self.lifetime_path).lstat().st_ino
         self.lifetime_socket.listen(capacity)
         self.lifetimes = {}
         threading.Thread(target=self.accept_lifetimes, daemon=True).start()
@@ -441,10 +442,12 @@ class Bridge:
 
     def mark_unknown(self, operation_id, attempt):
         with self.lock:
-            self.unknown[operation_id] = attempt
             record = self.executing.get(operation_id)
-            if record is not None:
-                record["unknown"] = True
+            # A response/disconnect callback belongs to one physical delivery.
+            if record is None or record["attempt"] != attempt:
+                return
+            self.unknown[operation_id] = attempt
+            record["unknown"] = True
         # Also handles a cancel ACK received before the execution stream failed.
         self.proof_wakeup.set()
 
@@ -516,6 +519,12 @@ class Bridge:
             verifications = list(self.verification_probes.items())
             operations = list(self.executing.items())
         self.lifetime_socket.close()
+        # R-sock: unlink only our own socket, never a replacement at that path.
+        try:
+            if Path(self.lifetime_path).lstat().st_ino == self.lifetime_inode:
+                Path(self.lifetime_path).unlink()
+        except FileNotFoundError:
+            pass  # Parent may already have removed this exact owned endpoint.
         for lease, _handle in handles:
             self.drop_lifetime(lease["lease_id"])
         for operation_id, record in operations:

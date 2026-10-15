@@ -11,6 +11,27 @@ METHODS = ("get_database_info", "get_analysis_status", "list_functions",
            "batch_decompile", "search_pseudocode", "run_auto_analysis", "_n5_cleanup")
 
 
+def parse_address(raw):
+    """P2-2: rpc_dispatch::parse_address_value (Rust u64 + str::trim)."""
+    import re
+    if type(raw) is int:
+        return raw if 0 <= raw < 2**64 else None
+    if not isinstance(raw, str):
+        return None
+    # Rust char::is_whitespace excludes Python's extra U+001C..U+001F.
+    raw = raw.strip("\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003"
+                    "\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000")
+    hexadecimal = raw.startswith(("0x", "0X"))
+    digits = raw[2:] if hexadecimal else raw
+    if not re.fullmatch(r"\+?[0-9a-fA-F]+" if hexadecimal else r"\+?[0-9]+", digits):
+        return None
+    digits = digits.lstrip("+").lstrip("0") or "0"
+    if len(digits) > (16 if hexadecimal else 20):
+        return None
+    value = int(digits, 16 if hexadecimal else 10)
+    return value if value < 2**64 else None
+
+
 def invoke_slice(method, params, context, source):
     try:
         return _invoke_slice(method, params, context, source)
@@ -41,7 +62,7 @@ def _invoke_slice(method, params, context, source):
         return {"ok": True, "value": None}
     try:
         return module.step(method, params, context, lambda ea, multiple: invoke(
-            "decompile_function", {"address": ea, "_multiple": multiple}))
+            "decompile_function", {"address": ea, "_multiple": multiple}), parse_address)
     except Exception as exc:
         if str(exc).startswith(("数据库已变化", "一致性无法确认")):
             raise
@@ -150,18 +171,7 @@ def invoke(method, params):
                      if name == info["name"] or name in info["name"]), (None, None))
 
     def address():
-        value = params.get("address", params.get("addr"))
-        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 2**64:
-            return value
-        if isinstance(value, str):
-            value = value.strip()
-            try:
-                result = int(value[2:], 16) if value.startswith(("0x", "0X")) else int(value, 10)
-                if 0 <= result < 2**64:
-                    return result
-            except ValueError:
-                pass
-        return None
+        return parse_address(params.get("address", params.get("addr")))
 
     def target():
         ea = address()

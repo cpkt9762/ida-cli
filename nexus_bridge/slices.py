@@ -150,7 +150,7 @@ def release_lease(context, expected_incarnation=None):
             release(job, context)
 
 
-def step(method, params, context, decompile):
+def step(method, params, context, decompile, parse_address):
     """One function (or one autoanalysis address) per scheduling turn."""
     global counter
     import ida_auto
@@ -197,7 +197,10 @@ def step(method, params, context, decompile):
             addresses = params["addresses"]
             if isinstance(addresses, str):
                 try:
-                    addresses = json.loads(addresses)
+                    decoded = json.loads(addresses)
+                    # P2-1: Rust decodes into Vec<Value>, accepting only arrays.
+                    if isinstance(decoded, list):
+                        addresses = decoded
                 except ValueError:
                     addresses = [addresses]
             if not isinstance(addresses, list):
@@ -247,18 +250,3 @@ def step(method, params, context, decompile):
     except BaseException:
         release(job, context)
         raise
-
-
-def parse_address(raw):
-    if isinstance(raw, bool):
-        return None
-    if isinstance(raw, int):
-        return raw if 0 <= raw < 2**64 else None
-    if isinstance(raw, str):
-        try:
-            raw = raw.strip()
-            ea = int(raw[2:], 16) if raw.startswith(("0x", "0X")) else int(raw)
-            return ea if 0 <= ea < 2**64 else None
-        except ValueError:
-            return None
-    return None

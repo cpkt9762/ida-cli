@@ -13,6 +13,7 @@ from pathlib import Path
 import subprocess
 import selectors
 import signal
+import socket
 import sys
 import tempfile
 import unittest
@@ -45,6 +46,43 @@ def ledger(env, pids):
     env.ledger.write_text("".join(json.dumps({"schema": 2, "pid": pid,
                                            "identity": BIRTH, "command": ["mock"]}) + "\n"
                                   for pid in pids))
+
+
+class SocketRecoveryTests(unittest.TestCase):
+    def test_exact_journal_removes_dead_owner_socket_only(self):
+        with environment() as env, socket.socket(socket.AF_UNIX) as endpoint:
+            path = env.root / "owned"
+            endpoint.bind(str(path))
+            env.record_socket(path, os.getpid())
+            unrelated = env.root / "unrelated"
+            with socket.socket(socket.AF_UNIX) as other:
+                other.bind(str(unrelated))
+                with patch("nexus_env._current_identity", return_value=None):
+                    self.assertEqual(env.cleanup_sockets(), [str(path)])
+                self.assertFalse(path.exists())
+                self.assertTrue(unrelated.is_socket(), "no socket name scanning")
+
+    def test_socket_journal_preserves_replacement(self):
+        with environment() as env, socket.socket(socket.AF_UNIX) as endpoint:
+            path = env.root / "owned"
+            endpoint.bind(str(path))
+            env.record_socket(path, os.getpid())
+            path.unlink()
+            path.write_text("replacement")
+            with patch("nexus_env._current_identity", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "replaced"):
+                    env.cleanup_sockets()
+            self.assertEqual(path.read_text(), "replacement")
+
+    def test_socket_journal_refuses_live_owner(self):
+        with environment() as env, socket.socket(socket.AF_UNIX) as endpoint:
+            path = env.root / "owned"
+            endpoint.bind(str(path))
+            env.record_socket(path, os.getpid())
+            with patch("nexus_env.time.monotonic", side_effect=[0, 4]):
+                with self.assertRaisesRegex(RuntimeError, "still alive"):
+                    env.cleanup_sockets()
+            self.assertTrue(path.is_socket())
 
 
 class ClientPatchEnvironmentTests(unittest.TestCase):

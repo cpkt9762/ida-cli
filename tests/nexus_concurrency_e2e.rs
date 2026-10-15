@@ -283,6 +283,7 @@ async fn e10_actual_router_batch_yields_to_short_query() {
     let output = search.await.unwrap().unwrap();
     assert_eq!(output["matches"], json!([]));
     assert!(output["total_searched"].as_u64().unwrap() >= 80);
+    router_cancelled_slice_cleanup(&router, &handle).await;
     router.nexus_close_token(&token).await.unwrap();
     router.shutdown_all().await;
     close(&mut b, &lb).await;
@@ -290,6 +291,78 @@ async fn e10_actual_router_batch_yields_to_short_query() {
         "E10",
         json!({"batch":40,"search_functions":output["total_searched"],"short_before_completion":true,"b_during_batch_and_search":true}),
     );
+}
+
+// Exercise SliceCleanup::drop through the actual router, retaining its lease.
+async fn router_cancelled_slice_cleanup(router: &ida_mcp::router::RouterState, handle: &str) {
+    for name in ["n5-boundary.observed", "n5-boundary.release"] {
+        std::fs::remove_file(root().join(name)).unwrap();
+    }
+    std::fs::write(root().join("n5-boundary.arm"), "").unwrap();
+    let r = router.clone();
+    let h = handle.to_owned();
+    let long = tokio::spawn(async move {
+        r.route_request(
+            Some(&h),
+            "batch_decompile",
+            json!({"addresses":["bad","bad"]}),
+        )
+        .await
+    });
+    barrier(&root().join("n5-boundary.observed")).await;
+    let operation: OperationIdentity = serde_json::from_str(
+        &std::fs::read_to_string(root().join("n5-boundary.identity")).unwrap(),
+    )
+    .unwrap();
+    let r = router.clone();
+    let h = handle.to_owned();
+    let marker = root().join("cleanup-blocker.started");
+    let release = root().join("cleanup-blocker.release");
+    let code = format!(
+        "from pathlib import Path\nPath({:?}).touch()\nwhile not Path({:?}).exists():\n    pass",
+        marker.to_str().unwrap(),
+        release.to_str().unwrap()
+    );
+    let blocker = tokio::spawn(async move {
+        r.route_request(Some(&h), "run_script", json!({"code":code}))
+            .await
+    });
+    response(async {
+        while router
+            .status_snapshot()
+            .await
+            .workers
+            .iter()
+            .all(|w| w.pending_requests < 2)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    std::fs::write(root().join("n5-boundary.release"), "").unwrap();
+    barrier(&marker).await;
+    assert!(!long.is_finished(), "continuation queued behind blocker");
+    let state = router
+        .nexus_endpoint()
+        .transition(|s, _| s.operation_progress(&operation.lease.client_id, &operation))
+        .unwrap();
+    assert_eq!(state.status, OperationStatus::Queued);
+    assert!(state.execution_stopped, "previous slice confirmed stopped");
+    long.abort();
+    assert!(long.await.unwrap_err().is_cancelled());
+    std::fs::write(release, "").unwrap();
+    assert_eq!(response(blocker).await.unwrap().unwrap()["success"], true);
+    response(async {
+        loop {
+            let state = router.route_request(Some(handle), "run_script", json!({"code":"import sys,json\nm=sys.modules['_ida_cli_nexus_slices_v1']\nprint(json.dumps([len(m.jobs),m.counter is None]))"})).await.unwrap();
+            if state["stdout"] == "[0, true]\n" { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await;
+    assert_eq!(router.status_snapshot().await.workers[0].ref_count, 1);
+    assert!(std::fs::read_to_string(root().join("n5-cleanup-executed"))
+        .unwrap()
+        .contains("_n5_job"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -538,10 +611,34 @@ async fn e18_real_stalled_bridge_output_has_bounded_backpressure() {
     .unwrap();
     assert!(evidence["capacity"].as_u64().unwrap() > 0);
     assert!(evidence["queued"].as_u64().unwrap() <= evidence["capacity"].as_u64().unwrap());
+    assert_eq!(
+        evidence["queued"], evidence["capacity"],
+        "real queue must fill"
+    );
+    assert!(evidence["blocked_send_bytes"].as_u64().unwrap() > 1000000);
+    assert_eq!(evidence["producer_returned"], false);
+    assert_eq!(evidence["consumer_paused"], true);
     response(a._router.status_snapshot()).await;
     response(a.bridge.status("e18-status")).await.unwrap();
     response(a.event(|v| v["event"] == "local_status")).await;
     response(b.value(&lb, "database_info", json!({}))).await;
+    // Drain every synthetic event concurrently, preserving strict no-loss checks.
+    let mut events = std::mem::replace(&mut a.events, a.bridge.subscribe());
+    let capacity = evidence["capacity"].as_u64().unwrap();
+    let drain = tokio::spawn(async move {
+        for index in 0..=capacity {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("no lag or event loss after resume");
+                if event["event"] == "local_status" && event["id"] == "n5-pressure" {
+                    assert_eq!(event["index"], index);
+                    break;
+                }
+            }
+        }
+    });
     std::fs::remove_file(root().join("n5-backpressure.arm")).unwrap();
     std::fs::write(root().join("n5-backpressure.release"), "").unwrap();
     assert_eq!(
@@ -552,6 +649,9 @@ async fn e18_real_stalled_bridge_output_has_bounded_backpressure() {
             .count(),
         1000000
     );
+    response(drain).await.unwrap();
+    a.events = a.bridge.subscribe();
+    response(a.value(&la, "database_info", json!({}))).await;
     close(&mut a, &la).await;
     close(&mut b, &lb).await;
     passed("E18", evidence);
@@ -655,6 +755,6 @@ fn n5_batch_and_search_match_fixed_legacy_binary() {
         &std::fs::read_to_string(root().join("N5-compare-result.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(evidence["comparisons"], 15);
+    assert_eq!(evidence["comparisons"], 54);
     passed("N5-compare", evidence);
 }

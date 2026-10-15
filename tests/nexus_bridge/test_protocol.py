@@ -306,3 +306,55 @@ def test_proof_deadline_preserves_unknown_and_never_claims_stop(harness, monkeyp
             break
     assert "op-1" in harness.bridge.unknown
     assert harness.bridge.executing["op-1"]["expired"]
+
+
+def test_old_attempt_callback_cannot_change_second_delivery(harness, monkeypatch):
+    """Late disconnect/finally from slice one cannot mutate slice two."""
+    harness.open()
+    gates = {name: threading.Event() for name in ("old", "new")}
+    started = {name: threading.Event() for name in gates}
+    original = harness.handle.execute_python
+    def controlled(code, **options):
+        if code.startswith("import time as _n5_time\n"):
+            guard, code = code.split("# nexus owner deadline checked\n", 1)
+            exec(guard, {})
+        if code in gates:
+            started[code].set()
+            assert gates[code].wait(3), "attempt release barrier"
+        return original(code, **options)
+    monkeypatch.setattr(harness.handle, "execute_python", controlled)
+    try:
+        old = harness.dispatch(0, harness.execute("old"))
+        assert harness.receive()["event"] == "ack"
+        assert started["old"].wait(1)
+        new = harness.dispatch(0, harness.execute("new"))
+        assert harness.receive()["event"] == "ack"
+        assert started["new"].wait(1)
+        harness.bridge.mark_unknown("op-1", old["attempt"])
+        current = harness.bridge.executing["op-1"]
+        assert current["attempt"] == new["attempt"]
+        assert current["unknown"] is False
+        assert "op-1" not in harness.bridge.unknown
+        gates["old"].set()
+        assert harness.receive()["attempt"] == old["attempt"]
+        assert harness.bridge.executing["op-1"] is current
+        gates["new"].set()
+        assert harness.receive()["attempt"] == new["attempt"]
+    finally:
+        for gate in gates.values():
+            gate.set()
+
+
+def test_close_removes_owned_lifetime_socket(harness):
+    path = Path(harness.bridge.lifetime_path)
+    assert path.is_socket()
+    harness.bridge.close()
+    assert not path.exists(), "normal close must unlink the lifetime endpoint"
+
+
+def test_close_preserves_replacement_at_lifetime_path(harness):
+    path = Path(harness.bridge.lifetime_path)
+    path.unlink()
+    path.write_text("replacement must survive")
+    harness.bridge.close()
+    assert path.read_text() == "replacement must survive"

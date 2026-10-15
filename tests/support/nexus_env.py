@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -224,6 +225,47 @@ class Environment:
             raise RuntimeError("process accounting unresolved: " + "; ".join(errors))
         return entries
 
+    def record_socket(self, path, owner_pid):
+        """R-sock recovery journal: exact path, inode/device and owner birth."""
+        path = Path(path).absolute()
+        metadata = path.lstat()
+        assert stat.S_ISSOCK(metadata.st_mode), path
+        owner = _current_identity(owner_pid)
+        assert valid_identity(owner), "socket owner identity must be confirmed"
+        with (self.root / "sockets.jsonl").open("a") as out:
+            out.write(json.dumps({"path": str(path), "dev": metadata.st_dev,
+                "ino": metadata.st_ino, "pid": owner_pid, "identity": owner}) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+
+    def cleanup_sockets(self):
+        ledger = self.root / "sockets.jsonl"
+        removed = []
+        for line in ledger.read_text().splitlines() if ledger.exists() else ():
+            entry = json.loads(line)
+            path = Path(entry["path"])
+            if not path.exists():
+                continue
+            end = time.monotonic() + 3
+            while same_process(_current_identity(entry["pid"]), entry["identity"]):
+                if time.monotonic() >= end:
+                    raise RuntimeError(f"socket owner still alive: {path}")
+                time.sleep(.02)
+            current = path.lstat()
+            if (not stat.S_ISSOCK(current.st_mode)
+                    or (current.st_dev, current.st_ino) != (entry["dev"], entry["ino"])):
+                raise RuntimeError(f"recorded socket replaced; refusing cleanup: {path}")
+            path.unlink()
+            removed.append(str(path))
+        return removed
+
+    def residual_sockets(self):
+        record = self.root / "ipc-root.json"
+        if not record.exists():
+            return []
+        return [str(path) for path in Path(json.loads(record.read_text())).rglob("*")
+                if stat.S_ISSOCK(path.lstat().st_mode)]
+
     def cleanup(self) -> list[int]:
         """Visit every held child and confirmed entry; aggregate uncertain failures."""
         killed, errors = [], []
@@ -244,6 +286,7 @@ class Environment:
                     errors.append(f"recorded PID {entry['pid']}: {error}")
         if errors:
             raise RuntimeError("cleanup incomplete: " + "; ".join(errors))
+        self.cleanup_sockets()
         return killed
 
     def _stop_recorded(self, entry):
@@ -286,3 +329,4 @@ class Environment:
             time.sleep(0.05)
         if live:
             raise AssertionError(f"owned processes still alive: {live}")
+        assert not self.residual_sockets(), f"owned IPC sockets remain: {self.residual_sockets()}"

@@ -191,6 +191,17 @@ impl Rig {
     }
     async fn close(self) {
         self.bridge.shutdown().await.unwrap();
+        let directory = self.root.join("ipc");
+        drop(self);
+        use std::os::unix::fs::FileTypeExt;
+        for path in std::fs::read_dir(directory).expect("gate 13 IPC directory") {
+            let path = path.expect("IPC entry").path();
+            assert!(
+                !path.symlink_metadata().unwrap().file_type().is_socket(),
+                "gate 13 socket residue: {}",
+                path.display()
+            );
+        }
     }
 }
 

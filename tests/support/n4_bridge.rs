@@ -123,3 +123,147 @@ async fn n4_fix_open_delivery_survives_broadcast_lag() {
         );
     });
 }
+
+#[tokio::test]
+async fn n5_old_delivery_callbacks_preserve_second_attempt_and_terminal_state() {
+    let mut caps = NexusCapabilities {
+        runtime: NexusRuntime {
+            ida: Version(9, 5, 0),
+            python: Version(3, 14, 7),
+            nexus: Some(Version(0, 13, 4)),
+            domain: Some(Version(0, 5, 1)),
+        },
+        methods: BTreeMap::new(),
+    };
+    caps.methods
+        .insert("batch_decompile".into(), MethodEffect::ReadOnly);
+    let endpoint = NexusEndpoint::with_capabilities(8, Ok(caps.clone()));
+    let mut lanes = endpoint.take_lanes().unwrap();
+    let (events, _) = broadcast::channel(8);
+    let state = Arc::new(State {
+        endpoint: endpoint.clone(),
+        callbacks: Mutex::new(()),
+        pending: Mutex::new(HashMap::new()),
+        leases: Mutex::new(HashMap::new()),
+        events,
+        open_replies: Mutex::new(HashMap::new()),
+        open_reply_capacity: 8,
+        failed: std::sync::atomic::AtomicBool::new(false),
+        stop: tokio_util::sync::CancellationToken::new(),
+    });
+    let lease = SessionLease {
+        client_id: ClientId::new("late-client").unwrap(),
+        lease_id: LeaseId::new("late-lease").unwrap(),
+        instance_id: InstanceId::new("late-owner").unwrap(),
+        generation: 1,
+        owner: OwnerKind::Managed,
+    };
+    let opened = endpoint.transition(|s, t| {
+        s.open(
+            &lease.client_id,
+            AcceptedRequest::new(
+                &SystemClock,
+                RequestId::new("late-open").unwrap(),
+                None,
+                "open",
+                json!({}),
+            )
+            .unwrap(),
+            OpenSpec {
+                operation_id: OperationId::new("late-open-op").unwrap(),
+                path: "/copy.i64".into(),
+                options: json!({}),
+            },
+            t,
+        )
+        .unwrap()
+    });
+    let mut open = lanes.business.recv().await.unwrap();
+    open.begin().unwrap();
+    open.acknowledged().unwrap();
+    let op = endpoint.transition(|s, _| {
+        assert!(matches!(
+            s.opened(&opened, lease.clone(), caps).unwrap(),
+            OpenDisposition::Ready(_)
+        ));
+        s.queue(
+            &lease.client_id,
+            &lease,
+            AcceptedRequest::new(
+                &SystemClock,
+                RequestId::new("late-batch").unwrap(),
+                None,
+                "batch_decompile",
+                json!({"addresses":[]}),
+            )
+            .unwrap(),
+            OperationId::new("late-batch-op").unwrap(),
+        )
+        .unwrap()
+    });
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let (_, writer) = socket.into_split();
+    let writer = Arc::new(AsyncMutex::new(writer));
+    let mut attempts = Vec::new();
+    for index in 0..2 {
+        endpoint
+            .transition(|s, t| s.dispatch(&lease.client_id, &op, t))
+            .unwrap();
+        let mut delivery = lanes.business.recv().await.unwrap();
+        delivery.begin().unwrap();
+        let attempt = delivery.attempt.clone();
+        delivery.acknowledged().unwrap();
+        state.pending.lock().unwrap().insert(
+            attempt.sequence.get(),
+            Pending {
+                attempt: attempt.clone(),
+                granted: true,
+                uncertain: false,
+                stopped: false,
+                open_disconnected: None,
+            },
+        );
+        attempts.push(attempt.clone());
+        if index == 0 {
+            event_received(
+                json!({"event":"yielded","attempt":attempt,"checkpoint":{"index":1}}),
+                &writer,
+                &state,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+    }
+    for terminal in [false, true] {
+        if terminal {
+            event_received(
+                json!({"event":"completed","attempt":attempts[1],"result":"second"}),
+                &writer,
+                &state,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        for event in ["completed", "yielded", "uncertain", "stopped"] {
+            event_received(json!({"event":event,"attempt":attempts[0],"result":"old",
+                "checkpoint":{"index":999},"error":{"code":"disconnected","message":"late old callback"}}),&writer,&state,false).await.expect("old callbacks must be harmless, including to the physical channel");
+            let snapshot = endpoint
+                .transition(|s, _| s.operation_status(&lease.client_id, &op))
+                .unwrap();
+            assert_eq!(
+                snapshot.status,
+                if terminal {
+                    OperationStatus::Succeeded
+                } else {
+                    OperationStatus::Running
+                }
+            );
+            assert_eq!(snapshot.execution_stopped, terminal);
+            if terminal {
+                assert_eq!(snapshot.result, Some(json!("second")));
+            }
+        }
+    }
+}

@@ -429,9 +429,12 @@ functions for real search fairness. The suite uses marker/FIFO/protocol barriers
 separate 15-second startup and 3-second response budgets, and an inner 180-second
 shell timeout. Announce an outer 210-second timeout for exact cleanup before use.
 
-The comparator saves `n5-comparison.json`: 15 exact scalar-type/shape/value checks
+The comparator saves `n5-comparison.json`: 54 exact scalar-type/shape/value checks
 against the fixed binary include repeated/invalid addresses, batch ordering,
 search limits including zero, no matches, Unicode and injected decompiler errors.
+N5-F1 adds JSON scalar strings and Rust u64 address grammar cases (prefix/case,
+outer versus inner whitespace, signs, underscores, Unicode digits and overflow),
+also exercising N4 address methods with the same strict CLI error rule as E04.
 Hook tests cover real external rename/comment/type with unconsumed public events,
 installation/state/module loss, shared lease references, killed bridge cleanup,
 new-owner rejection and self decompilation. E11 keeps real startup analysis work
@@ -442,8 +445,26 @@ It does not establish arbitrary Hex-Rays GIL behavior.
 
 Run the lifecycle 9 and contract 4 regressions separately with fresh prepared
 roots. Keep E04 at 38 exact comparisons, both patch probes' red/green evidence,
-the 12 standard gates plus gate 13, N0 support 33, bridge pytest 22 and N4 fix 5.
+the 12 standard gates plus gate 13, N0 support 36, bridge pytest 25 and N4 fix 5.
 Run lib at least three consecutive times. Every invocation records uptime and its
 exit status; retain failed runs and explain the changed variable before rerunning.
 Audit each environment with cleanup/assert_clean and exact registered process
 identities. A timeout, ignored replacement assertion or zero-test run is not PASS.
+
+N5-F1 E18 pauses the consumer of a real socketpair relay on the business output
+lane. It proves a blocked kernel send of the large real Nexus response, a full
+unchanged 512-item bridge queue and one pending producer. Router/control/B remain
+responsive. After resuming, all 513 test status messages arrive in order and A
+serves another query. E10 additionally aborts an actual router continuation while
+N1 reports Queued behind a barrier, then observes `_n5_cleanup` releasing the last
+hook without closing its lease. The bridge callback regression covers an older
+physical delivery after its successor starts and after that successor completes.
+
+Each real suite and gate 13 must finish with no socket under its IPC root.
+The bridge unlinks its own lifetime endpoint, and its Rust parent also removes
+that exact endpoint on shutdown/termination/drop/readiness failure. Test
+`Environment` journals exact socket paths with device/inode and owner birth;
+after owned processes exit, cleanup can remove recorded leftovers from SIGKILL.
+It refuses live owners or replacement files and never scans names to authorize
+deletion. The suite-wide scan is an assertion only. Keep the socket journal,
+process ledger and final zero-socket audit alongside the test logs.
