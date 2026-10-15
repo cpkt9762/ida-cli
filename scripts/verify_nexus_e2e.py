@@ -23,7 +23,7 @@ def main():
     parser.add_argument("--sdk", type=Path, required=True)
     parser.add_argument("--ipc-root", type=Path, help="short private directory for per-router Unix sockets")
     parser.add_argument("--cleanup", action="store_true")
-    parser.add_argument("--suite", choices=("lifecycle", "contract"), default="lifecycle")
+    parser.add_argument("--suite", choices=("lifecycle", "contract", "concurrency"), default="lifecycle")
     parser.add_argument("--baseline", type=Path, help="fixed independently hashed N0 binary for N4")
     parser.add_argument("--case", choices=("E22",), help="run only E22 in a fresh contract environment")
     args = parser.parse_args()
@@ -58,7 +58,12 @@ def main():
                           "CARGO_TARGET_DIR": str(args.target.resolve(strict=True)),
                           "IDA_TEST": "1", "RUSTC_WRAPPER": "", "N3_ENV_ROOT": str(env.root),
                           "N3_IPC_ROOT": str(ipc_root)})
-        if args.suite == "contract":
+        if args.suite == "concurrency":
+            variables.update({"IDA_CLI_NEXUS_DEV": "1",
+                "IDA_NEXUS_PYTHON": str(env.root / "venv/bin/python"),
+                "IDA_NEXUS_IPC_ROOT": str(ipc_root),
+                "IDA_NEXUS_BRIDGE_SCRIPT": str(REPO / "tests/support/nexus_client_fixture.py")})
+        if args.suite in {"contract", "concurrency"}:
             if args.baseline is None or not args.baseline.is_file():
                 parser.error("contract suite requires --baseline")
             variables["N4_BASELINE"] = str(args.baseline.resolve(strict=True))
@@ -73,6 +78,16 @@ def main():
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, interrupted)
         try:
+            if args.suite == "concurrency":
+                native_command = ["timeout", "30s", "/usr/bin/cc", "-dynamiclib",
+                    str(REPO / "tests/support/n5_hold.c"), "-o",
+                    str(env.root / "fixtures/n5_hold.dylib")]
+                with (env.root / "native-fixture.log").open("w") as output:
+                    native = env.spawn(lambda: subprocess.Popen(native_command, cwd=REPO,
+                        env=variables, stdout=output, stderr=subprocess.STDOUT), native_command)
+                    result["native_fixture_exit"] = native.wait()
+                assert result["native_fixture_exit"] == 0, "native fixture compilation failed"
+                result["native_fixture_command"] = native_command
             with (env.root / f"{args.suite}.log").open("w") as output:
                 child = env.spawn(lambda: subprocess.Popen(command, cwd=REPO, env=variables, stdout=output, stderr=subprocess.STDOUT), command)
                 result["exit"] = child.wait()
@@ -81,16 +96,20 @@ def main():
             if child.returncode and re.search(r"license.*(?:invalid|failed|not found|unavailable|expired)|no valid license", text, re.IGNORECASE):
                 result["status"] = "BLOCKED"
             assert child.returncode == 0, f"{result['status']}: lifecycle command failed: {child.returncode}"
-            count = 1 if args.case else (9 if args.suite == "lifecycle" else 4)
+            count = 1 if args.case else {"lifecycle": 9, "contract": 4, "concurrency": 14}[args.suite]
             assert summary == [(str(count), "0", "0")], f"wrong actual test count: {summary}"
             if args.suite == "lifecycle":
                 events = [json.loads(line) for line in (env.root / "rust-evidence.jsonl").read_text().splitlines()]
                 cases = [event["case"] for event in events if event.get("status") == "PASS"]
                 expected = ["E02", "E03", "E05", "E06-client", "E06-bridge", "E07-packed", "E07-unpacked", "E05-concurrent-open", "E06-lease-fault"]
-            else:
+            elif args.suite == "contract":
                 expected = [args.case] if args.case else ["E04", "E16", "E17", "E22"]
                 events = [json.loads((env.root/f"{case}-result.json").read_text()) for case in expected]
                 cases = [event["case"] for event in events if event["status"] == "PASS"]
+            else:
+                events = [json.loads(line) for line in (env.root / "rust-evidence.jsonl").read_text().splitlines()]
+                expected = ["E08", "E09", "E10", "E11", "E12", "E13", "E14", "E15", "E18", "E26", "N5-hooks", "N5-lifecycle", "N5-reconnect", "N5-compare"]
+                cases = [event["case"] for event in events if event.get("status") == "PASS"]
             assert sorted(cases) == sorted(expected), f"wrong scenario evidence: {cases}"
             env.assert_clean()
             assert not list((env.root / "state/instances").glob("*.json")), "Nexus registrations remain"

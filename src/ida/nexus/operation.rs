@@ -16,6 +16,7 @@ impl<C: Clock> NexusSessions<C> {
             .capabilities
             .require(&request.method)?;
         self.reserve(&request.request_id, &operation_id)?;
+        let turn = self.next_turn()?;
         let identity = OperationIdentity {
             task_id: request.task_id.clone(),
             request_id: request.request_id.clone(),
@@ -25,6 +26,7 @@ impl<C: Clock> NexusSessions<C> {
         self.operations.insert(
             identity.operation_id.clone(),
             Operation {
+                turn,
                 snapshot: OperationSnapshot {
                     identity: identity.clone(),
                     status: OperationStatus::Queued,
@@ -114,6 +116,63 @@ impl<C: Clock> NexusSessions<C> {
         })
     }
 
+    fn next_turn(&mut self) -> Result<u64, NexusError> {
+        self.queue_sequence = self
+            .queue_sequence
+            .checked_add(1)
+            .ok_or_else(|| NexusError::new(NexusErrorCode::Busy, "queue sequence exhausted"))?;
+        Ok(self.queue_sequence)
+    }
+
+    /// A returned, read-only slice proves native execution stopped. Retain the
+    /// logical identity/deadline and rejoin the tail of this instance's FIFO.
+    pub fn yield_operation(
+        &mut self,
+        identity: &OperationIdentity,
+        checkpoint: serde_json::Value,
+    ) -> Result<(), NexusError> {
+        let op = self.match_operation(identity)?;
+        if op.snapshot.status.is_terminal() {
+            // A late slice proves stop, never permission to resume or a new
+            // caller outcome after disconnection/uncertainty.
+            self.complete(identity, Completion::Success(serde_json::Value::Null))?;
+            return Ok(());
+        }
+        if !matches!(
+            op.request.method.as_str(),
+            "batch_decompile" | "search_pseudocode" | "run_auto_analysis"
+        ) || !matches!(
+            op.snapshot.status,
+            OperationStatus::Running | OperationStatus::CancelRequested
+        ) || self.generations.get(&identity.lease.instance_id)
+            != Some(&identity.lease.generation)
+        {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "invalid continuation boundary",
+            ));
+        }
+        if op.snapshot.status == OperationStatus::CancelRequested {
+            self.complete(identity, Completion::Cancelled)?;
+            return Ok(());
+        }
+        if op.request.deadline.expired(self.clock.now()) {
+            self.complete(identity, Completion::ExecutionTimedOut)?;
+            return Ok(());
+        }
+        let turn = self.next_turn()?;
+        if let Some(op) = self.operations.get_mut(&identity.operation_id) {
+            op.request.params["_n5_checkpoint"] = checkpoint;
+            op.snapshot.status = OperationStatus::Queued;
+            op.snapshot.execution_stopped = true;
+            op.turn = turn;
+        }
+        self.confirm_delivery(DeliveryTarget::Execute {
+            identity: identity.clone(),
+        });
+        Ok(())
+    }
+
     /// Last local gate before enqueueing any command with possible side effects.
     /// Running means dispatched (including a remote queue), not proof of native
     /// execution. The bridge must subtract its queue time from remaining_ms.
@@ -152,6 +211,17 @@ impl<C: Clock> NexusSessions<C> {
             return Err(NexusError::new(
                 NexusErrorCode::Busy,
                 "instance has an operation without stop confirmation",
+            ));
+        }
+        if self.operations.values().any(|other| {
+            other.snapshot.status == OperationStatus::Queued
+                && other.snapshot.identity.lease.instance_id == identity.lease.instance_id
+                && other.snapshot.identity.lease.generation == identity.lease.generation
+                && other.turn < op.turn
+        }) {
+            return Err(NexusError::new(
+                NexusErrorCode::Busy,
+                "earlier instance request is queued",
             ));
         }
         let command = SessionCommand::Execute(ExecuteCommand {

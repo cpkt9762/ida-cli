@@ -7,7 +7,45 @@ opening, process creation, or legacy execution belongs in this module.
 METHODS = ("get_database_info", "get_analysis_status", "list_functions",
            "get_function_by_name", "get_function_at_address", "get_xrefs_to",
            "get_xrefs_from", "disassemble", "disassemble_function",
-           "disassemble_function_at", "decompile_function", "run_script")
+           "disassemble_function_at", "decompile_function", "run_script",
+           "batch_decompile", "search_pseudocode", "run_auto_analysis", "_n5_cleanup")
+
+
+def invoke_slice(method, params, context, source):
+    try:
+        return _invoke_slice(method, params, context, source)
+    except Exception as exc:
+        # Preserve the existing business-error envelope. Consistency failure
+        # discards partial results and is explicit in the caller's error text.
+        message = str(exc)
+        if not message.startswith(("数据库已变化", "一致性无法确认")):
+            message = "一致性无法确认: " + message
+        return {"ok": False, "error": message}
+
+
+def _invoke_slice(method, params, context, source):
+    import sys
+    import types
+    name = "_ida_cli_nexus_slices_v1"
+    module = sys.modules.get(name)
+    if module is None:
+        if params.get("_n5_checkpoint") is not None:
+            raise RuntimeError("一致性无法确认: private module lost")
+        if method == "_n5_cleanup":
+            return {"ok": True, "value": None}
+        module = types.ModuleType(name)
+        exec(source, module.__dict__)
+        sys.modules[name] = module
+    if method == "_n5_cleanup":
+        module.release(params["_n5_job"], context)
+        return {"ok": True, "value": None}
+    try:
+        return module.step(method, params, context, lambda ea, multiple: invoke(
+            "decompile_function", {"address": ea, "_multiple": multiple}))
+    except Exception as exc:
+        if str(exc).startswith(("数据库已变化", "一致性无法确认")):
+            raise
+        raise RuntimeError("一致性无法确认: " + str(exc)) from exc
 
 
 def _processor_long_name():

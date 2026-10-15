@@ -22,6 +22,8 @@ METHODS = {"execute_python": "may_write", "database_info": "read_only",
 METHODS.update({method: "may_write" if method == "run_script" else "read_only"
                 for method in TOOL_METHODS})
 TOOL_SOURCE = Path(__file__).with_name("tools.py").read_text(encoding="utf-8")
+SLICE_SOURCE = Path(__file__).with_name("slices.py").read_text(encoding="utf-8")
+SLICE_METHODS = {"batch_decompile", "search_pseudocode", "run_auto_analysis", "_n5_cleanup"}
 
 
 def error(code, message):
@@ -98,6 +100,7 @@ class Bridge:
         self.Options = DatabaseOpenOptions
         self.lock = threading.Lock()
         self.handles = {}
+        self.identity = uuid.uuid4().hex
         self.verification_probes = {}
         self.grants = {}
         self.generations = {}
@@ -114,11 +117,47 @@ class Bridge:
         self.business_gate = threading.BoundedSemaphore(capacity)
         self.control_gate = threading.BoundedSemaphore(8)
         self.owners = []
+        # Adapter-owned lifetime lane, never a Nexus wire protocol. Owner-side
+        # watchers use only public Nexus APIs to release our jobs after EOF.
+        self.lifetime_path = str(Path(business).with_name("l"))
+        self.lifetime_socket = socket.socket(socket.AF_UNIX)
+        self.lifetime_socket.bind(self.lifetime_path)
+        self.lifetime_socket.listen(capacity)
+        self.lifetimes = {}
+        threading.Thread(target=self.accept_lifetimes, daemon=True).start()
         self.business = Channel(business, capacity, self.receive, self.stopped)
         self.control = Channel(control, 8, self.receive, self.stopped)
         self.initialized.set()
         threading.Thread(target=self.discover, daemon=True).start()
         threading.Thread(target=self.proofs, daemon=True).start()
+
+    def accept_lifetimes(self):
+        while not self.stopped.is_set():
+            try:
+                connection, _ = self.lifetime_socket.accept()
+                connection.settimeout(2)
+                raw = connection.recv(256)
+                lease_id = raw.decode("ascii")
+                with self.lock:
+                    if lease_id not in self.handles:
+                        connection.close()
+                        continue
+                    previous = self.lifetimes.get(lease_id)
+                    self.lifetimes[lease_id] = connection
+                    if previous is not None:
+                        previous.close()
+                connection.sendall(b"ok")
+                connection.settimeout(None)
+            except OSError:
+                if not self.stopped.is_set():
+                    self.stopped.set()
+                return
+
+    def drop_lifetime(self, lease_id):
+        with self.lock:
+            connection = self.lifetimes.pop(lease_id, None)
+        if connection is not None:
+            connection.close()
 
     def discover(self):
         from ida_nexus import discover_databases
@@ -140,7 +179,7 @@ class Bridge:
                 holder = self.grants.get(message["sequence"])
             if holder is None:
                 raise ValueError("unknown grant")
-            holder[1].append(message)
+            holder[1].append((message, time.monotonic()))
             holder[0].set()
             return
         if "local_status" in message:
@@ -178,12 +217,14 @@ class Bridge:
             while not holder[0].wait(0.05):
                 if self.stopped.is_set():
                     return
-            grant = holder[1][0]
+            grant, received_at = holder[1][0]
             if grant["grant"] is False:
                 return
             payload = frame["payload"]
             budget = grant["remaining_ms"] / 1000
-            deadline = time.monotonic() + budget
+            deadline = received_at + budget
+            if time.monotonic() >= deadline:
+                raise TimeoutError("total deadline expired in bridge queue; not executed")
             self.invoke(channel, attempt, payload, deadline, public_started)
         except Exception as exc:
             from ida_nexus import NexusConnectionError, RemoteError
@@ -206,13 +247,15 @@ class Bridge:
                 self.grants.pop(key, None)
                 if frame["payload"]["command"] == "execute":
                     operation_id = frame["payload"]["identity"]["operation_id"]
-                    if operation_id not in self.unknown:
+                    if (operation_id not in self.unknown
+                            and self.executing.get(operation_id, {}).get("attempt") == attempt):
                         self.executing.pop(operation_id, None)
             gate.release()
 
     def disconnected(self, lease, reason, attempt):
         # The callback may be replayed synchronously by set_disconnect_callback,
         # before N1 knows this lease. Keep its bounded open correlation intact.
+        self.drop_lifetime(lease["lease_id"])
         self.control.send({"event": "disconnected", "lease": lease, "reason": reason,
                            "attempt": attempt})
 
@@ -323,23 +366,41 @@ class Bridge:
                 code = f"import ida_name\nresult = ida_name.get_name({int(params['address'])})"
             elif method == "rename_address":
                 code = f"import ida_name\nresult = ida_name.set_name({int(params['address'])}, {str(params['name'])!r}, ida_name.SN_CHECK)"
+            elif method in SLICE_METHODS:
+                context = [self.identity, lease["lease_id"], lease["instance_id"], lease["generation"], self.lifetime_path]
+                code = TOOL_SOURCE + f"\nresult = invoke_slice({method!r}, {params!r}, {context!r}, {SLICE_SOURCE!r})\n"
             elif method in TOOL_METHODS:
                 code = TOOL_SOURCE + f"\nresult = invoke({method!r}, {params!r})\n"
             else:
                 raise ValueError("unsupported bridge method")
             operation_id = command["identity"]["operation_id"]
+            # Each confirmed continuation is a new public Nexus operation. A
+            # logical ID is never reused for native execution or replay.
+            native_id = f"{operation_id}:{attempt['sequence']}" if method in SLICE_METHODS else operation_id
             with self.lock:
                 self.executing[operation_id] = {"attempt": attempt, "handle": handle,
+                    "native_id": native_id,
                     "deadline": deadline, "unknown": False, "cancel_requested": False,
                     "proving": False, "next": 0, "expired": False}
             channel.send({"event": "ack", "attempt": attempt})
+            # Recheck on the owner thread after waiting behind other public
+            # clients. Host monotonic time is shared across these local processes.
+            code = ("import time as _n5_time\n"
+                    f"if _n5_time.monotonic() >= {deadline!r}:\n"
+                    "    raise TimeoutError('total deadline expired before owner execution')\n# nexus owner deadline checked\n" + code)
             public_started[0] = True
-            result = handle.execute_python(code, timeout=None, operation_id=command["identity"]["operation_id"])
-            channel.send({"event": "completed", "attempt": attempt, "result": result})
+            result = handle.execute_python(code, timeout=None, operation_id=native_id)
+            if method in SLICE_METHODS and result["result"].get("more") is True:
+                channel.send({"event": "yielded", "attempt": attempt,
+                              "checkpoint": result["result"]["checkpoint"]})
+            else:
+                channel.send({"event": "completed", "attempt": attempt, "result": result})
         elif kind == "cancel":
             public_started[0] = True
             operation_id = command["identity"]["operation_id"]
-            outcome = handle.cancel_operation_outcome(operation_id)
+            with self.lock:
+                native_id = self.executing.get(operation_id, {}).get("native_id", operation_id)
+            outcome = handle.cancel_operation_outcome(native_id)
             with self.lock:
                 record = self.executing.get(operation_id)
                 if record is not None:
@@ -351,7 +412,25 @@ class Bridge:
             self.proof_wakeup.set()
         elif kind == "release":
             public_started[0] = True
+            context = [self.identity, lease["lease_id"], lease["instance_id"], lease["generation"], self.lifetime_path]
+            cleanup_code = ("import sys\nmodule = sys.modules.get('_ida_cli_nexus_slices_v1')\n"
+                            f"result = module.release_lease({context!r}) if module else None")
+            if handle.connected:
+                handle.execute_python(cleanup_code, timeout=max(0.001, deadline - time.monotonic()))
+            else:
+                # This lease cannot execute again. A new public lease can only
+                # reclaim our references on the exact surviving instance.
+                instances = [item.instance for item in discover_databases()
+                             if item.instance.record_id == lease["instance_id"]]
+                if instances:
+                    cleanup_handle = self.Handle.attach(instances[0])
+                    try:
+                        cleanup_handle.execute_python(cleanup_code,
+                            timeout=max(0.001, deadline - time.monotonic()))
+                    finally:
+                        cleanup_handle.close(wait_for_database=False)
             handle.close(wait_for_database=True, timeout=max(0.001, deadline - time.monotonic()))
+            self.drop_lifetime(lease["lease_id"])
             with self.lock:
                 self.handles.pop(lease["lease_id"], None)
             channel.send({"event": "released", "attempt": attempt})
@@ -402,12 +481,14 @@ class Bridge:
         self.control.send({"event": "stopped", "attempt": record["attempt"],
                            "proof": "causal_cancel_not_pending", "outcome": outcome})
         with self.lock:
-            self.unknown.pop(operation_id, None)
-            self.executing.pop(operation_id, None)
+            if self.unknown.get(operation_id) == record["attempt"]:
+                self.unknown.pop(operation_id, None)
+            if self.executing.get(operation_id) is record:
+                self.executing.pop(operation_id, None)
 
     def confirm_stop(self, operation_id, record):
         try:
-            outcome = record.get("stop_proof") or record["handle"].cancel_operation_outcome(operation_id)
+            outcome = record.get("stop_proof") or record["handle"].cancel_operation_outcome(record.get("native_id", operation_id))
             if outcome["execution_stopped"]:
                 self.publish_stop(operation_id, record, outcome)
             elif outcome["status"] == "failed":
@@ -422,7 +503,7 @@ class Bridge:
                 record["next"] = time.monotonic() + 0.02
                 # Rotate retryable records so a failed proof cannot monopolize
                 # the two reserved slots while other unknowns wait.
-                if operation_id in self.executing:
+                if self.executing.get(operation_id) is record:
                     self.executing.pop(operation_id)
                     self.executing[operation_id] = record
             self.proof_gate.release()
@@ -434,9 +515,12 @@ class Bridge:
             handles = list(self.handles.values())
             verifications = list(self.verification_probes.items())
             operations = list(self.executing.items())
+        self.lifetime_socket.close()
+        for lease, _handle in handles:
+            self.drop_lifetime(lease["lease_id"])
         for operation_id, record in operations:
             try:
-                record["handle"].cancel_operation_outcome(operation_id)
+                record["handle"].cancel_operation_outcome(record.get("native_id", operation_id))
             except Exception as exc:
                 print(f"cancel during cleanup failed: {type(exc).__name__}", file=sys.stderr)
         for _lease, handle in handles:

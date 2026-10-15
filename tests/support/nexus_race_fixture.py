@@ -39,6 +39,14 @@ original_send = bridge.Channel.send
 
 
 def send(self, event):
+    if event.get("event") == "ack" and SCENARIO == "expired-proof":
+        # Shorten only stop-proof admission. The owner must still receive the
+        # accepted execution deadline so its new deadline guard runs normally.
+        owner = instance_bridge[0]
+        with owner.lock:
+            for record in owner.executing.values():
+                if record["attempt"] == event["attempt"]:
+                    record["deadline"] = 0
     if event.get("event") == "local_status" and SCENARIO == "control" and os.environ.get("N4_F2_DELAY"):
         threading.Event().wait(1.5)
     if event.get("event") == "uncertain" and os.environ.get("F1_SCENARIO") == "early-proof":
@@ -87,6 +95,9 @@ class Connection:
                 cancelled = index == 0
             return json.dumps({"result": {"cancelled": cancelled}}).encode()
         code = self.payload.get("code", "")
+        if code.startswith("import time as _n5_time\n"):
+            guard, code = code.split("# nexus owner deadline checked\n", 1)
+            exec(guard, {})
         if code == "result = None" and SCENARIO in {"late-success", "stale-false"}:
             barrier("proof")
         if code == "unknown":
@@ -128,10 +139,6 @@ original_invoke = bridge.Bridge.invoke
 
 def invoke(self, channel, attempt, command, deadline, public_started):
     instance_bridge[0] = self
-    if command["command"] == "execute" and SCENARIO == "expired-proof":
-        # Only the Python probe admission deadline is shortened. N1 retains its
-        # real deadline and sends the later escalation through the control lane.
-        deadline = 0
     if command["command"] == "execute" and SCENARIO in {"late-success", "stale-false", "active-fairness"}:
         handle = self.handles[command["identity"]["lease"]["lease_id"]][1]
         operation = command["identity"]["operation_id"]

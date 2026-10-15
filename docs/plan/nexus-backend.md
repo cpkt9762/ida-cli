@@ -445,17 +445,35 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N5：长任务、公平调度、期限与取消
 
-- 2026-10-16 首轮诊断（`306623c`）：输入 `f2075ac73769482ca41f1ac0f055c60d13e01d46`、指定 worktree/分支及 clean 状态核对通过。固定 Nexus 0.13.4 的公开修改订阅有事件修订号，但没有与分片读取同步的修订水位或事件消费屏障；`execute_python` 结果也不携带该水位。订阅消费者尚未读取修改事件时，后续查询可以先完成，不能将“目前收到的最后一个 revision”当成数据库当前修订。首轮据此停止，原报告已保留为外部 `n5/report-blocked.md`。
-- 真实 IDA 9.5 的两客户端隔离诊断确认：外部重命名及注释修改均未改变 `inf_get_database_change_count()`（仍为 4），而重命名事件有 `revision=1`。SDK `ida.hpp` 对该计数器只承诺字节和常规段修改，不能代替全量修改修订；Nexus 文档还注明事件 hook 在初始分析完成后安装。该诊断只证明接口边界，不计作 E26 或其他 E2E 通过；首轮完整证据在外部 `n5/report-blocked.md`，续派报告为 `n5/report.md`。
-- 2026-10-16 续派已批准经公开 `execute_python` 在 IDA 主线程安装、持有公开 IDAPython `IDB_Hooks` 的同步修改计数器，并在同一执行区间检查分片边界；同时要求 hook 被卸载或状态无法确认时 fail-closed。需定义覆盖的修改事件、任务自身反编译修改的归属、hook 生命周期及取消后回收，再用外部客户端改库验收。
-- 续派健康检查诊断目前 **BLOCKED，未实施、未验收**：真实 IDA 9.5 中，hook 注册时外部重命名使自建计数器从 0 增至 1；另一客户端通过公开的 `ida_idp.IDB_Hooks.unhook(obj)` 卸载后再重命名，计数仍为 1、`database_change_count` 仍为 4，Python 对象与包装层 active 标志仍存在。重复 `hook()` 在已注册和重新注册时都返回 true，不能作为“中间从未卸载”的证明；当前公开 Python 接口没有注册状态查询，测试的只读 FlowChart/qflow_chart_t 也没有触发 `flow_chart_created` 回调。不得读原生内部字段、全局 monkeypatch 其他客户端或用主动改库探针绕过。
-- 严格的“外部基类公开 unhook 后仍识别卸载”要求，不能用适配器自己的布尔值代替证明。按再次缺口停止规则，交编排者裁定是否将检测承诺限定为适配器可观察的正常卸载/状态丢失，明确排除其他代码直接调用基类卸载；或另行批准可验证的公开健康检测方案。当前未缩小承诺或采用绕过，尚无产品 hook 订阅清单、批次大小、公平策略或 N5 状态机实现；诊断不计作任何 N5 E2E 通过。
-- 将批量反编译和伪代码搜索改为可恢复进度的分片任务，定义批次大小和队列公平策略。
-- 总期限涵盖输入准备和排队；向 Nexus 传递剩余预算，处理 HTTP 超时后远端仍可能执行的状态。
-- 排队取消保证不产生副作用；运行取消确认后才释放运行槽位和必要的生命周期引用。
-- 用后台分析切片和显式等待的不同用例验证行为，不能把二者混成“分析已完全异步”。
-- 检测跨分片数据库修改；保持已有结果顺序、limit 和部分错误语义。
-- 验收：短查询在长批量任务全部完成前得到执行，取消后的下一条查询可继续；不可中断场景准确暴露状态。
+- 原两轮公共接口诊断记录保留在外部 `n5/report-blocked.md`、`n5/report-blocked-2.md`，输入 `228aae87230145836f3dd7fa73df568f5598e14f`。编排者已批准同步 `IDB_Hooks` 方案及下面的健康承诺边界；历史阻塞已解除。N5 实现与最终验证见 `n5/report.md`，是否验收及进入 N6 由编排者裁定。
+- `batch_decompile`、`search_pseudocode` 每片 **一个函数**；`run_auto_analysis` 每片一次公开 `auto_make_step(0, BADADDR)`。同一逻辑 operation 保持 request/task/operation/lease/总期限，片返回后确认停止、更新小 checkpoint、放回同实例 FIFO 尾部。已排队短请求先于续片；物理 Nexus operation ID 加投递序号，绝不复用或重放旧调用。每片不产生额外逻辑终态记录，不扩大容量。
+- 函数反编译串行，不能抢占单个 native 调用。普通文本匹配、聚合目前也在该 IDA 执行区间内；只有普通 JSON checkpoint 跨线程/连接，未转交 IDA 对象。结果聚合保留在 owner 的私有模块，最终沿已有响应编码/落盘路径交付。
+- 经公开 `execute_python` 在 owner 的 IDA 线程安装私有模块 `_ida_cli_nexus_slices_v1`，不在 `__main__` 放 hook。每次安装唯一 UUID；共享 counter/job 引用按 bridge、lease、instance、generation 归属。每片开始在同一 IDA 执行区间读取 `[installation, revision, database_change_count]`，严格比较上一片末 stamp；不同则“数据库已变化”。片内自身反编译产生的通知被纳入本片末基线，下一片只比较片间修改。其他分片任务或后台分析的可观测修改也保守中止，不能静默混合。
+- 一致性失败与无法确认均返回既有 business-error envelope，经 router 转为明确错误，**丢弃整个任务的部分结果**。这是新增失败情况，不增加外部 JSON 字段。普通函数反编译失败仍逐项保留 error、success、顺序及重复地址；搜索保留 limit、total_searched、decompile_errors，包括旧版 limit=0 首个匹配即停止的行为。固定 N0 二进制逐类型严格对照覆盖这些情况及注入的部分反编译失败。
+- 保证 fail-closed：安装失败、owner/实例/代际变化、模块/hook/唯一安装标识缺失或不一致、计数器读取失败或格式异常、bridge/lease 断连后新连接试图使用旧 checkpoint，均明确“一致性无法确认”。不靠重复 hook() 或 active 布尔值证明未漏事件。
+- **已接受限制**：同 owner 受信任代码直接 unhook 或改写私有计数器不承诺检测；Hex-Rays 用户局部变量、仅 netnode 层修改等无所订阅通知的修改不承诺；native 绕过通知的写入不承诺。不是数据库事务快照或完整修改覆盖。沿用 N4 `run_script` 受信任代码模型。
+- 最后一个任务成功/失败/确认取消后卸载；排队取消的残余任务由同 FIFO 的内部清理释放，取消未确认前仍保留引用。lease 释放先释放自己的 job，不能卸载其他 lease 的共享 counter。数据库关闭使 hook 无效，托管 owner 退出清除注册；GUI 留在 N7。
+- bridge 有适配器自己的受限寿命 socket，owner 仅传普通 context 给监视线程。EOF（bridge 退出或单 lease 断连）后，监视线程以公开 discover/attach/execute_python 将精确 lease 清理送入同一 owner 的串行队列，等待 native 返回后才释放；从不在线程上直接调用 IDA/unhook。临时清理 lease 最后释放，不关闭其他客户端数据库。模块 incarnation 防止旧监视器清理重建模块的新任务。断连 handle 的正常释放同样经新的公开临时 lease 清理精确实例，不重放业务。
+- 总期限从 Preparation 接受输入开始，涵盖准备/连接/队列/执行。Rust 连接等待受 Preparation 期限约束；每次 dispatch/grant 检查剩余预算，bridge 扣本地排队时间，owner 脚本开头再以同宿主 monotonic clock 检查，避免在其他公共客户端后排队过期的写请求执行。运行超时/取消只请求停止，必须收到执行返回或因果停止证明才释放占用；不可中断期间 `cancel_requested`、`execution_stopped=false`，冲突写请求 Busy。
+- N1 首个确定终态原子获胜；取消请求不是终态。完成和取消确认竞争保留原契约，迟到结果只补停止证明，不覆盖结果；迟到 yield 不能重启已确定结果。native 永不返回时不能承诺取消时限；清理保持保守并报告未确认，不声称硬抢占。
+- E11 单独验证真正启动分析：公开 import script 包装真实 auto_make_step，在 marker 释放前持续投放真实分析工作，前台查询先返回并显示未完成；还验证后台分析区间的修改通知中止分片。E12 单独测试显式等待切片的取消与总期限。E26 用真实 PyDLL/FIFO 持 GIL，恢复后进入明确 Python 取消边界；只证明人工 native 边界，不代表任意 Hex-Rays 调用的 GIL 行为。
+- 同步 counter 订阅 IDA 9.5 公开通知（before/after 可重复计数，仅比较相等；回调只增计数、异常标不健康、返回 0）：
+
+  `renamed`, `changing_cmt`, `cmt_changed`, `extra_cmt_changed`, `changing_range_cmt`, `range_cmt_changed`, `moving_range_cmt`
+  `changing_ti`, `ti_changed`, `changing_op_ti`, `op_ti_changed`, `changing_op_type`, `op_type_changed`, `local_types_changed`
+  `local_type_renamed`, `lt_udm_created`, `lt_udm_deleted`, `lt_udm_renamed`, `lt_udm_changed`, `lt_udt_expanded`, `lt_edm_created`
+  `lt_edm_deleted`, `lt_edm_renamed`, `lt_edm_changed`, `frame_created`, `frame_deleted`, `frame_expanded`, `frame_udm_created`
+  `frame_udm_deleted`, `frame_udm_renamed`, `frame_udm_changed`, `func_added`, `deleting_func`, `func_deleted`, `func_updated`
+  `func_noret_changed`, `set_func_start`, `set_func_end`, `func_tail_appended`, `deleting_func_tail`, `func_tail_deleted`, `tail_owner_changed`
+  `stkpnts_changed`, `thunk_func_created`, `byte_patched`, `make_code`, `make_data`, `destroyed_items`, `adding_segm`
+  `segm_added`, `deleting_segm`, `segm_deleted`, `changing_segm_start`, `segm_start_changed`, `changing_segm_end`, `segm_end_changed`
+  `changing_segm_name`, `segm_name_changed`, `changing_segm_class`, `segm_class_changed`, `segm_attrs_updated`, `segm_moved`, `allsegs_moved`
+  `sgr_changed`, `sgr_deleted`, `compiler_changed`, `deleting_tryblks`, `updating_tryblks`, `tryblks_updated`, `callee_addr_changed`
+  `item_color_changed`, `bookmark_changed`, `flirt_applied`, `idasgn_matched_ea`, `dirtree_mkdir`, `dirtree_rmdir`, `dirtree_link`
+  `dirtree_rminode`, `dirtree_move`, `dirtree_rank`, `dirtree_ordering_changed`, `dirtree_bulk_move`, `dirtree_segm_moved`
+
+- 另订阅 `closebase` 使健康状态无效；`database_change_count` 仅作字节/段修改的补充，不能代替重命名、注释、类型通知。公开异步事件订阅没有分片同步水位，故不以消费者进度证明一致性；真实测试故意积压事件至任务中止后才消费。
+- 验收语句：短查询在长批量任务全部完成前得到执行，取消后的下一查询可继续；不可中断场景准确暴露状态。最终结果、实际数量、所有失败与修复原因、命令/退出码/uptime、旧版比较和精确进程审计集中在外部报告。
 
 ### N6：修改数据库与高级分析能力
 

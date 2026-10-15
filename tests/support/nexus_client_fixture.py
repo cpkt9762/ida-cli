@@ -94,8 +94,58 @@ else:
         original_version = importlib.metadata.version
         importlib.metadata.version = lambda name: "0.13.3" if name == "ida-nexus" else original_version(name)
     runtime = runpy.run_path(str(REPO / "nexus_bridge/bridge.py"), run_name="n4_fixture")
+    send = runtime["Channel"].send
+    def boundary_send(self, message):
+        arm = env.root / "n5-boundary.arm"
+        if message.get("event") == "yielded" and arm.exists():
+            arm.unlink()
+            (env.root / "n5-boundary.observed").touch()
+            import time
+            end = time.monotonic() + 15
+            while not (env.root / "n5-boundary.release").exists():
+                if time.monotonic() >= end:
+                    raise TimeoutError("test slice boundary release missing")
+                threading.Event().wait(0.005)
+        return send(self, message)
+    runtime["Channel"].send = boundary_send
+    channel_write = runtime["Channel"].write
+    def stalled_write(self):
+        original_socket = self.socket
+        class StallSocket:
+            def __getattr__(self, name):
+                return getattr(original_socket, name)
+            def sendall(self, raw):
+                if (original_socket.getpeername().endswith('/b')
+                        and (env.root / "n5-backpressure.arm").exists()
+                        and (env.root / "n5-backpressure.arm").read_text() == str(os.getpid())):
+                    (env.root / "n5-backpressure.observed").write_text(json.dumps({
+                        "capacity": self_channel.output.maxsize,
+                        "queued": self_channel.output.qsize()}))
+                    import time
+                    end = time.monotonic() + 15
+                    while not (env.root / "n5-backpressure.release").exists():
+                        if time.monotonic() >= end:
+                            raise TimeoutError("test pipe consumer release missing")
+                        threading.Event().wait(0.005)
+                return original_socket.sendall(raw)
+        self_channel = self
+        self.socket = StallSocket()
+        return channel_write(self)
+    runtime["Channel"].write = stalled_write
     invoke = runtime["Bridge"].invoke
+    subscriptions = {}
     def record_task(self, channel, attempt, command, deadline, public_started):
+        action = command.get("params", {}).get("n5_subscription")
+        if action:
+            lease = command["identity"]["lease"]
+            handle = self.handles[lease["lease_id"]][1]
+            if action == "start":
+                subscriptions[lease["lease_id"]] = handle.subscribe_idb_events()
+            else:
+                subscription = subscriptions.pop(lease["lease_id"])
+                event = next(subscription)
+                subscription.close()
+                (env.root / "n5-subscription-drained").write_text(str(event))
         identity = command.get("identity", {})
         if command.get("command") == "execute" and identity.get("task_id"):
             with (env.root / "task-identities.jsonl").open("a") as output:

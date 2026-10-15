@@ -24,6 +24,9 @@ pub const METHODS: &[&str] = &[
     "disassemble_function_at",
     "decompile_function",
     "run_script",
+    "batch_decompile",
+    "search_pseudocode",
+    "run_auto_analysis",
 ];
 tokio::task_local! { pub(crate) static CURRENT_TASK_ID: TaskId; }
 
@@ -251,7 +254,7 @@ impl Tools {
             &preparation,
         )
         .await?;
-        let bridge = Self::bridge(router).await?;
+        let bridge = preparation.wait(Self::bridge(router)).await?;
         let client = ClientId::new(id())?;
         let operation_id = OperationId::new(id())?;
         let mut reply = bridge.open_reply(&operation_id).map_err(diagnostic)?;
@@ -342,7 +345,7 @@ impl Tools {
         }
     }
     pub async fn execute(
-        &self,
+        self: &Arc<Self>,
         router: &RouterState,
         handle: Option<&str>,
         method: &str,
@@ -350,6 +353,83 @@ impl Tools {
         preparation: Preparation,
     ) -> Result<Value, ToolError> {
         Self::require(method)?;
+        if matches!(
+            method,
+            "batch_decompile" | "search_pseudocode" | "run_auto_analysis"
+        ) {
+            params = match method {
+                "batch_decompile" => serde_json::to_value(
+                    serde_json::from_value::<crate::server::BatchDecompileRequest>(params)
+                        .map_err(diagnostic)?,
+                )
+                .map_err(diagnostic)?,
+                "search_pseudocode" => serde_json::to_value(
+                    serde_json::from_value::<crate::server::SearchPseudocodeRequest>(params)
+                        .map_err(diagnostic)?,
+                )
+                .map_err(diagnostic)?,
+                _ => params,
+            };
+            params
+                .as_object_mut()
+                .ok_or_else(|| diagnostic("params must be an object"))?
+                .remove("_n5_checkpoint");
+            let job = id();
+            params["_n5_job"] = json!(job);
+            let target = if let Some(handle) = handle {
+                handle.to_owned()
+            } else {
+                let records = self.records();
+                let (key, first) = records.iter().next().ok_or(ToolError::NoDatabaseOpen)?;
+                if records
+                    .values()
+                    .any(|db| db.lease.instance_id != first.lease.instance_id)
+                {
+                    return Err(ToolError::InvalidParams(
+                        "db_handle is required when multiple databases are open".into(),
+                    ));
+                }
+                key.clone()
+            };
+            let mut cleanup = SliceCleanup {
+                tools: self.clone(),
+                router: router.clone(),
+                handle: Some(target.clone()),
+                job,
+                active: true,
+            };
+            let result = self
+                .execute_one(
+                    router,
+                    Some(&target),
+                    method,
+                    params,
+                    preparation,
+                    Some(&mut cleanup.active),
+                )
+                .await;
+            // A normal final slice released its own reference on the owner.
+            // Do not race a needless cleanup request against an immediate close.
+            if result.is_ok() {
+                cleanup.active = false;
+            }
+            return result;
+        }
+        self.execute_one(router, handle, method, params, preparation, None)
+            .await
+    }
+    async fn execute_one(
+        &self,
+        router: &RouterState,
+        handle: Option<&str>,
+        method: &str,
+        mut params: Value,
+        preparation: Preparation,
+        mut cleanup_pending: Option<&mut bool>,
+    ) -> Result<Value, ToolError> {
+        if method != "_n5_cleanup" {
+            Self::require(method)?;
+        }
         preparation.check()?;
         params = normalize(method, params)?;
         if matches!(method, "disassemble" | "decompile_function") {
@@ -377,7 +457,7 @@ impl Tools {
             .ok_or_else(|| ToolError::InvalidParams("params must be an object".into()))?
             .insert("_database_path".into(), json!(database.idb));
         let request = accepted(method, params, &preparation)?;
-        let bridge = Self::bridge(router).await?;
+        let bridge = preparation.wait(Self::bridge(router)).await?;
         let endpoint = bridge.endpoint();
         let identity = endpoint.transition(|s, _| {
             s.queue(
@@ -397,23 +477,18 @@ impl Tools {
         };
         let mut events = bridge.subscribe();
         loop {
-            let dispatch =
-                endpoint.transition(|s, t| s.dispatch(&database.lease.client_id, &identity, t));
-            match dispatch {
-                Ok(()) => break,
-                Err(error) if error.code == NexusErrorCode::Busy => {
-                    tokio::select! {
-                        _ = preparation.cancel.cancelled() => return Err(diagnostic("queued request cancelled")),
-                        _ = tokio::time::sleep_until(preparation.deadline.into()) => return Err(diagnostic("queued request expired")),
-                        event = events.recv() => { receive(event)?; }
-                    }
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        loop {
             let snapshot = endpoint
                 .transition(|s, _| s.operation_progress(&database.lease.client_id, &identity))?;
+            if snapshot.status == OperationStatus::Queued {
+                preparation.check()?;
+                match endpoint
+                    .transition(|s, t| s.dispatch(&database.lease.client_id, &identity, t))
+                {
+                    Ok(()) => continue,
+                    Err(error) if error.code == NexusErrorCode::Busy => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
             if snapshot.status.is_terminal() {
                 guard.identity.take();
                 if snapshot.execution_stopped {
@@ -427,6 +502,9 @@ impl Tools {
                         .error
                         .map(ToolError::Nexus)
                         .unwrap_or_else(|| diagnostic("operation ended without a result")));
+                }
+                if let Some(pending) = &mut cleanup_pending {
+                    **pending = false;
                 }
                 let mut result = endpoint
                     .transition(|s, _| {
@@ -454,6 +532,7 @@ impl Tools {
                     return Err(diagnostic("total deadline expired; execution_stopped=false; never replay"));
                 }
                 event = events.recv() => { receive(event)?; }
+                _ = tokio::time::sleep(Duration::from_millis(20)), if snapshot.status == OperationStatus::Queued => {}
             }
         }
     }
@@ -536,7 +615,7 @@ impl Tools {
         });
     }
     pub async fn open_details(
-        &self,
+        self: &Arc<Self>,
         router: &RouterState,
         handle: &str,
         preparation: Preparation,
@@ -568,6 +647,42 @@ impl Tools {
             json!({"path":path,"file_type":meta["file_type"],"processor":meta["processor"],"bits":meta["bits"],
             "function_count":meta["function_count"],"debug_info":null,"analysis_status":analysis}),
         )
+    }
+}
+
+// Cleanup joins the same instance FIFO; a pending native cancellation therefore
+// retains the hook until actual stop evidence permits this command to execute.
+struct SliceCleanup {
+    tools: Arc<Tools>,
+    router: RouterState,
+    handle: Option<String>,
+    job: String,
+    active: bool,
+}
+impl Drop for SliceCleanup {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let tools = self.tools.clone();
+        let router = self.router.clone();
+        let handle = self.handle.clone();
+        let job = self.job.clone();
+        tokio::spawn(async move {
+            let result = tools
+                .execute_one(
+                    &router,
+                    handle.as_deref(),
+                    "_n5_cleanup",
+                    json!({"_n5_job":job,"timeout_secs":600}),
+                    Preparation::new(Duration::from_secs(600)),
+                    None,
+                )
+                .await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "Nexus slice cleanup unconfirmed; lease tracking retained");
+            }
+        });
     }
 }
 

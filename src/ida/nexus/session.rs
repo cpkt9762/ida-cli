@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 
 pub(super) struct Operation {
+    pub(super) turn: u64,
     pub(super) snapshot: OperationSnapshot,
     pub(super) request: AcceptedRequest,
     pub(super) effect: MethodEffect,
@@ -28,6 +29,7 @@ pub struct NexusSessions<C> {
     pub(super) sessions: HashMap<LeaseId, SessionSnapshot>,
     pub(super) deliveries: HashMap<super::delivery::DeliveryKey, super::delivery::DeliveryRecord>,
     pub(super) send_sequence: u64,
+    pub(super) queue_sequence: u64,
     pub(super) generations: HashMap<InstanceId, u64>,
     pub(super) operations: HashMap<OperationId, Operation>,
     pub(super) openings: HashMap<OperationId, Opening>,
@@ -50,6 +52,7 @@ impl<C: Clock> NexusSessions<C> {
             sessions: HashMap::new(),
             deliveries: HashMap::new(),
             send_sequence: 0,
+            queue_sequence: 0,
             generations: HashMap::new(),
             operations: HashMap::new(),
             openings: HashMap::new(),

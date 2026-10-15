@@ -13,6 +13,122 @@ mod compatibility;
 mod lifecycle;
 
 #[test]
+fn n5_yield_rejoins_fifo_without_renewing_identity_or_deadline() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("n5", "n5-instance", 1);
+    let long = rig.queue(&lease, "long", "batch_decompile", 1);
+    rig.dispatch(&long);
+    let short = rig.queue(&lease, "short", "list_functions", 120);
+    rig.sessions
+        .yield_operation(&long, json!({"index":1}))
+        .unwrap();
+    assert_eq!(rig.snapshot(&long).status, OperationStatus::Queued);
+    assert!(rig.snapshot(&long).execution_stopped);
+    assert_eq!(
+        rig.sessions
+            .dispatch(&lease.client_id, &long, &mut rig.backend)
+            .unwrap_err()
+            .code,
+        NexusErrorCode::Busy
+    );
+    rig.dispatch(&short);
+    rig.sessions
+        .complete(&short, Completion::Success(json!("short")))
+        .unwrap();
+    rig.dispatch(&long);
+    assert_eq!(
+        rig.backend.executed.last().unwrap().params["_n5_checkpoint"]["index"],
+        1
+    );
+    rig.sessions
+        .yield_operation(&long, json!({"index":2}))
+        .unwrap();
+    rig.clock.advance(1001);
+    assert_eq!(
+        rig.sessions
+            .dispatch(&lease.client_id, &long, &mut rig.backend)
+            .unwrap_err()
+            .code,
+        NexusErrorCode::QueueExpired
+    );
+    assert_eq!(rig.snapshot(&long).status, OperationStatus::TimedOut);
+    assert_eq!(rig.backend.executed.len(), 3);
+}
+
+#[test]
+fn n5_cancel_at_slice_boundary_confirms_stop_and_does_not_resume() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("n5", "n5-instance", 1);
+    let long = rig.queue(&lease, "cancel-long", "batch_decompile", 120);
+    rig.dispatch(&long);
+    rig.sessions
+        .cancel(
+            &lease.client_id,
+            &long,
+            CancelReason::Client,
+            &mut rig.backend,
+        )
+        .unwrap();
+    assert!(!rig.snapshot(&long).execution_stopped);
+    rig.sessions
+        .yield_operation(&long, json!({"index":1}))
+        .unwrap();
+    assert_eq!(rig.snapshot(&long).status, OperationStatus::Cancelled);
+    assert!(rig.snapshot(&long).execution_stopped);
+    assert!(rig
+        .sessions
+        .dispatch(&lease.client_id, &long, &mut rig.backend)
+        .is_err());
+    let next = rig.queue(&lease, "next", "list_functions", 120);
+    rig.dispatch(&next);
+}
+
+#[test]
+fn n5_late_slice_preserves_unknown_outcome_and_deadline_boundary_stops() {
+    for unknown in [false, true] {
+        let mut rig = Rig::new();
+        let lease = rig.connect("n5-boundary", "n5-owner", 1);
+        let long = rig.queue(&lease, "boundary", "batch_decompile", 1);
+        rig.dispatch(&long);
+        if unknown {
+            rig.sessions
+                .delivery_failed(
+                    rig.backend.attempts.last().unwrap(),
+                    DispatchFailure::Uncertain(NexusError::new(
+                        NexusErrorCode::Disconnected,
+                        "fixture",
+                    )),
+                )
+                .unwrap();
+            assert_eq!(rig.snapshot(&long).status, OperationStatus::UnknownOutcome);
+        } else {
+            rig.clock.advance(1001);
+        }
+        rig.sessions
+            .yield_operation(&long, json!({"index":1}))
+            .unwrap();
+        assert_eq!(
+            rig.snapshot(&long).status,
+            if unknown {
+                OperationStatus::UnknownOutcome
+            } else {
+                OperationStatus::TimedOut
+            }
+        );
+        assert!(rig.snapshot(&long).execution_stopped);
+        assert!(rig
+            .sessions
+            .dispatch(&lease.client_id, &long, &mut rig.backend)
+            .is_err());
+        assert_eq!(
+            rig.backend.executed.len(),
+            1,
+            "late slice never resumes/replays"
+        );
+    }
+}
+
+#[test]
 fn e02_capability_and_readiness_rejections_never_execute_or_fallback() {
     let mut rig = Rig::new();
     let lease = rig.connect("a", "instance", 1);

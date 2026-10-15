@@ -704,6 +704,12 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
                 };
                 s.complete(identity, Completion::Success(value.take()))?;
             }
+            "yielded" => {
+                let DeliveryTarget::Execute { identity } = &attempt.target else {
+                    return Err(invalid("yield target mismatch"));
+                };
+                s.yield_operation(identity, event["checkpoint"].clone())?;
+            }
             "stopped" => {
                 let DeliveryTarget::Execute { identity } = &attempt.target else {
                     return Err(invalid("stop target mismatch"));

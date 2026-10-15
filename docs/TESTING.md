@@ -412,3 +412,38 @@ future Nexus bridge.
 E22 验证匹配旧库后保留原输入快照，再让活动 owner 保存数据库，随后验证 keep-warm 与最后释放。可用 `scripts/verify_nexus_e2e.py --suite contract --case E22` 单独运行，其他参数沿用完整 contract 命令；每轮必须全新 prepare，内层 180s、外层 210s。测试环境根目录的 `e22-reverify-save.inject` 仅由测试 bridge fixture 使用：若再次验证已打开的 packed IDB，就让该真实 owner 修改重复注释并保存，以确定性触发验证窗口。绿例必须保留快照且不再进入该窗口。所有样本和保存均在私有环境中。
 
 第十三门禁现有 13 项，新增 P25 事件流断开后的 RAII 释放回归；失败时先救援测试 barrier、回收任务，再断言，红例也不遗留 Control 许可。库测试另覆盖已验证快照、owner 保存、取消、未关闭 probe 和发布冲突；原库内容与无覆盖断言保留。
+
+
+## Nexus N5 concurrency acceptance
+
+Use a fresh N0 prepared environment and a short root under the delegated evidence
+folder. Both IPC paths and CLI home paths must fit macOS Unix sockets: a path of
+104 bytes already exceeds the usable `sun_path` length. Do not reuse a suite root
+with a process ledger. All IDA samples, profiles, CLI home and state are isolated.
+
+`verify_nexus_e2e.py --suite concurrency` requires `--baseline` naming the fixed N0
+binary. It runs exactly 14 tests and checks the complete PASS case set: E08–E15,
+E18, E26, N5-hooks, N5-lifecycle, N5-reconnect and N5-compare. The test driver builds
+its PyDLL fixture with `timeout 30s cc`; the fixture also exports 80 independent
+functions for real search fairness. The suite uses marker/FIFO/protocol barriers,
+separate 15-second startup and 3-second response budgets, and an inner 180-second
+shell timeout. Announce an outer 210-second timeout for exact cleanup before use.
+
+The comparator saves `n5-comparison.json`: 15 exact scalar-type/shape/value checks
+against the fixed binary include repeated/invalid addresses, batch ordering,
+search limits including zero, no matches, Unicode and injected decompiler errors.
+Hook tests cover real external rename/comment/type with unconsumed public events,
+installation/state/module loss, shared lease references, killed bridge cleanup,
+new-owner rejection and self decompilation. E11 keeps real startup analysis work
+pending through a public import script; E12 tests explicit wait independently.
+E26 holds the GIL through ctypes.PyDLL, checks pending cancellation and conflicting
+writes, then releases the native FIFO into a cooperative cancellation boundary.
+It does not establish arbitrary Hex-Rays GIL behavior.
+
+Run the lifecycle 9 and contract 4 regressions separately with fresh prepared
+roots. Keep E04 at 38 exact comparisons, both patch probes' red/green evidence,
+the 12 standard gates plus gate 13, N0 support 33, bridge pytest 22 and N4 fix 5.
+Run lib at least three consecutive times. Every invocation records uptime and its
+exit status; retain failed runs and explain the changed variable before rerunning.
+Audit each environment with cleanup/assert_clean and exact registered process
+identities. A timeout, ignored replacement assertion or zero-test run is not PASS.

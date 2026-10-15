@@ -29,6 +29,9 @@ class Handle:
         self.disconnect = False
 
     def execute_python(self, code, **options):
+        if code.startswith("import time as _n5_time\n"):
+            guard, code = code.split("# nexus owner deadline checked\n", 1)
+            exec(guard, {})  # Exercise the actual deadline check, then the fixture.
         self.calls.append((code, options))
         if "get_kernel_version" in code:
             return {"result": "9.5"}

@@ -78,6 +78,7 @@ pub fn capabilities() -> NexusCapabilities {
         methods: BTreeMap::from([
             ("list_functions".into(), MethodEffect::ReadOnly),
             ("rename_symbol".into(), MethodEffect::MayWrite),
+            ("batch_decompile".into(), MethodEffect::ReadOnly),
         ]),
     }
 }
