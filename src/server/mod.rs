@@ -74,10 +74,15 @@ impl ToolMux<IdaMcpServer> {
             if router.uses_nexus()
                 && !matches!(
                     context.name.as_ref(),
-                    "open_idb" | "close_idb" | "tool_catalog" | "tool_help"
+                    "open_idb"
+                        | "close_idb"
+                        | "tool_catalog"
+                        | "tool_help"
+                        | "get_task_status"
+                        | "convert_number"
                 )
             {
-                if let Err(error) = crate::router::nexus_tools::Tools::require(
+                if let Err(error) = crate::router::nexus_tools::Tools::require_tool(
                     tool_registry::primary_name_for(&context.name),
                 ) {
                     return Ok(error.to_tool_result());

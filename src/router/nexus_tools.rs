@@ -27,6 +27,61 @@ pub const METHODS: &[&str] = &[
     "batch_decompile",
     "search_pseudocode",
     "run_auto_analysis",
+    "list_local_types",
+    "declare_c_type",
+    "apply_type",
+    "infer_type",
+    "set_function_prototype",
+    "get_function_prototype",
+    "get_stack_frame",
+    "create_stack_variable",
+    "delete_stack_variable",
+    "rename_stack_variable",
+    "set_stack_variable_type",
+    "list_enums",
+    "create_enum",
+    "set_comment",
+    "set_function_comment",
+    "rename_symbol",
+    "patch_bytes",
+    "patch_assembly",
+    "rename_local_variable",
+    "set_local_variable_type",
+    "set_decompiler_comment",
+    "read_bytes",
+    "read_int",
+    "read_string",
+    "get_basic_blocks",
+    "get_callers",
+    "get_callees",
+    "build_callgraph",
+    "find_control_flow_paths",
+    "build_xref_matrix",
+    "list_segments",
+    "list_imports",
+    "list_exports",
+    "list_entry_points",
+    "list_structs",
+    "get_struct_info",
+    "read_struct_at_address",
+    "get_xrefs_to_struct_field",
+    "batch_lookup_functions",
+    "export_functions",
+    "list_globals",
+    "read_global_variable",
+    "list_strings",
+    "get_xrefs_to_string",
+    "get_address_info",
+    "scan_memory_table",
+    "diff_pseudocode",
+    "get_pseudocode_at",
+    "load_debug_info",
+    "search_bytes",
+    "search_text",
+    "search_imm",
+    "search_instructions",
+    "search_instruction_operands",
+    "batch_rename",
 ];
 tokio::task_local! { pub(crate) static CURRENT_TASK_ID: TaskId; }
 
@@ -167,9 +222,24 @@ impl Tools {
         } else {
             Err(NexusError::new(
                 NexusErrorCode::UnsupportedCapability,
-                format!("method {method} is not implemented by Nexus N4; no legacy fallback"),
+                format!("method {method} is not implemented by Nexus; no legacy fallback"),
             )
             .into())
+        }
+    }
+    pub fn require_tool(method: &str) -> Result<(), ToolError> {
+        // These existing MCP adapters generate Python and route run_script.
+        // Database execution still passes the same Execute capability check.
+        if matches!(method, "decompile_structured" | "search_structs") || method.starts_with("dbg_")
+        {
+            Self::require("run_script")
+        } else if matches!(
+            method,
+            "read_byte" | "read_word" | "read_dword" | "read_qword"
+        ) {
+            Self::require("read_int")
+        } else {
+            Self::require(method)
         }
     }
     pub async fn open(
@@ -355,7 +425,7 @@ impl Tools {
         Self::require(method)?;
         if matches!(
             method,
-            "batch_decompile" | "search_pseudocode" | "run_auto_analysis"
+            "batch_decompile" | "search_pseudocode" | "run_auto_analysis" | "batch_rename"
         ) {
             params = match method {
                 "batch_decompile" => serde_json::to_value(
@@ -365,6 +435,11 @@ impl Tools {
                 .map_err(diagnostic)?,
                 "search_pseudocode" => serde_json::to_value(
                     serde_json::from_value::<crate::server::SearchPseudocodeRequest>(params)
+                        .map_err(diagnostic)?,
+                )
+                .map_err(diagnostic)?,
+                "batch_rename" => serde_json::to_value(
+                    serde_json::from_value::<crate::server::BatchRenameRequest>(params)
                         .map_err(diagnostic)?,
                 )
                 .map_err(diagnostic)?,
@@ -468,6 +543,32 @@ impl Tools {
         }
         preparation.check()?;
         params = normalize(method, params)?;
+        if matches!(
+            method,
+            "search_bytes" | "search_instructions" | "search_instruction_operands"
+        ) {
+            let raw = &params["patterns"];
+            let list = if let Some(values) = raw.as_array() {
+                values.clone()
+            } else if let Some(text) = raw.as_str() {
+                match serde_json::from_str::<Value>(text) {
+                    Ok(Value::Array(values)) if text.trim().starts_with('[') => values,
+                    _ => vec![raw.clone()],
+                }
+            } else {
+                Vec::new()
+            };
+            params["patterns"] = json!(list
+                .into_iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect::<Vec<_>>());
+        }
+        if method == "read_global_variable" && !params["query"].is_string() {
+            params["query"] = json!(serde_json::to_string(&params["query"]).map_err(diagnostic)?);
+        }
+        if method == "patch_bytes" {
+            params["bytes"] = json!(parse_patch_bytes(&params["bytes"])?);
+        }
         if matches!(method, "disassemble" | "decompile_function") {
             params["address"] = normalize_addresses(&params["address"])?;
         }
@@ -741,8 +842,115 @@ fn normalize(method: &str, params: Value) -> Result<Value, ToolError> {
         "decompile_function" => typed::<DecompileRequest>(params),
         "get_xrefs_to" | "get_xrefs_from" => typed::<AddressRequest>(params),
         "run_script" => typed::<RunScriptRequest>(params),
+        "list_local_types" => typed::<LocalTypesRequest>(params),
+        "declare_c_type" => typed::<DeclareTypeRequest>(params),
+        "apply_type" => typed::<ApplyTypesRequest>(params),
+        "infer_type" => typed::<InferTypesRequest>(params),
+        "set_function_prototype" => typed::<SetFunctionPrototypeRequest>(params),
+        "get_stack_frame" => typed::<AddressRequest>(params),
+        "create_stack_variable" => typed::<DeclareStackRequest>(params),
+        "delete_stack_variable" => typed::<DeleteStackRequest>(params),
+        "rename_stack_variable" => typed::<RenameStackVariableRequest>(params),
+        "set_stack_variable_type" => typed::<SetStackVariableTypeRequest>(params),
+        "list_enums" => typed::<ListEnumsRequest>(params),
+        "create_enum" => typed::<CreateEnumRequest>(params),
+        "set_comment" => typed::<SetCommentsRequest>(params),
+        "set_function_comment" => typed::<SetFunctionCommentRequest>(params),
+        "rename_symbol" => typed::<RenameRequest>(params),
+        "patch_bytes" => typed::<PatchRequest>(params),
+        "patch_assembly" => typed::<PatchAsmRequest>(params),
+        "rename_local_variable" => typed::<RenameLvarRequest>(params),
+        "set_local_variable_type" => typed::<SetLvarTypeRequest>(params),
+        "set_decompiler_comment" => typed::<SetDecompilerCommentRequest>(params),
+        "read_bytes" => typed::<GetBytesRequest>(params),
+        "read_string" => typed::<GetStringRequest>(params),
+        "get_basic_blocks" => typed::<AddressRequest>(params),
+        "get_callers" => typed::<AddressRequest>(params),
+        "get_callees" => typed::<AddressRequest>(params),
+        "build_callgraph" => typed::<CallGraphRequest>(params),
+        "find_control_flow_paths" => typed::<FindPathsRequest>(params),
+        "build_xref_matrix" => typed::<XrefMatrixRequest>(params),
+        "list_imports" => typed::<PaginatedRequest>(params),
+        "list_exports" => typed::<PaginatedRequest>(params),
+        "list_structs" => typed::<StructsRequest>(params),
+        "get_struct_info" => typed::<StructInfoRequest>(params),
+        "read_struct_at_address" => typed::<ReadStructRequest>(params),
+        "get_xrefs_to_struct_field" => typed::<XrefsToFieldRequest>(params),
+        "batch_lookup_functions" => typed::<LookupFuncsRequest>(params),
+        "export_functions" => typed::<ExportFuncsRequest>(params),
+        "list_globals" => typed::<ListGlobalsRequest>(params),
+        "read_global_variable" => typed::<GetGlobalValueRequest>(params),
+        "get_xrefs_to_string" => typed::<XrefsToStringRequest>(params),
+        "get_address_info" => typed::<AddrInfoRequest>(params),
+        "scan_memory_table" => typed::<TableScanRequest>(params),
+        "diff_pseudocode" => typed::<DiffFunctionsRequest>(params),
+        "get_pseudocode_at" => typed::<PseudocodeAtRequest>(params),
+        "load_debug_info" => typed::<LoadDebugInfoRequest>(params),
+        "search_bytes" => typed::<FindBytesRequest>(params),
+        "search_instructions" => typed::<FindInsnsRequest>(params),
+        "search_instruction_operands" => typed::<FindInsnOperandsRequest>(params),
         _ => Ok(params),
     }
+}
+
+fn parse_patch_bytes(v: &Value) -> Result<Vec<u8>, ToolError> {
+    if let Some(arr) = v.as_array() {
+        let out: Vec<u8> = arr
+            .iter()
+            .filter_map(|item| item.as_u64().map(|n| n as u8))
+            .collect();
+        if out.is_empty() {
+            return Err(ToolError::InvalidParams("no bytes provided".to_string()));
+        }
+        return Ok(out);
+    }
+    if let Some(s) = v.as_str() {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(ToolError::InvalidParams("no bytes provided".to_string()));
+        }
+        // Split by common separators (whitespace, comma, colon, dash, underscore)
+        let tokens: Vec<&str> = s
+            .split(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | ':' | '-' | '_'))
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        let mut hex_str = String::with_capacity(s.len());
+        for token in &tokens {
+            // Strip 0x/0X prefix from each token
+            let cleaned = token
+                .strip_prefix("0x")
+                .or_else(|| token.strip_prefix("0X"))
+                .unwrap_or(token);
+            for c in cleaned.chars() {
+                if !c.is_ascii_hexdigit() {
+                    return Err(ToolError::InvalidParams(format!(
+                        "invalid hex character: {c}"
+                    )));
+                }
+            }
+            hex_str.push_str(cleaned);
+        }
+
+        if hex_str.is_empty() {
+            return Err(ToolError::InvalidParams("no bytes provided".to_string()));
+        }
+        if !hex_str.len().is_multiple_of(2) {
+            return Err(ToolError::InvalidParams(
+                "hex string has odd length".to_string(),
+            ));
+        }
+        let mut out = Vec::with_capacity(hex_str.len() / 2);
+        for i in (0..hex_str.len()).step_by(2) {
+            let byte = u8::from_str_radix(&hex_str[i..i + 2], 16)
+                .map_err(|_| ToolError::InvalidParams("invalid hex byte".to_string()))?;
+            out.push(byte);
+        }
+        return Ok(out);
+    }
+    Err(ToolError::InvalidParams(
+        "bytes must be a hex string or array of integers".to_string(),
+    ))
 }
 
 fn normalize_addresses(value: &Value) -> Result<Value, ToolError> {
@@ -769,6 +977,12 @@ fn normalize_addresses(value: &Value) -> Result<Value, ToolError> {
 }
 
 fn business_error(message: &str) -> ToolError {
+    if let Some(message) = message.strip_prefix("Invalid database path: ") {
+        return ToolError::InvalidPath(message.into());
+    }
+    if let Some(message) = message.strip_prefix("Not supported: ") {
+        return ToolError::NotSupported(message.into());
+    }
     if let Some(message) = message.strip_prefix("IDA error: ") {
         return ToolError::IdaError(message.into());
     }

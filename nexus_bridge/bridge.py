@@ -15,15 +15,24 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tools import METHODS as TOOL_METHODS
+from type_tools import TYPE_METHODS
+from edit_tools import EDIT_METHODS, WRITE_METHODS
+from analysis_tools import ANALYSIS_METHODS
+from struct_tools import STRUCT_METHODS
+from query_tools import QUERY_METHODS
+from search_tools import SEARCH_METHODS
+
+TOOL_METHODS = (*TOOL_METHODS, *TYPE_METHODS, *EDIT_METHODS, *ANALYSIS_METHODS, *STRUCT_METHODS, *QUERY_METHODS, *SEARCH_METHODS, "batch_rename")
 
 HANDLE_SHA = "4cd1a9c27e969504eed4ae55d7cbd0e2b4b5a6ba67f0c2529ccb6006a8d67b76"
 METHODS = {"execute_python": "may_write", "database_info": "read_only",
            "rename_address": "may_write", "read_name": "read_only"}
-METHODS.update({method: "may_write" if method == "run_script" else "read_only"
+METHODS.update({method: "may_write" if method in WRITE_METHODS else "read_only"
                 for method in TOOL_METHODS})
-TOOL_SOURCE = Path(__file__).with_name("tools.py").read_text(encoding="utf-8")
+TOOL_SOURCE = "\n".join(Path(__file__).with_name(name).read_text(encoding="utf-8")
+                        for name in ("type_tools.py", "edit_tools.py", "analysis_tools.py", "struct_tools.py", "query_tools.py", "search_tools.py", "tools.py"))
 SLICE_SOURCE = Path(__file__).with_name("slices.py").read_text(encoding="utf-8")
-SLICE_METHODS = {"batch_decompile", "search_pseudocode", "run_auto_analysis", "_n5_cleanup"}
+SLICE_METHODS = {"batch_decompile", "search_pseudocode", "run_auto_analysis", "batch_rename", "_n5_cleanup"}
 
 
 def error(code, message):

@@ -256,14 +256,42 @@ def cases(address, name):
         ("run_script", {"code":"print('雪'*400000)"})]
 
 
-def json_equal(left, right):
-    """JSON equality including exact scalar types, recursively."""
+# Each entry requires repeated fixed-N0 observations on the same IDB/input.
+# Evidence and approval: docs/plan/nexus-backend.md, N6 differences list.
+UNORDERED_FIELDS = {("build_callgraph", ("result", "nodes")): "address"}
+
+
+def json_equal(left, right, method=None, path=()):
+    """Strict JSON equality, with only registered method/field order exceptions."""
     if type(left) is not type(right):
         return False
     if isinstance(left, dict):
-        return left.keys() == right.keys() and all(json_equal(left[k], right[k]) for k in left)
+        return left.keys() == right.keys() and all(
+            json_equal(left[k], right[k], method, path + (k,)) for k in left)
     if isinstance(left, list):
-        return len(left) == len(right) and all(json_equal(a, b) for a, b in zip(left, right))
+        if len(left) != len(right):
+            return False
+        key = UNORDERED_FIELDS.get((method, path))
+        if key:
+            # Type-tagged scalar identities prevent bool/int and string/number
+            # collisions. Missing, composite or duplicate identities fail closed.
+            def indexed(items):
+                result = {}
+                for item in items:
+                    if not isinstance(item, dict) or key not in item:
+                        return None
+                    identity = item[key]
+                    if type(identity) not in (str, int, float, bool, type(None)):
+                        return None
+                    identity = (type(identity), identity)
+                    if identity in result:
+                        return None
+                    result[identity] = item
+                return result
+            a, b = indexed(left), indexed(right)
+            return a is not None and b is not None and a.keys() == b.keys() and all(
+                json_equal(a[k], b[k], method, path + ("[]",)) for k in a)
+        return all(json_equal(a, b, method, path + ("[]",)) for a, b in zip(left, right))
     return left == right
 
 
@@ -312,7 +340,7 @@ def comparison(env, baseline, binary):
                 assert actual.get("exit") == 1, actual
                 assert actual["error"] == "Error: " + expected["error"]["message"], (method,expected,actual)
             else:
-                assert json_equal(normalized(expected,sample), normalized(actual,new_sample)), (method,params,expected,actual)
+                assert json_equal(normalized(expected,sample), normalized(actual,new_sample), method), (method,params,expected,actual)
             if method == "decompile_function" and params.get("address") == [address, funcs[1]["address"]]:
                 results = expected["result"]["results"]
                 assert "error" in results[0] and "code" in results[1], results
@@ -363,14 +391,14 @@ def entrypoints(env, binary):
             if "error" in baseline:
                 assert direct.get("exit") == 1 and direct["error"] == "Error: "+baseline["error"], (baseline,direct)
             else:
-                assert json_equal(normalized(direct,sample), normalized(baseline,sample)),(method,baseline,direct)
+                assert json_equal(normalized(direct,sample), normalized(baseline,sample), method),(method,baseline,direct)
         std_sample=env.root/"fixtures/e16-stdio"
         shutil.copyfile(sample,std_sample)
         stdio=Candidate(env,binary,std_sample,"e16-stdio","stdio")
         try:
             for (method,params), baseline in zip(matrix,expected):
                 actual=stdio.call(method,params)
-                assert json_equal(normalized(actual,std_sample), normalized(baseline,sample)),(method,baseline,actual)
+                assert json_equal(normalized(actual,std_sample), normalized(baseline,sample), method),(method,baseline,actual)
             for candidate in (http,stdio):
                 refusal=candidate.call("rename_symbol",{"address":functions[0]["address"],"new_name":"FORBIDDEN"})
                 assert "not implemented by Nexus N4" in refusal["error"],refusal

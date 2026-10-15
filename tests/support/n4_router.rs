@@ -121,7 +121,7 @@ async fn n4_fix_enqueue_rejects_before_queue_or_open() {
             router
                 .enqueue_federated_task(
                     "/missing-test-copy",
-                    "rename_symbol",
+                    "open_dsc",
                     serde_json::json!({}),
                     None,
                     0,
@@ -132,7 +132,7 @@ async fn n4_fix_enqueue_rejects_before_queue_or_open() {
             router
                 .enqueue_route_task(
                     "/missing-test-copy",
-                    "rename_symbol",
+                    "open_dsc",
                     serde_json::json!({}),
                     None,
                     0,
@@ -143,7 +143,9 @@ async fn n4_fix_enqueue_rejects_before_queue_or_open() {
         let error = result
             .expect_err("unsupported Nexus method must not be queued")
             .to_string();
-        assert!(error.contains("not implemented by Nexus N4"), "{error}");
+        assert!(error.contains("UnsupportedCapability"), "{error}");
+        assert!(error.contains("method open_dsc"), "{error}");
+        assert!(error.contains("no legacy fallback"), "{error}");
         assert!(router.list_task_states().is_empty());
         assert!(router.nexus_tools.handles().is_empty());
     }

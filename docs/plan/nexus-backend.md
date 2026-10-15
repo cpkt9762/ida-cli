@@ -489,8 +489,12 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 ### N6：修改数据库与高级分析能力
 
 - 2026-10-16 阻塞预检：输入 `9d71e70fa7e3903f702a158c2aa9229b4367e909` clean，固定 N0 二进制 SHA256 匹配。真实 IDA 同一测试库连续 8 次 `build_callgraph` 的 `nodes` 数组有两种顺序；现有严格比较器有 2 次与首个响应不等，按地址对应的完整节点及 `edges` 均相同。旧实现用 `HashMap::values()` 输出节点，当前 E04 已接受规则只允许规范化已核验的输入路径；新增节点顺序例外需要编排者裁定，未改比较器、旧路径或输出，也未开始 N6 生产接线。
-- 建议裁定仅对 `build_callgraph.nodes` 按唯一 `address` 对应后用原严格比较器比较完整节点，并拒绝重复地址；`edges` 和所有其他数组仍保留原序。该建议尚未生效，不能重试选取恰好相同的排列作为通过。外部预检证据：`n6/dev/preflight-result.json`、`n6/preflight.py`、`n6/report.md`。
-- [N6 完整输入能力盘点](nexus-n6-capabilities.md) 覆盖全部 106 个注册工具（含 23 个 `dbg_*`）、73 个 native 方法及 34 个 idat 方法。明确区分历史已迁移、N7 和当前拒绝但尚未迁移的 N6 能力；没有把未实施当成永久不支持。该盘点不是 N6 验收完成对照表，E04 扩展、E20 和 12+13 门禁本轮未完成，N6 保持 BLOCKED。
+- 2026-10-16 续派已批准通用规则：仅对有固定 N0 同库同输入多次运行实证顺序不确定的字段，按两边唯一身份键配对；数量、每个元素的所有字段和值类型继续严格比较。每个字段单独登记，其他数组保持原序，不能重试挑选排列。
+- 比较例外清单当前仅一项：方法 `build_callgraph`，字段路径 `result.nodes`，唯一身份键 `address`；同库 8 次原始证据 `n6/dev/preflight-result.json`，独立核验 `n6/preflight-verification.json`。比较器 `scripts/compare_nexus_baseline.py::UNORDERED_FIELDS` 已登记，六项单测覆盖换序相等、内容/类型/重复键/数量不同不等、未登记字段和 edges 严格原序。Nexus nodes 按数值地址稳定排序，edges 保留旧遍历顺序。
+- 续派输入 `5e9931ec9ba5f9871d40549df4f6237b6226ebcd`。已编写 70 个普通 Execute 方法的接线及独立 owner 模块；写方法声明 MayWrite，`batch_rename` 每片一项并沿用 N5 stamp、期限与取消。真实高级/写入对照 `n6/impl3/type-comparison.json` 执行 60 项，59 PASS、1 FAIL，覆盖 50 个不同方法；这不是全部方法验收。
+- 新阻塞是 `get_xrefs_to_struct_field.result.tid` 的值差异：N0 为 `0xff00000000000116`，Nexus 为 `0xff00000000000117`，其他字段严格一致。独立诊断的两个公开 netnode 快照显示 Nexus 打开原始样本后多出 `$ debugger application` 节点，后续共有类型/成员节点整体偏移 1；原始样本 SHA256 相同。证据 `n6/tid/type-comparison.json`、`n6/tid-diagnosis.json`，两轮独立环境复现相同成员 tid 差异。旧打开包装调用 `init_database`，Nexus/IDA Domain 调用公开 `idapro.open_database`；没有修改服务端、删除节点或伪造 tid。
+- 该差异不是数组顺序，未扩大已批准例外。若要按逻辑类型/成员身份比较运行时分配的 tid，需要编排者另行裁定严格规则；也可提出能消除差异的公开 API 方案。当前按委托的语义变更停止要求交付，N6 仍 BLOCKED。此项不是永久放弃工具的决定。
+- [N6 完整能力盘点及当前对照](nexus-n6-capabilities.md) 覆盖全部 106 个注册工具（含 23 个 `dbg_*`）、73 个 native 方法及 34 个 idat 方法。区分本轮方法对照、历史通过、已接线待验和 N7；没有把未验能力标成永久不支持。E20、全部方法无 fallback 验证、三个真实回归套件及完整 N6 E2E 尚未完成，详细门禁、失败和清理记录见外部 `n6/report.md`。
 - 迁移重命名、注释、字节 patch、类型声明/应用、结构体/枚举/栈变量及现有高级分析方法。
 - 从当前 `capabilities.rs` 和工具注册表生成能力对照，逐项记录通过、明确不支持和原因，不能漏项后宣称全量完成。
 - 核对反编译扩展字段；若最终选定基线包含 `line_addresses` 等新增能力，同样列入契约。

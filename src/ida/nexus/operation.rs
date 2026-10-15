@@ -124,7 +124,7 @@ impl<C: Clock> NexusSessions<C> {
         Ok(self.queue_sequence)
     }
 
-    /// A returned, read-only slice proves native execution stopped. Retain the
+    /// A returned slice proves native execution stopped. Retain the
     /// logical identity/deadline and rejoin the tail of this instance's FIFO.
     pub fn yield_operation(
         &mut self,
@@ -140,7 +140,7 @@ impl<C: Clock> NexusSessions<C> {
         }
         if !matches!(
             op.request.method.as_str(),
-            "batch_decompile" | "search_pseudocode" | "run_auto_analysis"
+            "batch_decompile" | "search_pseudocode" | "run_auto_analysis" | "batch_rename"
         ) || !matches!(
             op.snapshot.status,
             OperationStatus::Running | OperationStatus::CancelRequested

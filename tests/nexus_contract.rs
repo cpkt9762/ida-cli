@@ -13,6 +13,41 @@ mod compatibility;
 mod lifecycle;
 
 #[test]
+fn n6_write_slices_resume_at_checkpoint_and_cancel_never_replays() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("n6", "n6-owner", 1);
+    let write = rig.queue(&lease, "rename", "batch_rename", 120);
+    rig.dispatch(&write);
+    rig.sessions
+        .yield_operation(&write, json!({"index":1}))
+        .expect("completed write slice permits continuation");
+    rig.dispatch(&write);
+    assert_eq!(rig.backend.writes, 2);
+    assert_eq!(rig.backend.executed[1].params["_n5_checkpoint"]["index"], 1);
+    rig.sessions
+        .cancel(
+            &lease.client_id,
+            &write,
+            CancelReason::Client,
+            &mut rig.backend,
+        )
+        .expect("cancel in-flight slice");
+    rig.sessions
+        .yield_operation(&write, json!({"index":2}))
+        .expect("returned slice confirms execution stopped");
+    assert_eq!(rig.snapshot(&write).status, OperationStatus::Cancelled);
+    assert!(rig.snapshot(&write).execution_stopped);
+    assert!(rig
+        .sessions
+        .dispatch(&lease.client_id, &write, &mut rig.backend)
+        .is_err());
+    assert_eq!(
+        rig.backend.writes, 2,
+        "cancellation never replays already dispatched writes"
+    );
+}
+
+#[test]
 fn n5_yield_rejoins_fifo_without_renewing_identity_or_deadline() {
     let mut rig = Rig::new();
     let lease = rig.connect("n5", "n5-instance", 1);

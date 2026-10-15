@@ -62,7 +62,8 @@ def _invoke_slice(method, params, context, source):
         return {"ok": True, "value": None}
     try:
         return module.step(method, params, context, lambda ea, multiple: invoke(
-            "decompile_function", {"address": ea, "_multiple": multiple}), parse_address)
+        "decompile_function", {"address": ea, "_multiple": multiple}), parse_address,
+                           globals().get("rename_entry"))
     except Exception as exc:
         if str(exc).startswith(("数据库已变化", "一致性无法确认")):
             raise
@@ -190,6 +191,43 @@ def invoke(method, params):
     def unsigned(key, default):
         value = params.get(key)
         return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 2**64 else default
+
+    def resolve(raw=None, name=None, offset=0):
+        ea = parse_address(raw)
+        if ea is None:
+            if name is None:
+                raise ValueError("Invalid parameters: expected address or name")
+            func, _ = named(name)
+            if func:
+                ea = func.start_ea
+            else:
+                ea = next((ea for ea, symbol in idautils.Names() if name == symbol or name in symbol), None)
+            if ea is None:
+                raise ValueError(f"Function not found: {name}")
+        return min(2**64 - 1, ea + offset)
+
+    if any(method in globals().get(group, ()) for group in ("TYPE_METHODS", "EDIT_METHODS", "ANALYSIS_METHODS", "STRUCT_METHODS", "QUERY_METHODS", "SEARCH_METHODS")):
+        try:
+            if method in TYPE_METHODS:
+                value = invoke_type(method, params, resolve)
+            elif method in EDIT_METHODS:
+                value = invoke_edit(method, params, resolve, parse_address)
+            elif method in ANALYSIS_METHODS:
+                value = invoke_analysis(method, params, parse_address)
+            elif method in STRUCT_METHODS:
+                def ref_info(ref):
+                    code_types = {0: "Unknown", 16: "FarCall", 17: "NearCall", 18: "FarJump", 19: "NearJump", 20: "Obsolete", 21: "Flow"}
+                    data_types = {0: "Unknown", 1: "Offset", 2: "Write", 3: "Read", 4: "Text", 5: "Informational", 6: "EnumMember"}
+                    return {"from": hex(ref.frm), "to": hex(ref.to), "is_code": bool(ref.iscode),
+                            "type": ("Code(" + code_types[ref.type & 31] + ")") if ref.iscode else ("Data(" + data_types[ref.type & 31] + ")")}
+                value = invoke_struct(method, params, parse_address, ref_info)
+            elif method in QUERY_METHODS:
+                value = invoke_query(method, params, resolve, parse_address, invoke)
+            else:
+                value = invoke_search(method, params)
+            return {"ok": True, "value": value}
+        except ValueError as exc:
+            return failure(str(exc))
 
     def disasm(ea, count, end=None):
         import ida_bytes

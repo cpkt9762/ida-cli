@@ -1,12 +1,18 @@
 # Testing
 
-N6 的全部迁移方法对照尚未执行，当前停在固定 N0 调用图顺序的预检裁定。
-见 [完整输入能力盘点](plan/nexus-n6-capabilities.md) 和计划 N6 小节。
-`build_callgraph.nodes` 在旧产物中来自随机顺序的 `HashMap`，同库重复调用
-也可能不通过当前逐位置的严格数组比较。不能通过重试、忽略该工具或无记录排序
-制造 E04 通过；任何逐方法比较例外须先记录并由编排者裁定。本轮原始响应及
-清理证据位于委托的外部 `n6/dev/preflight-result.json`；历史 N4/N5 通过记录
-不能替代 N6 当前改动后的验证。
+N6 续派已实现部分迁移，尚未验收，见 [完整能力盘点](plan/nexus-n6-capabilities.md)
+和计划 N6 小节。严格比较器只为已有 N0 同库多次运行证据的
+`build_callgraph.result.nodes` 登记唯一 `address` 配对例外；数量、完整节点值与类型、
+其他字段及 edges 仍严格。六项回归为
+`timeout 30s python3 -B -m unittest discover -s tests -p test_nexus_n6_compare.py -v`。
+Nexus nodes 按数值地址稳定排序。证据为外部 `n6/dev/preflight-result.json`。
+
+当前真实对照 60 项中 59 项通过，结构体成员 `result.tid` 存在运行时节点分配的
+值差异，未按顺序例外处理。原始响应与节点诊断见外部
+`n6/impl3/type-comparison.json`、`n6/tid/type-comparison.json`、`n6/tid-diagnosis.json`。
+此轮脚本 `n6/advanced_compare.py` 和 `n6/tid_diagnostic.py` 是阻塞诊断，exit 1
+表示严格比较失败，不能称为 N6 E2E 通过。E20 和完整真实回归尚未执行；历史
+N4/N5 记录不能替代当前改动后的验证。恢复实现前须处理值差异的比较语义。
 
 ## Run tests
 

@@ -150,7 +150,7 @@ def release_lease(context, expected_incarnation=None):
             release(job, context)
 
 
-def step(method, params, context, decompile, parse_address):
+def step(method, params, context, decompile, parse_address, rename=None):
     """One function (or one autoanalysis address) per scheduling turn."""
     global counter
     import ida_auto
@@ -212,6 +212,13 @@ def step(method, params, context, decompile, parse_address):
                 state["index"] += 1
             done = state["index"] >= len(addresses)
             value = state["results"]
+        elif method == "batch_rename":
+            entries = params["renames"]
+            if index < len(entries):
+                state["results"].append(rename(entries[index], parse_address))
+                state["index"] += 1
+            done = state["index"] >= len(entries)
+            value = {"results": state["results"], "total": len(state["results"])}
         else:
             import ida_hexrays
             if not ida_hexrays.init_hexrays_plugin():

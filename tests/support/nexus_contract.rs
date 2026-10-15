@@ -79,6 +79,7 @@ pub fn capabilities() -> NexusCapabilities {
             ("list_functions".into(), MethodEffect::ReadOnly),
             ("rename_symbol".into(), MethodEffect::MayWrite),
             ("batch_decompile".into(), MethodEffect::ReadOnly),
+            ("batch_rename".into(), MethodEffect::MayWrite),
         ]),
     }
 }
