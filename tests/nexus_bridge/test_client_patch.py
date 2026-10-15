@@ -141,7 +141,8 @@ def test_control_response_close_failure_is_not_authoritative_absence(client, mon
     assert "unknown" in client._uncertain_operations
 
 
-def test_control_connection_close_failure_preserves_authoritative_stop(client, monkeypatch):
+@pytest.mark.parametrize("close_error", [OSError, RuntimeError])
+def test_control_connection_close_failure_preserves_authoritative_stop(client, monkeypatch, close_error):
     fail_request(client, monkeypatch, "unknown")
     ack = Connection({"result": {"cancelled": True}})
     monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: ack)
@@ -152,10 +153,11 @@ def test_control_connection_close_failure_preserves_authoritative_stop(client, m
             return Connection({"result": {"cancelled": False}})
 
         def close(self):
-            raise OSError("control connection close failed after parsed result")
+            raise close_error("control connection close failed after parsed result")
     monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: ConnectionCloseFailure())
     outcome = client.cancel_operation_outcome("unknown")
     assert outcome["status"] == "not_pending" and outcome["execution_stopped"]
     assert outcome["attempt_sequence"] > outcome["ack_cutoff"]
     assert outcome["cleanup_failure"] == "transport"
+    assert outcome["cleanup_failure_type"] == close_error.__name__
     assert "unknown" not in client._uncertain_operations

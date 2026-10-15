@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 
-HANDLE_SHA = "5d60799c1ac7fe6728a5e95ca2b91e421e172bba059a0ff846d6a37fd0819b05"
+HANDLE_SHA = "4cd1a9c27e969504eed4ae55d7cbd0e2b4b5a6ba67f0c2529ccb6006a8d67b76"
 METHODS = {"execute_python": "may_write", "database_info": "read_only",
            "rename_address": "may_write", "read_name": "read_only"}
 
