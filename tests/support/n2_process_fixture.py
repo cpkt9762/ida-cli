@@ -9,6 +9,9 @@ import sys
 
 mode, socket_path, marker = sys.argv[1:4]
 if mode == 'escaped_pipe':
+    if os.environ.get('N4_F2_STARTUP_DELAY'):
+        import time
+        time.sleep(4)
     control = str(Path(marker).parent / 'escaped.sock')
     script = """import os,socket,sys
 with socket.socket(socket.AF_UNIX) as listener:
@@ -21,7 +24,7 @@ with socket.socket(socket.AF_UNIX) as listener:
     escaped = subprocess.Popen([sys.executable, '-c', script, control], start_new_session=True)
     # A regular pipe provides deterministic startup without scanning PIDs.
     import time
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + 15
     while not Path(control).exists():
         assert time.monotonic() < deadline
         time.sleep(.001)

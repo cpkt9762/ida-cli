@@ -55,6 +55,9 @@ impl Rig {
         );
         environment.insert("F1_ROOT".into(), root.to_string_lossy().into_owned());
         environment.insert("F1_SCENARIO".into(), scenario.into());
+        if std::env::var_os("N4_F2_DELAY").is_some() {
+            environment.insert("N4_F2_DELAY".into(), "1".into());
+        }
         if let Ok(directory) = std::env::var("F1_BRIDGE_DIR") {
             environment.insert("F1_BRIDGE_DIR".into(), directory);
         }
@@ -353,14 +356,13 @@ async fn p25_cli_control_saturation_cannot_disconnect_bridge() {
         starts.recv().await.unwrap();
     }
     r.bridge.status("while-cli-full").await.unwrap();
-    let event = tokio::time::timeout(Duration::from_secs(1), r.events.recv()).await;
+    let event = r.event("local_status").await;
     release.wait();
     for job in jobs {
         job.await.unwrap().unwrap();
     }
     assert_eq!(
-        event.unwrap().unwrap()["event"],
-        "local_status",
+        event["event"], "local_status",
         "decode backpressure must preserve bridge"
     );
     assert_eq!(
@@ -382,6 +384,9 @@ async fn causal_ordering(scenario: &str) {
     let op = r.begin(&l, "unknown");
     r.operation_event("uncertain", &op).await;
     if scenario == "late-success" {
+        if std::env::var_os("N4_F2_DELAY").is_some() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
         r.release_marker("start-success");
         r.marker("success.arrived").await;
     }

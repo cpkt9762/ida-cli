@@ -620,11 +620,17 @@ mod pipe_ownership_regressions {
             .arg("escaped_pipe")
             .arg(&socket)
             .arg(directory.join("unused-final"));
-        let task = tokio::spawn(run(command, Preparation::new(Duration::from_secs(15))));
-        let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
-            .await
-            .unwrap()
-            .unwrap();
+        let task = tokio::spawn(run(command, Preparation::new(Duration::from_secs(25))));
+        let startup = tokio::time::timeout(Duration::from_secs(15), listener.accept()).await;
+        let startup_in_budget = startup.is_ok();
+        // Even a failed startup assertion must complete the owned handshake.
+        let (stream, _) = match startup {
+            Ok(result) => result.unwrap(),
+            Err(_) => tokio::time::timeout(Duration::from_secs(15), listener.accept())
+                .await
+                .expect("fixture cleanup connection")
+                .unwrap(),
+        };
         let mut stream = BufReader::new(stream);
         let mut line = String::new();
         stream.read_line(&mut line).await.unwrap();
@@ -672,6 +678,7 @@ mod pipe_ownership_regressions {
         .await
         .unwrap();
         std::fs::remove_dir_all(directory).unwrap();
+        assert!(startup_in_budget, "fixture startup exceeded startup budget");
         assert!(
             retained,
             "a reaped group leader cannot release capacity while task-owned pipe writers remain"

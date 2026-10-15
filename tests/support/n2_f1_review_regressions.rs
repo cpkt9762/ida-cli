@@ -135,24 +135,42 @@ async fn valid_large_response_must_not_close_before_output_caching() {
             "large".into(),
             b"{\"jsonrpc\":\"2.0\",\"id\":\"large\",\"method\":\"run_script\",\"params\":{}}\n"
                 .to_vec(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(25),
         )
         .unwrap();
+    let (release, held) = tokio::sync::oneshot::channel();
     let sender = tokio::spawn(async move {
         let (read, mut write) = server.into_split();
         let mut read = BufReader::new(read);
         let mut line = String::new();
         read.read_line(&mut line).await.unwrap();
+        if std::env::var_os("N4_F2_TRANSFER_DELAY").is_some() {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+        }
         let output =
             json!({"jsonrpc":"2.0","id":"large","result":{"stdout":"x".repeat(16*1024*1024+128)}});
         let mut bytes = serde_json::to_vec(&output).unwrap();
         bytes.push(b'\n');
-        write.write_all(&bytes).await
+        let sent = write.write_all(&bytes).await;
+        held.await
+            .expect("test releases server only after observing connection");
+        sent
     });
-    let result = tokio::time::timeout(Duration::from_secs(5), response.wait(5)).await;
-    let sent = sender.await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(25), response.wait(25)).await;
     let closed = connection.is_closed();
+    release.send(()).unwrap();
+    let sent = sender.await.unwrap();
     connection.close();
-    eprintln!("valid oversized result sent={sent:?}; reply={result:?}; closed={closed}");
-    assert!(matches!(result,Ok(Ok(_))),"legal response needs a compatible bounded transfer/cache path instead of connection destruction");
+    assert!(
+        !closed,
+        "valid oversized response must never close its connection"
+    );
+    assert!(sent.is_ok(), "full response must be sent: {sent:?}");
+    let response = result
+        .expect("large response must arrive within its transfer budget")
+        .expect("legal response must be delivered");
+    assert_eq!(
+        response["stdout"].as_str().unwrap().len(),
+        16 * 1024 * 1024 + 128
+    );
 }

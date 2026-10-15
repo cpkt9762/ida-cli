@@ -39,6 +39,8 @@ original_send = bridge.Channel.send
 
 
 def send(self, event):
+    if event.get("event") == "local_status" and SCENARIO == "control" and os.environ.get("N4_F2_DELAY"):
+        threading.Event().wait(1.5)
     if event.get("event") == "uncertain" and os.environ.get("F1_SCENARIO") == "early-proof":
         barrier("uncertain")
     if event.get("event") == "opened" and SCENARIO == "open-early-event" and len(handles) == 2:
@@ -134,6 +136,7 @@ def invoke(self, channel, attempt, command, deadline, public_started):
         handle = self.handles[command["identity"]["lease"]["lease_id"]][1]
         operation = command["identity"]["operation_id"]
         if SCENARIO == "late-success":
+            started = threading.Event()
             done = threading.Event()
             def success():
                 handle.execute_python("late-success-result", operation_id="S", timeout=None)
@@ -141,10 +144,12 @@ def invoke(self, channel, attempt, command, deadline, public_started):
             def start_success():
                 while not (ROOT / "start-success").exists():
                     threading.Event().wait(0.005)
+                started.set()
                 success()
             threading.Thread(target=start_success, name="late-success", daemon=True).start()
             def inspect_success():
-                assert done.wait(4), "late success processing barrier"
+                assert started.wait(15), "late success startup marker"
+                assert done.wait(5), "late success processing response"
                 outcome_event(retained=handle.cancel_operation(operation), operation_id=operation)
             threading.Thread(target=inspect_success, name="identity-check", daemon=True).start()
         elif SCENARIO == "stale-false":
