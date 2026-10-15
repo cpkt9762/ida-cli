@@ -712,14 +712,57 @@ async fn f3_index_cancellation_retains_pending_input_evidence() {
     .await;
 }
 
+struct PrivateFixtureSocket(std::path::PathBuf);
+
+impl Drop for PrivateFixtureSocket {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).expect("remove private fixture socket directory");
+    }
+}
+
+fn short_fixture_listener(
+    directory: &std::path::Path,
+) -> (PrivateFixtureSocket, tokio::net::UnixListener) {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static IDS: AtomicU64 = AtomicU64::new(1);
+    let private = loop {
+        let path = std::path::PathBuf::from("/tmp").join(format!(
+            "ida-n2-{}-{}",
+            std::process::id(),
+            IDS.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => break PrivateFixtureSocket(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create short private fixture socket directory: {error}"),
+        }
+    };
+    let socket = private.0.join("ready.sock");
+    std::os::unix::net::SocketAddr::from_pathname(&socket).unwrap_or_else(|error| {
+        panic!(
+            "fixture socket path exceeds platform SUN_LEN: {}: {error}",
+            socket.display()
+        )
+    });
+    let listener = tokio::net::UnixListener::bind(&socket)
+        .unwrap_or_else(|error| panic!("bind short fixture socket {}: {error}", socket.display()));
+    let config_path = directory.join("worker.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["socket"] = serde_json::json!(socket);
+    std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    (private, listener)
+}
+
 async fn f4_prewarm_fault(keep_warm: bool, already_open: bool, fault: &str) {
     let directory = std::env::temp_dir().join(format!(
         "n2-f4-prewarm-{}-{keep_warm}-{already_open}-{fault}",
         std::process::id()
     ));
     std::fs::create_dir(&directory).unwrap();
-    let listener = tokio::net::UnixListener::bind(directory.join("ready.sock")).unwrap();
     let (router, path) = first_open_fixture(&directory, "none", Some("get_database_info")).await;
+    let (_socket_directory, listener) = short_fixture_listener(&directory);
     let existing = if already_open {
         Some(router.ensure_worker_with_ref(&path, None).await.unwrap())
     } else {
@@ -976,9 +1019,9 @@ async fn f4_first_open_cancel_preserves_other_client_reference() {
             let directory =
                 std::env::temp_dir().join(format!("n2-f4-shared-open-{}", std::process::id()));
             std::fs::create_dir(&directory).unwrap();
-            let listener = tokio::net::UnixListener::bind(directory.join("ready.sock")).unwrap();
             let (router, path) =
                 first_open_fixture(&directory, "none", Some("get_function_by_name")).await;
+            let (_socket_directory, listener) = short_fixture_listener(&directory);
             let preparation = crate::preprocess::Preparation::new(Duration::from_secs(4));
             let cancel = preparation.cancel.clone();
             let owned = router.clone();

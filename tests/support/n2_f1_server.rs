@@ -48,7 +48,19 @@ async fn c1_open_case(case: &str) {
         _ => None,
     };
     let (router, path) = first_open_fixture(&directory, "none", blocked).await;
-    std::fs::write(directory.join("worker.py"), include_str!("n2_f5_worker.py")).unwrap();
+    let script = include_str!("n2_f5_worker.py");
+    // Exercise ordinary startup taking longer than the old 700ms cancellation
+    // bound. This case has no barrier and must retain a normal completion budget.
+    let script = if case == "error" {
+        script.replacen(
+            "import json\n",
+            "import json\nimport time\ntime.sleep(1)\n",
+            1,
+        )
+    } else {
+        script.to_string()
+    };
+    std::fs::write(directory.join("worker.py"), script).unwrap();
     if case != "drop-detect" {
         // Still an isolated .i64 fixture, but not sBPF; never invoke real IDA.
         std::fs::write(&path, b"plain synthetic database fixture").unwrap();
@@ -145,20 +157,22 @@ async fn c1_open_case(case: &str) {
     if dropped {
         call.abort();
     }
-    let first = tokio::time::timeout(Duration::from_millis(700), &mut call).await;
+    // Only cancel/deadline measure responsiveness after the started barrier.
+    // Ordinary completion includes subprocess startup and gets its own budget.
+    let completion_limit = Duration::from_secs(if inherit { 2 } else { 10 });
+    let first = tokio::time::timeout(completion_limit, &mut call).await;
     let timely = first.is_ok();
     // On the red baseline, cancellation/deadline are not consumed by this
     // entry; release its pipe before asserting so no fixture is stranded.
     let output = match first {
         Ok(output) => output,
         Err(_) => {
-            barrier
-                .as_mut()
-                .expect("only a deliberately blocked case may time out")
-                .get_mut()
-                .write_all(b"x")
-                .await
-                .unwrap();
+            if let Some(barrier) = barrier.as_mut() {
+                barrier.get_mut().write_all(b"x").await.unwrap();
+            } else {
+                call.abort();
+                panic!("ordinary {case} completion exceeded {completion_limit:?}");
+            }
             tokio::time::timeout(Duration::from_secs(2), call)
                 .await
                 .unwrap()
@@ -215,7 +229,7 @@ async fn c1_open_case(case: &str) {
     }
     assert!(
         timely,
-        "entry must consume cancellation/total deadline: {observed}"
+        "entry must complete within its scenario budget {completion_limit:?}: {observed}"
     );
     assert!(
         other_preserved,
