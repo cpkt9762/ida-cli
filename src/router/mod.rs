@@ -1380,48 +1380,50 @@ impl RouterState {
                 "auto_analyse": true,
                 "timeout_secs": 3600,
             });
-            match self
-                .route_request_prepared(Some(&h), "open", open_params, preparation.clone())
-                .await
-            {
-                Ok(_) => {
-                    if let Some(ref idb_out) = effective_idb_output {
-                        let binary = canonical.clone();
-                        let destination = PathBuf::from(idb_out);
-                        preparation
-                            .wait(crate::blocking::run(
-                                crate::blocking::WorkClass::Prepare,
-                                move || {
-                                    let _ = destination;
-                                    crate::idb_store::IdbStore::new()
-                                        .try_record(&binary)
-                                        .map_err(|e| {
-                                            crate::error::ToolError::IdaError(format!(
-                                                "IDB index record: {e}"
-                                            ))
-                                        })
-                                },
-                            ))
-                            .await??;
-                    }
+            let opened = async {
+                self.route_request_prepared(Some(&h), "open", open_params, preparation.clone())
+                    .await?;
+                if let Some(ref idb_out) = effective_idb_output {
                     let binary = canonical.clone();
-                    if preparation
+                    let destination = PathBuf::from(idb_out);
+                    preparation
                         .wait(crate::blocking::run(
                             crate::blocking::WorkClass::Prepare,
-                            move || is_sbpf_elf(&binary),
+                            move || {
+                                let _ = destination;
+                                crate::idb_store::IdbStore::new()
+                                    .try_record(&binary)
+                                    .map_err(|e| {
+                                        crate::error::ToolError::IdaError(format!(
+                                            "IDB index record: {e}"
+                                        ))
+                                    })
+                            },
                         ))
-                        .await?
-                    {
-                        self.detect_and_rename_sbpf_entry(&h, preparation.clone())
-                            .await?;
-                    }
+                        .await??;
                 }
-                Err(e) => {
-                    warn!(handle = %h, error = %e, "open failed, cleaning up worker");
-                    let _ = self.close_worker(&h).await;
-                    return Err(e);
+                let binary = canonical.clone();
+                if preparation
+                    .wait(crate::blocking::run(
+                        crate::blocking::WorkClass::Prepare,
+                        move || is_sbpf_elf(&binary),
+                    ))
+                    .await?
+                {
+                    self.detect_and_rename_sbpf_entry(&h, preparation.clone())
+                        .await?;
                 }
+                Ok::<_, ToolError>(())
             }
+            .await;
+            if let Err(error) = opened {
+                warn!(handle = %h, error = %error, "open or required follow-up failed, cleaning up worker");
+                if let Err(cleanup) = self.close_worker(&h).await {
+                    warn!(handle = %h, error = %cleanup, "failed-open worker cleanup failed");
+                }
+                return Err(error);
+            }
+
             h
         };
 
@@ -1435,16 +1437,52 @@ impl RouterState {
         handle: &str,
         preparation: crate::preprocess::Preparation,
     ) -> Result<(), crate::error::ToolError> {
-        let ep_addr: Option<u64> = self
-            .route_request_prepared(
-                Some(handle),
-                "get_function_by_name",
-                serde_json::json!({"name": "entrypoint"}),
-                preparation.clone(),
-            )
-            .await?
+        async fn query(
+            router: &RouterState,
+            handle: &str,
+            method: &str,
+            params: serde_json::Value,
+            preparation: crate::preprocess::Preparation,
+        ) -> Result<Option<serde_json::Value>, crate::error::ToolError> {
+            let result = router
+                .route_request_prepared(Some(handle), method, params, preparation.clone())
+                .await;
+            // A response can win the waiter race with cancellation. It must not
+            // authorize another optional native request after the common deadline.
+            match result {
+                Ok(value) => {
+                    preparation.check()?;
+                    Ok(Some(value))
+                }
+                Err(crate::error::ToolError::IdaError(message))
+                    if !message.starts_with("NotSent")
+                        && !message.starts_with("UnknownOutcome")
+                        && !message.contains("execution_stopped=false")
+                        && !message.contains("never replay")
+                        // Legacy worker errors arrive as display strings too.
+                        && message != "Worker channel closed" =>
+                {
+                    preparation.check()?;
+                    warn!(%handle, %method, error = %message, "optional sBPF post-open query failed");
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        let Some(entrypoint) = query(
+            self,
+            handle,
+            "get_function_by_name",
+            serde_json::json!({"name":"entrypoint"}),
+            preparation.clone(),
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let ep_addr: Option<u64> = entrypoint
             .get("address")
-            .and_then(|v| v.as_str().map(String::from))
+            .and_then(|v| v.as_str())
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
 
         let Some(ep_addr) = ep_addr else {
@@ -1452,17 +1490,16 @@ impl RouterState {
         };
         let ep_hex = format!("0x{:x}", ep_addr);
 
-        let cg_val = match self
-            .route_request_prepared(
-                Some(handle),
-                "build_callgraph",
-                serde_json::json!({"roots": ep_hex, "max_depth": 2, "max_nodes": 256}),
-                preparation.clone(),
-            )
-            .await
-        {
-            Ok(v) => v,
-            Err(error) => return Err(error),
+        let Some(cg_val) = query(
+            self,
+            handle,
+            "build_callgraph",
+            serde_json::json!({"roots": ep_hex, "max_depth": 2, "max_nodes": 256}),
+            preparation.clone(),
+        )
+        .await?
+        else {
+            return Ok(());
         };
 
         let edges = match cg_val.get("edges").and_then(|v| v.as_array()) {
@@ -1515,14 +1552,18 @@ impl RouterState {
         }
         let pi_hex = if c0 > c1 { direct[0] } else { direct[1] };
 
-        let _ = self
-            .route_request_prepared(
-                Some(handle),
-                "rename_symbol",
-                serde_json::json!({"address": pi_hex, "new_name": "process_instruction"}),
-                preparation.clone(),
-            )
-            .await?;
+        if query(
+            self,
+            handle,
+            "rename_symbol",
+            serde_json::json!({"address": pi_hex, "new_name": "process_instruction"}),
+            preparation,
+        )
+        .await?
+        .is_none()
+        {
+            return Ok(());
+        }
 
         info!(handle = %handle, pi = %pi_hex, "sBPF: renamed process_instruction");
         Ok(())

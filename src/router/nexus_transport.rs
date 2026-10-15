@@ -223,6 +223,15 @@ impl Delivery {
                 if let Err(error) = self.eligible() {
                     return std::task::Poll::Ready(Err(error));
                 }
+                // timeout_at polls its inner future first, including after the
+                // timer expired. Enforce the local deadline before every writer
+                // poll for business AND control frames, even if it is Ready.
+                if deadline.is_some_and(|limit| limit <= Instant::now()) {
+                    return std::task::Poll::Ready(Err(NexusError::new(
+                        NexusErrorCode::QueueExpired,
+                        "total transport deadline before write",
+                    )));
+                }
                 self.possible = true;
                 match std::pin::Pin::new(&mut *writer).poll_write(cx, &bytes[offset..]) {
                     std::task::Poll::Pending => {

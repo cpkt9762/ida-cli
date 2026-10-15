@@ -357,13 +357,13 @@ async fn read_loop<R: AsyncRead + Unpin>(
     stop.cancel();
     fail_all(&state, "response EOF / read failure");
 }
-// Response parsing has its own finite workers. A saturated request encoder cannot
-// invalidate a healthy response. Small replies never wait for large decoders.
+// Only complete frames may occupy the two CPU decoders. A peer stalled in the
+// middle of a response owns its received chunks, never a parser thread/permit.
 const INLINE_RESPONSE_BYTES: usize = 64 * 1024;
 static DECODERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
 struct ChunkReader {
-    receiver: mpsc::Receiver<Vec<u8>>,
+    chunks: std::vec::IntoIter<Vec<u8>>,
     chunk: std::io::Cursor<Vec<u8>>,
 }
 impl std::io::Read for ChunkReader {
@@ -373,7 +373,7 @@ impl std::io::Read for ChunkReader {
             if n != 0 || output.is_empty() {
                 return Ok(n);
             }
-            match self.receiver.blocking_recv() {
+            match self.chunks.next() {
                 Some(chunk) => self.chunk = std::io::Cursor::new(chunk),
                 None => return Ok(0),
             }
@@ -384,8 +384,8 @@ async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<Option<Result<RpcResponse, serde_json::Error>>> {
     let mut initial = Vec::new();
+    let mut chunks = Vec::new();
     let mut total = 0usize;
-    let mut stream = None;
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
@@ -407,49 +407,42 @@ async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(
             .checked_add(length)
             .ok_or_else(|| std::io::Error::other("response size overflow"))?;
         let finished = available[length - 1] == b'\n';
-        let chunk = available[..length].to_vec();
-        reader.consume(length);
-        if stream.is_none() && total > INLINE_RESPONSE_BYTES {
-            // Only this connection waits. Its reader owns at most 128 KiB here;
-            // the router's connection limit bounds admission waiters.
-            let permit = DECODERS
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| std::io::Error::other("response decoder closed"))?;
-            let (send, receiver) = mpsc::channel(2);
-            let (done, result) = oneshot::channel();
-            std::thread::Builder::new()
-                .name("ida-response-decode".into())
-                .spawn(move || {
-                    let _permit = permit;
-                    let reader = ChunkReader {
-                        receiver,
-                        chunk: std::io::Cursor::new(initial),
-                    };
-                    let _ = done.send(serde_json::from_reader::<_, RpcResponse>(reader));
-                })?;
-            initial = Vec::new();
-            stream = Some((send, result));
-        }
-        if let Some((send, _)) = &stream {
-            send.send(chunk)
-                .await
-                .map_err(|_| std::io::Error::other("response decoder exited"))?;
+        if total <= INLINE_RESPONSE_BYTES {
+            initial.extend_from_slice(&available[..length]);
         } else {
-            initial.extend_from_slice(&chunk);
+            chunks.push(available[..length].to_vec());
         }
+        reader.consume(length);
         if finished {
-            return if let Some((send, result)) = stream {
-                drop(send);
-                Ok(Some(result.await.map_err(|_| {
-                    std::io::Error::other("response decoder panicked")
-                })?))
-            } else {
-                Ok(Some(serde_json::from_slice(&initial)))
-            };
+            break;
         }
+        // A continuously ready large pipe must also yield to local control.
+        tokio::task::consume_budget().await;
     }
+    if chunks.is_empty() {
+        return Ok(Some(serde_json::from_slice(&initial)));
+    }
+    // One complete frame per admitted connection waits here. Legal response
+    // memory follows received result size; no new response byte limit is imposed.
+    let permit = DECODERS
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| std::io::Error::other("response decoder closed"))?;
+    let (done, result) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("ida-response-decode".into())
+        .spawn(move || {
+            let _permit = permit;
+            let reader = ChunkReader {
+                chunks: chunks.into_iter(),
+                chunk: std::io::Cursor::new(initial),
+            };
+            let _ = done.send(serde_json::from_reader::<_, RpcResponse>(reader));
+        })?;
+    Ok(Some(result.await.map_err(|_| {
+        std::io::Error::other("response decoder panicked")
+    })?))
 }
 pub async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,

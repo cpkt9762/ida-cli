@@ -127,7 +127,7 @@ pub async fn run(
         .kill_on_drop(false);
     #[cfg(unix)]
     command.process_group(0);
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|e| ToolError::IdaError(format!("offline process spawn: {e}")))?;
     let pid = child
@@ -135,7 +135,11 @@ pub async fn run(
         .ok_or_else(|| ToolError::IdaError("offline child PID missing".into()))?;
     #[cfg(test)]
     record_owned_fixture(pid, true, "offline-supervisor");
-    let owner = OwnedChild {
+    // Capture original readers synchronously before any task handoff. On dup
+    // failure they remain owned and observable by the emergency reaper.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let mut owner = OwnedChild {
         child: Some(child),
         pid: i32::try_from(pid).map_err(|e| ToolError::IdaError(e.to_string()))?,
         reaped: false,
@@ -143,9 +147,25 @@ pub async fn run(
         #[cfg(unix)]
         pipes: Vec::new(),
         #[cfg(unix)]
-        pipes_observed: false,
+        pipes_observed: stdout.is_some() && stderr.is_some(),
+        stdout,
+        stderr,
         permits: Some((permit, admission)),
     };
+    #[cfg(unix)]
+    {
+        for (name, descriptor) in [
+            ("stdout", owner.stdout.as_ref().map(AsRawFd::as_raw_fd)),
+            ("stderr", owner.stderr.as_ref().map(AsRawFd::as_raw_fd)),
+        ] {
+            let descriptor =
+                descriptor.ok_or_else(|| ToolError::IdaError(format!("offline {name} missing")))?;
+            owner.pipes.push(
+                duplicate_pipe(descriptor)
+                    .map_err(|error| ToolError::IdaError(format!("{name} ownership: {error}")))?,
+            );
+        }
+    }
     let (send, receive) = oneshot::channel();
     let mut guard = CancelOnDrop(Some(preparation.cancel.clone()));
     tokio::spawn(async move {
@@ -168,6 +188,8 @@ struct OwnedChild {
     pipes: Vec<OwnedFd>,
     #[cfg(unix)]
     pipes_observed: bool,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
     permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
 }
 impl Drop for OwnedChild {
@@ -194,6 +216,10 @@ impl Drop for OwnedChild {
         let pid = self.pid;
         let reaped = self.reaped;
         let child = self.child.take();
+        #[cfg(unix)]
+        let mut stdout = self.stdout.take();
+        #[cfg(unix)]
+        let mut stderr = self.stderr.take();
         let permits = self.permits.take();
         #[cfg(unix)]
         let mut pipes = std::mem::take(&mut self.pipes);
@@ -227,7 +253,13 @@ impl Drop for OwnedChild {
                 if !pipes_observed {
                     return false;
                 }
-                match pipes_eof(&mut pipes) {
+                let observed = (|| {
+                    let monitors = pipes_eof(&mut pipes)?;
+                    let stdout = original_pipe_eof(&mut stdout)?;
+                    let stderr = original_pipe_eof(&mut stderr)?;
+                    Ok::<_, std::io::Error>(monitors && stdout && stderr)
+                })();
+                match observed {
                     Ok(closed) => closed,
                     Err(error) => {
                         if !pipe_error_logged {
@@ -283,6 +315,14 @@ use process_query::signal_group;
 
 #[cfg(unix)]
 fn duplicate_pipe(fd: std::os::fd::RawFd) -> std::io::Result<OwnedFd> {
+    #[cfg(test)]
+    if DUPLICATE_FAILURE.with(|remaining| {
+        let value = remaining.get();
+        remaining.set(value.saturating_sub(1));
+        value == 1
+    }) {
+        return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+    }
     // SAFETY: duplicate a live owned pipe; CLOEXEC prevents descriptor leaks.
     let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
@@ -291,30 +331,42 @@ fn duplicate_pipe(fd: std::os::fd::RawFd) -> std::io::Result<OwnedFd> {
     // SAFETY: successful fcntl returned a new exclusively owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
+#[cfg(test)]
+thread_local! { static DUPLICATE_FAILURE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(unix)]
+fn original_pipe_eof<T: AsRawFd>(pipe: &mut Option<T>) -> std::io::Result<bool> {
+    let Some(reader) = pipe.as_ref() else {
+        return Ok(true);
+    };
+    if pipe_eof(reader.as_raw_fd())? {
+        *pipe = None;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+#[cfg(unix)]
+fn pipe_eof(descriptor: std::os::fd::RawFd) -> std::io::Result<bool> {
+    let mut buffer = [0u8; 8192];
+    // SAFETY: callers own the live nonblocking reader; the buffer is writable.
+    let n = unsafe { libc::read(descriptor, buffer.as_mut_ptr().cast(), buffer.len()) };
+    if n < 0 {
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
+            return Err(error);
+        }
+    }
+    Ok(n == 0)
+}
 #[cfg(unix)]
 fn pipes_eof(pipes: &mut Vec<OwnedFd>) -> std::io::Result<bool> {
-    let mut buffer = [0u8; 8192];
     let mut index = 0;
     while index < pipes.len() {
-        // SAFETY: live nonblocking owned pipe and bounded writable byte buffer.
-        let n = unsafe {
-            libc::read(
-                pipes[index].as_raw_fd(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-            )
-        };
-        if n == 0 {
+        if pipe_eof(pipes[index].as_raw_fd())? {
             pipes.swap_remove(index);
-            continue;
+        } else {
+            index += 1;
         }
-        if n < 0 {
-            let error = std::io::Error::last_os_error();
-            if !matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
-                return Err(error);
-            }
-        }
-        index += 1;
     }
     Ok(pipes.is_empty())
 }
@@ -347,28 +399,14 @@ async fn supervise(
     preparation: Preparation,
 ) -> Result<ProcessOutput, ToolError> {
     let pid = owner.pid as u32;
-    let child = owner
-        .child
-        .as_mut()
-        .ok_or_else(|| ToolError::IdaError("offline child missing".into()))?;
-    let stdout = child
+    let stdout = owner
         .stdout
         .take()
         .ok_or_else(|| ToolError::IdaError("offline stdout missing".into()))?;
-    let stderr = child
+    let stderr = owner
         .stderr
         .take()
         .ok_or_else(|| ToolError::IdaError("offline stderr missing".into()))?;
-    #[cfg(unix)]
-    {
-        owner.pipes = vec![
-            duplicate_pipe(stdout.as_raw_fd())
-                .map_err(|error| ToolError::IdaError(format!("stdout ownership: {error}")))?,
-            duplicate_pipe(stderr.as_raw_fd())
-                .map_err(|error| ToolError::IdaError(format!("stderr ownership: {error}")))?,
-        ];
-        owner.pipes_observed = true;
-    }
     let mut drains = DrainTasks {
         stdout: tokio::spawn(drain(stdout)),
         stderr: tokio::spawn(drain(stderr)),
@@ -534,8 +572,40 @@ pub(crate) fn record_owned_fixture(pid: u32, group_owned: bool, kind: &str) {
 mod pipe_ownership_regressions {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    static PIPE_FIXTURE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_pipe_failure_keeps_original_observation_and_recovers_capacity() {
+        let _fixture = PIPE_FIXTURE_GATE.lock().await;
+        for failure in [1, 2, 1, 2] {
+            DUPLICATE_FAILURE.with(|remaining| remaining.set(failure));
+            let result = run(
+                Command::new("/usr/bin/true"),
+                Preparation::new(Duration::from_secs(1)),
+            )
+            .await;
+            DUPLICATE_FAILURE.with(|remaining| remaining.set(0));
+            assert!(
+                matches!(result,Err(ToolError::IdaError(ref message)) if message.contains("ownership")),
+                "{result:?}"
+            );
+        }
+        let result = run(
+            Command::new("/usr/bin/true"),
+            Preparation::new(Duration::from_secs(1)),
+        )
+        .await;
+        assert!(result.is_ok(), "duplicate failure must retain original pipes until EOF, then release owned capacity: {result:?}");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while PROCESS_GATE.available_permits() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all four process permits recovered after real group disappearance and pipe EOF");
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn escaped_open_pipe_is_unknown_and_retains_owned_capacity_until_real_eof() {
+        let _fixture = PIPE_FIXTURE_GATE.lock().await;
         let directory =
             std::env::temp_dir().join(format!("n2-escaped-pipe-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
