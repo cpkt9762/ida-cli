@@ -334,16 +334,94 @@ async fn p14_one_lease_sse_loss_preserves_other_lease_and_active_operation() {
     assert_eq!(r.snapshot(&op).status, OperationStatus::Succeeded);
     r.close().await;
 }
+// A failed event wait must return the two occupied Control slots as well.
+#[derive(Clone)]
+struct ControlRelease {
+    barrier: Arc<std::sync::Barrier>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+impl ControlRelease {
+    fn new() -> Self {
+        Self {
+            barrier: Arc::new(std::sync::Barrier::new(3)),
+            released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            self.barrier.wait();
+        }
+    }
+}
+struct ControlReleaseGuard(ControlRelease);
+impl Drop for ControlReleaseGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[tokio::test]
+async fn p25_failed_event_wait_releases_control_slots() {
+    let release = ControlRelease::new();
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let mut jobs = Vec::new();
+    for _ in 0..2 {
+        let started = started.clone();
+        let barrier = release.barrier.clone();
+        jobs.push(tokio::spawn(ida_mcp::blocking::run(
+            ida_mcp::blocking::WorkClass::Control,
+            move || {
+                started.send(()).unwrap();
+                barrier.wait();
+            },
+        )));
+    }
+    for _ in 0..2 {
+        starts.recv().await.unwrap();
+    }
+    let guarded = release.clone();
+    let failed = tokio::spawn(async move {
+        let _guard = ControlReleaseGuard(guarded);
+        let (sender, mut events) = broadcast::channel(1);
+        drop(sender); // Deterministically fail the same unified event helper.
+        wait_event(
+            &mut events,
+            &mut VecDeque::new(),
+            "local_status",
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
+    })
+    .await;
+    let released_on_failure = release.released.load(Ordering::SeqCst);
+    // Test-only rescue lets the red regression exit without stranding workers.
+    release.release();
+    for job in jobs {
+        job.await.unwrap().unwrap();
+    }
+    assert!(
+        failed.unwrap_err().is_panic(),
+        "inject event stream disconnection"
+    );
+    assert!(
+        released_on_failure,
+        "failed event wait stranded both Control permits"
+    );
+    ida_mcp::blocking::run(ida_mcp::blocking::WorkClass::Control, || ())
+        .await
+        .unwrap();
+}
 #[tokio::test]
 async fn p25_cli_control_saturation_cannot_disconnect_bridge() {
     let mut r = Rig::new("control").await;
     let l = r.open().await;
     let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
-    let release = Arc::new(std::sync::Barrier::new(3));
+    let release = ControlRelease::new();
     let mut jobs = Vec::new();
     for _ in 0..2 {
         let started = started.clone();
-        let release = release.clone();
+        let release = release.barrier.clone();
         jobs.push(tokio::spawn(ida_mcp::blocking::run(
             ida_mcp::blocking::WorkClass::Control,
             move || {
@@ -355,9 +433,11 @@ async fn p25_cli_control_saturation_cannot_disconnect_bridge() {
     for _ in 0..2 {
         starts.recv().await.unwrap();
     }
+    let guard = ControlReleaseGuard(release.clone());
     r.bridge.status("while-cli-full").await.unwrap();
     let event = r.event("local_status").await;
-    release.wait();
+    release.release();
+    drop(guard);
     for job in jobs {
         job.await.unwrap().unwrap();
     }
