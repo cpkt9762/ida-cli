@@ -47,6 +47,16 @@ class Handle:
         self.cancelled = operation_id
         return True
 
+    def cancel_operation_outcome(self, operation_id):
+        calls = getattr(self, "control_calls", {})
+        self.control_calls = calls
+        calls[operation_id] = calls.get(operation_id, 0) + 1
+        self.cancelled = operation_id
+        self.cancel_operation(operation_id)
+        return {"status": "cancelled" if calls[operation_id] == 1 else "not_pending",
+                "execution_stopped": calls[operation_id] > 1,
+                "attempt_sequence": sum(calls.values()), "failure": None}
+
     def cancel_active(self, **_options):
         return False
 
@@ -177,7 +187,7 @@ def test_business_capacity_rejects_without_invocation(harness):
     assert not any(code == "must-not-run" for code, _ in harness.handle.calls)
 
 
-def test_unknown_result_requires_successor_stop_proof(harness):
+def test_unknown_result_requires_causal_control_stop_proof(harness):
     harness.open()
     harness.handle.disconnect = True
     original = harness.dispatch(0, harness.execute("disconnect"))
@@ -188,10 +198,11 @@ def test_unknown_result_requires_successor_stop_proof(harness):
     stopped = harness.receive(1)
     assert stopped["event"] == "stopped"
     assert stopped["attempt"] == original["attempt"]
-    assert stopped["proof"] == "same_lease_serialized_successor_completed"
+    assert stopped["proof"] == "causal_cancel_not_pending"
     codes = [code for code, _ in harness.handle.calls]
     assert codes.count("disconnect") == 1
-    assert codes[-1] == "result = None"
+    assert "result = None" not in codes
+    assert harness.handle.control_calls["op-1"] == 2
 
 
 def test_release_only_closes_held_exact_lease(harness):
@@ -204,16 +215,20 @@ def test_release_only_closes_held_exact_lease(harness):
     assert harness.handle.closed
 
 
-def test_cancellation_ack_without_successor_does_not_claim_stop(harness, monkeypatch):
+def test_proof_failure_retries_without_losing_unknown_or_claiming_stop(harness, monkeypatch):
     harness.open()
     harness.handle.disconnect = True
-    execute = harness.handle.execute_python
-    def fail_proof(code, **options):
-        if code == "result = None":
-            from ida_nexus import NexusConnectionError
-            raise NexusConnectionError("successor not confirmed")
-        return execute(code, **options)
-    monkeypatch.setattr(harness.handle, "execute_python", fail_proof)
+    original = harness.handle.cancel_operation_outcome
+    release = threading.Event()
+    def fail_proof(operation_id):
+        count = getattr(harness.handle, "proof_attempts", 0) + 1
+        harness.handle.proof_attempts = count
+        if count == 2:
+            return {"status": "failed", "execution_stopped": False, "failure": "transport", "attempt_sequence": count}
+        if count == 3:
+            assert release.wait(3), "release retry barrier"
+        return original(operation_id)
+    monkeypatch.setattr(harness.handle, "cancel_operation_outcome", fail_proof)
     harness.dispatch(0, harness.execute("disconnect"))
     assert harness.receive()["event"] == "ack"
     assert harness.receive()["event"] == "uncertain"
@@ -221,19 +236,21 @@ def test_cancellation_ack_without_successor_does_not_claim_stop(harness, monkeyp
     assert harness.receive(1)["event"] == "cancel_ack"
     assert harness.receive(1)["event"] == "stop_unconfirmed"
     assert "op-1" in harness.bridge.unknown
+    release.set()
+    assert harness.receive(1)["event"] == "stopped"
+    assert harness.handle.proof_attempts == 3
 
 
-def test_blocked_stop_proofs_do_not_occupy_cancellation_capacity(harness, monkeypatch):
+def test_full_proof_pool_queues_and_eventually_proves_every_unknown(harness, monkeypatch):
     harness.open()
     harness.handle.disconnect = True
-    execute = harness.handle.execute_python
+    original = harness.handle.cancel_operation_outcome
     release = threading.Event()
-    def blocked_proof(code, **options):
-        if code == "result = None":
-            assert release.wait(3), "test must release stop proof barrier"
-            return {"result": None}
-        return execute(code, **options)
-    monkeypatch.setattr(harness.handle, "execute_python", blocked_proof)
+    def blocked_proof(operation_id):
+        if threading.current_thread().name.startswith("nexus-proof"):
+            assert release.wait(3), "release stop proof barrier"
+        return original(operation_id)
+    monkeypatch.setattr(harness.handle, "cancel_operation_outcome", blocked_proof)
     try:
         for number in range(4):
             harness.dispatch(0, harness.execute("disconnect", f"unknown-{number}"))
@@ -241,13 +258,12 @@ def test_blocked_stop_proofs_do_not_occupy_cancellation_capacity(harness, monkey
             assert harness.receive()["event"] == "uncertain"
             harness.dispatch(1, {"command": "cancel", "identity": {"lease": harness.lease, "operation_id": f"unknown-{number}"}})
             assert harness.receive(1)["event"] == "cancel_ack"
-            if number >= 2:
-                assert harness.receive(1)["event"] == "stop_unconfirmed"
         harness.dispatch(1, {"command": "cancel", "identity": {"lease": harness.lease, "operation_id": "next-control"}})
         assert harness.receive(1)["event"] == "cancel_ack"
     finally:
         release.set()
-    assert [harness.receive(1)["event"] for _ in range(2)] == ["stopped", "stopped"]
+    assert [harness.receive(1)["event"] for _ in range(4)] == ["stopped"] * 4
+    assert not harness.bridge.unknown
 
 
 def test_wrong_physical_lane_stops_protocol(harness):
@@ -259,3 +275,31 @@ def test_wrong_physical_lane_stops_protocol(harness):
 def test_eof_stops_bridge(harness):
     harness.sockets[0].shutdown(socket.SHUT_WR)
     assert harness.bridge.stopped.wait(1), "EOF must initiate owned lease cleanup"
+
+
+def test_proof_deadline_preserves_unknown_and_never_claims_stop(harness, monkeypatch):
+    harness.open()
+    harness.handle.disconnect = True
+    original = harness.handle.cancel_operation_outcome
+    def failure(operation_id):
+        if threading.current_thread().name.startswith("nexus-proof"):
+            return {"status": "failed", "execution_stopped": False, "failure": "transport", "attempt_sequence": 2}
+        return original(operation_id)
+    monkeypatch.setattr(harness.handle, "cancel_operation_outcome", failure)
+    harness.dispatch(0, harness.execute("disconnect"))
+    assert harness.receive()["event"] == "ack"
+    assert harness.receive()["event"] == "uncertain"
+    harness.dispatch(1, {"command": "cancel", "identity": {"lease": harness.lease, "operation_id": "op-1"}})
+    assert harness.receive(1)["event"] == "cancel_ack"
+    assert harness.receive(1)["event"] == "stop_unconfirmed"
+    # Explicit deadline barrier, without timing a sleep against the supervisor.
+    with harness.bridge.lock:
+        harness.bridge.executing["op-1"]["deadline"] = 0
+    harness.bridge.proof_wakeup.set()
+    while True:
+        event = harness.receive(1)
+        assert event["event"] == "stop_unconfirmed", "failure/expiry cannot prove stop"
+        if "deadline expired" in event["error"]["message"]:
+            break
+    assert "op-1" in harness.bridge.unknown
+    assert harness.bridge.executing["op-1"]["expired"]

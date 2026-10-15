@@ -371,3 +371,96 @@ async fn e07_crash_without_packed_base_repairs() {
 async fn e07_crash_with_packed_base_restores_backup() {
     crash_recovery(true).await;
 }
+
+#[tokio::test]
+async fn e05_concurrent_ordinary_open_shares_owner_without_explicit_attach() {
+    let source = sample("e05-concurrent-open");
+    let mut a = Client::new().await;
+    let mut b = Client::new().await;
+    assert_ne!(a.bridge.pid, b.bridge.pid);
+    // Both normal opens enter via separate bridge processes, sharing only the
+    // canonical snapshot published by the production cache preparation path.
+    let ((la, oa), (lb, ob)) = tokio::join!(a.open(&source, json!({})), b.open(&source, json!({})));
+    assert_eq!(la.instance_id, lb.instance_id);
+    assert_eq!(oa["pid"], ob["pid"]);
+    let address = rename(&mut a, &la, "F1_CONCURRENT_OPEN").await;
+    assert_eq!(name(&mut b, &lb, address).await, "F1_CONCURRENT_OPEN");
+    a.release(&la).await;
+    assert_eq!(name(&mut b, &lb, address).await, "F1_CONCURRENT_OPEN");
+    b.release(&lb).await;
+    owner_exited(oa["pid"].as_u64().unwrap() as u32).await;
+    let (reopened, _) = a.open(&source, json!({})).await;
+    assert_eq!(name(&mut a, &reopened, address).await, "F1_CONCURRENT_OPEN");
+    a.release(&reopened).await;
+    a.bridge.shutdown().await.unwrap();
+    b.bridge.shutdown().await.unwrap();
+    record(
+        json!({"case":"E05-concurrent-open", "status":"PASS", "instance_id":la.instance_id, "owner_pid":oa["pid"], "saved_name":"F1_CONCURRENT_OPEN"}),
+    );
+}
+
+#[tokio::test]
+async fn e06_same_router_lease_sse_fault_preserves_sibling_operation() {
+    let source = sample("e06-lease-fault");
+    let mut cfg = config();
+    cfg.environment.insert("N3_LEASE_FAULT".into(), "1".into());
+    let mut a = Client::configured(cfg).await;
+    let (idle, opened) = a.open(&source, json!({})).await;
+    let (healthy, peer) = a.open(&source, json!({})).await;
+    assert_eq!(idle.instance_id, healthy.instance_id);
+    assert_eq!(opened["pid"], peer["pid"]);
+    let started = root().join("lease-fault-sibling.started");
+    let release = root().join("lease-fault-sibling.release");
+    let operation = a.begin(&healthy, "execute_python", json!({"timeout_secs":12,
+        "code":format!("from pathlib import Path\nimport time\nPath({:?}).touch()\ndeadline = time.monotonic() + 10\nwhile not Path({:?}).exists():\n    assert time.monotonic() < deadline, 'sibling release barrier'\n    time.sleep(0.01)\nresult = 'sibling_survived_lease_fault'",started.to_string_lossy(),release.to_string_lossy())}));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        while !started.exists() {
+            poll.tick().await;
+        }
+    })
+    .await
+    .expect("healthy operation entered IDA barrier before injected SSE failure");
+    std::fs::write(root().join("lease-fault.inject"), b"inject first SSE only").unwrap();
+    let disconnected = a
+        .event(|event| {
+            event["event"] == "disconnected" && event["lease"]["lease_id"] == idle.lease_id.as_str()
+        })
+        .await;
+    assert!(
+        disconnected["reason"]
+            .as_str()
+            .unwrap()
+            .contains("injected isolated first-lease SSE failure"),
+        "{disconnected}"
+    );
+    let (dead, live, active) = a.bridge.endpoint().transition(|s, _| {
+        (
+            s.status(&a.client, &idle).unwrap(),
+            s.status(&a.client, &healthy).unwrap(),
+            s.operation_status(&a.client, &operation).unwrap(),
+        )
+    });
+    assert_eq!(dead.phase, SessionPhase::Disconnected);
+    assert_eq!(live.phase, SessionPhase::Active);
+    assert_eq!(active.status, OperationStatus::Running);
+    std::fs::write(&release, b"release").unwrap();
+    let result = a.finish(&operation).await;
+    assert_eq!(result.status, OperationStatus::Succeeded);
+    assert_eq!(
+        result.result.unwrap()["result"],
+        "sibling_survived_lease_fault"
+    );
+    let address = rename(&mut a, &healthy, "F1_HEALTHY_AFTER_LEASE_FAULT").await;
+    a.release(&idle).await;
+    assert_eq!(
+        name(&mut a, &healthy, address).await,
+        "F1_HEALTHY_AFTER_LEASE_FAULT"
+    );
+    a.release(&healthy).await;
+    owner_exited(opened["pid"].as_u64().unwrap() as u32).await;
+    a.bridge.shutdown().await.unwrap();
+    record(
+        json!({"case":"E06-lease-fault", "status":"PASS", "expired_lease":idle, "healthy_lease":healthy, "reason":disconnected["reason"], "active_operation":operation}),
+    );
+}

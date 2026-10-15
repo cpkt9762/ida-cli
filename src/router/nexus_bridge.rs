@@ -25,9 +25,12 @@ pub struct BridgeConfig {
 struct Pending {
     attempt: DeliveryAttempt,
     granted: bool,
+    uncertain: bool,
+    stopped: bool,
 }
 struct State {
     endpoint: NexusEndpoint,
+    callbacks: Mutex<()>,
     pending: Mutex<HashMap<u64, Pending>>,
     leases: Mutex<HashMap<LeaseId, SessionLease>>,
     events: broadcast::Sender<Value>,
@@ -152,6 +155,7 @@ impl NexusBridge {
         let (events, _) = broadcast::channel(capacity.max(8));
         let state = Arc::new(State {
             endpoint,
+            callbacks: Mutex::new(()),
             pending: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
             events,
@@ -268,6 +272,8 @@ async fn pump(mut lane: tokio::sync::mpsc::Receiver<Delivery>, writer: Writer, s
                 Pending {
                     attempt: delivery.attempt.clone(),
                     granted: false,
+                    uncertain: false,
+                    stopped: false,
                 },
             );
         let mut stream = writer.lock().await;
@@ -324,6 +330,22 @@ impl tokio::io::AsyncWrite for CountingWriter<'_> {
     }
 }
 
+// One in-flight decoder, queued by the existing control stream reader. No
+// try-acquire, no CLI control encoder permit, no increase in lane admission.
+async fn decode_control(line: String) -> anyhow::Result<Result<Value, serde_json::Error>> {
+    static GATE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    let permit = GATE.clone().acquire_owned().await?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("nexus-control-decode".into())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = send.send(serde_json::from_str(&line));
+        })?;
+    Ok(receive.await?)
+}
+
 fn start_channel(stream: UnixStream, state: Arc<State>, control: bool) -> Writer {
     let (read, write) = stream.into_split();
     let writer = Arc::new(AsyncMutex::new(write));
@@ -335,10 +357,9 @@ fn start_channel(stream: UnixStream, state: Arc<State>, control: bool) -> Writer
             match next {
                 Ok(Some(line)) => {
                     let decoded = if control {
-                        crate::blocking::run(crate::blocking::WorkClass::Control, move || {
-                            serde_json::from_str::<Value>(&line)
-                        })
-                        .await
+                        decode_control(line)
+                            .await
+                            .map_err(|e| crate::error::ToolError::IdaError(e.to_string()))
                     } else {
                         crate::blocking::request_decode(move || {
                             serde_json::from_str::<Value>(&line)
@@ -464,21 +485,13 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
         let lease: SessionLease = serde_json::from_value(event["lease"].clone())?;
         state
             .endpoint
-            .transition(|s, _| s.disconnected(&lease.instance_id, lease.generation));
+            .transition(|s, _| s.lease_disconnected(&lease))?;
         state.emit(event);
         return Ok(());
     }
     if event["event"] == "local_status" {
         state.emit(event);
         return Ok(());
-    }
-    let attempt: DeliveryAttempt = serde_json::from_value(event["attempt"].clone())?;
-    let sequence = attempt.sequence.get();
-    {
-        let pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if pending.get(&sequence).is_none_or(|p| p.attempt != attempt) {
-            anyhow::bail!("unknown or mismatched bridge attempt");
-        }
     }
     let name = event["event"].as_str().unwrap_or("");
     // Clone/decode potentially large results and errors before taking N1's lock.
@@ -491,6 +504,27 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
             .take()
             .ok_or_else(|| invalid("bridge error missing"))
     };
+    let _ordered = state.callbacks.lock().unwrap_or_else(|e| e.into_inner());
+    let attempt: DeliveryAttempt = serde_json::from_value(event["attempt"].clone())?;
+    let sequence = attempt.sequence.get();
+    {
+        let pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.get(&sequence).is_none_or(|p| p.attempt != attempt) {
+            if event["event"] == "stopped" && !pending.contains_key(&sequence) {
+                state.endpoint.transition(|s, _| {
+                    let DeliveryTarget::Execute { identity } = &attempt.target else {
+                        return Err(invalid("stop target mismatch"));
+                    };
+                    s.delivery_status(&identity.lease.client_id, &attempt)?;
+                    s.execution_stopped(identity)?;
+                    Ok::<_, NexusError>(())
+                })?;
+                state.emit(event);
+                return Ok(());
+            }
+            anyhow::bail!("unknown or mismatched bridge attempt");
+        }
+    }
     let result = state.endpoint.transition(|s, t| -> Result<(), NexusError> {
         match name {
             "ack" => {
@@ -514,11 +548,23 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
                     }
                 }
             }
-            "completed" | "stopped" => {
+            "completed" => {
                 let DeliveryTarget::Execute { identity } = &attempt.target else {
                     return Err(invalid("execute target mismatch"));
                 };
                 s.complete(identity, Completion::Success(value.take()))?;
+            }
+            "stopped" => {
+                let DeliveryTarget::Execute { identity } = &attempt.target else {
+                    return Err(invalid("stop target mismatch"));
+                };
+                let mut pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(item) = pending.get_mut(&sequence) {
+                    item.stopped = true;
+                    if item.uncertain {
+                        s.execution_stopped(identity)?;
+                    }
+                }
             }
             "cancel_ack" => {
                 if event["accepted"] == true {
@@ -560,6 +606,15 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
             "stop_unconfirmed" => {}
             "uncertain" => {
                 s.delivery_failed(&attempt, DispatchFailure::Uncertain(take_error()?))?;
+                if let DeliveryTarget::Execute { identity } = &attempt.target {
+                    let mut pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(item) = pending.get_mut(&sequence) {
+                        item.uncertain = true;
+                        if item.stopped {
+                            s.execution_stopped(identity)?;
+                        }
+                    }
+                }
             }
             "remote_error" if matches!(&attempt.target, DeliveryTarget::Shutdown { .. }) => {
                 s.shutdown_rejected(&attempt)?;
@@ -575,7 +630,15 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
         Ok(())
     });
     result?;
-    if !matches!(name, "ack" | "uncertain" | "stop_unconfirmed") {
+    let waiting_for_outcome_or_proof = state
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&sequence)
+        .is_some_and(|p| {
+            (name == "uncertain" && !p.stopped) || (name == "stopped" && !p.uncertain)
+        });
+    if !matches!(name, "ack" | "stop_unconfirmed") && !waiting_for_outcome_or_proof {
         state
             .pending
             .lock()

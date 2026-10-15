@@ -46,6 +46,9 @@ impl Rig {
         );
         environment.insert("F1_ROOT".into(), root.to_string_lossy().into_owned());
         environment.insert("F1_SCENARIO".into(), scenario.into());
+        if let Ok(directory) = std::env::var("F1_BRIDGE_DIR") {
+            environment.insert("F1_BRIDGE_DIR".into(), directory);
+        }
         environment.insert("IDA_CLI_HOME".into(), root.to_string_lossy().into_owned());
         environment.insert(
             "IDA_NEXUS_STATE_DIR".into(),
@@ -261,4 +264,86 @@ async fn p25_cli_control_saturation_cannot_disconnect_bridge() {
         SessionPhase::Active
     );
     r.close().await;
+}
+
+// These client transport barriers keep U pending while earlier responses arrive.
+// The verdict is observed on the real control socket; N1 still owns U throughout.
+async fn causal_ordering(scenario: &str) {
+    let mut r = Rig::new(scenario).await;
+    let l = r.open().await;
+    let op = r.begin(&l, "unknown");
+    r.event("uncertain").await;
+    if scenario == "late-success" {
+        r.release_marker("start-success");
+        r.marker("success.arrived").await;
+    }
+    if scenario == "stale-false" {
+        r.release_marker("old-start");
+        r.marker("old-false.arrived").await;
+    }
+    r.cancel(&op);
+    r.event("cancel_ack").await;
+    assert!(!r.snapshot(&op).execution_stopped);
+    r.release_marker(if scenario == "late-success" {
+        "success.release"
+    } else {
+        "old-false.release"
+    });
+    let verdict = r.event("local_status").await;
+    let retained = verdict["retained"] == true;
+    let before = r.snapshot(&op);
+    r.marker("proof.arrived").await;
+    r.release_marker("proof.release");
+    r.event("stopped").await;
+    let after = r.snapshot(&op);
+    r.close().await;
+    assert!(
+        retained,
+        "an earlier response must not retire the exact unknown identity: {verdict}"
+    );
+    assert_eq!(before.status, OperationStatus::UnknownOutcome);
+    assert!(!before.execution_stopped);
+    assert_eq!(after.status, OperationStatus::UnknownOutcome);
+    assert!(after.execution_stopped);
+}
+#[tokio::test]
+async fn p11_delayed_success_through_both_lanes_retains_unknown() {
+    causal_ordering("late-success").await;
+}
+#[tokio::test]
+async fn p11_false_issued_before_ack_through_both_lanes_retains_unknown() {
+    causal_ordering("stale-false").await;
+}
+#[tokio::test]
+async fn p26_stale_unknown_cannot_block_active_cancel_and_bridge_uses_exact_id() {
+    let mut r = Rig::new("active-fairness").await;
+    let l = r.open().await;
+    let op = r.begin(&l, "unknown");
+    r.event("uncertain").await;
+    r.release_marker("active-check");
+    let verdict = r.event("local_status").await;
+    r.cancel(&op);
+    let ack = r.event("cancel_ack").await;
+    r.event("stopped").await;
+    let snapshot = r.snapshot(&op);
+    r.close().await;
+    assert_eq!(
+        verdict["accepted"], false,
+        "active-only API must not choose an unknown identity"
+    );
+    assert_eq!(
+        verdict["cancelled_ids"],
+        json!([]),
+        "stale unknown must never monopolize cancel_active: {verdict}"
+    );
+    assert_eq!(
+        ack["attempt"]["target"]["identity"]["operation_id"],
+        op.operation_id.as_str()
+    );
+    assert_eq!(
+        ack["accepted"], true,
+        "bridge must cancel the exact newer unknown"
+    );
+    assert_eq!(snapshot.status, OperationStatus::UnknownOutcome);
+    assert!(snapshot.execution_stopped);
 }

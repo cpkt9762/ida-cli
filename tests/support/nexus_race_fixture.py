@@ -13,7 +13,7 @@ from types import SimpleNamespace
 ROOT = Path(os.environ["F1_ROOT"])
 (ROOT / "process.json").write_text(json.dumps({"pid": os.getpid(), "birth": subprocess.check_output(["timeout", "3s", "/bin/ps", "-p", str(os.getpid()), "-o", "lstart="], text=True).strip(), "command": [sys.executable, __file__]}))
 REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO / "nexus_bridge"))
+sys.path.insert(0, os.environ.get("F1_BRIDGE_DIR", str(REPO / "nexus_bridge")))
 import bridge
 from ida_nexus import DatabaseHandle
 import ida_nexus
@@ -59,21 +59,105 @@ class Connection:
             index = counts.get(op, 0)
             counts[op] = index + 1
             (ROOT / f"cancel-{op}-{index}").touch()
-            # First cancellation registers intent, later requests observe completion.
-            return json.dumps({"result": {"cancelled": index == 0}}).encode()
+            cancelled_ids.append(op)
+            if SCENARIO in {"late-success", "stale-false"}:
+                if threading.current_thread().name == "old-false" and index == 0:
+                    barrier("old-false")
+                    cancelled = False
+                elif threading.current_thread().name in {"identity-check", "old-false"}:
+                    cancelled = True
+                elif index == (1 if SCENARIO == "stale-false" else 0):
+                    cancelled = True
+                else:
+                    barrier("proof")
+                    cancelled = False
+            elif SCENARIO == "active-fairness":
+                cancelled = op != "stale" and index == 0
+            else:
+                cancelled = index == 0
+            return json.dumps({"result": {"cancelled": cancelled}}).encode()
         code = self.payload.get("code", "")
+        if code == "result = None" and SCENARIO in {"late-success", "stale-false"}:
+            barrier("proof")
         if code == "unknown":
+            if SCENARIO == "stale-false":
+                (ROOT / "unknown.arrived").touch()
             if os.environ.get("F1_SCENARIO") == "ack-first":
                 barrier("failure")
             raise http.client.RemoteDisconnected("fixture execution stream loss")
         if code == "block":
             barrier("business")
+            if SCENARIO == "active-fairness":
+                return json.dumps({"error": {"code": "operation_cancelled", "message": "exact operation cancelled"}}).encode()
         return json.dumps({"ok": True, "result": {"result": "9.5" if "get_kernel_version" in code else code}}).encode()
     def close(self):
         pass
 
 
 counts = {}
+SCENARIO = os.environ.get("F1_SCENARIO")
+original_loads = json.loads
+
+def causal_loads(raw, *args, **kwargs):
+    # _request releases the execution lock before parsing this response. S has
+    # already executed, while U can run before S's success is processed.
+    if SCENARIO == "late-success" and threading.current_thread().name == "late-success":
+        if b'"ok": true' in (raw.encode() if isinstance(raw, str) else raw) and b'late-success-result' in (raw.encode() if isinstance(raw, str) else raw):
+            barrier("success")
+    return original_loads(raw, *args, **kwargs)
+json.loads = causal_loads
+
+
+def outcome_event(**values):
+    while instance_bridge[0] is None:
+        threading.Event().wait(0.005)
+    instance_bridge[0].control.send({"event": "local_status", "id": "fixture-verdict", **values})
+
+instance_bridge = [None]
+original_invoke = bridge.Bridge.invoke
+
+def invoke(self, channel, attempt, command, deadline, public_started):
+    instance_bridge[0] = self
+    if command["command"] == "execute" and SCENARIO in {"late-success", "stale-false", "active-fairness"}:
+        handle = self.handles[command["identity"]["lease"]["lease_id"]][1]
+        operation = command["identity"]["operation_id"]
+        if SCENARIO == "late-success":
+            done = threading.Event()
+            def success():
+                handle.execute_python("late-success-result", operation_id="S", timeout=None)
+                done.set()
+            def start_success():
+                while not (ROOT / "start-success").exists():
+                    threading.Event().wait(0.005)
+                success()
+            threading.Thread(target=start_success, name="late-success", daemon=True).start()
+            def inspect_success():
+                assert done.wait(4), "late success processing barrier"
+                outcome_event(retained=handle.cancel_operation(operation), operation_id=operation)
+            threading.Thread(target=inspect_success, name="identity-check", daemon=True).start()
+        elif SCENARIO == "stale-false":
+            def old_false():
+                while not (ROOT / "old-start").exists():
+                    threading.Event().wait(0.005)
+                handle.cancel_operation(operation)
+                outcome_event(retained=handle.cancel_operation(operation), operation_id=operation)
+            threading.Thread(target=old_false, name="old-false", daemon=True).start()
+        else:
+            try:
+                handle.execute_python("unknown", operation_id="stale", timeout=None)
+            except ida_nexus.NexusConnectionError:
+                pass
+            else:
+                raise AssertionError("stale unknown fixture must disconnect")
+            def active():
+                while not (ROOT / "active-check").exists():
+                    threading.Event().wait(0.005)
+                ack = handle.cancel_active(timeout=0.05)
+                outcome_event(accepted=ack, cancelled_ids=list(cancelled_ids), operation_id=operation)
+            threading.Thread(target=active, name="active-check", daemon=True).start()
+    return original_invoke(self, channel, attempt, command, deadline, public_started)
+bridge.Bridge.invoke = invoke
+cancelled_ids = []
 handle_module.http.client.HTTPConnection = lambda *_a, **_k: Connection(control=True)
 DatabaseHandle._rpc_connection_for = lambda *_: Connection()
 

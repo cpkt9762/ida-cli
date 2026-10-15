@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 
-HANDLE_SHA = "b1d6bcbdfedcde5689a8a5c086f6be53eb3e8aa333ef2fe1030856e0f7f9bb15"
+HANDLE_SHA = "441ab56d01fbfba4faf602e36feccf4da4269272c571fa4f18b6ffe7b96f8ea5"
 METHODS = {"execute_python": "may_write", "database_info": "read_only",
            "rename_address": "may_write", "read_name": "read_only"}
 
@@ -95,7 +95,8 @@ class Bridge:
         self.grants = {}
         self.generations = {}
         self.unknown = {}
-        self.confirming = set()
+        self.executing = {}
+        self.proof_wakeup = threading.Event()
         self.initialized = threading.Event()
         self.stopped = threading.Event()
         self.business_pool = concurrent.futures.ThreadPoolExecutor(4, thread_name_prefix="nexus-business")
@@ -110,6 +111,7 @@ class Bridge:
         self.control = Channel(control, 8, self.receive, self.stopped)
         self.initialized.set()
         threading.Thread(target=self.discover, daemon=True).start()
+        threading.Thread(target=self.proofs, daemon=True).start()
 
     def discover(self):
         from ida_nexus import discover_databases
@@ -182,20 +184,22 @@ class Bridge:
                               "error": error("operation_failed", str(exc))})
             elif isinstance(exc, NexusConnectionError):
                 if frame["payload"]["command"] == "execute":
-                    with self.lock:
-                        self.unknown[frame["payload"]["identity"]["operation_id"]] = attempt
+                    self.mark_unknown(frame["payload"]["identity"]["operation_id"], attempt)
                 channel.send({"event": "uncertain", "attempt": attempt,
                               "error": error("disconnected", str(exc))})
             else:
                 uncertain = public_started[0]
                 if uncertain and frame["payload"]["command"] == "execute":
-                    with self.lock:
-                        self.unknown[frame["payload"]["identity"]["operation_id"]] = attempt
+                    self.mark_unknown(frame["payload"]["identity"]["operation_id"], attempt)
                 channel.send({"event": "uncertain" if uncertain else "failed", "attempt": attempt,
                               "error": error("operation_failed", f"{type(exc).__name__}: {exc}")})
         finally:
             with self.lock:
                 self.grants.pop(key, None)
+                if frame["payload"]["command"] == "execute":
+                    operation_id = frame["payload"]["identity"]["operation_id"]
+                    if operation_id not in self.unknown:
+                        self.executing.pop(operation_id, None)
             gate.release()
 
     def disconnected(self, lease, reason):
@@ -215,7 +219,7 @@ class Bridge:
                 if len(instances) != 1:
                     raise ValueError("attach instance is not available")
                 public_started[0] = True
-                handle = self.Handle.attach(instances[0])
+                handle = self.Handle.attach(instances[0], idle_timeout=options.get("idle_timeout"))
             else:
                 public_started[0] = True
                 handle = self.Handle.open(command["path"], options=self.Options(**options))
@@ -260,32 +264,28 @@ class Bridge:
                 code = f"import ida_name\nresult = ida_name.set_name({int(params['address'])}, {str(params['name'])!r}, ida_name.SN_CHECK)"
             else:
                 raise ValueError("unsupported bridge method")
+            operation_id = command["identity"]["operation_id"]
+            with self.lock:
+                self.executing[operation_id] = {"attempt": attempt, "handle": handle,
+                    "deadline": deadline, "unknown": False, "cancel_requested": False,
+                    "proving": False, "next": 0, "expired": False}
             channel.send({"event": "ack", "attempt": attempt})
             public_started[0] = True
             result = handle.execute_python(code, timeout=None, operation_id=command["identity"]["operation_id"])
             channel.send({"event": "completed", "attempt": attempt, "result": result})
         elif kind == "cancel":
             public_started[0] = True
-            ack = handle.cancel_operation(command["identity"]["operation_id"])
-            channel.send({"event": "cancel_ack", "attempt": attempt, "accepted": ack})
-            if ack:
-                # Public successor completion is a stop proof after transport loss,
-                # never a replay. It carries a distinct ID and no database writes.
-                with self.lock:
-                    unknown = self.unknown.get(command["identity"]["operation_id"])
-                if unknown is not None:
-                    operation_id = command["identity"]["operation_id"]
-                    with self.lock:
-                        if operation_id in self.confirming:
-                            return
-                        available = self.proof_gate.acquire(blocking=False)
-                        if available:
-                            self.confirming.add(operation_id)
-                    if available:
-                        self.proof_pool.submit(self.confirm_stop, channel, handle, operation_id, unknown)
-                    else:
-                        channel.send({"event": "stop_unconfirmed", "attempt": unknown,
-                                      "error": error("busy", "stop proof capacity exhausted")})
+            operation_id = command["identity"]["operation_id"]
+            outcome = handle.cancel_operation_outcome(operation_id)
+            channel.send({"event": "cancel_ack", "attempt": attempt,
+                          "accepted": outcome["status"] == "cancelled", "outcome": outcome})
+            with self.lock:
+                record = self.executing.get(operation_id)
+                if record is not None:
+                    record["cancel_requested"] = True
+                    if outcome["execution_stopped"]:
+                        record["stop_proof"] = outcome
+            self.proof_wakeup.set()
         elif kind == "release":
             public_started[0] = True
             handle.close(wait_for_database=True, timeout=max(0.001, deadline - time.monotonic()))
@@ -297,31 +297,72 @@ class Bridge:
             handle.shutdown_database(save=command["save"])
             channel.send({"event": "shutdown_completed", "attempt": attempt})
 
-    def confirm_stop(self, channel, handle, operation_id, attempt):
-        try:
-            handle.execute_python("result = None", timeout=None, operation_id=uuid.uuid4().hex)
-        except Exception as exc:
-            channel.send({"event": "stop_unconfirmed", "attempt": attempt,
-                          "error": error("cancel_pending", type(exc).__name__)})
-        else:
-            channel.send({"event": "stopped", "attempt": attempt, "result": None,
-                          "proof": "same_lease_serialized_successor_completed"})
+    def mark_unknown(self, operation_id, attempt):
+        with self.lock:
+            self.unknown[operation_id] = attempt
+            record = self.executing.get(operation_id)
+            if record is not None:
+                record["unknown"] = True
+        # Also handles a cancel ACK received before the execution stream failed.
+        self.proof_wakeup.set()
+
+    def proofs(self):
+        while not self.stopped.is_set():
+            self.proof_wakeup.wait(0.02)
+            self.proof_wakeup.clear()
+            expired = []
             with self.lock:
-                self.unknown.pop(operation_id, None)
+                for operation_id, record in self.executing.items():
+                    if not record["unknown"] or not record["cancel_requested"] or record["proving"] or record["expired"]:
+                        continue
+                    if time.monotonic() >= record["deadline"]:
+                        record["expired"] = True
+                        expired.append(record["attempt"])
+                    elif time.monotonic() >= record["next"] and self.proof_gate.acquire(blocking=False):
+                        record["proving"] = True
+                        self.proof_pool.submit(self.confirm_stop, operation_id, record)
+            for attempt in expired:
+                self.control.send({"event": "stop_unconfirmed", "attempt": attempt,
+                                   "error": error("cancel_pending", "stop proof deadline expired; outcome remains unknown")})
+
+    def confirm_stop(self, operation_id, record):
+        try:
+            outcome = record.get("stop_proof") or record["handle"].cancel_operation_outcome(operation_id)
+            if outcome["execution_stopped"]:
+                self.control.send({"event": "stopped", "attempt": record["attempt"],
+                    "proof": "causal_cancel_not_pending", "outcome": outcome})
+                with self.lock:
+                    self.unknown.pop(operation_id, None)
+                    self.executing.pop(operation_id, None)
+            elif outcome["status"] == "failed":
+                self.control.send({"event": "stop_unconfirmed", "attempt": record["attempt"],
+                    "error": error("cancel_pending", outcome["failure"])})
+        except Exception as exc:
+            self.control.send({"event": "stop_unconfirmed", "attempt": record["attempt"],
+                               "error": error("cancel_pending", type(exc).__name__)})
         finally:
             with self.lock:
-                self.confirming.discard(operation_id)
+                record["proving"] = False
+                record["next"] = time.monotonic() + 0.02
+                # Rotate retryable records so a failed proof cannot monopolize
+                # the two reserved slots while other unknowns wait.
+                if operation_id in self.executing:
+                    self.executing.pop(operation_id)
+                    self.executing[operation_id] = record
             self.proof_gate.release()
 
     def close(self):
         self.stopped.set()
+        self.proof_wakeup.set()
         with self.lock:
             handles = list(self.handles.values())
-        for _lease, handle in handles:
+            operations = list(self.executing.items())
+        for operation_id, record in operations:
             try:
-                handle.cancel_active(timeout=0.1)
+                record["handle"].cancel_operation_outcome(operation_id)
             except Exception as exc:
                 print(f"cancel during cleanup failed: {type(exc).__name__}", file=sys.stderr)
+        for _lease, handle in handles:
             try:
                 handle.close(wait_for_database=True, timeout=5)
             except Exception as exc:

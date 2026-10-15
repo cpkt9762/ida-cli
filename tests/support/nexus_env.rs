@@ -60,12 +60,14 @@ pub struct Client {
 }
 impl Client {
     pub async fn new() -> Self {
+        Self::configured(config()).await
+    }
+    pub async fn configured(cfg: BridgeConfig) -> Self {
         assert_eq!(
             std::env::var("IDA_TEST").expect("explicit real IDA opt-in"),
             "1"
         );
         let router = RouterState::new().expect("router");
-        let cfg = config();
         let bridge = router
             .connect_nexus(cfg.clone())
             .await

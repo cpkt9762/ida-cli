@@ -1,4 +1,5 @@
 """Test-only identity instrumentation and an independent public Nexus client."""
+import http.client
 import importlib.metadata
 import json
 import os
@@ -69,6 +70,26 @@ if len(sys.argv) > 1 and sys.argv[1] == "external":
     finally:
         handle.close(wait_for_database=True, timeout=10)
 else:
+    if os.environ.get("N3_LEASE_FAULT"):
+        from ida_nexus import DatabaseHandle
+        original_open_lease = DatabaseHandle._open_lease
+        first = [True]
+        def open_lease(handle, instance):
+            connection, response, stream = original_open_lease(handle, instance)
+            if first[0]:
+                first[0] = False
+                readline = response.readline
+                def faulted_readline(*args, **kwargs):
+                    line = readline(*args, **kwargs)
+                    if (env.root / "lease-fault.inject").exists():
+                        (env.root / "lease-fault.observed").touch()
+                        raise http.client.RemoteDisconnected("injected isolated first-lease SSE failure")
+                    return line
+                response.readline = faulted_readline
+            return connection, response, stream
+        # Fault only one actual HTTP response at its read boundary. Never change
+        # the server or restore client fields; sibling SSE/execute sockets remain real.
+        DatabaseHandle._open_lease = open_lease
     if os.environ.get("N3_WRONG_VERSION"):
         original_version = importlib.metadata.version
         importlib.metadata.version = lambda name: "0.13.3" if name == "ida-nexus" else original_version(name)

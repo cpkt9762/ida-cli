@@ -254,6 +254,33 @@ impl<C: Clock> NexusSessions<C> {
         self.cancel(client, identity, CancelReason::Deadline, backend)
     }
 
+    /// Independent stop evidence after an unknown result. This never supplies a
+    /// business outcome or permits queued/running work to finish successfully.
+    pub fn execution_stopped(&mut self, identity: &OperationIdentity) -> Result<bool, NexusError> {
+        let op = self.match_operation(identity)?;
+        if self.generations.get(&identity.lease.instance_id) != Some(&identity.lease.generation) {
+            return Ok(false);
+        }
+        if !op.snapshot.status.is_terminal() {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "stop proof requires a determined caller outcome",
+            ));
+        }
+        let changed = !op.snapshot.execution_stopped;
+        if let Some(op) = self.operations.get_mut(&identity.operation_id) {
+            op.snapshot.execution_stopped = true;
+        }
+        self.confirm_delivery(DeliveryTarget::Execute {
+            identity: identity.clone(),
+        });
+        self.confirm_delivery(DeliveryTarget::Cancel {
+            identity: identity.clone(),
+            reason: CancelReason::Client,
+        });
+        Ok(changed)
+    }
+
     /// Completion events mean the remote operation has actually returned/stopped.
     /// Nexus cancel_operation's bool is only a request acknowledgment and MUST
     /// NOT be translated into Completion::Cancelled by the bridge.

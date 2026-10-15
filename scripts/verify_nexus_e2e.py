@@ -70,14 +70,14 @@ def main():
             if child.returncode and re.search(r"license.*(?:invalid|failed|not found|unavailable|expired)|no valid license", text, re.IGNORECASE):
                 result["status"] = "BLOCKED"
             assert child.returncode == 0, f"{result['status']}: lifecycle command failed: {child.returncode}"
-            assert summary == [("7", "0", "0")], f"wrong actual test count: {summary}"
+            assert summary == [("9", "0", "0")], f"wrong actual test count: {summary}"
             events = [json.loads(line) for line in (env.root / "rust-evidence.jsonl").read_text().splitlines()]
             cases = [event["case"] for event in events if event.get("status") == "PASS"]
-            expected = ["E02", "E03", "E05", "E06-client", "E06-bridge", "E07-packed", "E07-unpacked"]
+            expected = ["E02", "E03", "E05", "E06-client", "E06-bridge", "E07-packed", "E07-unpacked", "E05-concurrent-open", "E06-lease-fault"]
             assert sorted(cases) == sorted(expected), f"wrong scenario evidence: {cases}"
             env.assert_clean()
             assert not list((env.root / "state/instances").glob("*.json")), "Nexus registrations remain"
-            result.update({"status":"PASS", "actual_tests":7, "cases":cases})
+            result.update({"status":"PASS", "actual_tests":9, "cases":cases})
         finally:
             result["cleanup_signalled_pids"] = env.cleanup()
             env.assert_clean()

@@ -1,5 +1,11 @@
 //! Prepare a canonical cache input before acquiring any Nexus lease.
-use crate::{blocking, error::ToolError, idb_store::IdbStore, preprocess::Preparation};
+#[cfg(test)]
+use crate::idb_store::IdbStore;
+use crate::{
+    blocking,
+    error::ToolError,
+    preprocess::{Preparation, StagedArtifact},
+};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,20 +49,6 @@ fn prepare(path: PathBuf, cache: PathBuf, preparation: &Preparation) -> anyhow::
         return Ok(path);
     }
     std::fs::create_dir_all(&cache)?;
-    let store = IdbStore::with_root(cache.clone());
-    let hash = digest(&path, preparation)?;
-    #[cfg(test)]
-    hook("snapshot_hashed");
-    let (cached, destination) = store.prepared_paths(&path)?;
-    let input = cached.unwrap_or(destination).with_extension("");
-    #[cfg(test)]
-    hook("path_selected");
-    if input.exists() {
-        if digest(&input, preparation)? != hash {
-            anyhow::bail!("central cache input collision; refusing replacement");
-        }
-        return Ok(input);
-    }
     static IDS: AtomicU64 = AtomicU64::new(1);
     let staging = cache.join(format!(
         ".nexus-input-{}-{}",
@@ -71,13 +63,14 @@ fn prepare(path: PathBuf, cache: PathBuf, preparation: &Preparation) -> anyhow::
     impl Drop for Remove {
         fn drop(&mut self) {
             if let Err(error) = std::fs::remove_file(&self.0) {
-                tracing::warn!(%error, "cache input staging cleanup failed");
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(%error, "cache input staging cleanup failed");
+                }
             }
         }
     }
-    let _remove = Remove(staging.clone());
-    let mut source = std::fs::File::open(path)?;
-    let mut copied = blake3::Hasher::new();
+    let remove = Remove(staging.clone());
+    let mut source = std::fs::File::open(&path)?;
     let mut buffer = [0; 65536];
     loop {
         preparation.check()?;
@@ -86,23 +79,54 @@ fn prepare(path: PathBuf, cache: PathBuf, preparation: &Preparation) -> anyhow::
             break;
         }
         output.write_all(&buffer[..size])?;
-        copied.update(&buffer[..size]);
-    }
-    if copied.finalize() != hash {
-        anyhow::bail!("source changed during cache preparation");
     }
     output.sync_all()?;
-    preparation.check()?;
+    drop(output);
+    // Hash only the copied snapshot. The original is never read again.
+    let hash = digest(&staging, preparation)?;
+    #[cfg(test)]
+    hook("snapshot_hashed");
+    let short = &hash.to_hex()[..12];
+    let mut existing = None;
+    for entry in std::fs::read_dir(&cache)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.contains(&format!(".{short}.")) && name.ends_with(".i64") {
+            existing = Some(entry.path());
+            break;
+        }
+    }
+    let basename = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("input has no basename"))?
+        .to_string_lossy();
+    let idb = existing.unwrap_or_else(|| cache.join(format!("{basename}.{short}.dylib.i64")));
+    let input = idb.with_extension("");
+    #[cfg(test)]
+    hook("path_selected");
+    if input.exists() {
+        if digest(&input, preparation)? != hash {
+            anyhow::bail!("central cache input collision; refusing replacement");
+        }
+        return Ok(input);
+    }
+    if idb.exists() {
+        anyhow::bail!(
+            "existing central IDB has no input snapshot proving its hash; refusing reuse"
+        );
+    }
+    let stage = StagedArtifact::create(&input)?;
+    std::fs::rename(&staging, &stage.output)?;
+    drop(remove);
     #[cfg(test)]
     hook("before_publish");
-    match std::fs::hard_link(&staging, &input) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if digest(&input, preparation)? != hash {
-                anyhow::bail!("concurrent central cache input collision");
-            }
+    if let Err(error) = stage.publish(preparation) {
+        preparation.check()?;
+        if !input.exists() || digest(&input, preparation)? != hash {
+            return Err(error.into());
         }
-        Err(error) => return Err(error.into()),
+        // Another opener published the identical snapshot. Never overwrite it.
     }
     Ok(input)
 }

@@ -78,20 +78,41 @@ probe and N0/N3 gates permits removal; N9 packages must carry both local patches
 Prepare separate fresh external environments using the N0 command below.
 The red control alone adds `--without-client-cancel-patch` to preparation and
 `--expect-unpatched` to the probe command. It must exit 2. The normal patched
-probe must exit 0. Each executes exactly three probes, never replays execution,
-and records `cancel-gap.json`, actual loaded source, versions and owned cleanup.
+probe must exit 0. The red executes three probes; the green executes five,
+including both causal response orderings. Neither replays execution. Each records `cancel-gap.json`, actual loaded source, versions and owned cleanup.
 The green disconnect case sends exactly one control request and proves the old
-operation stopped before a distinct same-lease successor completes. Cancelling
+operation stopped using a precise true ACK followed by an authoritative false
+from a control request issued after that ACK. Cancelling
 an already completed operation returns false and leaves the next operation intact.
 
 ```bash
 timeout 30s "$N0_ROOT/venv/bin/python" scripts/nexus/probe_cancel_after_disconnect.py --root "$N0_ROOT"
 ```
 
-Unknown identities are bounded at 64. The backend lock is not FIFO: a successor
-alone cannot prove an unacknowledged old request stopped. Only a precise cancel
-ACK followed by backend success, a later exact false after that ACK, or close
-clears the corresponding unknown identity. Unacknowledged false remains retryable.
+Unknown identities are bounded at 64. `cancel_operation_outcome` adds structured
+`cancelled/not_pending/failed` results, failure category and per-handle issuance
+sequence; existing bool APIs keep their contract. The first true ACK captures
+all cancellation sequences already issued. Only a later-issued authoritative
+`not_pending` proves stopping; delayed older false, transport/parse failure and
+successful execution responses cannot retire an unknown ID. The bridge uses
+this public API with exact IDs, an independent two-slot proof queue and bounded
+retry until the original deadline. It never replays. Stop evidence preserves
+UnknownOutcome and its cause; early control evidence waits for the business
+outcome. `cancel_active` remains active-only. Close clears identities.
+
+The ambiguity probe uses three controlled outcomes without starting IDA. In a
+fresh patched environment it must exit 0, distinguishing authoritative absence
+from transport and JSON parsing failures. The original F1 baseline exits 2.
+
+```bash
+timeout 30s "$N0_ROOT/venv/bin/python" scripts/nexus/probe_cancel_proof_ambiguity.py --evidence "$N3_ROOT/ambiguity.json"
+```
+
+`nexus_bridge_regressions` uses the installed client, persistent bridge, two real
+Unix sockets and Rust/N1, with file barriers for ACK-before-stream-loss,
+stopped-before-uncertain, delayed success/false, lease isolation, CLI control
+saturation and stale unknown cancellation. Set `F1_PYTHON` to the prepared Python
+and `F1_ROOT` to a short isolated directory, then run with a 30-second timeout.
 No bridge code accesses authentication tokens or reconstructs private protocols.
 
 The protocol suite uses fake public handles and two real local sockets. Set a
@@ -114,15 +135,19 @@ timeout 210s "$N0_ROOT/venv/bin/python" scripts/verify_nexus_e2e.py \
   --root "$N0_ROOT" --target "$CARGO_TARGET_DIR" --sdk "$IDASDKDIR" --ipc-root "$N3_ROOT/i"
 ```
 
-Exactly seven real tests and seven distinct PASS records are required: E02
+Exactly nine real tests and nine distinct PASS records are required: E02
 (bridge readiness, missing dependency, wrong version, unsupported runtime), E03
 (raw/existing IDB, deadline cancellation and persistence), E05 (two independent
-bridge clients), E06-client, E06-bridge, E07-packed, E07-unpacked. Missing IDA,
+bridge clients), E06-client, E06-bridge, E07-packed, E07-unpacked,
+E05-concurrent-open (two ordinary concurrent opens) and E06-lease-fault (one
+router's SSE lease fails while a sibling operation stays active). Missing IDA,
 license or sample is BLOCKED, never an ignored pass. Results are in
 `lifecycle-result.json`, `lifecycle.log`, `rust-evidence.jsonl` and the process
 identity ledger. Cleanup may be rerun with `--cleanup`; it never scans or kills
 by process name. No staging files or instance registration JSON may remain.
-The cache deliberately publishes a content-addressed raw copy whose default
+The cache copies to staging first, hashes that same snapshot, and uses N2's
+publication arbitration so cancellation winning first cannot publish. Existing
+cache IDBs require a matching full-hash input snapshot. Its default
 Nexus output is the central cache IDB; custom output without a packed base is
 not automatically recoverable upstream. Public tool migration is N4;
 E08/E18/E19 full real-chain coverage remains later work.

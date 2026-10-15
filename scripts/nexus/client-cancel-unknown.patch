@@ -1,78 +1,122 @@
-Nexus 0.13.4 client cancellation after uncertain execution transport failure.
+Nexus 0.13.4 exact cancellation after uncertain execution transport failure.
 Upstream: d60ff582fde90c59726336c0dbdf3e8286e9df7a.
-Reason: retain at most 64 exact handle-owned IDs, reject new execution at capacity,
-and use the existing independent control connection without replay. Values track
-whether cancellation received a true ACK. Backend locking is not FIFO: success
-clears only already ACKed predecessors. A later false after a true ACK removes the
-exact ID; unacknowledged false remains retryable because POST registration may
-still be pending. Health/error responses never clear IDs. Close clears all.
-Probe: scripts/nexus/probe_cancel_after_disconnect.py; tests/nexus_bridge/.
-Removal: only after a pinned upstream fix passes the probe, N0 and N3 gates.
-N9 packaging must carry this patch until that revalidation.
+User approved 2026-10-15; N3-F1 continuation authorizes structured public outcome.
+Retain at most 64 unknown identities. Never replay. Independent control uses no
+execution slots. cancel_operation/cancel_active retain bool and exception behavior;
+cancel_active is active-only again, so stale unknown IDs cannot starve it.
+New cancel_operation_outcome reports cancelled/not_pending/failed, failure category,
+per-handle attempt_sequence, ACK issuance cutoff and causal execution_stopped.
+Only authoritative not_pending ISSUED AFTER a true ACK retires an unknown ID.
+Delayed pre-ACK false and all failures retain it. Successful executions never
+clear unrelated IDs. Active ACK state survives a later execution disconnect.
+Close clears identity state. Server pending keys disappear after backend unlock;
+exact cancellation prohibits queued cancelled operations from later executing.
+Probes: scripts/nexus/probe_cancel_after_disconnect.py,
+        scripts/nexus/probe_cancel_proof_ambiguity.py; tests/nexus_bridge/.
+Removal: pinned upstream equivalent must pass probes and N0/N3 revalidation.
+N9 packaging MUST carry this patch until then.
 
 --- a/ida_nexus/handle.py
 +++ b/ida_nexus/handle.py
-@@ -289,6 +289,9 @@
+@@ -289,6 +289,11 @@
          self._rpc_connection: http.client.HTTPConnection | None = None
          self._rpc_last_used: float | None = None
          self._active_operation_id: str | None = None
-+        # Bounded, exact identities whose transport failed, never replayed.
-+        self._uncertain_operations: dict[str, bool] = {}
++        # Exact handle-owned identities; control/proof requests need no slots.
++        self._uncertain_operations: dict[str, dict[str, Any]] = {}
 +        self._uncertain_capacity = 64
++        self._cancel_sequence = 0
++        self._active_cancel_state: dict[str, Any] | None = None
          self._lease_connection: http.client.HTTPConnection | None = None
          self._lease_response: http.client.HTTPResponse | None = None
          self._lease_socket: socket.socket | None = None
-@@ -644,6 +647,9 @@
+@@ -644,11 +649,18 @@
                  raise DatabaseDisconnectedError(
                      self._disconnect_reason or "database instance disconnected"
                  )
 +            with self._lock:
-+                if operation_id is not None and len(self._uncertain_operations) >= self._uncertain_capacity:
-+                    raise NexusConnectionError("uncertain operation capacity exhausted; reconcile or close this handle")
++                if operation_id is not None and (
++                    operation_id in self._uncertain_operations
++                    or len(self._uncertain_operations) >= self._uncertain_capacity
++                ):
++                    raise NexusConnectionError("uncertain operation capacity exhausted or identity reused; reconcile or close this handle")
              entry = self.instance
              connection = self._rpc_connection_for(entry, timeout)
              if operation_id is not None:
-@@ -669,6 +675,10 @@
+                 with self._lock:
+                     self._active_operation_id = operation_id
++                    self._active_cancel_state = {"ack_cutoff": None}
+             try:
+                 connection.request(
+                     method,
+@@ -669,6 +681,10 @@
              except (TimeoutError, OSError, http.client.HTTPException) as exc:
                  # Do not retry automatically: a POST may have executed before
                  # the connection failed. The next operation gets a fresh socket.
 +                if operation_id is not None:
 +                    with self._lock:
-+                        if not self._closed.is_set():
-+                            self._uncertain_operations[operation_id] = False
++                        if not self._closed.is_set() and self._active_cancel_state is not None:
++                            self._uncertain_operations[operation_id] = self._active_cancel_state
                  self._discard_rpc_connection(connection)
                  crash_state = self._crashed_database_state(entry)
                  if crash_state is not None:
-@@ -684,6 +694,20 @@
+@@ -684,6 +700,7 @@
                      with self._lock:
                          if self._active_operation_id == operation_id:
                              self._active_operation_id = None
-+            # Backend locking is not FIFO. Only predecessors already ACKed as
-+            # cancelled are stopped/prohibited from running after this success.
-+            if status == 200 and endpoint in {"/execute_python", "/wait_autoanalysis", "/save_database"}:
-+                try:
-+                    proof = json.loads(response_body)
-+                except (UnicodeDecodeError, json.JSONDecodeError):
-+                    proof = None
-+                if isinstance(proof, dict) and (proof.get("ok") is True or
-+                        (endpoint == "/wait_autoanalysis" and isinstance(proof.get("complete"), bool))):
-+                    with self._lock:
-+                        self._uncertain_operations = {
-+                            key: acknowledged for key, acknowledged in self._uncertain_operations.items()
-+                            if not acknowledged
-+                        }
++                            self._active_cancel_state = None
              with self._lock:
                  if self._rpc_connection is connection:
                      self._rpc_last_used = time.monotonic()
-@@ -801,6 +825,6 @@
+@@ -799,24 +816,37 @@
+         return result
+
      def cancel_operation(self, operation_id: str) -> bool:
-         """Cancel one identified in-flight operation over a control connection."""
+-        """Cancel one identified in-flight operation over a control connection."""
++        """Cancel one identified operation; retain the original bool/error contract."""
++        return self.cancel_operation_outcome(operation_id)["status"] == "cancelled"
++
++    def cancel_operation_outcome(self, operation_id: str) -> dict[str, Any]:
++        """Cancel an exact owned ID over an independent control connection.
++
++        Only an authoritative not_pending request issued after a true ACK can
++        prove stopping. Failed/local results never do, even when bool is false.
++        The sequence and ACK cutoff refer to request issuance on this handle.
++        """
          with self._lock:
 -            if self._active_operation_id != operation_id:
-+            if self._active_operation_id != operation_id and operation_id not in self._uncertain_operations:
-                 return False
+-                return False
++            self._cancel_sequence += 1
++            sequence = self._cancel_sequence
++            state = self._uncertain_operations.get(operation_id)
++            if state is None and self._active_operation_id == operation_id:
++                state = self._active_cancel_state
++            outcome: dict[str, Any] = {
++                "status": "failed", "attempt_sequence": sequence,
++                "execution_stopped": False, "failure": "local_identity",
++            }
++            if state is None or self._closed.is_set():
++                return outcome
              entry = self._instance
-@@ -826,12 +850,19 @@
+
+         connection = http.client.HTTPConnection(HOST, entry.port, timeout=2.0)
+         try:
+             body = json.dumps(
+-                {
+-                    "lease_id": self._lease_id,
+-                    "operation_id": operation_id,
+-                }
++                {"lease_id": self._lease_id, "operation_id": operation_id}
+             ).encode("utf-8")
+             connection.request(
+-                "POST",
+-                "/cancel_operation",
+-                body=body,
++                "POST", "/cancel_operation", body=body,
+                 headers={
+                     "Accept": "application/json",
+                     "Content-Type": "application/json",
+@@ -826,22 +856,35 @@
              response = connection.getresponse()
              try:
                  payload = json.loads(response.read())
@@ -82,44 +126,52 @@ N9 packaging must carry this patch until that revalidation.
 -                    and isinstance(payload.get("result"), dict)
 -                    and payload["result"].get("cancelled") is True
 -                )
-+                result = payload.get("result") if isinstance(payload, dict) else None
-+                if response.status == 200 and isinstance(result, dict) and result.get("cancelled") is False:
-+                    # Without a prior true ACK, false could race the execution
-+                    # POST registering itself. Keep its exact identity retryable.
-+                    with self._lock:
-+                        if self._uncertain_operations.get(operation_id) is True:
-+                            self._uncertain_operations.pop(operation_id, None)
-+                elif response.status == 200 and isinstance(result, dict) and result.get("cancelled") is True:
-+                    with self._lock:
-+                        if operation_id in self._uncertain_operations:
-+                            self._uncertain_operations[operation_id] = True
-+                return bool(response.status == 200 and isinstance(result, dict)
-+                            and result.get("cancelled") is True)
              finally:
                  response.close()
-         except (
-@@ -849,6 +880,6 @@
-         """Cancel this handle's in-flight operation over a control connection."""
-         deadline = time.monotonic() + timeout
-         with self._lock:
--            operation_id = self._active_operation_id
-+            operation_id = self._active_operation_id or next(iter(self._uncertain_operations), None)
-         if operation_id is None:
-             return False
-@@ -857,7 +888,7 @@
-             if self.cancel_operation(operation_id):
-                 return True
-             with self._lock:
--                if self._active_operation_id != operation_id:
-+                if self._active_operation_id != operation_id and operation_id not in self._uncertain_operations:
-                     return False
-             if time.monotonic() >= deadline:
-                 return False
-@@ -941,6 +972,7 @@
+-        except (
+-            TimeoutError,
+-            OSError,
+-            http.client.HTTPException,
+-            UnicodeDecodeError,
+-            json.JSONDecodeError,
+-        ):
+-            return False
++            result = payload.get("result") if isinstance(payload, dict) else None
++            if response.status != 200:
++                outcome["failure"] = "http_status"
++                return outcome
++            if not isinstance(result, dict) or type(result.get("cancelled")) is not bool:
++                outcome["failure"] = "unexpected_response"
++                return outcome
++            cancelled = result["cancelled"]
++            outcome.update(status="cancelled" if cancelled else "not_pending", failure=None)
++            with self._lock:
++                # Capture ALL requests issued by the time of the first true
++                # ACK. A delayed older false cannot cross this causal fence.
++                if cancelled and state["ack_cutoff"] is None:
++                    state["ack_cutoff"] = self._cancel_sequence
++                cutoff = state["ack_cutoff"]
++                outcome["ack_cutoff"] = cutoff
++                if not cancelled and cutoff is not None and sequence > cutoff:
++                    outcome["execution_stopped"] = True
++                    if self._uncertain_operations.get(operation_id) is state:
++                        self._uncertain_operations.pop(operation_id)
++            return outcome
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            outcome["failure"] = "parse"
++            return outcome
++        except (TimeoutError, OSError, http.client.HTTPException):
++            outcome["failure"] = "transport"
++            return outcome
+         finally:
+             connection.close()
+
+@@ -941,6 +984,8 @@
              return
          self._closed.set()
          with self._lock:
 +            self._uncertain_operations.clear()
++            self._active_cancel_state = None
              subscriptions = tuple(self._idb_subscriptions)
              self._idb_subscriptions.clear()
          for subscription in subscriptions:

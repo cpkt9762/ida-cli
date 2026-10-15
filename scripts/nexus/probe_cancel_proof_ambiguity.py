@@ -3,7 +3,7 @@
 
 No IDA runtime/owner is started. Transport faults affect only in-memory test
 connections; the installed client source is neither modified nor replaced.
-Exit 2 proves the ambiguity, exit 0 means the public observations differ.
+Exit 2 proves the legacy ambiguity; exit 0 validates the structured outcomes.
 """
 import argparse
 import http.client
@@ -60,7 +60,8 @@ def scenario(mode):
             assert execution_connection.requests == 1, "uncertain execution must not replay"
             proof_connection = Connection(mode)
             with patch.object(handle_module.http.client, "HTTPConnection", lambda *_a, **_k: proof_connection):
-                proof_result = handle.cancel_operation("original")
+                proof_result = (handle.cancel_operation_outcome("original")
+                                if hasattr(handle, "cancel_operation_outcome") else handle.cancel_operation("original"))
             assert proof_connection.requests == 1, "must issue after the true ACK"
             return {"injected_control_outcome": mode,
                     "execution_requests": execution_connection.requests,
@@ -79,9 +80,15 @@ def main():
     args = parser.parse_args()
     rows = [scenario(mode) for mode in ("false", "transport_error", "invalid_json")]
     ambiguous = all(row["public_observation"] == rows[0]["public_observation"] for row in rows)
+    if not ambiguous:
+        outcomes = [row["public_observation"]["subsequent_cancel"] for row in rows]
+        assert outcomes[0]["status"] == "not_pending" and outcomes[0]["execution_stopped"]
+        assert [outcome["failure"] for outcome in outcomes[1:]] == ["transport", "parse"]
+        assert all(outcome["status"] == "failed" and not outcome["execution_stopped"] for outcome in outcomes[1:])
+        assert all(outcome["attempt_sequence"] == 2 for outcome in outcomes)
     assert rows[0]["unknown_retained_test_observation"] is False
     assert all(row["unknown_retained_test_observation"] is True for row in rows[1:])
-    result = {"status": "BLOCKED_PUBLIC_CANCEL_PROOF_AMBIGUITY" if ambiguous else "DISTINGUISHABLE",
+    result = {"status": "BLOCKED_PUBLIC_CANCEL_PROOF_AMBIGUITY" if ambiguous else "PASS",
               "actual_scenarios": len(rows), "scenarios": rows,
               "client_source": handle_module.__file__, "owners_started": 0}
     args.evidence.write_text(json.dumps(result, indent=2) + "\n")

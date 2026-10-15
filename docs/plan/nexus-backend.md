@@ -293,7 +293,7 @@ N1/N2 在 bridge 尚未接通时先验收契约和模拟行为，这些结果不
 - 检查现有测试、构建依赖、IDA SDK/运行时匹配关系；记录未修改代码时的 lint、测试及能力输出。
 - 保存可执行的旧版本对照产物及源码 SHA、构建方式、匹配运行时，并制作关闭/保存完成后的数据库备份副本。对照和回退演练依赖这些固定产物，不依赖最终源码保留旧后端。
 - 固定 Nexus/Domain 版本和依赖获取方式，测试环境使用独立 venv；不要依赖评估时的临时 venv。
-- 2026-10-15 用户裁定将 `scripts/nexus/client-cancel-unknown.patch` 与 loopback DNS 补丁同样作为专用环境依赖补丁维护；只改固定上游 `d60ff582` 的客户端 `handle.py`，不改服务端、安装或私有锁。prepare 先检查补丁、再验证产物 SHA-256，环境检查报告补丁状态。只有固定上游修复通过 probe、N0/N3 重新验收后才能移除；N9 打包必须携带。
+- 2026-10-15 用户裁定将 `scripts/nexus/client-cancel-unknown.patch` 与 loopback DNS 补丁同样作为专用环境依赖补丁维护；只改固定上游 `d60ff582` 的客户端 `handle.py`，不改服务端、安装或私有锁。prepare 先检查补丁、再验证产物 SHA-256，环境检查报告补丁状态。N3-F1 新增公开结构化取消结果及因果序号；只有固定上游等价修复通过两种 probe、N0/N3 重新验收后才能移除；N9 打包必须携带。
 - 对 DNS 问题给出最小复现及解决方案。若需补丁，固定补丁版本和来源，在专用环境测试，不能通过修改系统 DNS 或全局 Python 来掩盖。
 - 将历史临时并发诊断转为可维护测试设计，记录原版行为和目标行为的区别。
 - 验收：另一台具备对应 IDA 条件的环境能按说明准备隔离测试；缺依赖明确失败，不能显示“全部通过”。
@@ -398,16 +398,16 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N3：常驻 Python bridge 和 Nexus 生命周期
 
-- N3-F1 尚未完成：在 `3c05a51` 上补充的红例确认停止证明、双通道乱序、lease 断连及缓存发布问题。新增诊断 `scripts/nexus/probe_cancel_proof_ambiguity.py` 还确认公共 `cancel_operation()` 将明确 `cancelled=false`、控制连接故障和 JSON 解析失败均表示为 `false`；仅增加取消请求序号仍不能让 bridge 区分这三者。该诊断不启动 IDA，预期退出 2。按委托的新公共 API 缺口停止规则，等待对客户端补丁公开明确控制结果/停止证明的额外授权；不将 false 当作停止确认，不声称修复或重新验收通过。下述 N3 行为和旧验证描述属于待修复基线。
-
-- 2026-10-15 用户已裁定采用本地客户端补丁，解除原公共 API 阻塞。补丁在执行连接异常后保留本 handle 的精确 operation ID（最多 64 项，满时拒绝新执行），取消继续走公共 API 原有独立控制连接；不读取 token、不恢复私有字段、不重放。正常完成/明确错误不进入未知集合。
-- 官方 `_server._run_operation` 的 backend lock 不保证 FIFO，所以未取消的后继请求完成不能独自证明旧排队请求结束。补丁只在精确取消 ACK 后的成功串行后继完成时移除旧 ID；或在先前 ACK 后再收到精确 false 时移除。未 ACK 的 false 可能早于旧 POST 登记，保守保留至可证明停止或 handle close。health/error 响应不能清理该集合。bridge 只有原执行返回取消，或 ACK 后的同 lease 只读后继完成，才确认停止；后继失败保留 UnknownOutcome、原 cause 与 execution_stopped=false。
+- 2026-10-15 用户裁定采用本地客户端补丁；编排者在同一授权范围追加允许公开结构化取消方法。`DatabaseHandle.cancel_operation_outcome` 新增 `cancelled/not_pending/failed`、失败类别、每 handle 取消序号和因果停止证明；原 `cancel_operation/cancel_active` 保留 bool 与异常语义。歧义 probe 区分服务端明确 false、连接故障和解析失败，后两者不证明停止。
+- 补丁在执行连接异常后保留本 handle 的精确 operation ID（最多 64 项，满时拒绝新执行），取消继续走原有独立控制连接；不读取 token、不恢复私有字段、不重放。正常完成/明确错误不进入未知集合；`cancel_active` 恢复官方 active-only 选择，bridge 始终按精确 operation_id 调用新方法。
+- 官方 `_server._run_operation` 在释放 backend lock 之后才移除精确 pending key，取消过的排队操作会在取得锁前被拒绝。补丁删除“后继成功即清理”：第一次 true ACK 记录当时所有已发取消请求的序号上界；只有此后才发出的另一次取消得到 HTTP 200、`cancelled=false`，才能移除未知 ID并证明停止。先发后到的 false、晚解析的成功响应及任何控制失败均不作数；handle close 清空记账。
+- bridge 独立停止证明池保留 2 槽，失败轮转重试，容量满时保留待办；ACK 先于执行断流仍补安排证明，到原操作期限保留 UnknownOutcome/原 cause，不伪造停止。控制 `stopped` 早于业务 `uncertain` 时先缓冲，再经 N1 `execution_stopped` 仅补停止证据，绝不改变业务结果为成功。N1 `lease_disconnected` 仅影响精确 lease；整桥 EOF 才按 owner/generation 标记断连。Rust 控制解码使用独立等待式单槽，不争用 CLI 的 Control try许可；lane 容量不变。
 - `nexus_bridge/bridge.py` 作为独立可打包 Python 客户端目录，只加载 Nexus 公共客户端。每 router 复用一个进程，stdout 只写 readiness，诊断写 stderr；业务、控制使用两个 Unix socket，各自持续读取/写入。业务池 4，接纳容量沿用 N2 tenant 上限；控制接纳 8，取消池 4、释放池 2；停止确认另有容量 2 的独立线程池，不占取消处理容量。本地状态直接读内存，发现 owner 独立后台刷新。
 - `src/router/nexus_bridge.rs` 消费 N2 的两条 lane，完整回传 DeliveryAttempt。Python executor 就绪后回传原 wire frame，Rust 在实际 grant 前调用 `NexusWireFrame::consume()` 并复核发送资格；最终小 grant 仅传剩余时长。总期限由 Rust 触发控制取消，执行 HTTP 连接使用 timeout=None 并等待真实结果。真实连接丢失进入 UnknownOutcome，桥接进程 EOF/异常使 N1 断连，不强杀共享 owner。
 - readiness 校验 Nexus 0.13.4、Domain 0.5.1、补丁后 handle 哈希、Python 与 IDA 最低版本；每 router 能力只安装一次。open 后从实际 owner 查询 IDA 版本。公共 open/attach 获取真实 handle，lease key 为本地非敏感 UUID，instance_id 使用公共 record_id；其身份不可变，generation 在该 instance 命名空间为 1，替换 owner 有新的 record_id。
-- `nexus_bridge::cache::prepare_open` 在原总期限内通过 N2 受限 Prepare 工作准备内容寻址中央缓存输入，不覆盖已有输入；默认输出与既有缓存 `.dylib.i64` 路径一致，从而支持无 packed base 的公共修复流程。已有 IDB 保留 canonical 路径。公开 CLI/MCP 工具尚未切换，由 N4 消费内部接口。
-- 可复现诊断 `scripts/nexus/probe_cancel_after_disconnect.py` 每轮实际 3 probes（正常取消、响应断连、已结束操作取消不影响后继）。未打补丁的新环境 `--expect-unpatched` 退出 2；打补丁的新环境退出 0，断连后控制请求恰好 1 次，无 continued marker，无重放。这些 probe 不计作生命周期 E2E。
-- `tests/nexus_lifecycle_e2e.rs` 实际 7 个场景覆盖 E02 bridge 部分、E03、E05、E06-client/bridge、E07-packed/unpacked。通过脚本核对数量、PASS 场景集合、保存重开、精确进程身份及注册清理。E08/E18/E19 的完整真实链路留待后续阶段，N2 既有模拟/OS fixture 门禁继续保留。
+- `nexus_bridge::cache::prepare_open` 在原总期限内先复制 staging、对副本计算完整 hash，再决定内容寻址中央缓存路径，经 N2 `StagedArtifact::publish` 仲裁取消与发布，不覆盖已有输入；已有缓存必须有完整 hash 匹配的输入证明，孤立 IDB 拒绝复用；默认输出与既有缓存 `.dylib.i64` 路径一致，从而支持无 packed base 的公共修复流程。已有 IDB 保留 canonical 路径。公开 CLI/MCP 工具尚未切换，由 N4 消费内部接口。
+- 可复现诊断 `scripts/nexus/probe_cancel_after_disconnect.py` 未打补丁对照实际 3 probes；补丁环境实际 5 probes（正常取消、响应断连、已结束操作取消不影响后继，以及两种因果乱序）。未打补丁的新环境 `--expect-unpatched` 退出 2；打补丁的新环境退出 0，断连后控制请求恰好 1 次，无 continued marker，无重放。这些 probe 不计作生命周期 E2E。
+- `tests/nexus_lifecycle_e2e.rs` 实际 9 个场景覆盖 E02 bridge 部分、E03、E05、E06-client/bridge、E07-packed/unpacked，新增 E05-concurrent-open（两个普通 open 并发共享 owner）和 E06-lease-fault（同 router 两 lease，单 lease SSE 故障不影响 sibling 活动操作）。通过脚本核对数量、PASS 场景集合、保存重开、精确进程身份及注册清理。E08/E18/E19 的完整真实链路留待后续阶段，N2 既有模拟/OS fixture 门禁继续保留。
 - 验收要求：同库两客户端共享；任一释放或异常退出不影响另一客户端；最后一个引用释放后保存可重开。本阶段实现和证据提交后，由编排者裁定 N3 验收及 N4 派发。
 
 ### N4：首批方法与输出兼容

@@ -419,6 +419,40 @@ impl<C: Clock> NexusSessions<C> {
         Ok(snapshot)
     }
 
+    /// Loss of one public client lease/SSE stream says nothing about siblings.
+    pub fn lease_disconnected(&mut self, lease: &SessionLease) -> Result<bool, NexusError> {
+        self.authorize(&lease.client_id, lease)?;
+        if self.generations.get(&lease.instance_id) != Some(&lease.generation) {
+            return Ok(false);
+        }
+        let session = self
+            .sessions
+            .get_mut(&lease.lease_id)
+            .ok_or_else(|| NexusError::new(NexusErrorCode::InvalidIdentity, "unknown lease"))?;
+        if matches!(
+            session.phase,
+            SessionPhase::Released | SessionPhase::Disconnected
+        ) {
+            return Ok(false);
+        }
+        session.phase = SessionPhase::Disconnected;
+        for op in self.operations.values_mut() {
+            if &op.snapshot.identity.lease == lease && !op.snapshot.status.is_terminal() {
+                let sent = !op.snapshot.execution_stopped;
+                op.snapshot.status = if sent {
+                    OperationStatus::UnknownOutcome
+                } else {
+                    OperationStatus::Failed
+                };
+                op.snapshot.error = Some(NexusError::new(
+                    if sent { NexusErrorCode::UnknownOutcome } else { NexusErrorCode::Disconnected },
+                    "client lease disconnected; effects and stop of dispatched work are unknown; do not replay",
+                ));
+            }
+        }
+        Ok(true)
+    }
+
     /// Called only for an actual disconnect event from this exact owner.
     /// A global instance count or a failed health poll is insufficient evidence.
     pub fn disconnected(&mut self, instance: &InstanceId, generation: u64) -> bool {

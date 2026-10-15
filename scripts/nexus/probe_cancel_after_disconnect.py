@@ -167,8 +167,10 @@ def main():
                         proof = handle.execute_python("result = 'same_lease_successor_completed'", timeout=3)
                         assert proof["result"] == "same_lease_successor_completed"
                         assert not continued.exists(), "cancelled original must never cross the continued barrier"
+                        stopped = handle.cancel_operation_outcome("n3-unknown-operation")
+                        assert stopped["status"] == "not_pending" and stopped["execution_stopped"], stopped
                         observe.touch()
-                        assert not continued.exists(), "successor proves original stopped before barrier release"
+                        assert not continued.exists(), "causal control absence proves original stopped before barrier release"
                         active_ack = None
                     evidence["after_disconnect"] = {
                         "connected": handle.connected, "cancel_ack": ack,
@@ -194,6 +196,28 @@ def main():
                 assert future.result(timeout=5)["result"] == "finished_once"
                 evidence["completed_then_cancel"] = {"old_cancel": False, "successor_unaffected": True}
                 evidence["actual_probes"] += 1
+            if not args.expect_unpatched:
+                # Deterministic causal ordering checks use a separate in-memory
+                # client. The real-IDA scenarios above remain unchanged.
+                sys.path.insert(0, str(REPO / "tests/nexus_bridge"))
+                import pytest
+                import test_client_patch
+                import test_causal_patch
+                for check in (test_causal_patch.test_p11_delayed_success_cannot_retire_later_running_unknown,
+                              test_causal_patch.test_p11_false_issued_before_true_ack_cannot_retire_unknown):
+                    with pytest.MonkeyPatch.context() as injected:
+                        fixture = test_client_patch.client.__wrapped__(injected)
+                        client = next(fixture)
+                        try:
+                            check(client, injected)
+                        finally:
+                            try:
+                                next(fixture)
+                            except StopIteration:
+                                pass
+                    evidence["actual_probes"] += 1
+                evidence["causal_orderings"] = ["late_success", "late_pre_ack_false"]
+            assert evidence["actual_probes"] == (3 if args.expect_unpatched else 5)
             instance = handle.instance
             for item in handles:
                 item.close(wait_for_database=True, timeout=5)

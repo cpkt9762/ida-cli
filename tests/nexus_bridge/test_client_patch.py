@@ -68,7 +68,8 @@ def test_only_handle_owned_identity_can_use_independent_cancel(client, monkeypat
     monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: control)
     assert client.cancel_operation("foreign") is False
     assert control.requests == []
-    assert client.cancel_active() is True
+    assert client.cancel_active() is False
+    assert client.cancel_operation("unknown") is True
     assert len(control.requests) == 1
     body = json.loads(control.requests[0][2])
     assert body == {"lease_id": client._lease_id, "operation_id": "unknown"}
@@ -78,7 +79,7 @@ def test_only_handle_owned_identity_can_use_independent_cancel(client, monkeypat
     assert not client._uncertain_operations
 
 
-def test_health_and_remote_error_cannot_clear_unknown_but_serial_success_can(client, monkeypatch):
+def test_health_error_and_success_cannot_clear_unknown_without_causal_cancel(client, monkeypatch):
     fail_request(client, monkeypatch, "unknown")
     connection = Connection()
     monkeypatch.setattr(client, "_rpc_connection_for", lambda *_a: connection)
@@ -98,6 +99,10 @@ def test_health_and_remote_error_cannot_clear_unknown_but_serial_success_can(cli
     control.payload = {"result": {"cancelled": True}}
     assert client.cancel_operation("unknown") is True
     client._request("/execute_python", {}, operation_id="successor")
+    assert "unknown" in client._uncertain_operations
+    control.payload = {"result": {"cancelled": False}}
+    outcome = client.cancel_operation_outcome("unknown")
+    assert outcome["status"] == "not_pending" and outcome["execution_stopped"]
     assert not client._uncertain_operations
     assert client.cancel_operation("successor") is False
 
@@ -106,3 +111,31 @@ def test_close_clears_unknown_identities(client, monkeypatch):
     fail_request(client, monkeypatch, "unknown")
     client.close()
     assert not client._uncertain_operations
+
+
+def test_change_subscription_close_does_not_require_handle_cancel_state(client, monkeypatch):
+    from ida_nexus.handle import DatabaseChangeSubscription
+    monkeypatch.setattr(DatabaseChangeSubscription, "_open", lambda *_: None)
+    subscription = DatabaseChangeSubscription(client)
+    subscription.close()
+    subscription.close()
+    assert client.connected
+
+
+def test_control_response_close_failure_is_not_authoritative_absence(client, monkeypatch):
+    fail_request(client, monkeypatch, "unknown")
+    ack = Connection({"result": {"cancelled": True}})
+    monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: ack)
+    assert client.cancel_operation("unknown")
+    class CloseFailure(Connection):
+        def getresponse(self):
+            response = Connection({"result": {"cancelled": False}})
+            def close():
+                raise OSError("control response close failed")
+            response.close = close
+            return response
+    monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: CloseFailure())
+    outcome = client.cancel_operation_outcome("unknown")
+    assert outcome["status"] == "failed" and outcome["failure"] == "transport"
+    assert not outcome["execution_stopped"]
+    assert "unknown" in client._uncertain_operations

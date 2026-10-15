@@ -732,3 +732,74 @@ mod delivery_regression;
 
 #[path = "support/nexus_send_eligibility.rs"]
 mod send_eligibility;
+
+#[test]
+fn f1_lease_disconnect_is_scoped_and_keeps_sibling_execution_live() {
+    let mut rig = Rig::new();
+    let a = rig.connect("a", "owner", 1);
+    let b = rig.connect("b", "owner", 1);
+    let op = rig.queue(&b, "sibling-running", "rename_symbol", 120);
+    rig.sessions
+        .dispatch(&b.client_id, &op, &mut rig.backend)
+        .unwrap();
+    assert!(rig.sessions.lease_disconnected(&a).unwrap());
+    assert!(!rig.sessions.lease_disconnected(&a).unwrap());
+    assert_eq!(
+        rig.sessions.status(&a.client_id, &a).unwrap().phase,
+        SessionPhase::Disconnected
+    );
+    assert_eq!(
+        rig.sessions.status(&b.client_id, &b).unwrap().phase,
+        SessionPhase::Active
+    );
+    assert_eq!(rig.snapshot(&op).status, OperationStatus::Running);
+    assert!(!rig.snapshot(&op).execution_stopped);
+    rig.sessions
+        .complete(&op, Completion::Success(json!("sibling result")))
+        .unwrap();
+    assert_eq!(rig.snapshot(&op).status, OperationStatus::Succeeded);
+    let mut forged = a.clone();
+    forged.client_id = b.client_id.clone();
+    assert!(rig.sessions.lease_disconnected(&forged).is_err());
+}
+
+#[test]
+fn f1_stop_proof_is_independent_of_business_outcome_and_preserves_unknown_cause() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("a", "owner", 1);
+    let op = rig.queue(&lease, "unknown-stop", "rename_symbol", 120);
+    assert!(
+        rig.sessions.execution_stopped(&op).is_err(),
+        "queued work cannot receive a stop proof"
+    );
+    rig.sessions
+        .dispatch(&lease.client_id, &op, &mut rig.backend)
+        .unwrap();
+    assert!(
+        rig.sessions.execution_stopped(&op).is_err(),
+        "running work still needs its business outcome"
+    );
+    let attempt = rig.backend.attempts.last().unwrap().clone();
+    rig.sessions
+        .delivery_failed(
+            &attempt,
+            DispatchFailure::Uncertain(NexusError::new(
+                NexusErrorCode::Disconnected,
+                "lost response",
+            )),
+        )
+        .unwrap();
+    let before = rig.snapshot(&op);
+    assert_eq!(before.status, OperationStatus::UnknownOutcome);
+    assert!(!before.execution_stopped);
+    assert!(rig.sessions.execution_stopped(&op).unwrap());
+    assert!(!rig.sessions.execution_stopped(&op).unwrap());
+    let after = rig.snapshot(&op);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.error, before.error);
+    assert_eq!(after.result, None);
+    assert!(after.execution_stopped);
+    rig.sessions
+        .release(&lease.client_id, &lease, &mut rig.backend)
+        .unwrap();
+}
