@@ -68,44 +68,71 @@ Tests use `test/fixtures/mini.c`, a minimal C program compiled into a
 Mach-O binary. The integration tests open the raw binary via `open_idb`;
 IDA auto-analyses it and writes an `.i64` alongside.
 
-## Nexus N3 public API blocker probe
+## Nexus N3 bridge, patch and lifecycle
 
-N3 is blocked before bridge implementation by the pinned public client's
-cancellation behavior after a request response connection fails. Prepare a
-fresh external environment with the N0 command below, then run:
+N3 uses the fixed public Nexus client with the user-approved local
+`client-cancel-unknown.patch`. Preparation verifies the patched `handle.py`
+SHA-256 and records patch status. Only a validated upstream fix passing the
+probe and N0/N3 gates permits removal; N9 packages must carry both local patches.
+
+Prepare separate fresh external environments using the N0 command below.
+The red control alone adds `--without-client-cancel-patch` to preparation and
+`--expect-unpatched` to the probe command. It must exit 2. The normal patched
+probe must exit 0. Each executes exactly three probes, never replays execution,
+and records `cancel-gap.json`, actual loaded source, versions and owned cleanup.
+The green disconnect case sends exactly one control request and proves the old
+operation stopped before a distinct same-lease successor completes. Cancelling
+an already completed operation returns false and leaves the next operation intact.
 
 ```bash
 timeout 30s "$N0_ROOT/venv/bin/python" scripts/nexus/probe_cancel_after_disconnect.py --root "$N0_ROOT"
 ```
 
-The diagnostic requires real IDA and a legal license. It executes two probes:
-healthy precise cancellation (one control request, `operation_cancelled`) and
-an injected response disconnect after the operation's started barrier. The
-second probe verifies that the SSE lease remains connected, both public cancel
-methods return false without sending a control request, and the same operation
-reaches another marker after cancellation was attempted. Execution is never
-replayed. File barriers establish ordering; bounded polling only observes them.
+Unknown identities are bounded at 64. The backend lock is not FIFO: a successor
+alone cannot prove an unacknowledged old request stopped. Only a precise cancel
+ACK followed by backend success, a later exact false after that ACK, or close
+clears the corresponding unknown identity. Unacknowledged false remains retryable.
+No bridge code accesses authentication tokens or reconstructs private protocols.
 
-Exit 2 with `BLOCKED_PUBLIC_CANCEL_AFTER_TRANSPORT_LOSS` is evidence of the API
-gap, not a passing bridge/E2E suite. Exit 1 or 124 is a failed/incomplete probe.
-`cancel-gap.json` records versions, two actual probes, non-secret identities,
-and cleanup; `public-api-source.txt` captures the loaded implementation. A used
-environment is refused. The diagnostic uses the N0 identity ledger and cleanup,
-releases only its own handles, and never loads IDA in the client process. It
-changes neither private Nexus cancellation state nor the upstream installation.
-The N0 spawn instrumentation exists only to register test-owned workers before
-they can escape the cleanup ledger.
+The protocol suite uses fake public handles and two real local sockets. Set a
+short private IPC directory outside the worktree. All protocol tests and N0
+support tests use the prepared venv, without loading the IDA runtime.
 
-E02 (bridge), E03, E05, E06 and E07 remain BLOCKED with zero N3 acceptance
-scenarios executed. Do not count these two diagnostic probes as those E2Es.
-Changing the pinned dependency or accepted cancellation semantics requires an
-orchestrator decision before N3 can continue.
+```bash
+N3_TEST_IPC_ROOT="$N3_ROOT/i" timeout 30s "$N0_ROOT/venv/bin/python" -m pytest tests/nexus_bridge -q
+```
+
+The real lifecycle verifier requires another fresh patched environment and
+explicit absolute target/SDK paths. Its suite has a 180-second shell timeout
+for multiple IDA starts, save/reopen and crash repair; an outer 210-second
+supervisor leaves 30 seconds for owned cleanup. It runs this worktree's absolute
+Rust integration executable via cargo and disables daemon discovery by exercising
+only the internal router endpoint. It never invokes the installed CLI.
+
+```bash
+timeout 210s "$N0_ROOT/venv/bin/python" scripts/verify_nexus_e2e.py \
+  --root "$N0_ROOT" --target "$CARGO_TARGET_DIR" --sdk "$IDASDKDIR" --ipc-root "$N3_ROOT/i"
+```
+
+Exactly seven real tests and seven distinct PASS records are required: E02
+(bridge readiness, missing dependency, wrong version, unsupported runtime), E03
+(raw/existing IDB, deadline cancellation and persistence), E05 (two independent
+bridge clients), E06-client, E06-bridge, E07-packed, E07-unpacked. Missing IDA,
+license or sample is BLOCKED, never an ignored pass. Results are in
+`lifecycle-result.json`, `lifecycle.log`, `rust-evidence.jsonl` and the process
+identity ledger. Cleanup may be rerun with `--cleanup`; it never scans or kills
+by process name. No staging files or instance registration JSON may remain.
+The cache deliberately publishes a content-addressed raw copy whose default
+Nexus output is the central cache IDB; custom output without a packed base is
+not automatically recoverable upstream. Public tool migration is N4;
+E08/E18/E19 full real-chain coverage remains later work.
 
 ## Nexus N0 isolation and baseline
 
 N0 prepares and verifies the dependency environment only. Business handlers
-still use the existing backend. The `nexus_*_e2e` Rust targets in the migration
-plan are future work; do not count them as executed tests.
+still use the existing backend. The N3 lifecycle target is implemented; the other
+`nexus_*_e2e` targets in the migration plan remain future work and cannot be counted
+as executed tests.
 
 Use a new worktree and an external, nonexistent environment directory. Install
 GNU `timeout` first. Select an IDA 9.4+ installation with its existing legal

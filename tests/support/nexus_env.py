@@ -1,6 +1,7 @@
 """Isolated N0 process accounting; no user daemon discovery or global cleanup."""
 
 import json
+import hashlib
 from contextlib import contextmanager
 import fcntl
 import os
@@ -81,6 +82,21 @@ class Environment:
         self.ledger = self.root / "processes.jsonl"
         self.intents = self.root / "process-intents"
         self.children = []
+
+    def client_patch_status(self):
+        """Check installed code against the prepared manifest, without loading IDA."""
+        import importlib.util
+        spec = importlib.util.find_spec("ida_nexus")
+        if spec is None or spec.origin is None:
+            raise RuntimeError("ida-nexus is missing; BLOCKED")
+        source = Path(spec.origin).parent / "handle.py"
+        if not source.resolve().is_relative_to(self.root / "venv"):
+            raise RuntimeError("Nexus must load from this isolated environment")
+        actual = hashlib.sha256(source.read_bytes()).hexdigest()
+        if actual != self.manifest.get("client_handle_sha256"):
+            raise RuntimeError("installed Nexus client hash differs from environment manifest")
+        return {"applied": self.manifest.get("client_cancel_patch_applied", False),
+                "handle_sha256": actual}
 
     @contextmanager
     def exclusive(self):

@@ -160,6 +160,7 @@ def nexus_baseline(env):
     from ida_nexus import DatabaseHandle, DatabaseOpenOptions, discover_databases, probe_database_state
 
     check(Path(ida_nexus.__file__).resolve().is_relative_to(env.root / "venv"), "Nexus must load from isolated venv")
+    print(json.dumps({"client_cancel_patch": env.client_patch_status()}))
     custom = sys.modules.get("sitecustomize")
     custom_path = Path(custom.__file__).resolve() if custom is not None else None
     check(custom_path is None or custom_path.is_relative_to(Path(sys.base_prefix).resolve()),

@@ -1,6 +1,9 @@
 """N0 isolation and DNS regression tests, independent of an IDA license."""
 
 import json
+import hashlib
+import importlib.util
+from types import SimpleNamespace
 from contextlib import contextmanager, redirect_stdout
 import ctypes
 import errno
@@ -42,6 +45,30 @@ def ledger(env, pids):
     env.ledger.write_text("".join(json.dumps({"schema": 2, "pid": pid,
                                            "identity": BIRTH, "command": ["mock"]}) + "\n"
                                   for pid in pids))
+
+
+class ClientPatchEnvironmentTests(unittest.TestCase):
+    def test_patched_and_red_control_hashes_are_reported(self):
+        for applied in (True, False):
+            with self.subTest(applied=applied), environment() as env:
+                source = env.root / "venv/lib/ida_nexus/handle.py"
+                source.parent.mkdir(parents=True)
+                source.write_bytes(b"isolated test source")
+                env.manifest.update(client_cancel_patch_applied=applied, client_handle_sha256=hashlib.sha256(source.read_bytes()).hexdigest())
+                with patch("importlib.util.find_spec", return_value=SimpleNamespace(origin=str(source.parent / "__init__.py"))):
+                    self.assertEqual(env.client_patch_status()["applied"], applied)
+                    source.write_bytes(b"tampered")
+                    with self.assertRaisesRegex(RuntimeError, "hash differs"):
+                        env.client_patch_status()
+
+    def test_missing_or_global_dependency_is_rejected(self):
+        with environment() as env:
+            with patch("importlib.util.find_spec", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "missing"):
+                    env.client_patch_status()
+            with patch("importlib.util.find_spec", return_value=SimpleNamespace(origin="/global/ida_nexus/__init__.py")):
+                with self.assertRaisesRegex(RuntimeError, "isolated environment"):
+                    env.client_patch_status()
 
 
 class ChildTests(unittest.TestCase):

@@ -1,0 +1,125 @@
+Nexus 0.13.4 client cancellation after uncertain execution transport failure.
+Upstream: d60ff582fde90c59726336c0dbdf3e8286e9df7a.
+Reason: retain at most 64 exact handle-owned IDs, reject new execution at capacity,
+and use the existing independent control connection without replay. Values track
+whether cancellation received a true ACK. Backend locking is not FIFO: success
+clears only already ACKed predecessors. A later false after a true ACK removes the
+exact ID; unacknowledged false remains retryable because POST registration may
+still be pending. Health/error responses never clear IDs. Close clears all.
+Probe: scripts/nexus/probe_cancel_after_disconnect.py; tests/nexus_bridge/.
+Removal: only after a pinned upstream fix passes the probe, N0 and N3 gates.
+N9 packaging must carry this patch until that revalidation.
+
+--- a/ida_nexus/handle.py
++++ b/ida_nexus/handle.py
+@@ -289,6 +289,9 @@
+         self._rpc_connection: http.client.HTTPConnection | None = None
+         self._rpc_last_used: float | None = None
+         self._active_operation_id: str | None = None
++        # Bounded, exact identities whose transport failed, never replayed.
++        self._uncertain_operations: dict[str, bool] = {}
++        self._uncertain_capacity = 64
+         self._lease_connection: http.client.HTTPConnection | None = None
+         self._lease_response: http.client.HTTPResponse | None = None
+         self._lease_socket: socket.socket | None = None
+@@ -644,6 +647,9 @@
+                 raise DatabaseDisconnectedError(
+                     self._disconnect_reason or "database instance disconnected"
+                 )
++            with self._lock:
++                if operation_id is not None and len(self._uncertain_operations) >= self._uncertain_capacity:
++                    raise NexusConnectionError("uncertain operation capacity exhausted; reconcile or close this handle")
+             entry = self.instance
+             connection = self._rpc_connection_for(entry, timeout)
+             if operation_id is not None:
+@@ -669,6 +675,10 @@
+             except (TimeoutError, OSError, http.client.HTTPException) as exc:
+                 # Do not retry automatically: a POST may have executed before
+                 # the connection failed. The next operation gets a fresh socket.
++                if operation_id is not None:
++                    with self._lock:
++                        if not self._closed.is_set():
++                            self._uncertain_operations[operation_id] = False
+                 self._discard_rpc_connection(connection)
+                 crash_state = self._crashed_database_state(entry)
+                 if crash_state is not None:
+@@ -684,6 +694,20 @@
+                     with self._lock:
+                         if self._active_operation_id == operation_id:
+                             self._active_operation_id = None
++            # Backend locking is not FIFO. Only predecessors already ACKed as
++            # cancelled are stopped/prohibited from running after this success.
++            if status == 200 and endpoint in {"/execute_python", "/wait_autoanalysis", "/save_database"}:
++                try:
++                    proof = json.loads(response_body)
++                except (UnicodeDecodeError, json.JSONDecodeError):
++                    proof = None
++                if isinstance(proof, dict) and (proof.get("ok") is True or
++                        (endpoint == "/wait_autoanalysis" and isinstance(proof.get("complete"), bool))):
++                    with self._lock:
++                        self._uncertain_operations = {
++                            key: acknowledged for key, acknowledged in self._uncertain_operations.items()
++                            if not acknowledged
++                        }
+             with self._lock:
+                 if self._rpc_connection is connection:
+                     self._rpc_last_used = time.monotonic()
+@@ -801,6 +825,6 @@
+     def cancel_operation(self, operation_id: str) -> bool:
+         """Cancel one identified in-flight operation over a control connection."""
+         with self._lock:
+-            if self._active_operation_id != operation_id:
++            if self._active_operation_id != operation_id and operation_id not in self._uncertain_operations:
+                 return False
+             entry = self._instance
+@@ -826,12 +850,19 @@
+             response = connection.getresponse()
+             try:
+                 payload = json.loads(response.read())
+-                return bool(
+-                    response.status == 200
+-                    and isinstance(payload, dict)
+-                    and isinstance(payload.get("result"), dict)
+-                    and payload["result"].get("cancelled") is True
+-                )
++                result = payload.get("result") if isinstance(payload, dict) else None
++                if response.status == 200 and isinstance(result, dict) and result.get("cancelled") is False:
++                    # Without a prior true ACK, false could race the execution
++                    # POST registering itself. Keep its exact identity retryable.
++                    with self._lock:
++                        if self._uncertain_operations.get(operation_id) is True:
++                            self._uncertain_operations.pop(operation_id, None)
++                elif response.status == 200 and isinstance(result, dict) and result.get("cancelled") is True:
++                    with self._lock:
++                        if operation_id in self._uncertain_operations:
++                            self._uncertain_operations[operation_id] = True
++                return bool(response.status == 200 and isinstance(result, dict)
++                            and result.get("cancelled") is True)
+             finally:
+                 response.close()
+         except (
+@@ -849,6 +880,6 @@
+         """Cancel this handle's in-flight operation over a control connection."""
+         deadline = time.monotonic() + timeout
+         with self._lock:
+-            operation_id = self._active_operation_id
++            operation_id = self._active_operation_id or next(iter(self._uncertain_operations), None)
+         if operation_id is None:
+             return False
+@@ -857,7 +888,7 @@
+             if self.cancel_operation(operation_id):
+                 return True
+             with self._lock:
+-                if self._active_operation_id != operation_id:
++                if self._active_operation_id != operation_id and operation_id not in self._uncertain_operations:
+                     return False
+             if time.monotonic() >= deadline:
+                 return False
+@@ -941,6 +972,7 @@
+             return
+         self._closed.set()
+         with self._lock:
++            self._uncertain_operations.clear()
+             subscriptions = tuple(self._idb_subscriptions)
+             self._idb_subscriptions.clear()
+         for subscription in subscriptions:

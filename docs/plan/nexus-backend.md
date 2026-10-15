@@ -293,6 +293,7 @@ N1/N2 在 bridge 尚未接通时先验收契约和模拟行为，这些结果不
 - 检查现有测试、构建依赖、IDA SDK/运行时匹配关系；记录未修改代码时的 lint、测试及能力输出。
 - 保存可执行的旧版本对照产物及源码 SHA、构建方式、匹配运行时，并制作关闭/保存完成后的数据库备份副本。对照和回退演练依赖这些固定产物，不依赖最终源码保留旧后端。
 - 固定 Nexus/Domain 版本和依赖获取方式，测试环境使用独立 venv；不要依赖评估时的临时 venv。
+- 2026-10-15 用户裁定将 `scripts/nexus/client-cancel-unknown.patch` 与 loopback DNS 补丁同样作为专用环境依赖补丁维护；只改固定上游 `d60ff582` 的客户端 `handle.py`，不改服务端、安装或私有锁。prepare 先检查补丁、再验证产物 SHA-256，环境检查报告补丁状态。只有固定上游修复通过 probe、N0/N3 重新验收后才能移除；N9 打包必须携带。
 - 对 DNS 问题给出最小复现及解决方案。若需补丁，固定补丁版本和来源，在专用环境测试，不能通过修改系统 DNS 或全局 Python 来掩盖。
 - 将历史临时并发诊断转为可维护测试设计，记录原版行为和目标行为的区别。
 - 验收：另一台具备对应 IDA 条件的环境能按说明准备隔离测试；缺依赖明确失败，不能显示“全部通过”。
@@ -397,14 +398,15 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N3：常驻 Python bridge 和 Nexus 生命周期
 
-- 2026-10-15 前置核对发现公共 API 阻塞，尚未实现 bridge、接通 lanes 或安装能力。固定 Nexus 0.13.4 的执行响应连接断开后，`DatabaseHandle._request` 在 `finally` 清空活动 operation ID；公共 `cancel_operation(原 ID)` 随即返回 false，未发送控制请求，`cancel_active` 也无法补救。真实 IDA 9.5 的 started/continued barrier 已证明此时 SSE lease 仍连接、原操作继续执行。该行为无法满足 N1 关于 UnknownOutcome 且 execution_stopped=false 时继续按精确 ID 投递控制请求的消费约定。
-- 可复现诊断为 `scripts/nexus/probe_cancel_after_disconnect.py`，使用独立 N0 环境和样本，只在标准库响应接收处注入断连；正常取消对照与故障场景各实际执行一次。复现缺口时退出 2 并报告 BLOCKED，不算 N3 E2E PASS。未修改 Nexus 私有状态、注册/锁文件或公共 API，也没有重放执行请求。
-- 按 N3 委托的公共 API 缺口停止规则，等待编排者决定并授权修复/更新固定依赖，或明确调整已接受的契约。不得自行恢复私有 operation ID、直连私有取消协议、释放执行中 lease 来冒充精确取消，或把 false 当停止确认。E02（bridge 部分）、E03、E05、E06、E07 的实际 N3 验收执行数量目前为 0，均 BLOCKED；下列实施和验收要求仍待完成。
-- 通过公共 Nexus API 建立数据库句柄，注册断连事件，管理 lease 和输出路径。
-- 实现 bridge readiness、版本握手、有界请求调度、独立取消处理、异常退出传播和确定性清理。
-- 取消和状态不能被业务线程池耗尽挡住，也不能等待同一个正在执行请求的客户端锁。
-- 不将 bridge 退出等同于可以强杀 Nexus worker；其他独立客户端的 lease 必须继续有效。
-- 验收：同库两客户端共享；任一释放或异常退出不影响另一客户端；最后一个引用释放后保存可重开。
+- 2026-10-15 用户已裁定采用本地客户端补丁，解除原公共 API 阻塞。补丁在执行连接异常后保留本 handle 的精确 operation ID（最多 64 项，满时拒绝新执行），取消继续走公共 API 原有独立控制连接；不读取 token、不恢复私有字段、不重放。正常完成/明确错误不进入未知集合。
+- 官方 `_server._run_operation` 的 backend lock 不保证 FIFO，所以未取消的后继请求完成不能独自证明旧排队请求结束。补丁只在精确取消 ACK 后的成功串行后继完成时移除旧 ID；或在先前 ACK 后再收到精确 false 时移除。未 ACK 的 false 可能早于旧 POST 登记，保守保留至可证明停止或 handle close。health/error 响应不能清理该集合。bridge 只有原执行返回取消，或 ACK 后的同 lease 只读后继完成，才确认停止；后继失败保留 UnknownOutcome、原 cause 与 execution_stopped=false。
+- `nexus_bridge/bridge.py` 作为独立可打包 Python 客户端目录，只加载 Nexus 公共客户端。每 router 复用一个进程，stdout 只写 readiness，诊断写 stderr；业务、控制使用两个 Unix socket，各自持续读取/写入。业务池 4，接纳容量沿用 N2 tenant 上限；控制接纳 8，取消池 4、释放池 2；停止确认另有容量 2 的独立线程池，不占取消处理容量。本地状态直接读内存，发现 owner 独立后台刷新。
+- `src/router/nexus_bridge.rs` 消费 N2 的两条 lane，完整回传 DeliveryAttempt。Python executor 就绪后回传原 wire frame，Rust 在实际 grant 前调用 `NexusWireFrame::consume()` 并复核发送资格；最终小 grant 仅传剩余时长。总期限由 Rust 触发控制取消，执行 HTTP 连接使用 timeout=None 并等待真实结果。真实连接丢失进入 UnknownOutcome，桥接进程 EOF/异常使 N1 断连，不强杀共享 owner。
+- readiness 校验 Nexus 0.13.4、Domain 0.5.1、补丁后 handle 哈希、Python 与 IDA 最低版本；每 router 能力只安装一次。open 后从实际 owner 查询 IDA 版本。公共 open/attach 获取真实 handle，lease key 为本地非敏感 UUID，instance_id 使用公共 record_id；其身份不可变，generation 在该 instance 命名空间为 1，替换 owner 有新的 record_id。
+- `nexus_bridge::cache::prepare_open` 在原总期限内通过 N2 受限 Prepare 工作准备内容寻址中央缓存输入，不覆盖已有输入；默认输出与既有缓存 `.dylib.i64` 路径一致，从而支持无 packed base 的公共修复流程。已有 IDB 保留 canonical 路径。公开 CLI/MCP 工具尚未切换，由 N4 消费内部接口。
+- 可复现诊断 `scripts/nexus/probe_cancel_after_disconnect.py` 每轮实际 3 probes（正常取消、响应断连、已结束操作取消不影响后继）。未打补丁的新环境 `--expect-unpatched` 退出 2；打补丁的新环境退出 0，断连后控制请求恰好 1 次，无 continued marker，无重放。这些 probe 不计作生命周期 E2E。
+- `tests/nexus_lifecycle_e2e.rs` 实际 7 个场景覆盖 E02 bridge 部分、E03、E05、E06-client/bridge、E07-packed/unpacked。通过脚本核对数量、PASS 场景集合、保存重开、精确进程身份及注册清理。E08/E18/E19 的完整真实链路留待后续阶段，N2 既有模拟/OS fixture 门禁继续保留。
+- 验收要求：同库两客户端共享；任一释放或异常退出不影响另一客户端；最后一个引用释放后保存可重开。本阶段实现和证据提交后，由编排者裁定 N3 验收及 N4 派发。
 
 ### N4：首批方法与输出兼容
 
@@ -448,6 +450,8 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N9 与 R：旧后端清理、唯一后端打包和最终复验
 
+- 发布包必须携带 N0 loopback DNS 补丁及用户 2026-10-15 批准的客户端未知操作取消补丁、固定依赖和哈希校验；上游修复经 probe 与 N0/N3 重新验收后才可移除。
+
 - 删除 `native-linked`、`idat-compat` 数据库执行路径，以及迁移期的后端选择入口、自动分流和 fallback。常规启动、CLI、MCP 和后台任务统一走 Nexus。
 - 清点并移除仅为旧后端服务的 Rust idalib/FFI、SDK 构建要求、Cargo 依赖/锁文件项、vendored 代码及旧 worker 启动分支；先确认引用已迁移，不能通过删工具来消除依赖。
 - 保留 sBPF/DSC 离线产物准备必要的 sbx/idat 调用，但它们不得继续承担普通查询、编辑或常驻数据库会话。Nexus 内部使用 IDA native SDK 不属于旧后端残留。
@@ -462,7 +466,7 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### 7.1 拟新增测试组织
 
-以下路径是开发交付目标，目前尚不存在，不可当成已可执行的测试：
+以下路径为开发交付目标；N3 已实现 support、lifecycle、bridge 协议和 verify 脚本，其余 targets 仍属后续阶段，不能计作已执行：
 
 | 路径 | 责任 |
 |---|---|

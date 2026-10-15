@@ -5,6 +5,7 @@
 //! - Requests are routed to workers via JSON-RPC over stdin/stdout
 //! - Router maintains an "active" handle for backward compatibility
 
+pub mod nexus_bridge;
 pub mod nexus_transport;
 pub mod protocol;
 pub mod transport;
@@ -344,6 +345,7 @@ pub struct RouterState {
     config: Arc<RouterConfig>,
     spawn_gate: Arc<Semaphore>,
     nexus: Arc<std::sync::Mutex<(nexus_transport::NexusEndpoint, bool)>>,
+    nexus_bridge: Arc<tokio::sync::OnceCell<Arc<nexus_bridge::NexusBridge>>>,
     cached_probe: Arc<Mutex<Option<RuntimeProbeResult>>>,
     warm_pool: Arc<Mutex<HashMap<PathBuf, WarmLease>>>,
     prewarm_queue: Arc<Mutex<PrewarmQueueState>>,
@@ -456,6 +458,7 @@ impl RouterState {
                 nexus_transport::NexusEndpoint::new(config.max_pending_per_tenant),
                 false,
             ))),
+            nexus_bridge: Arc::new(tokio::sync::OnceCell::new()),
             cached_probe: Arc::new(Mutex::new(None)),
             warm_pool: Arc::new(Mutex::new(HashMap::new())),
             prewarm_queue: Arc::new(Mutex::new(PrewarmQueueState::default())),
@@ -475,6 +478,20 @@ impl RouterState {
             .unwrap_or_else(|e| e.into_inner())
             .0
             .clone()
+    }
+    /// Internal N3 connection point; public CLI/MCP tools are switched in N4.
+    pub async fn connect_nexus(
+        &self,
+        config: nexus_bridge::BridgeConfig,
+    ) -> anyhow::Result<Arc<nexus_bridge::NexusBridge>> {
+        self.nexus_bridge
+            .get_or_try_init(|| async {
+                nexus_bridge::NexusBridge::start(self, config)
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+            .cloned()
     }
     pub fn install_nexus_capabilities(
         &self,

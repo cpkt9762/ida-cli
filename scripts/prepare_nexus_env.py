@@ -13,6 +13,7 @@ import sys
 
 REPO = Path(__file__).resolve().parents[1]
 NEXUS_SHA = "d60ff582fde90c59726336c0dbdf3e8286e9df7a"
+PATCHED_HANDLE_SHA256 = "b1d6bcbdfedcde5689a8a5c086f6be53eb3e8aa333ef2fe1030856e0f7f9bb15"
 
 
 def accepted_eula_entries(data: bytes) -> list[str]:
@@ -80,6 +81,13 @@ def prepare(args: argparse.Namespace) -> None:
     patch = REPO / "scripts/nexus/loopback-bind.patch"
     run(root, "patch-check", ["git", "apply", "--check", str(patch)], cwd=source)
     run(root, "patch", ["git", "apply", str(patch)], cwd=source)
+    cancel_patch = REPO / "scripts/nexus/client-cancel-unknown.patch"
+    cancel_applied = not args.without_client_cancel_patch
+    if cancel_applied:
+        run(root, "cancel-patch-check", ["git", "apply", "--check", str(cancel_patch)], cwd=source)
+        run(root, "cancel-patch", ["git", "apply", str(cancel_patch)], cwd=source)
+        if digest(source / "ida_nexus/handle.py") != PATCHED_HANDLE_SHA256:
+            raise RuntimeError("client cancellation patch output hash mismatch; BLOCKED")
     run(root, "nexus-wheel", [*pip, "wheel", "--no-deps", "--no-build-isolation",
                               "--no-cache-dir", "-w", str(root / "wheels"), str(source)])
     run(root, "nexus-install", [*pip, "install", "--no-deps", "--no-index", "--find-links", str(root / "wheels"),
@@ -104,6 +112,9 @@ def prepare(args: argparse.Namespace) -> None:
     checksums["fixtures/mini"] = digest(sample)
     manifest = {"root": str(root), "ida_dir": str(ida), "nexus_sha": sha,
                 "patch_sha256": digest(patch), "python": sys.version,
+                "client_cancel_patch_applied": cancel_applied,
+                "client_cancel_patch_sha256": digest(cancel_patch) if cancel_applied else None,
+                "client_handle_sha256": digest(source / "ida_nexus/handle.py"),
                 "eula_entries_copied": len(eula), "checksums": checksums}
     (root / "environment.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps({"status": "PREPARED", "root": str(root), "nexus_sha": sha}))
@@ -114,6 +125,8 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True, help="new directory outside the repository")
     parser.add_argument("--ida-dir", type=Path, required=True)
     parser.add_argument("--eula-registry", type=Path, required=True, help="existing legally prepared ida.reg")
+    parser.add_argument("--without-client-cancel-patch", action="store_true",
+                        help="diagnostic red control only; not a supported bridge environment")
     args = parser.parse_args()
     try:
         prepare(args)

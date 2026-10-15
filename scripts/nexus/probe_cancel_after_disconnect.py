@@ -1,4 +1,4 @@
-"""Probe the pinned public API's cancellation gap; exit 2 means N3 BLOCKED.
+"""Verify precise public cancellation after transport failure; unpatched red exits 2.
 
 This diagnostic is not a bridge or an E02/E03/E05/E06/E07 acceptance suite.
 Only the standard-library response connection is faulted. The N0 spawn hook
@@ -33,6 +33,7 @@ def wait_for(path, timeout=5):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--expect-unpatched", action="store_true", help="fresh red control only")
     args = parser.parse_args()
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(REPO / "scripts"))
@@ -68,6 +69,8 @@ def main():
     gates = []
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="probe-execute")
     evidence = {"status": "FAIL", "actual_probes": 0}
+    evidence["client_cancel_patch"] = env.client_patch_status()
+    assert evidence["client_cancel_patch"]["applied"] != args.expect_unpatched
     def program(label):
         started = env.root / f"{label}.started"
         continued = env.root / f"{label}.continued"
@@ -104,9 +107,13 @@ def main():
             original_request = http.client.HTTPConnection.request
             original_response = http.client.HTTPConnection.getresponse
             control_requests = []
+            executions = {}
             def request(connection, method, url, *args, **kwargs):
                 if url == "/cancel_operation":
                     control_requests.append(url)  # Never retain headers, tokens or lease secrets.
+                if url == "/execute_python":
+                    operation = json.loads(kwargs["body"])["operation_id"]
+                    executions[operation] = executions.get(operation, 0) + 1
                 return original_request(connection, method, url, *args, **kwargs)
             with patch.object(http.client.HTTPConnection, "request", request):
                 code, started, continued, observe, release = program("healthy")
@@ -148,21 +155,44 @@ def main():
                     assert handle.connected, "SSE lease must remain alive after one request connection fails"
                     before = len(control_requests)
                     ack = handle.cancel_operation("n3-unknown-operation")
-                    active_ack = handle.cancel_active(timeout=0.1)
                     sent = len(control_requests) - before
-                    observe.touch()
-                    wait_for(continued)
+                    if args.expect_unpatched:
+                        active_ack = handle.cancel_active(timeout=0.1)
+                        assert ack is False and active_ack is False and sent == 0
+                        observe.touch()
+                        wait_for(continued)
+                        release.touch()
+                    else:
+                        assert ack is True and sent == 1, "patched unknown cancellation must send exactly once"
+                        proof = handle.execute_python("result = 'same_lease_successor_completed'", timeout=3)
+                        assert proof["result"] == "same_lease_successor_completed"
+                        assert not continued.exists(), "cancelled original must never cross the continued barrier"
+                        observe.touch()
+                        assert not continued.exists(), "successor proves original stopped before barrier release"
+                        active_ack = None
                     evidence["after_disconnect"] = {
                         "connected": handle.connected, "cancel_ack": ack,
                         "cancel_active_ack": active_ack, "control_requests": sent,
                         "continued_after_cancel": continued.exists(),
                         "operation_id": "n3-unknown-operation",
                         "operation_replayed": False}
-                    assert ack is False and active_ack is False and sent == 0, "pinned API gap changed; re-evaluate"
-                    release.touch()
+                    assert executions["n3-unknown-operation"] == 1, "unknown execution must never replay"
                 result = peer.execute_python("result = 'peer_usable_after_unknown_stopped'", timeout=3)
                 assert result["result"] == "peer_usable_after_unknown_stopped"
                 evidence["peer_usable"] = True
+                evidence["actual_probes"] += 1
+                done = handle.execute_python("result = 'done'", operation_id="n3-already-ended", timeout=3)
+                assert done["result"] == "done"
+                code, started, continued, observe, release = program("successor")
+                future = pool.submit(handle.execute_python, code, operation_id="n3-new-operation", timeout=None)
+                futures.append(future)
+                wait_for(started)
+                assert handle.cancel_operation("n3-already-ended") is False
+                observe.touch()
+                wait_for(continued)
+                release.touch()
+                assert future.result(timeout=5)["result"] == "finished_once"
+                evidence["completed_then_cancel"] = {"old_cancel": False, "successor_unaffected": True}
                 evidence["actual_probes"] += 1
             instance = handle.instance
             for item in handles:
@@ -172,7 +202,7 @@ def main():
             evidence["saved_packed_database"] = Path(instance.idb_path).is_file()
             assert evidence["saved_packed_database"]
             env.assert_clean()
-            evidence["status"] = "BLOCKED_PUBLIC_CANCEL_AFTER_TRANSPORT_LOSS"
+            evidence["status"] = "BLOCKED_PUBLIC_CANCEL_AFTER_TRANSPORT_LOSS" if args.expect_unpatched else "PASS"
     finally:
         cleanup_errors = []
         for gate in gates:
@@ -204,7 +234,7 @@ def main():
         if cleanup_errors:
             raise RuntimeError("probe cleanup failed; inspect cancel-gap.json")
     print(json.dumps(evidence))
-    return 2  # A reproduced contract gap is BLOCKED, not a successful N3 suite.
+    return 2 if args.expect_unpatched else 0
 
 
 if __name__ == "__main__":
