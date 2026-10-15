@@ -1,7 +1,7 @@
 use super::*;
 use tokio::io::AsyncWriteExt;
 
-async fn first_open_fixture(
+pub(crate) async fn first_open_fixture(
     directory: &std::path::Path,
     failure: &str,
     blocked: Option<&str>,
@@ -1035,4 +1035,15 @@ async fn f4_first_open_cancel_preserves_other_client_reference() {
         },
     )
     .await;
+}
+
+pub(crate) fn fixture_reference_count(router: &RouterState) -> usize {
+    router
+        .references
+        .lock()
+        .unwrap()
+        .ref_tokens
+        .values()
+        .map(HashSet::len)
+        .sum()
 }

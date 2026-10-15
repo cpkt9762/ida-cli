@@ -612,7 +612,11 @@ impl IdaMcpServer {
         router: &crate::router::RouterState,
         req: &OpenIdbRequest,
     ) -> Result<CallToolResult, McpError> {
-        let preparation = crate::preprocess::Preparation::new(std::time::Duration::from_secs(120));
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut preparation = crate::preprocess::current().unwrap_or_else(|| {
+            crate::preprocess::Preparation::new(std::time::Duration::from_secs(120))
+        });
+        preparation.deadline = preparation.deadline.min(limit);
         let expanded = crate::expand_path(&req.path);
         let sbpf_input = expanded.clone();
         let is_sbpf = match preparation
@@ -640,6 +644,7 @@ impl IdaMcpServer {
             Ok(r) => r,
             Err(e) => return Ok(ToolError::OpenFailed(e.to_string()).to_tool_result()),
         };
+        let mut reference = close_token.map(|token| router.scoped_ref(token));
 
         let params = json!({
             "path": resolved.open_path.as_deref().unwrap_or(&req.path),
@@ -653,17 +658,27 @@ impl IdaMcpServer {
         });
 
         let result = match router
-            .route_request_prepared(Some(&db_handle), "open", params, preparation)
+            .route_request_prepared(Some(&db_handle), "open", params, preparation.clone())
             .await
         {
             Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
+            Err(e) => {
+                if let Some(reference) = reference.as_mut() {
+                    if let Err(cleanup) = preparation
+                        .scope(router.release_failed_open(&db_handle, reference))
+                        .await
+                    {
+                        warn!(handle = %db_handle, %cleanup, "failed MCP open cleanup failed");
+                    }
+                }
+                return Ok(e.to_tool_result());
+            }
         };
 
         let mut value = result;
         if let Value::Object(map) = &mut value {
             map.insert("db_handle".to_string(), json!(db_handle));
-            if let Some(token) = close_token {
+            if let Some(token) = reference.as_ref().and_then(|reference| reference.token()) {
                 map.insert("close_token".to_string(), json!(token));
             }
             map.insert("close_hint".to_string(), json!(self.close_hint()));
@@ -690,9 +705,23 @@ impl IdaMcpServer {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{value:?}")),
-        )]))
+        let encoded = serde_json::to_string_pretty(&value);
+        let transfers_token = encoded.is_ok()
+            && reference
+                .as_ref()
+                .and_then(|reference| reference.token())
+                .is_some_and(|token| {
+                    value.get("close_token").and_then(Value::as_str) == Some(token)
+                });
+        let response = CallToolResult::success(vec![Content::text(
+            encoded.unwrap_or_else(|_| format!("{value:?}")),
+        )]);
+        if transfers_token {
+            if let Some(reference) = reference.as_mut() {
+                reference.transfer();
+            }
+        }
+        Ok(response)
     }
 
     async fn detect_sbpf_entry(

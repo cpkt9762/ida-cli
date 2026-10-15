@@ -392,11 +392,20 @@ impl ReferenceTokens {
         Some((handle, remaining))
     }
 }
-struct ScopedRefToken {
+pub(crate) struct ScopedRefToken {
     references: Arc<std::sync::Mutex<ReferenceTokens>>,
     token: Option<String>,
 }
 impl ScopedRefToken {
+    pub(crate) fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
+    /// Transfer only after the completed response contains this token.
+    pub(crate) fn transfer(&mut self) {
+        self.token.take();
+    }
+
     fn release(&mut self) -> Option<(DbHandle, usize)> {
         self.token.take().and_then(|token| {
             self.references
@@ -1065,11 +1074,33 @@ impl RouterState {
         Ok(closed)
     }
 
-    fn scoped_ref(&self, token: String) -> ScopedRefToken {
+    pub(crate) fn scoped_ref(&self, token: String) -> ScopedRefToken {
         ScopedRefToken {
             references: self.references.clone(),
             token: Some(token),
         }
+    }
+
+    pub(crate) async fn release_failed_open(
+        &self,
+        handle: &str,
+        reference: &mut ScopedRefToken,
+    ) -> Result<(), crate::error::ToolError> {
+        // Reused workers receive a new token. Only the creator receives the
+        // exact initial token recorded on this worker, including spawn races.
+        let created = {
+            let inner = self.inner.lock().await;
+            inner.workers.get(handle).is_some_and(|worker| {
+                reference.token().is_some() && worker.close_token.as_deref() == reference.token()
+            })
+        };
+        reference.release();
+        if created {
+            // Recheck under the removal lock: another client may have acquired
+            // a reference since creation or since releasing this opener's ref.
+            self.close_worker_inner(handle, true).await?;
+        }
+        Ok(())
     }
 
     /// Release a reference token. Returns `Some((handle, remaining))` if the token was valid:
@@ -3101,4 +3132,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "../../tests/support/n2_f1_router.rs"]
-mod n2_f1_regressions;
+pub(crate) mod n2_f1_regressions;
