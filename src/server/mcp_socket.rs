@@ -326,6 +326,17 @@ impl McpSocketOwnerLock {
     }
 }
 
+impl Drop for McpSocketOwnerLock {
+    fn drop(&mut self) {
+        // CLOEXEC protects exec, not the fork-to-exec window. Explicitly release
+        // our ownership even if another thread's child still references the OFD.
+        // SAFETY: this guard owns a live descriptor and never clones its lock.
+        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            warn!(path = %self.path.display(), error = %std::io::Error::last_os_error(), "MCP socket owner unlock failed");
+        }
+    }
+}
+
 fn owner_lock_path(socket_path: &Path) -> anyhow::Result<PathBuf> {
     let mut name = socket_path
         .file_name()
@@ -692,3 +703,7 @@ mod tests {
         std::fs::remove_file(test_owner_lock_path(&path)).expect("cleanup owner lock");
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/n4_f2_lock.rs"]
+mod n4_f2_lock;

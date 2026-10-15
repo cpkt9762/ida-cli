@@ -214,6 +214,26 @@ and a public Hexrays_Hooks fault on an existing function: that item must fail wh
 a second valid function still decompiles. JSON scalar types and nested types must
 match exactly. Only the already documented verified input path is normalized.
 
+N4-F2 adds seven fault cases through the production Rust `Tools::open` /
+`open_owned` path using an internal bridge wire fixture (no real IDB). They cover
+zero-byte cancellation, cancellation/expiry before grant, bridge rejection,
+remote error, total-deadline fallback with late acquisition, and control-lane
+saturation after acquisition. Each case checks returned failure, recovered open
+permit/reply slot, same-path reopen/close and confirmed cleanup of acquired leases.
+These new subprocess fixtures serialize their startup to avoid adding a burst to
+the parallel library suite. A pure N1 contract checks owner validation and cleanup
+state after NotSent; the existing real lifecycle/contract suites remain required.
+
+The separate test-maintenance commit gives the 16 MiB response a 25s transfer
+budget, checks its full length and keeps its peer alive until connection state is
+observed. Escaped-pipe startup has a 15s budget distinct from EOF/capacity assertions.
+Late-success checks wait for the start marker (15s) before timing the response (5s);
+P25 uses the shared event helper. Optional test-only `N4_F2_*_DELAY` variables inject
+startup/transfer delays for red/green evidence. Five consecutive parallel library
+runs record their own `uptime` and exit codes. The owner-lock regression checks
+CLOEXEC, holds a child before exec, verifies immediate unlock on parent Drop, and
+checks that the lock descriptor does not survive exec.
+
 Known limits: run_script uses process-level __main__; clients and leases sharing
 an owner share script globals, which closing a lease does not clear. This matches
 the old per-IDB worker and is intended for trusted scripts, without client

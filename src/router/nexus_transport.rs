@@ -352,6 +352,13 @@ impl NexusWireFrame {
     }
 }
 impl NexusTransport {
+    #[cfg(test)]
+    pub(crate) fn test_hold_control(&self) -> OwnedSemaphorePermit {
+        self.control_gate
+            .clone()
+            .try_acquire_many_owned(self.control_gate.available_permits() as u32)
+            .unwrap()
+    }
     pub fn new(
         sessions: Sessions,
         business_capacity: usize,

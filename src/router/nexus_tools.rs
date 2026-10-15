@@ -264,10 +264,25 @@ impl Tools {
             }
         };
         prepared.handed_off();
+        let mut ownership = OpeningGuard {
+            bridge: bridge.clone(),
+            identity: identity.clone(),
+            transferred: false,
+        };
         let mut cancelled = false;
         loop {
+            let (_, failure) = bridge
+                .endpoint()
+                .transition(|s, _| s.open_progress(&client, &identity))?;
+            if let Some(error) = failure {
+                return Err(error.into());
+            }
             tokio::select! {
                 biased;
+                _ = tokio::time::sleep_until(preparation.deadline.into()) => {
+                    return Err(diagnostic("open total deadline expired; late acquisition retained for cleanup; never replay"));
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
                 _ = preparation.cancel.cancelled(), if !cancelled => {
                     let cancellation = bridge.endpoint().transition(|s,_| s.cancel_open(&client, &identity));
                     match cancellation {
@@ -286,19 +301,24 @@ impl Tools {
                     }
                     match event["event"].as_str() {
                         Some("opened") => {
+                            #[cfg(test)]
+                            if std::env::var("N4_F2_OPEN_FAULT").as_deref() == Ok("release-busy") {
+                                static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+                                if FIRST.swap(false, Ordering::SeqCst) { preparation.cancel.cancel(); }
+                            }
                             let lease: SessionLease = serde_json::from_value(event["lease"].clone()).map_err(diagnostic)?;
                             if cancelled || preparation.check().is_err() {
-                                release(&bridge, &lease).await?;
-                                return Err(diagnostic("open cancelled/expired; acquired lease released"));
+                                return Err(diagnostic("open cancelled/expired; acquired lease transferred to bridge cleanup"));
                             }
                             let handle = id();
                             let token = id();
                             let idb = match event["idb_path"].as_str() {
                                 Some(path) => path.to_string(),
-                                None => { release(&bridge, &lease).await?; return Err(diagnostic("open missing IDB path; lease released")); }
+                                None => return Err(diagnostic("open missing IDB path; lease retained for bridge cleanup")),
                             };
                             let pid = event["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
                             self.records().insert(handle.clone(), Database { path: canonical, lease, idb, token: token.clone(), pid, opened_at: Instant::now() });
+                            ownership.transferred = true;
                             return Ok((handle,token));
                         }
                         Some("failed" | "uncertain") => return Err(diagnostic(event["error"].to_string())),
@@ -711,6 +731,28 @@ async fn release(
     .map_err(|_| diagnostic("lease release unconfirmed; lease tracking retained"))?
 }
 
+// Installed before awaiting an opening outcome. Every error/deadline/drop
+// transfers cleanup to the bounded N1/bridge lease registry, including late opens.
+struct OpeningGuard {
+    bridge: Arc<super::nexus_bridge::NexusBridge>,
+    identity: OpenIdentity,
+    transferred: bool,
+}
+impl Drop for OpeningGuard {
+    fn drop(&mut self) {
+        self.bridge.forget_open_reply(&self.identity.operation_id);
+        if !self.transferred {
+            if let Err(error) = self
+                .bridge
+                .endpoint()
+                .transition(|s, _| s.abandon_open(&self.identity.client_id, &self.identity))
+            {
+                tracing::error!(%error, "Nexus open cleanup ownership could not be reconciled");
+            }
+        }
+    }
+}
+
 pub struct ReferenceGuard {
     router: RouterState,
     token: Option<String>,
@@ -761,3 +803,7 @@ mod n4_fix_regressions {
         .is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/n4_f2_open.rs"]
+mod n4_f2_regressions;

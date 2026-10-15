@@ -130,6 +130,46 @@ impl<C: Clock> NexusSessions<C> {
         Ok(identity)
     }
 
+    /// Reconcile an opening without relying on diagnostic transport events.
+    pub fn open_progress(
+        &self,
+        client: &ClientId,
+        identity: &OpenIdentity,
+    ) -> Result<(Option<SessionLease>, Option<NexusError>), NexusError> {
+        let opening = self
+            .openings
+            .get(&identity.operation_id)
+            .ok_or_else(|| NexusError::new(NexusErrorCode::InvalidIdentity, "unknown opening"))?;
+        if &opening.identity != identity || &identity.client_id != client {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidIdentity,
+                "opening owner mismatch",
+            ));
+        }
+        Ok((opening.acquired.clone(), opening.failure.clone()))
+    }
+
+    /// Transfer an undelivered opening to bridge cleanup. A late acquisition
+    /// becomes ReleaseRequired; no native stop or successful release is claimed.
+    pub fn abandon_open(
+        &mut self,
+        client: &ClientId,
+        identity: &OpenIdentity,
+    ) -> Result<(), NexusError> {
+        let (lease, _) = self.open_progress(client, identity)?;
+        if let Some(opening) = self.openings.get_mut(&identity.operation_id) {
+            opening.cancel_requested = true;
+        }
+        if let Some(lease) = lease {
+            if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
+                if session.phase == SessionPhase::Active {
+                    session.phase = SessionPhase::ReleaseRequired;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A late successful open must still track and release its acquired lease.
     /// The caller must drive ReleaseRequired through release/released, not drop
     /// the handle or pretend the remote lease never existed.

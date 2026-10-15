@@ -64,7 +64,7 @@ impl State {
         // but a registered supervisor must receive its exact terminal outcome.
         if matches!(
             event["event"].as_str(),
-            Some("opened" | "failed" | "uncertain")
+            Some("opened" | "failed" | "uncertain" | "not_sent" | "remote_error")
         ) && event["attempt"]["target"]["kind"] == "open"
         {
             if let Some(id) = event["attempt"]["target"]["identity"]["operation_id"].as_str() {
@@ -233,7 +233,21 @@ impl NexusBridge {
                         _ => None,
                     })
                     .collect();
+                let leases: Vec<_> = ticking
+                    .leases
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .cloned()
+                    .collect();
                 ticking.endpoint.transition(|s, t| {
+                    for lease in leases {
+                        if s.status(&lease.client_id, &lease).is_ok_and(|status| status.phase == SessionPhase::ReleaseRequired) {
+                            if let Err(error) = s.release(&lease.client_id, &lease, t) {
+                                tracing::debug!(%error, lease_id=lease.lease_id.as_str(), "Nexus retained open lease cleanup pending");
+                            }
+                        }
+                    }
                     for op in operations {
                         if s.operation_progress(&op.lease.client_id, &op)
                             .is_ok_and(|snapshot| snapshot.status.is_terminal() && snapshot.execution_stopped) {
@@ -270,6 +284,10 @@ impl NexusBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
+    }
+    #[cfg(test)]
+    pub(crate) fn test_reply_count(&self) -> usize {
+        self.state.open_replies.lock().unwrap().len()
     }
     pub fn endpoint(&self) -> NexusEndpoint {
         self.state.endpoint.clone()
@@ -330,6 +348,18 @@ async fn pump(mut lane: tokio::sync::mpsc::Receiver<Delivery>, writer: Writer, s
         };
         if state.failed.load(std::sync::atomic::Ordering::Acquire) {
             break;
+        }
+        #[cfg(test)]
+        if std::env::var("N4_F2_OPEN_FAULT").as_deref() == Ok("zero-byte") {
+            static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            if let DeliveryTarget::Open { identity } = &delivery.attempt.target {
+                if FIRST.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    state
+                        .endpoint
+                        .transition(|s, _| s.cancel_open(&identity.client_id, identity))
+                        .unwrap();
+                }
+            }
         }
         let sequence = delivery.attempt.sequence.get();
         state
@@ -626,7 +656,7 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
             anyhow::bail!("unknown or mismatched bridge attempt");
         }
     }
-    let result = state.endpoint.transition(|s, t| -> Result<(), NexusError> {
+    let result = state.endpoint.transition(|s, _| -> Result<(), NexusError> {
         match name {
             "ack" => {
                 s.delivery_acknowledged(&attempt)?;
@@ -644,8 +674,9 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
                     .insert(lease.lease_id.clone(), lease.clone());
                 match s.opened(identity, lease.clone(), caps)? {
                     OpenDisposition::Ready(_) => {}
-                    OpenDisposition::ReleaseRequired { lease, .. } => {
-                        s.release(&lease.client_id.clone(), &lease, t)?;
+                    OpenDisposition::ReleaseRequired { .. } => {
+                        // The bridge poll owns retries after proven NotSent. A
+                        // full control lane must not discard lease responsibility.
                     }
                 }
                 let pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());

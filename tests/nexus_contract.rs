@@ -862,3 +862,71 @@ fn n4_fix_large_result_is_moved_without_copying_its_allocation() {
         "result is consumed exactly once"
     );
 }
+
+#[test]
+fn abandoned_open_retains_late_lease_and_preserves_not_sent_release_ownership() {
+    for late in [false, true] {
+        let mut rig = Rig::new();
+        let (open, lease) = rig.begin_open("abandoned", "owner", 1, 120);
+        if !late {
+            assert!(matches!(
+                rig.sessions
+                    .opened(&open, lease.clone(), capabilities())
+                    .unwrap(),
+                OpenDisposition::Ready(_)
+            ));
+        }
+        rig.sessions.abandon_open(&lease.client_id, &open).unwrap();
+        if late {
+            assert!(matches!(
+                rig.sessions
+                    .opened(&open, lease.clone(), capabilities())
+                    .unwrap(),
+                OpenDisposition::ReleaseRequired { .. }
+            ));
+        }
+        assert_eq!(
+            rig.sessions
+                .open_progress(&lease.client_id, &open)
+                .unwrap()
+                .0,
+            Some(lease.clone())
+        );
+        assert_eq!(
+            rig.sessions
+                .open_progress(&ClientId::new("intruder").unwrap(), &open)
+                .unwrap_err()
+                .code,
+            NexusErrorCode::InvalidIdentity
+        );
+        assert_eq!(
+            rig.sessions.status(&lease.client_id, &lease).unwrap().phase,
+            SessionPhase::ReleaseRequired
+        );
+        rig.sessions
+            .release(&lease.client_id, &lease, &mut rig.backend)
+            .unwrap();
+        let attempt = rig.backend.attempts.last().unwrap().clone();
+        rig.sessions
+            .delivery_failed(
+                &attempt,
+                DispatchFailure::NotSent(NexusError::new(NexusErrorCode::Busy, "fixture full")),
+            )
+            .unwrap();
+        assert_eq!(
+            rig.sessions.status(&lease.client_id, &lease).unwrap().phase,
+            SessionPhase::ReleaseRequired
+        );
+        rig.sessions
+            .release(&lease.client_id, &lease, &mut rig.backend)
+            .unwrap();
+        rig.sessions
+            .released(rig.backend.attempts.last().unwrap())
+            .unwrap();
+        rig.sessions.abandon_open(&lease.client_id, &open).unwrap();
+        assert_eq!(
+            rig.sessions.status(&lease.client_id, &lease).unwrap().phase,
+            SessionPhase::Released
+        );
+    }
+}
