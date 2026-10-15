@@ -398,6 +398,8 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N3：常驻 Python bridge 和 Nexus 生命周期
 
+- N3-F1 尚未完成：在 `3c05a51` 上补充的红例确认停止证明、双通道乱序、lease 断连及缓存发布问题。新增诊断 `scripts/nexus/probe_cancel_proof_ambiguity.py` 还确认公共 `cancel_operation()` 将明确 `cancelled=false`、控制连接故障和 JSON 解析失败均表示为 `false`；仅增加取消请求序号仍不能让 bridge 区分这三者。该诊断不启动 IDA，预期退出 2。按委托的新公共 API 缺口停止规则，等待对客户端补丁公开明确控制结果/停止证明的额外授权；不将 false 当作停止确认，不声称修复或重新验收通过。下述 N3 行为和旧验证描述属于待修复基线。
+
 - 2026-10-15 用户已裁定采用本地客户端补丁，解除原公共 API 阻塞。补丁在执行连接异常后保留本 handle 的精确 operation ID（最多 64 项，满时拒绝新执行），取消继续走公共 API 原有独立控制连接；不读取 token、不恢复私有字段、不重放。正常完成/明确错误不进入未知集合。
 - 官方 `_server._run_operation` 的 backend lock 不保证 FIFO，所以未取消的后继请求完成不能独自证明旧排队请求结束。补丁只在精确取消 ACK 后的成功串行后继完成时移除旧 ID；或在先前 ACK 后再收到精确 false 时移除。未 ACK 的 false 可能早于旧 POST 登记，保守保留至可证明停止或 handle close。health/error 响应不能清理该集合。bridge 只有原执行返回取消，或 ACK 后的同 lease 只读后继完成，才确认停止；后继失败保留 UnknownOutcome、原 cause 与 execution_stopped=false。
 - `nexus_bridge/bridge.py` 作为独立可打包 Python 客户端目录，只加载 Nexus 公共客户端。每 router 复用一个进程，stdout 只写 readiness，诊断写 stderr；业务、控制使用两个 Unix socket，各自持续读取/写入。业务池 4，接纳容量沿用 N2 tenant 上限；控制接纳 8，取消池 4、释放池 2；停止确认另有容量 2 的独立线程池，不占取消处理容量。本地状态直接读内存，发现 owner 独立后台刷新。

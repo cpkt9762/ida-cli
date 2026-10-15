@@ -277,3 +277,15 @@ recovery after native return. Later fairness tests must insert a short query
 between batch boundaries; process exit or a cancelled Rust future alone is
 insufficient evidence. N0 does not claim these scenarios passed for ida-cli's
 future Nexus bridge.
+
+
+### N3-F1 阻塞诊断与基线红例
+
+`3c05a51` 的停止证明仍有缺陷，新增回归目前应失败，不能作为 N3 验收通过证据。使用本轮全新 N0 venv（旧客户端补丁），设置 `F1_PYTHON` 为该 venv 的绝对 Python 路径、`F1_ROOT` 为独立测试目录，并沿用 N1 的 target 与 SDK 环境。`tests/nexus_bridge_regressions.rs` 使用真实常驻 bridge、两条 Unix socket 和 Rust/N1；公共客户端底层传输由测试 fixture 注入，未启动真实 IDA。缓存 barrier 只在 `cfg(test)` 生效。
+
+- `timeout 30s "$F1_PYTHON" scripts/nexus/probe_cancel_proof_ambiguity.py --evidence "$F1_ROOT/ambiguity.json"`：应 exit 2，实际 3 种控制结果的公开观察相同；不读取生产 token，也不修改安装。
+- `timeout 30s "$F1_PYTHON" -m pytest tests/nexus_bridge/test_causal_patch.py -q`：3 条基线失败，覆盖迟到成功、迟到旧 false、陈旧 unknown 不应干预 cancel_active。
+- `timeout 30s cargo test --locked --test nexus_bridge_regressions -- --test-threads=1`：4 条基线失败，覆盖 ACK 早于断流、停止先于 uncertain、单 lease 断连、CLI 控制容量耗尽。
+- `timeout 30s cargo test --locked --lib router::nexus_bridge::cache::f1_regressions -- --test-threads=1`：3 条基线失败，覆盖取消赢得发布、路径/内容快照不一致、已有 IDB 无输入证明。
+
+这些红例没有通过跳过或删除断言转绿。P1-1/P2-6 目前仅有 Python 客户端 barrier 回归；完整双通道贯通及修复后绿例仍待后续授权实施。遇到公共 API 缺口后，本轮未扩展补丁接口，也未重跑真实 IDA E2E。
