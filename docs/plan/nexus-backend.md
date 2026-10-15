@@ -397,6 +397,9 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N3：常驻 Python bridge 和 Nexus 生命周期
 
+- 2026-10-15 前置核对发现公共 API 阻塞，尚未实现 bridge、接通 lanes 或安装能力。固定 Nexus 0.13.4 的执行响应连接断开后，`DatabaseHandle._request` 在 `finally` 清空活动 operation ID；公共 `cancel_operation(原 ID)` 随即返回 false，未发送控制请求，`cancel_active` 也无法补救。真实 IDA 9.5 的 started/continued barrier 已证明此时 SSE lease 仍连接、原操作继续执行。该行为无法满足 N1 关于 UnknownOutcome 且 execution_stopped=false 时继续按精确 ID 投递控制请求的消费约定。
+- 可复现诊断为 `scripts/nexus/probe_cancel_after_disconnect.py`，使用独立 N0 环境和样本，只在标准库响应接收处注入断连；正常取消对照与故障场景各实际执行一次。复现缺口时退出 2 并报告 BLOCKED，不算 N3 E2E PASS。未修改 Nexus 私有状态、注册/锁文件或公共 API，也没有重放执行请求。
+- 按 N3 委托的公共 API 缺口停止规则，等待编排者决定并授权修复/更新固定依赖，或明确调整已接受的契约。不得自行恢复私有 operation ID、直连私有取消协议、释放执行中 lease 来冒充精确取消，或把 false 当停止确认。E02（bridge 部分）、E03、E05、E06、E07 的实际 N3 验收执行数量目前为 0，均 BLOCKED；下列实施和验收要求仍待完成。
 - 通过公共 Nexus API 建立数据库句柄，注册断连事件，管理 lease 和输出路径。
 - 实现 bridge readiness、版本握手、有界请求调度、独立取消处理、异常退出传播和确定性清理。
 - 取消和状态不能被业务线程池耗尽挡住，也不能等待同一个正在执行请求的客户端锁。

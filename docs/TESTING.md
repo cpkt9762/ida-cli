@@ -68,6 +68,39 @@ Tests use `test/fixtures/mini.c`, a minimal C program compiled into a
 Mach-O binary. The integration tests open the raw binary via `open_idb`;
 IDA auto-analyses it and writes an `.i64` alongside.
 
+## Nexus N3 public API blocker probe
+
+N3 is blocked before bridge implementation by the pinned public client's
+cancellation behavior after a request response connection fails. Prepare a
+fresh external environment with the N0 command below, then run:
+
+```bash
+timeout 30s "$N0_ROOT/venv/bin/python" scripts/nexus/probe_cancel_after_disconnect.py --root "$N0_ROOT"
+```
+
+The diagnostic requires real IDA and a legal license. It executes two probes:
+healthy precise cancellation (one control request, `operation_cancelled`) and
+an injected response disconnect after the operation's started barrier. The
+second probe verifies that the SSE lease remains connected, both public cancel
+methods return false without sending a control request, and the same operation
+reaches another marker after cancellation was attempted. Execution is never
+replayed. File barriers establish ordering; bounded polling only observes them.
+
+Exit 2 with `BLOCKED_PUBLIC_CANCEL_AFTER_TRANSPORT_LOSS` is evidence of the API
+gap, not a passing bridge/E2E suite. Exit 1 or 124 is a failed/incomplete probe.
+`cancel-gap.json` records versions, two actual probes, non-secret identities,
+and cleanup; `public-api-source.txt` captures the loaded implementation. A used
+environment is refused. The diagnostic uses the N0 identity ledger and cleanup,
+releases only its own handles, and never loads IDA in the client process. It
+changes neither private Nexus cancellation state nor the upstream installation.
+The N0 spawn instrumentation exists only to register test-owned workers before
+they can escape the cleanup ledger.
+
+E02 (bridge), E03, E05, E06 and E07 remain BLOCKED with zero N3 acceptance
+scenarios executed. Do not count these two diagnostic probes as those E2Es.
+Changing the pinned dependency or accepted cancellation semantics requires an
+orchestrator decision before N3 can continue.
+
 ## Nexus N0 isolation and baseline
 
 N0 prepares and verifies the dependency environment only. Business handlers
