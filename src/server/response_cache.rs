@@ -37,12 +37,35 @@ where
         Output = Result<Result<Option<Value>, crate::error::ToolError>, crate::error::ToolError>,
     >,
 {
+    cache_shared(
+        method,
+        std::sync::Arc::new(std::sync::Mutex::new(result)),
+        launch,
+    )
+    .await
+}
+
+async fn cache_shared<F>(
+    method: &str,
+    original: std::sync::Arc<std::sync::Mutex<Value>>,
+    launch: impl FnOnce(CacheJob) -> F,
+) -> Value
+where
+    F: std::future::Future<
+        Output = Result<Result<Option<Value>, crate::error::ToolError>, crate::error::ToolError>,
+    >,
+{
     let method = method.to_string();
-    let original = std::sync::Arc::new(std::sync::Mutex::new(result));
     let borrowed = original.clone();
     let cached = launch(Box::new(move || {
-        let value = borrowed.lock().unwrap_or_else(|e| e.into_inner());
-        guard_response_size_sync(&method, &value)
+        let mut value = borrowed.lock().unwrap_or_else(|e| e.into_inner());
+        let cached = guard_response_size_sync(&method, &value)?;
+        if cached.is_some() {
+            let original = std::mem::take(&mut *value);
+            drop(value);
+            drop(original); // Destroy large arrays/objects on this bounded worker.
+        }
+        Ok(cached)
     }))
     .await;
     match cached {
@@ -264,5 +287,28 @@ mod compatibility_tests {
         })
         .await;
         assert_eq!(result, value);
+    }
+}
+
+#[cfg(test)]
+mod f4_regressions {
+    use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn cached_success_consumes_original_in_background_job() {
+        let original = std::sync::Arc::new(std::sync::Mutex::new(
+            serde_json::json!({"stdout":"large Unicode 输出".repeat(1000),"result":[1,2,3]}),
+        ));
+        let observed = original.clone();
+        let caller = std::thread::current().id();
+        let result = cache_shared("f4-drop", original.clone(), |job| async move {
+            crate::blocking::response(move || {
+                assert_ne!(std::thread::current().id(), caller);
+                let result = job();
+                assert!(observed.lock().unwrap().is_null(), "successful job must take and destroy the large original on this background thread");
+                result
+            }).await
+        }).await;
+        assert_eq!(result["cached"], true);
+        assert!(original.lock().unwrap().is_null());
     }
 }

@@ -203,8 +203,8 @@ async fn sbpf_first_open_cancellation_propagates_and_cleans_worker() {
                 let inner = router.inner.lock().await;
                 inner.workers.is_empty()
                     && inner.path_to_handle.is_empty()
-                    && inner.ref_tokens.is_empty()
-                    && inner.token_to_handle.is_empty()
+                    && router.references.lock().unwrap().ref_tokens.is_empty()
+                    && router.references.lock().unwrap().token_to_handle.is_empty()
             };
             for handle in handles {
                 router.close_worker(&handle).await.unwrap();
@@ -612,7 +612,8 @@ async fn isolated_f3_case(name: &str, work: impl std::future::Future<Output = ()
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("running 1 test") && stdout.contains("1 passed"),
-            "exact child case must run its assertions: {stdout}"
+            "exact child case must run its assertions: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
         assert!(
             output.status.success(),
@@ -706,6 +707,331 @@ async fn f3_index_cancellation_retains_pending_input_evidence() {
                 retained,
                 "cancelled waiter must retain blocking input tracking until actual FIFO EOF"
             );
+        },
+    )
+    .await;
+}
+
+async fn f4_prewarm_fault(keep_warm: bool, already_open: bool, fault: &str) {
+    let directory = std::env::temp_dir().join(format!(
+        "n2-f4-prewarm-{}-{keep_warm}-{already_open}-{fault}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let listener = tokio::net::UnixListener::bind(directory.join("ready.sock")).unwrap();
+    let (router, path) = first_open_fixture(&directory, "none", Some("get_database_info")).await;
+    let existing = if already_open {
+        Some(router.ensure_worker_with_ref(&path, None).await.unwrap())
+    } else {
+        None
+    };
+    let baseline = usize::from(already_open) + usize::from(fault == "new-client");
+    let preparation = crate::preprocess::Preparation::new(Duration::from_secs(4));
+    let cancel = preparation.cancel.clone();
+    let deadline = preparation.deadline;
+    let worker = router.clone();
+    let input = path.clone();
+    let call = tokio::spawn(async move {
+        preparation
+            .scope(worker.prewarm_path_with_options(&input, keep_warm, "default"))
+            .await
+    });
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stream = BufReader::new(stream);
+    let mut line = String::new();
+    stream.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "started\n");
+    let handles = router.all_handles().await;
+    for handle in &handles {
+        crate::preprocess::record_owned_fixture(
+            router.inner.lock().await.workers[handle]
+                .child
+                .id()
+                .unwrap(),
+            false,
+            "f4-prewarm",
+        );
+    }
+    let mut jobs = Vec::new();
+    let mut releases = Vec::new();
+    if fault == "busy" {
+        for _ in 0..4 {
+            let (release, released) = std::sync::mpsc::channel();
+            let (start, started) = tokio::sync::oneshot::channel();
+            jobs.push(tokio::spawn(crate::blocking::run(
+                crate::blocking::WorkClass::Prepare,
+                move || {
+                    start.send(()).unwrap();
+                    released.recv().unwrap();
+                },
+            )));
+            started.await.unwrap();
+            releases.push(release);
+        }
+    }
+    if fault == "io" {
+        std::fs::remove_file(&path).unwrap();
+    }
+    let new_client = if fault == "new-client" {
+        Some(router.issue_ref_for_handle(&handles[0]).await)
+    } else {
+        None
+    };
+    let dropped = fault == "drop";
+    if fault == "cancel" {
+        assert!(cancel.cancel());
+    }
+    if fault == "deadline" {
+        tokio::time::sleep_until(deadline.into()).await;
+    }
+    if dropped {
+        call.abort();
+    }
+    stream.get_mut().write_all(b"x").await.unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), call).await;
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    for job in jobs {
+        job.await.unwrap().unwrap();
+    }
+    let refs: usize = router
+        .references
+        .lock()
+        .unwrap()
+        .ref_tokens
+        .values()
+        .map(HashSet::len)
+        .sum();
+    let warm = router.warm_pool.lock().await.len();
+    let count = router.worker_count().await;
+    if let Some(token) = new_client {
+        router.release_ref_token(&token).await;
+    }
+    if let Some((_, token)) = existing {
+        router.release_ref_token(&token).await;
+    }
+    for handle in handles {
+        router.close_worker(&handle).await.unwrap();
+    }
+    std::fs::remove_dir_all(&directory).unwrap();
+    if dropped {
+        assert!(outcome.unwrap().unwrap_err().is_cancelled());
+        assert_eq!(
+            refs, baseline,
+            "dropping prewarm must release only its own reference"
+        );
+        assert_eq!(warm, 0);
+    } else {
+        let outcome = outcome.unwrap().unwrap();
+        if fault == "cancel" || fault == "deadline" {
+            assert!(
+                outcome.is_err(),
+                "prewarm must propagate cancellation: {outcome:?}"
+            );
+            assert_eq!(refs, baseline);
+            assert_eq!(warm, 0);
+        } else {
+            let value = outcome.expect("post-open cache observation must be best effort");
+            assert_eq!(value["cached_after"], false);
+            assert!(value["cache_path"].is_null());
+            assert_eq!(refs, baseline + usize::from(keep_warm));
+            assert_eq!(warm, usize::from(keep_warm));
+            assert_eq!(
+                count,
+                usize::from(keep_warm || already_open || fault == "new-client"),
+                "must keep another client's worker"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn f4_prewarm_busy_observation_releases_or_transfers_reference() {
+    isolated_f3_case(
+        "f4_prewarm_busy_observation_releases_or_transfers_reference",
+        async {
+            for keep in [false, true] {
+                for opened in [false, true] {
+                    f4_prewarm_fault(keep, opened, "busy").await;
+                }
+            }
+        },
+    )
+    .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn f4_prewarm_io_observation_keeps_existing_client() {
+    isolated_f3_case("f4_prewarm_io_observation_keeps_existing_client", async {
+        for keep in [false, true] {
+            for opened in [false, true] {
+                f4_prewarm_fault(keep, opened, "io").await;
+            }
+        }
+    })
+    .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn f4_prewarm_drop_releases_own_reference() {
+    isolated_f3_case("f4_prewarm_drop_releases_own_reference", async {
+        for keep in [false, true] {
+            for opened in [false, true] {
+                f4_prewarm_fault(keep, opened, "drop").await;
+            }
+        }
+    })
+    .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn f4_prewarm_cancel_propagates_without_ref_leak() {
+    isolated_f3_case("f4_prewarm_cancel_propagates_without_ref_leak", async {
+        f4_prewarm_fault(true, true, "cancel").await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn f4_prewarm_deadline_propagates_without_ref_leak() {
+    isolated_f3_case("f4_prewarm_deadline_propagates_without_ref_leak", async {
+        f4_prewarm_fault(true, true, "deadline").await;
+    })
+    .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn f4_prewarm_preserves_client_arriving_after_open() {
+    isolated_f3_case("f4_prewarm_preserves_client_arriving_after_open", async {
+        f4_prewarm_fault(false, false, "new-client").await;
+    })
+    .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn f4_repeated_warm_lease_retains_exactly_one_reference() {
+    isolated_f3_case(
+        "f4_repeated_warm_lease_retains_exactly_one_reference",
+        async {
+            let directory =
+                std::env::temp_dir().join(format!("n2-f4-rewarm-{}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let (router, path) = first_open_fixture(&directory, "none", None).await;
+            let first = router
+                .prewarm_path_with_options(&path, true, "default")
+                .await
+                .unwrap();
+            let second = router
+                .prewarm_path_with_options(&path, true, "default")
+                .await
+                .unwrap();
+            let refs: usize = router
+                .references
+                .lock()
+                .unwrap()
+                .ref_tokens
+                .values()
+                .map(HashSet::len)
+                .sum();
+            let warm = router.warm_pool.lock().await.len();
+            let handle = router.active_handle().await.unwrap();
+            // Drop must work while the async state locks are held. It cannot wait
+            // for them, acquire a new task/queue permit, or remove another token.
+            let token = router.issue_ref_for_handle(&handle).await;
+            let guard = router.scoped_ref(token);
+            let inner = router.inner.lock().await;
+            let pool = router.warm_pool.lock().await;
+            drop(guard);
+            let after_drop: usize = router
+                .references
+                .lock()
+                .unwrap()
+                .ref_tokens
+                .values()
+                .map(HashSet::len)
+                .sum();
+            drop(pool);
+            drop(inner);
+            router
+                .release_warm_lease(&std::fs::canonicalize(&path).unwrap())
+                .await
+                .unwrap();
+            let count = router.worker_count().await;
+            std::fs::remove_dir_all(directory).unwrap();
+            assert_eq!(first["kept_warm"], true);
+            assert_eq!(second["already_open"], true);
+            assert_eq!(refs, 1, "replacing lease releases its previous token");
+            assert_eq!(warm, 1);
+            assert_eq!(after_drop, 1);
+            assert_eq!(count, 0);
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn f4_first_open_cancel_preserves_other_client_reference() {
+    isolated_f3_case(
+        "f4_first_open_cancel_preserves_other_client_reference",
+        async {
+            let directory =
+                std::env::temp_dir().join(format!("n2-f4-shared-open-{}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let listener = tokio::net::UnixListener::bind(directory.join("ready.sock")).unwrap();
+            let (router, path) =
+                first_open_fixture(&directory, "none", Some("get_function_by_name")).await;
+            let preparation = crate::preprocess::Preparation::new(Duration::from_secs(4));
+            let cancel = preparation.cancel.clone();
+            let owned = router.clone();
+            let call = tokio::spawn(async move {
+                owned
+                    .ensure_worker_prepared(&path, None, None, preparation)
+                    .await
+            });
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "started\n");
+            let handle = router.active_handle().await.unwrap();
+            let other = router.issue_ref_for_handle(&handle).await;
+            assert!(cancel.cancel());
+            let result = tokio::time::timeout(Duration::from_secs(2), call)
+                .await
+                .unwrap()
+                .unwrap();
+            let other_handle = router.handle_for_token(&other).await;
+            let still_open = router.worker_count().await;
+            let refs = router
+                .references
+                .lock()
+                .unwrap()
+                .ref_tokens
+                .get(&handle)
+                .map_or(0, HashSet::len);
+            router.release_ref_token(&other).await;
+            router.close_worker(&handle).await.unwrap();
+            drop(stream);
+            std::fs::remove_dir_all(directory).unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::error::ToolError::Preparation {
+                        execution_stopped: false,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+            assert_eq!(
+                other_handle,
+                Some(handle),
+                "failed opener must not revoke another client token"
+            );
+            assert_eq!(still_open, 1);
+            assert_eq!(refs, 1, "only failed opener ref is released");
         },
     )
     .await;

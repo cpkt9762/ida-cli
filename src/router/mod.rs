@@ -340,6 +340,7 @@ type CacheSnapshot = (
 #[derive(Clone)]
 pub struct RouterState {
     inner: Arc<Mutex<RouterInner>>,
+    references: Arc<std::sync::Mutex<ReferenceTokens>>,
     config: Arc<RouterConfig>,
     spawn_gate: Arc<Semaphore>,
     nexus: Arc<std::sync::Mutex<(nexus_transport::NexusEndpoint, bool)>>,
@@ -365,10 +366,50 @@ struct RouterInner {
     workers: HashMap<DbHandle, WorkerProcess>,
     active: Option<DbHandle>,
     path_to_handle: HashMap<WorkerKey, DbHandle>,
-    token_to_handle: HashMap<String, DbHandle>,
-    ref_tokens: HashMap<DbHandle, HashSet<String>>,
     req_counter: u64,
     exe_path: PathBuf,
+}
+
+// Only short in-memory token operations use this lock. It is never held
+// across await, I/O, or acquisition of inner/warm_pool. When combined, lock
+// order is warm_pool -> inner -> references. Drop can release without a task.
+#[derive(Default)]
+struct ReferenceTokens {
+    token_to_handle: HashMap<String, DbHandle>,
+    ref_tokens: HashMap<DbHandle, HashSet<String>>,
+}
+impl ReferenceTokens {
+    fn release(&mut self, token: &str) -> Option<(DbHandle, usize)> {
+        let handle = self.token_to_handle.remove(token)?;
+        let remaining = self
+            .ref_tokens
+            .get_mut(&handle)
+            .map(|tokens| {
+                tokens.remove(token);
+                tokens.len()
+            })
+            .unwrap_or(0);
+        Some((handle, remaining))
+    }
+}
+struct ScopedRefToken {
+    references: Arc<std::sync::Mutex<ReferenceTokens>>,
+    token: Option<String>,
+}
+impl ScopedRefToken {
+    fn release(&mut self) -> Option<(DbHandle, usize)> {
+        self.token.take().and_then(|token| {
+            self.references
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .release(&token)
+        })
+    }
+}
+impl Drop for ScopedRefToken {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl RouterState {
@@ -396,11 +437,10 @@ impl RouterState {
                 workers: HashMap::new(),
                 active: None,
                 path_to_handle: HashMap::new(),
-                token_to_handle: HashMap::new(),
-                ref_tokens: HashMap::new(),
                 req_counter: 0,
                 exe_path,
             })),
+            references: Arc::new(std::sync::Mutex::new(ReferenceTokens::default())),
             config: config.clone(),
             spawn_gate: Arc::new(Semaphore::new(config.max_concurrent_spawns)),
             nexus: Arc::new(std::sync::Mutex::new((
@@ -617,13 +657,14 @@ impl RouterState {
                 inner.req_counter += 1;
                 let ref_token = format!("{now:x}-{pid:x}-{nonce:x}");
 
-                inner
+                let mut references = self.references.lock().unwrap_or_else(|e| e.into_inner());
+                references
                     .token_to_handle
                     .insert(ref_token.clone(), existing_handle.clone());
-                inner
+                references
                     .ref_tokens
                     .entry(existing_handle.clone())
-                    .or_insert_with(HashSet::new)
+                    .or_default()
                     .insert(ref_token.clone());
 
                 return Ok((existing_handle, Some(ref_token)));
@@ -666,7 +707,10 @@ impl RouterState {
                         .workers
                         .iter()
                         .filter(|(handle, worker)| {
-                            let ref_count = inner
+                            let ref_count = self
+                                .references
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
                                 .ref_tokens
                                 .get(*handle)
                                 .map(|set| set.len())
@@ -731,13 +775,14 @@ impl RouterState {
             inner.req_counter += 1;
             let ref_token = format!("{now:x}-{pid:x}-{nonce:x}");
 
-            inner
+            let mut references = self.references.lock().unwrap_or_else(|e| e.into_inner());
+            references
                 .token_to_handle
                 .insert(ref_token.clone(), existing_handle.clone());
-            inner
+            references
                 .ref_tokens
                 .entry(existing_handle.clone())
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(ref_token.clone());
 
             return Ok((existing_handle, Some(ref_token)));
@@ -822,12 +867,18 @@ impl RouterState {
             return Ok((existing, Some(token)));
         }
         inner.path_to_handle.insert(worker_key, handle.clone());
-        inner
+        self.references
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .token_to_handle
             .insert(close_token.clone(), handle.clone());
         let mut init_refs = HashSet::new();
         init_refs.insert(close_token.clone());
-        inner.ref_tokens.insert(handle.clone(), init_refs);
+        self.references
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ref_tokens
+            .insert(handle.clone(), init_refs);
         let connection = worker.connection.clone();
         inner.workers.insert(handle.clone(), worker);
         inner.active = Some(handle.clone());
@@ -934,12 +985,27 @@ impl RouterState {
     }
 
     pub async fn close_worker(&self, handle: &str) -> Result<(), crate::error::ToolError> {
-        self.warm_pool
-            .lock()
-            .await
-            .retain(|_, lease| lease.handle != handle);
+        self.close_worker_inner(handle, false).await.map(|_| ())
+    }
+
+    async fn close_worker_inner(
+        &self,
+        handle: &str,
+        only_unreferenced: bool,
+    ) -> Result<bool, crate::error::ToolError> {
+        let mut warm_pool = self.warm_pool.lock().await;
         let worker = {
             let mut inner = self.inner.lock().await;
+            let mut references = self.references.lock().unwrap_or_else(|e| e.into_inner());
+            if only_unreferenced
+                && references
+                    .ref_tokens
+                    .get(handle)
+                    .is_some_and(|tokens| !tokens.is_empty())
+            {
+                return Ok(false);
+            }
+            warm_pool.retain(|_, lease| lease.handle != handle);
             let worker = inner.workers.remove(handle);
             if let Some(worker) = &worker {
                 if let Some(path) = &worker.open_path {
@@ -947,9 +1013,9 @@ impl RouterState {
                         .path_to_handle
                         .remove(&Self::worker_key(path.clone(), &worker.tenant_id));
                 }
-                if let Some(tokens) = inner.ref_tokens.remove(handle) {
+                if let Some(tokens) = references.ref_tokens.remove(handle) {
                     for token in tokens {
-                        inner.token_to_handle.remove(&token);
+                        references.token_to_handle.remove(&token);
                     }
                 }
                 if inner.active.as_deref() == Some(handle) {
@@ -958,7 +1024,36 @@ impl RouterState {
             }
             worker
         };
+        drop(warm_pool);
+        let closed = worker.is_some();
         if let Some(mut worker) = worker {
+            if only_unreferenced {
+                let preparation = crate::preprocess::current().unwrap_or_else(|| {
+                    crate::preprocess::Preparation::new(Duration::from_secs(120))
+                });
+                for method in ["close", "shutdown"] {
+                    let id = format!("release-{handle}-{method}");
+                    let result = async {
+                        preparation.check()?;
+                        let bytes = preparation
+                            .wait(transport::RpcConnection::encode(RpcRequest::new(
+                                &id,
+                                method,
+                                serde_json::json!({}),
+                            )))
+                            .await?;
+                        worker
+                            .connection
+                            .enqueue(id, bytes, preparation.deadline)?
+                            .wait_prepared(120, &preparation.cancel)
+                            .await
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        warn!(%handle, method, %error, "unreferenced prewarm worker graceful close failed");
+                    }
+                }
+            }
             worker.connection.close();
             worker
                 .child
@@ -967,7 +1062,14 @@ impl RouterState {
                 .map_err(|e| crate::error::ToolError::IdaError(format!("worker cleanup: {e}")))?;
             info!("Closed worker {}", handle);
         }
-        Ok(())
+        Ok(closed)
+    }
+
+    fn scoped_ref(&self, token: String) -> ScopedRefToken {
+        ScopedRefToken {
+            references: self.references.clone(),
+            token: Some(token),
+        }
     }
 
     /// Release a reference token. Returns `Some((handle, remaining))` if the token was valid:
@@ -975,20 +1077,19 @@ impl RouterState {
     /// `remaining == 0` means last reference released (caller should close the worker).
     /// Returns `None` if the token was not found (invalid or already released).
     pub async fn release_ref_token(&self, token: &str) -> Option<(DbHandle, usize)> {
-        let mut inner = self.inner.lock().await;
-        let handle = inner.token_to_handle.remove(token)?;
-        let remaining = if let Some(set) = inner.ref_tokens.get_mut(&handle) {
-            set.remove(token);
-            set.len()
-        } else {
-            0
-        };
-        Some((handle, remaining))
+        self.references
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(token)
     }
 
     pub async fn handle_for_token(&self, token: &str) -> Option<DbHandle> {
-        let inner = self.inner.lock().await;
-        inner.token_to_handle.get(token).cloned()
+        self.references
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .token_to_handle
+            .get(token)
+            .cloned()
     }
 
     pub async fn active_handle(&self) -> Option<DbHandle> {
@@ -1059,7 +1160,14 @@ impl RouterState {
                     pid: worker.child.id(),
                     open_path: worker.open_path.as_ref().map(|p| p.display().to_string()),
                     pending_requests: worker.connection.pending_len(),
-                    ref_count: inner.ref_tokens.get(handle).map(|s| s.len()).unwrap_or(0),
+                    ref_count: self
+                        .references
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .ref_tokens
+                        .get(handle)
+                        .map(|s| s.len())
+                        .unwrap_or(0),
                     idle_secs: worker.last_active.elapsed().as_secs(),
                     active: inner.active.as_deref() == Some(handle.as_str()),
                 }
@@ -1265,6 +1373,10 @@ impl RouterState {
 
     pub async fn issue_ref_for_handle(&self, handle: &str) -> String {
         let mut inner = self.inner.lock().await;
+        self.issue_ref_locked(&mut inner, handle)
+    }
+
+    fn issue_ref_locked(&self, inner: &mut RouterInner, handle: &str) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -1273,10 +1385,11 @@ impl RouterState {
         inner.req_counter += 1;
         let token = format!("cli-{now:x}-{nonce:x}");
 
-        inner
+        let mut references = self.references.lock().unwrap_or_else(|e| e.into_inner());
+        references
             .token_to_handle
             .insert(token.clone(), handle.to_string());
-        inner
+        references
             .ref_tokens
             .entry(handle.to_string())
             .or_default()
@@ -1350,14 +1463,15 @@ impl RouterState {
                 if let Some(worker) = inner.workers.get_mut(&h) {
                     worker.last_active = Instant::now();
                 }
-                Some(h)
+                let token = self.issue_ref_locked(&mut inner, &h);
+                Some((h, token))
             } else {
                 None
             }
         };
 
-        let handle = if let Some(h) = handle {
-            h
+        let (handle, mut initial_reference) = if let Some((h, token)) = handle {
+            return Ok((h, token));
         } else {
             let spawned = tokio::select! {biased;
                 _=preparation.cancel.cancelled()=>return Err(ToolError::Preparation {message:"cancelled before worker startup completed".into(),execution_stopped:false}),
@@ -1367,9 +1481,7 @@ impl RouterState {
             let (h, initial_token) =
                 spawned.map_err(|e| ToolError::IdaError(format!("spawn_worker failed: {e}")))?;
 
-            if let Some(token) = initial_token {
-                self.release_ref_token(&token).await;
-            }
+            let mut initial_reference = initial_token.map(|token| self.scoped_ref(token));
 
             let effective_idb_output = explicit_idb_output
                 .map(String::from)
@@ -1435,17 +1547,27 @@ impl RouterState {
             }
             .await;
             if let Err(error) = opened {
-                warn!(handle = %h, error = %error, "open or required follow-up failed, cleaning up worker");
-                if let Err(cleanup) = self.close_worker(&h).await {
+                warn!(handle = %h, error = %error, "open or required follow-up failed, releasing opener reference");
+                if let Some(reference) = initial_reference.as_mut() {
+                    reference.release();
+                }
+                if let Err(cleanup) = preparation.scope(self.close_worker_inner(&h, true)).await {
                     warn!(handle = %h, error = %cleanup, "failed-open worker cleanup failed");
                 }
                 return Err(error);
             }
 
-            h
+            (h, initial_reference)
         };
 
-        let ref_token = self.issue_ref_for_handle(&handle).await;
+        let ref_token = if let Some(token) = initial_reference
+            .as_mut()
+            .and_then(|reference| reference.token.take())
+        {
+            token
+        } else {
+            self.issue_ref_for_handle(&handle).await
+        };
 
         Ok((handle, ref_token))
     }
@@ -1620,6 +1742,9 @@ impl RouterState {
         tenant_id: &str,
     ) -> Result<serde_json::Value, crate::error::ToolError> {
         use crate::error::ToolError;
+        let preparation = crate::preprocess::current()
+            .unwrap_or_else(|| crate::preprocess::Preparation::new(Duration::from_secs(3600)));
+        preparation.check()?;
 
         let expanded = crate::expand_path(path);
         if !expanded.exists() {
@@ -1629,11 +1754,13 @@ impl RouterState {
             )));
         }
 
-        let canonical = crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
-            std::fs::canonicalize(&expanded)
-        })
-        .await?
-        .map_err(|e| ToolError::InvalidPath(e.to_string()))?;
+        let canonical = preparation
+            .wait(crate::blocking::run(
+                crate::blocking::WorkClass::Prepare,
+                move || std::fs::canonicalize(&expanded),
+            ))
+            .await?
+            .map_err(|e| ToolError::InvalidPath(e.to_string()))?;
         let tenant_id = Self::normalize_tenant(Some(tenant_id));
         let already_open = {
             let inner = self.inner.lock().await;
@@ -1643,15 +1770,20 @@ impl RouterState {
         };
 
         let before = canonical.clone();
-        let cached_before = crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
-            crate::idb_store::IdbStore::new().prepared_paths(&before)
-        })
-        .await?
-        .map_err(|e| ToolError::IdaError(e.to_string()))?
-        .0
-        .map(|p| p.display().to_string());
+        let cached_before = preparation
+            .wait(crate::blocking::run(
+                crate::blocking::WorkClass::Prepare,
+                move || crate::idb_store::IdbStore::new().prepared_paths(&before),
+            ))
+            .await?
+            .map_err(|e| ToolError::IdaError(e.to_string()))?
+            .0
+            .map(|p| p.display().to_string());
 
-        let (handle, ref_token) = self.ensure_worker_with_ref(path, Some(&tenant_id)).await?;
+        let (handle, ref_token) = self
+            .ensure_worker_prepared(path, None, Some(&tenant_id), preparation.clone())
+            .await?;
+        let mut reference = self.scoped_ref(ref_token);
         let backend = {
             let inner = self.inner.lock().await;
             inner
@@ -1661,41 +1793,71 @@ impl RouterState {
                 .unwrap_or_else(|| "unknown".to_string())
         };
 
-        let database_info = self
-            .route_request(Some(&handle), "get_database_info", serde_json::json!({}))
+        let database_info = match self
+            .route_request_prepared(
+                Some(&handle),
+                "get_database_info",
+                serde_json::json!({}),
+                preparation.clone(),
+            )
             .await
-            .ok();
-
+        {
+            Ok(value) => Some(value),
+            Err(error) if optional_sbpf_failure(&error) => {
+                preparation.check()?;
+                warn!(path=%canonical.display(), %error, "optional prewarm database info unavailable");
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        preparation.check()?;
         let after = canonical.clone();
-        let cached_after = crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
-            crate::idb_store::IdbStore::new().prepared_paths(&after)
-        })
-        .await?
-        .map_err(|e| ToolError::IdaError(e.to_string()))?
-        .0
-        .map(|p| p.display().to_string());
+        let observed = preparation
+            .wait(crate::blocking::run(
+                crate::blocking::WorkClass::Prepare,
+                move || crate::idb_store::IdbStore::new().prepared_paths(&after),
+            ))
+            .await;
+        let cached_after = match observed {
+            Ok(Ok((cache, _))) => {
+                preparation.check()?;
+                cache.map(|p| p.display().to_string())
+            }
+            Ok(Err(error)) => {
+                preparation.check()?;
+                warn!(path=%canonical.display(), %error, "optional prewarm cache observation failed");
+                None
+            }
+            Err(ToolError::Busy) => {
+                preparation.check()?;
+                warn!(path=%canonical.display(), "optional prewarm cache observation skipped: local capacity full");
+                None
+            }
+            Err(error) => return Err(error),
+        };
 
         let mut closed_worker = false;
         let mut kept_warm = false;
         if keep_warm {
-            self.install_warm_lease(
-                canonical.clone(),
-                handle.clone(),
-                ref_token.clone(),
-                tenant_id.to_string(),
-                cached_after.as_ref().map(PathBuf::from),
-            )
-            .await?;
+            preparation
+                .wait(self.install_warm_lease(
+                    canonical.clone(),
+                    handle.clone(),
+                    &mut reference,
+                    tenant_id.to_string(),
+                    cached_after.as_ref().map(PathBuf::from),
+                ))
+                .await?;
             kept_warm = true;
-        } else if !already_open {
-            if let Some((_, remaining)) = self.release_ref_token(&ref_token).await {
-                if remaining == 0 {
-                    self.close_by_path(&canonical, Some(&tenant_id)).await?;
-                    closed_worker = true;
-                }
-            }
         } else {
-            self.release_ref_token(&ref_token).await;
+            reference.release();
+            if !already_open {
+                // Recheck refs and detach this exact handle under inner. A later
+                // opener cannot be closed through a stale path lookup.
+                closed_worker = preparation
+                    .scope(self.close_worker_inner(&handle, true))
+                    .await?;
+            }
         }
 
         Ok(serde_json::json!({
@@ -1715,34 +1877,52 @@ impl RouterState {
         &self,
         canonical_path: PathBuf,
         handle: DbHandle,
-        token: String,
+        reference: &mut ScopedRefToken,
         tenant_id: String,
         cache_path: Option<PathBuf>,
     ) -> Result<(), crate::error::ToolError> {
-        while self.warm_pool.lock().await.len() >= self.config.max_warm_workers {
-            let candidate = {
-                self.warm_pool
-                    .lock()
-                    .await
-                    .iter()
-                    .min_by_key(|(_, lease)| lease.last_hit)
-                    .map(|(path, _)| path.clone())
-            };
-            let Some(path) = candidate else { break };
-            self.release_warm_lease(&path).await?;
+        loop {
+            let mut pool = self.warm_pool.lock().await;
+            if let Some(preparation) = crate::preprocess::current() {
+                preparation.check()?;
+            }
+            if pool.contains_key(&canonical_path) || pool.len() < self.config.max_warm_workers {
+                let token = reference.token.take().ok_or_else(|| {
+                    crate::error::ToolError::IdaError(
+                        "prewarm reference already transferred".into(),
+                    )
+                })?;
+                let previous = pool.insert(
+                    canonical_path.clone(),
+                    WarmLease {
+                        handle,
+                        token,
+                        path: canonical_path,
+                        cache_path,
+                        tenant_id,
+                        pinned_at: Instant::now(),
+                        last_hit: Instant::now(),
+                    },
+                );
+                if let Some(previous) = previous {
+                    // Replacing a lease transfers exactly one new token. The
+                    // old worker remains available to any other references/GC.
+                    self.references
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .release(&previous.token);
+                }
+                return Ok(());
+            }
+            let candidate = pool
+                .iter()
+                .min_by_key(|(_, lease)| lease.last_hit)
+                .map(|(path, _)| path.clone());
+            drop(pool);
+            if let Some(path) = candidate {
+                self.release_warm_lease(&path).await?;
+            }
         }
-
-        let lease = WarmLease {
-            handle,
-            token,
-            path: canonical_path.clone(),
-            cache_path,
-            tenant_id,
-            pinned_at: Instant::now(),
-            last_hit: Instant::now(),
-        };
-        self.warm_pool.lock().await.insert(canonical_path, lease);
-        Ok(())
     }
 
     async fn release_warm_lease(&self, path: &PathBuf) -> Result<(), crate::error::ToolError> {
@@ -1750,7 +1930,7 @@ impl RouterState {
         if let Some(lease) = lease {
             if let Some((handle, remaining)) = self.release_ref_token(&lease.token).await {
                 if remaining == 0 {
-                    self.close_worker(&handle).await?;
+                    self.close_worker_inner(&handle, true).await?;
                 }
             }
         }
@@ -2237,16 +2417,15 @@ impl RouterState {
                             task.preparation.clone(),
                         )
                         .await?;
-                    let result = state
+                    let _reference = state.scoped_ref(token);
+                    state
                         .route_request_prepared(
                             Some(&handle),
                             &task.method,
                             task.params.clone(),
                             task.preparation.clone(),
                         )
-                        .await;
-                    state.release_ref_token(&token).await;
-                    result
+                        .await
                 }
                 .await;
 
@@ -2338,8 +2517,14 @@ impl RouterState {
                         .workers
                         .iter()
                         .filter(|(h, w)| {
-                            let ref_count =
-                                inner.ref_tokens.get(*h).map(|set| set.len()).unwrap_or(0);
+                            let ref_count = state
+                                .references
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .ref_tokens
+                                .get(*h)
+                                .map(|set| set.len())
+                                .unwrap_or(0);
                             ref_count == 0
                                 && w.connection.pending_len() == 0
                                 && w.last_active.elapsed() > idle_timeout
