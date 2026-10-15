@@ -1,6 +1,6 @@
 # Nexus 唯一后端迁移与长任务治理计划
 
-状态：在独立 worktree `../ida-cli-nexus`、分支 `feat/nexus-backend` 执行。N0 环境阶段已验收；N1 经 N1-F1 修复后，已在 `9148fba526bf403b9448b50131a3edc145c2229a` 完成编排者独立复验和原 reviewer 复审，纯契约阶段门禁通过。N2 经 F1–F5 修复后，已在 `a1cc1e527e237949e70c3c4b5b333a9f3478260a` 完成编排者独立复验和原 reviewer 复审，协议/模拟及真实 OS fixture 范围的门禁通过，后续按 N3 推进。本文不表示整个后端迁移或真实链路 E2E 已完成。
+状态：在独立 worktree `../ida-cli-nexus`、分支 `feat/nexus-backend` 执行。N0 环境阶段已验收；N1 经 N1-F1 修复后，已在 `9148fba526bf403b9448b50131a3edc145c2229a` 完成编排者独立复验和原 reviewer 复审，纯契约阶段门禁通过。N2 经 F1–F5 修复后，已在 `a1cc1e527e237949e70c3c4b5b333a9f3478260a` 完成编排者独立复验和原 reviewer 复审，协议/模拟及真实 OS fixture 范围的门禁通过。N3 经 F1–F2 修复后，已在 `86a35fa68749eb20f12856c92e20f9ca3b391449` 完成编排者独立复验和原 reviewer 复审，常驻 bridge 与生命周期的真实 IDA E2E（E02 bridge 部分、E03、E05、E06、E07）通过，后续按 N4 推进。本文不表示整个后端迁移或全部真实链路 E2E 已完成。
 
 日期：2026-10-15。
 
@@ -286,6 +286,11 @@ N1/N2 在 bridge 尚未接通时先验收契约和模拟行为，这些结果不
 - 编排者在最终 SHA 独立执行 12 项门禁，全部退出码为 0：fmt、check、全 target Clippy、库测试（465 passed、2 原有 ignored，连续三轮）、nexus_contract 57、nexus_transport 10、nexus_preprocess 12、nexus_fix_regressions 10、nexus_followup_regressions 9、nexus_compat_regressions 1、旧 E2E 编译、diff 检查。编排者各轮动态复现（decoder 饥饿、supervisor 启动窗口、过期控制帧及错误码、缓存失败保留结果，以及 F1 的 7 条回归）在最终 SHA 全部通过，未留下 probe 进程。原 reviewer `f1a0b1bb-c223-46ba-92b6-827ea3eab43b` 确认无新阻断，编排者据此验收 N2。
 - N2 已知限制，不阻断：A1（prewarm 在 open 前观察缓存时，普通 I/O 失败仍会让 prewarm 失败）；B1/B2（MCP 业务成功后编码线程失败返回 tool error，不能证明数据库操作失败，也不允许重放）；对端持续不发换行时响应内存增长到 close/EOF；sBPF 可选错误仍按旧 RPC 字符串前缀分类；MCP 路径的 detect_sbpf_entry 仍另建 Preparation；并发 spawn 归并分支只有源码审查；Linux 分支和逃离自有 process group 的后代清理未在真实 OS 验证。
 - N2 验收证据为 `/tmp/ida-nexus-n2-fix5-parent-20261015.Ge52zK/verification.md` 和 `validation.jsonl`，各轮复验在 `/tmp/ida-nexus-n2-fix*-parent-20261015.*`；实现报告为 `/tmp/ida-nexus-run-20261015.98rmfb/n2*/report.md`。旧 `ida_e2e` 仅编译；E08/E18/E19 的真实 Nexus 链路、native 取消和 N7 跨客户端缓存协调须在 N3 之后补验，不能由 N2 验收替代。
+- N3/N3-F1–F2：输入 `b531c4cf71308d194ad9abc0a3a3e6144bd886c9`。首轮 `83b8aadb569497945226749aafaccf7e0d544ae4` 报告 Nexus 0.13.4 公共客户端在执行连接断开后无法取消原操作；用户 2026-10-15 裁定采用本地客户端补丁。实现 `3c05a512eafc7d0caa63a9d53a89eee6ca7b5d49`；F1 阻塞 `cc59d9a559ff267a705d30ded59ec48c7b290646`（公开 cancel_operation 的 false 无法区分权威答复与传输/解析失败），编排者在同一补丁授权内追加结构化方法 `cancel_operation_outcome`，原方法语义不变；修复 `f56d11695d3260b093bc8b679fc2ff50a76020c5`、F2 `223d720`、`86a35fa68749eb20f12856c92e20f9ca3b391449`。只读 reviewer `2c11b5e2-0854-4386-9427-c14aaaf41028` 的 P1-1～P1-4、P2-5～P2-9 及编排者发现的 G1 均已关闭，无新阻断。
+- 编排者在最终 SHA 用 `env -i` 干净 shell（无 `F1_*`、短 TMPDIR）独立执行 12 项标准门禁，全部退出码为 0（库测试 468 passed、2 原有 ignored，连续四轮；contract 59）；第 13 项 `nexus_bridge_regressions` 按 TESTING 准备 `F1_PYTHON` 后 10 passed，缺少时明确失败。全新环境中补丁红绿对照成立：断连后取消 probe 未打补丁 exit 2、最终补丁 exit 0；歧义 probe 旧补丁 exit 2、最终补丁 exit 0。N0 支持 33、bridge pytest 22、真实 IDA 9.5 生命周期 E2E 9/9（E02、E03、E05、E05 并发普通 open、E06 客户端、E06 bridge、E06 同 router lease SSE 故障、E07 packed、E07 unpacked）；四个环境 cleanup CLEAN，登记进程全部退出。编排者据此验收 N3。
+- N3 已知限制，不阻断：本地补丁 `scripts/nexus/client-cancel-unknown.patch` 需持续维护，只有上游等价修复通过两类 probe 和 N0/N3 重验后才能去除，N9 打包必须携带；E08/E18/E19 的完整真实链路、native 硬停止、GUI/跨平台和 Linux 未验证；缓存准备会完整复制并哈希输入，大型 DSC 的开销留待 N7；当前对无输入副本的旧缓存 IDB 一律拒绝，N4 必须按 E22 方针实现兼容。
+- N2 遗留测试缺陷（测试代码，非生产缺陷），列为 N4 开工的第一个维护提交，修复需附先失败后通过的证据：T1，`tests/support/n2_f1_server.rs` 的 C1 回归对所有场景统一使用 700ms 超时，error 场景没有阻塞点，负载下会误触发 expect；T2，N2-F4 的 prewarm 测试把 Unix socket 建在 TMPDIR 下，TMPDIR 较长时超过 macOS 的 SUN_LEN，门禁结果依赖路径长度。
+- N3 验收证据为 `/tmp/ida-nexus-n3f2-parent-20261016.yjPNYw/verification.md` 和 `validation.jsonl`，前两轮复验在 `/tmp/ida-nexus-n3-parent-20261015.9BMEyf/` 与 `/tmp/ida-nexus-n3f1-parent-20261015.oEP8Oq/`；实现报告为 `/tmp/ida-nexus-run-20261015.98rmfb/n3*/report.md`。
 
 ### N0：工作区、环境和证据基线
 
