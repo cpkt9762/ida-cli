@@ -93,4 +93,13 @@ else:
     if os.environ.get("N3_WRONG_VERSION"):
         original_version = importlib.metadata.version
         importlib.metadata.version = lambda name: "0.13.3" if name == "ida-nexus" else original_version(name)
-    runpy.run_path(str(REPO / "nexus_bridge/bridge.py"), run_name="__main__")
+    runtime = runpy.run_path(str(REPO / "nexus_bridge/bridge.py"), run_name="n4_fixture")
+    invoke = runtime["Bridge"].invoke
+    def record_task(self, channel, attempt, command, deadline, public_started):
+        identity = command.get("identity", {})
+        if command.get("command") == "execute" and identity.get("task_id"):
+            with (env.root / "task-identities.jsonl").open("a") as output:
+                output.write(json.dumps(identity) + "\n")
+        return invoke(self, channel, attempt, command, deadline, public_started)
+    runtime["Bridge"].invoke = record_task
+    runtime["main"]()

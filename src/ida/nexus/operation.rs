@@ -74,6 +74,38 @@ impl<C: Clock> NexusSessions<C> {
         Ok(snapshot)
     }
 
+    /// Metadata-only status. Never clones the business Value under a session lock.
+    pub fn operation_progress(
+        &self,
+        client: &ClientId,
+        identity: &OperationIdentity,
+    ) -> Result<OperationSnapshot, NexusError> {
+        let snapshot = &self.operation(client, identity)?.snapshot;
+        Ok(OperationSnapshot {
+            identity: snapshot.identity.clone(),
+            status: snapshot.status,
+            execution_stopped: snapshot.execution_stopped,
+            cancel_reason: snapshot.cancel_reason,
+            cancel_delivery: self.cancel_delivery(identity),
+            error: snapshot.error.clone(),
+            result: None,
+        })
+    }
+
+    /// Destructive read for the single result consumer; identity/status tombstones
+    /// remain. The JSON allocation is moved out, never cloned while locked.
+    pub fn take_operation_result(
+        &mut self,
+        client: &ClientId,
+        identity: &OperationIdentity,
+    ) -> Result<Option<serde_json::Value>, NexusError> {
+        self.operation(client, identity)?;
+        Ok(self
+            .operations
+            .get_mut(&identity.operation_id)
+            .and_then(|op| op.snapshot.result.take()))
+    }
+
     pub(super) fn occupied(&self, lease: &SessionLease) -> bool {
         self.operations.values().any(|op| {
             op.snapshot.identity.lease.instance_id == lease.instance_id

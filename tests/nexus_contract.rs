@@ -803,3 +803,62 @@ fn f1_stop_proof_is_independent_of_business_outcome_and_preserves_unknown_cause(
         .release(&lease.client_id, &lease, &mut rig.backend)
         .unwrap();
 }
+
+// Baseline adapter: before N4-F1, reading a result was only possible by
+// operation_status(), which clones it. Inherent move API takes precedence.
+#[allow(dead_code)]
+trait BaselineResultRead {
+    fn take_operation_result(
+        &mut self,
+        client: &ClientId,
+        identity: &OperationIdentity,
+    ) -> Result<Option<serde_json::Value>, NexusError>;
+}
+impl<C: Clock> BaselineResultRead for NexusSessions<C> {
+    fn take_operation_result(
+        &mut self,
+        client: &ClientId,
+        identity: &OperationIdentity,
+    ) -> Result<Option<serde_json::Value>, NexusError> {
+        Ok(self.operation_status(client, identity)?.result)
+    }
+}
+#[test]
+fn n4_fix_large_result_is_moved_without_copying_its_allocation() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("move", "owner", 1);
+    let op = rig.queue(&lease, "large", "list_functions", 120);
+    rig.dispatch(&op);
+    let text = "payload".repeat(1024 * 1024);
+    let allocation = text.as_ptr();
+    rig.sessions
+        .complete(&op, Completion::Success(serde_json::Value::String(text)))
+        .unwrap();
+    let progress = rig
+        .sessions
+        .operation_progress(&lease.client_id, &op)
+        .unwrap();
+    assert_eq!(progress.status, OperationStatus::Succeeded);
+    assert!(
+        progress.result.is_none(),
+        "metadata poll cannot contain a business result"
+    );
+    let moved = rig
+        .sessions
+        .take_operation_result(&lease.client_id, &op)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        moved.as_str().unwrap().as_ptr(),
+        allocation,
+        "lock-held result extraction must move the original allocation"
+    );
+    assert!(
+        rig.sessions
+            .operation_status(&lease.client_id, &op)
+            .unwrap()
+            .result
+            .is_none(),
+        "result is consumed exactly once"
+    );
+}

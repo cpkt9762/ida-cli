@@ -85,6 +85,10 @@ pub fn socket_is_live() -> bool {
 }
 
 pub fn clean_stale_imcp_locks() {
+    if std::env::var("IDA_CLI_NEXUS_DEV").as_deref() == Ok("1") {
+        tracing::warn!("IDB lock cleanup skipped: Nexus/external owner absence cannot be proven; deferred to N7");
+        return;
+    }
     if let Ok(entries) = std::fs::read_dir(idb_root()) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -147,6 +151,16 @@ impl Default for IdbStore {
 }
 
 impl IdbStore {
+    fn nexus_gc_deferred(&self) -> bool {
+        if std::env::var("IDA_CLI_NEXUS_DEV").as_deref() == Ok("1") {
+            tracing::warn!(root = %self.root.display(),
+                "IDB GC skipped: Nexus lease/external owner/database lock absence cannot be proven; deferred to N7");
+            true
+        } else {
+            false
+        }
+    }
+
     /// Create a store using the default idb root (`~/.ida/idb/`).
     pub fn new() -> Self {
         let root = idb_root();
@@ -394,6 +408,14 @@ impl IdbStore {
         max_bytes: u64,
         pinned_group_stems: &HashSet<String>,
     ) -> IdbEvictionStats {
+        if self.nexus_gc_deferred() {
+            return IdbEvictionStats {
+                evicted_groups: 0,
+                evicted_files: 0,
+                evicted_bytes: 0,
+                remaining_bytes: self.stats().total_size_bytes,
+            };
+        }
         struct Group {
             files: Vec<PathBuf>,
             bytes: u64,
@@ -482,6 +504,9 @@ impl IdbStore {
     ///
     /// Returns `true` if the entry was found and removed.
     pub fn remove(&self, hash: &str) -> bool {
+        if self.nexus_gc_deferred() {
+            return false;
+        }
         let index_path = self.root.join("index.json");
         let mut index: HashMap<String, IdbEntry> = std::fs::read_to_string(&index_path)
             .ok()
@@ -520,6 +545,9 @@ impl IdbStore {
     ///
     /// Returns the removed entries.
     pub fn clean(&self) -> Vec<IdbEntry> {
+        if self.nexus_gc_deferred() {
+            return Vec::new();
+        }
         let index_path = self.root.join("index.json");
         let mut index: HashMap<String, IdbEntry> = std::fs::read_to_string(&index_path)
             .ok()

@@ -96,7 +96,7 @@ async fn handle_cli_connection(
         matches!(
             primary_name_for(&request.method),
             "status" | "list_tasks" | "task_status" | "cancel_task"
-        )
+        ) || (router.uses_nexus() && primary_name_for(&request.method) == "get_task_status")
     });
     let nexus_shutdown = router.uses_nexus()
         && parsed
@@ -123,6 +123,7 @@ async fn handle_cli_connection(
         Err(e) => RpcResponse::err("null", -32700, format!("Parse error: {e}")),
     };
 
+    let shutdown_accepted = nexus_shutdown && resp.error.is_none();
     let json = if control {
         crate::blocking::run(crate::blocking::WorkClass::Control, move || {
             serde_json::to_vec(&resp)
@@ -137,7 +138,7 @@ async fn handle_cli_connection(
         writer.flush().await
     })
     .await??;
-    if nexus_shutdown {
+    if shutdown_accepted {
         shutdown.cancel();
     }
     Ok(())
@@ -167,7 +168,10 @@ async fn dispatch_cli_request(
     router: &RouterState,
     shutdown: &CancellationToken,
 ) -> (RpcResponse, Option<CliRefGuard>) {
-    let method = primary_name_for(&req.method);
+    let method = match (router.uses_nexus(), primary_name_for(&req.method)) {
+        (true, "get_task_status") => "task_status",
+        (_, method) => method,
+    };
 
     let path = req
         .params
@@ -200,7 +204,13 @@ async fn dispatch_cli_request(
         }
 
         "shutdown" => {
-            router.shutdown_all().await;
+            if router.uses_nexus() {
+                if let Err(error) = router.shutdown_nexus().await {
+                    return (RpcResponse::err(&req.id, -32000, error.to_string()), None);
+                }
+            } else {
+                router.shutdown_all().await;
+            }
             // Trip the service-wide cancel token so the outer transport loop
             // (stdio or HTTP) also exits instead of leaving a zombie server.
             if !router.uses_nexus() {
@@ -473,3 +483,7 @@ mod n2_tests {
         task.await.unwrap().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/n4_socket.rs"]
+mod n4_fix_regressions;

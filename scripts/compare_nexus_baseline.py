@@ -248,10 +248,23 @@ def cases(address, name):
         ("disassemble", {"address":"bad"}), ("disassemble", {"address":"0x0"}),
         ("run_script", {"code":"import sys; print('中文 Ω'); print('错误 stderr',file=sys.stderr)"}),
         ("run_script", {"code":"print('before'); raise ValueError('N4 exception')"}),
+        ("run_script", {"code":"raise ValueError(chr(0)+'hidden')"}),
+        ("run_script", {"code":"raise ValueError('x'*(1024*1024+1))"}),
         ("run_script", {"code":"print('before exit'); raise SystemExit('N4 exit')"}),
         ("run_script", {"code":"global N4_GLOBAL; N4_GLOBAL=42; print('set')"}),
         ("run_script", {"code":"print(N4_GLOBAL)"}),
         ("run_script", {"code":"print('雪'*400000)"})]
+
+
+def json_equal(left, right):
+    """JSON equality including exact scalar types, recursively."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(json_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(json_equal(a, b) for a, b in zip(left, right))
+    return left == right
 
 
 def normalized(response, sample):
@@ -278,9 +291,19 @@ def comparison(env, baseline, binary):
     new_sample = env.root/"fixtures/e04-new"
     shutil.copyfile(sample,new_sample)
     new = Candidate(env,binary,new_sample,"e04")
+    fault_setup = ("import ida_hexrays\n"
+        "assert ida_hexrays.init_hexrays_plugin()\n"
+        "class N4Fault(ida_hexrays.Hexrays_Hooks):\n"
+        "    def microcode(self, mba):\n"
+        f"        return ida_hexrays.MERR_BADSP if mba.entry_ea == {int(address,16)} else 0\n"
+        "N4_FAULT = N4Fault()\nassert N4_FAULT.hook()")
+    matrix = cases(address, name) + [
+        ("run_script", {"code":fault_setup}),
+        ("decompile_function", {"address":[address, funcs[1]["address"]]}),
+        ("run_script", {"code":"assert N4_FAULT.unhook(); del N4_FAULT"})]
     observations = []
     try:
-        for method, params in cases(address,name):
+        for method, params in matrix:
             expected = old.rpc(method,params)
             expected.pop("jsonrpc",None); expected.pop("id",None)
             actual = new.direct(method,params)
@@ -289,14 +312,17 @@ def comparison(env, baseline, binary):
                 assert actual.get("exit") == 1, actual
                 assert actual["error"] == "Error: " + expected["error"]["message"], (method,expected,actual)
             else:
-                assert normalized(expected,sample) == normalized(actual,new_sample), (method,params,expected,actual)
+                assert json_equal(normalized(expected,sample), normalized(actual,new_sample)), (method,params,expected,actual)
+            if method == "decompile_function" and params.get("address") == [address, funcs[1]["address"]]:
+                results = expected["result"]["results"]
+                assert "error" in results[0] and "code" in results[1], results
             observations.append({"method":method,"params":params,"status":"PASS","baseline":expected,"nexus":actual})
     finally:
         (env.root/"comparison.json").write_text(json.dumps({"baseline_sha256":digest(baseline),"observations":observations,
             "differences":[{"field":"input_file_path","rule":"must resolve to exact identical input SHA256; path alone normalized"}]},ensure_ascii=False,indent=2)+"\n")
         old.rpc("close"); old.rpc("shutdown"); old.wait()
         new.stop()
-    assert len(observations) == len(cases(address,name))
+    assert len(observations) == len(matrix)
     return {"comparisons":len(observations),"methods":sorted({m for m,_ in cases(address,name)})}
 
 
@@ -311,6 +337,18 @@ def entrypoints(env, binary):
     matrix = [(m,p) for m,p in cases(functions[0]["address"],functions[0]["name"])
               if (m,p) not in (("list_functions",{"limit":-1}),("list_functions",{"offset":"bad"}))]
     expected = [http.call(m,p) for m,p in matrix]
+    queued = http.direct("enqueue", {"method":"run_script", "task_params":{"code":"print('queued identity')"}})["result"]
+    task_id = queued["task_id"]
+    deadline = time.monotonic() + 10
+    while True:
+        task = http.direct("task_status", {"task_id":task_id})["result"]
+        if task["status"] == "completed":
+            break
+        assert task["status"] != "failed" and time.monotonic() < deadline, task
+        time.sleep(.02)
+    assert task["result"]["stdout"] == "queued identity\n", task
+    identities = [json.loads(line) for line in (env.root/"task-identities.jsonl").read_text().splitlines()]
+    assert any(identity["task_id"] == task_id for identity in identities), identities
     # A second HTTP MCP session independently opens the same canonical IDB.
     other = Http(http.client.port)
     response = other.call("open_idb",{"path":str(sample)})["result"]
@@ -325,14 +363,14 @@ def entrypoints(env, binary):
             if "error" in baseline:
                 assert direct.get("exit") == 1 and direct["error"] == "Error: "+baseline["error"], (baseline,direct)
             else:
-                assert normalized(direct,sample) == normalized(baseline,sample),(method,baseline,direct)
+                assert json_equal(normalized(direct,sample), normalized(baseline,sample)),(method,baseline,direct)
         std_sample=env.root/"fixtures/e16-stdio"
         shutil.copyfile(sample,std_sample)
         stdio=Candidate(env,binary,std_sample,"e16-stdio","stdio")
         try:
             for (method,params), baseline in zip(matrix,expected):
                 actual=stdio.call(method,params)
-                assert normalized(actual,std_sample)==normalized(baseline,sample),(method,baseline,actual)
+                assert json_equal(normalized(actual,std_sample), normalized(baseline,sample)),(method,baseline,actual)
             for candidate in (http,stdio):
                 refusal=candidate.call("rename_symbol",{"address":functions[0]["address"],"new_name":"FORBIDDEN"})
                 assert "not implemented by Nexus N4" in refusal["error"],refusal

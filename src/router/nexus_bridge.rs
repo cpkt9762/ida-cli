@@ -35,13 +35,62 @@ struct State {
     pending: Mutex<HashMap<u64, Pending>>,
     leases: Mutex<HashMap<LeaseId, SessionLease>>,
     events: broadcast::Sender<Value>,
+    open_replies: Mutex<HashMap<OperationId, tokio::sync::oneshot::Sender<Value>>>,
+    open_reply_capacity: usize,
     failed: std::sync::atomic::AtomicBool,
     stop: tokio_util::sync::CancellationToken,
 }
 impl State {
+    fn open_reply(
+        &self,
+        id: &OperationId,
+    ) -> anyhow::Result<tokio::sync::oneshot::Receiver<Value>> {
+        let mut replies = self.open_replies.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            !self.failed.load(std::sync::atomic::Ordering::Acquire),
+            "bridge disconnected"
+        );
+        anyhow::ensure!(
+            replies.len() < self.open_reply_capacity && !replies.contains_key(id),
+            "Busy: open reply capacity or duplicate identity"
+        );
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        replies.insert(id.clone(), sender);
+        Ok(receiver)
+    }
     fn emit(&self, event: Value) {
         tracing::debug!(event = event["event"].as_str(), attempt = ?event.get("attempt"), lease = ?event.get("lease"), "Nexus bridge lifecycle");
-        let _ = self.events.send(event); // Subscribers are optional; N1 is authoritative.
+        // Open transfers lease responsibility: diagnostic broadcast may lag,
+        // but a registered supervisor must receive its exact terminal outcome.
+        if matches!(
+            event["event"].as_str(),
+            Some("opened" | "failed" | "uncertain")
+        ) && event["attempt"]["target"]["kind"] == "open"
+        {
+            if let Some(id) = event["attempt"]["target"]["identity"]["operation_id"].as_str() {
+                if let Ok(id) = OperationId::new(id) {
+                    if let Some(sender) = self
+                        .open_replies
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id)
+                    {
+                        let _ = sender.send(event.clone());
+                    }
+                }
+            }
+        }
+        if event["event"] == "bridge_disconnected" {
+            for (_, sender) in self
+                .open_replies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain()
+            {
+                let _ = sender.send(event.clone());
+            }
+        }
+        let _ = self.events.send(event); // Diagnostics only; N1 remains authoritative.
     }
     fn fail(&self, reason: &str) {
         if self.failed.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -160,6 +209,8 @@ impl NexusBridge {
             pending: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
             events,
+            open_replies: Mutex::new(HashMap::new()),
+            open_reply_capacity: capacity,
             failed: std::sync::atomic::AtomicBool::new(false),
             stop: tokio_util::sync::CancellationToken::new(),
         });
@@ -184,6 +235,10 @@ impl NexusBridge {
                     .collect();
                 ticking.endpoint.transition(|s, t| {
                     for op in operations {
+                        if s.operation_progress(&op.lease.client_id, &op)
+                            .is_ok_and(|snapshot| snapshot.status.is_terminal() && snapshot.execution_stopped) {
+                            continue;
+                        }
                         if let Err(error) = s.expire(&op.lease.client_id, &op, t) {
                             tracing::debug!(%error, operation_id=op.operation_id.as_str(), "bridge deadline poll");
                         }
@@ -202,6 +257,19 @@ impl NexusBridge {
     }
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.state.events.subscribe()
+    }
+    pub fn open_reply(
+        &self,
+        id: &OperationId,
+    ) -> anyhow::Result<tokio::sync::oneshot::Receiver<Value>> {
+        self.state.open_reply(id)
+    }
+    pub fn forget_open_reply(&self, id: &OperationId) {
+        self.state
+            .open_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
     }
     pub fn endpoint(&self) -> NexusEndpoint {
         self.state.endpoint.clone()
@@ -715,3 +783,7 @@ fn invalid(message: &str) -> NexusError {
 fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, NexusError> {
     serde_json::from_value(value).map_err(|error| invalid(&error.to_string()))
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/n4_bridge.rs"]
+mod n4_fix_regressions;

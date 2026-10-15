@@ -22,7 +22,8 @@ import ida_nexus.handle as handle_module
 
 def barrier(name):
     (ROOT / (name + ".arrived")).touch()
-    until = time.monotonic() + 4
+    # File barriers include test-process scheduling/startup, not response latency.
+    until = time.monotonic() + 15
     while not (ROOT / (name + ".release")).exists():
         if time.monotonic() > until:
             raise TimeoutError("fixture barrier " + name)

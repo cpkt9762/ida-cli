@@ -10,7 +10,7 @@ METHODS = ("get_database_info", "get_analysis_status", "list_functions",
            "disassemble_function_at", "decompile_function", "run_script")
 
 
-def processor_name():
+def _processor_long_name():
     """Read the public IDA 9.5 SDK processor_t prefix, absent from IDAPython.
 
     SDK idp.hpp declares get_ph(), psnames/plnames and get_proc_index().
@@ -22,8 +22,12 @@ def processor_name():
     import ida_idp
     import ida_kernwin
 
-    if ida_kernwin.get_kernel_version() != "9.5":
-        raise RuntimeError("processor long-name SDK adapter requires IDA 9.5")
+    version = ida_kernwin.get_kernel_version()
+    if version != "9.5":
+        import logging
+        logging.getLogger(__name__).warning(
+            "IDA %s processor_t ABI unverified; using public short processor name", version)
+        return ida_ida.inf_get_procname()
 
     class Prefix(ctypes.Structure):
         _fields_ = [("version", ctypes.c_int32), ("id", ctypes.c_int32),
@@ -55,6 +59,19 @@ def processor_name():
     if short.decode("utf-8").lstrip("-") != ida_ida.inf_get_procname():
         raise RuntimeError("public SDK processor subtype does not match database")
     return long.decode("utf-8")
+
+
+def processor_name():
+    import ida_ida
+    import ida_kernwin
+    try:
+        return _processor_long_name()
+    except (RuntimeError, AttributeError, OSError) as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "IDA %s processor_t ABI unverified (%s); using public short processor name",
+            ida_kernwin.get_kernel_version(), exc)
+        return ida_ida.inf_get_procname()
 
 
 def invoke(method, params):
@@ -147,7 +164,12 @@ def invoke(method, params):
     if method in ("disassemble", "decompile_function") and isinstance(params.get("address"), list):
         results = []
         for ea in params["address"]:
-            item = invoke(method, dict(params, address=ea, _multiple=True))
+            try:
+                item = invoke(method, dict(params, address=ea, _multiple=True))
+            except Exception as exc:
+                # Match native per-item ToolError presentation, without swallowing
+                # BaseException (in particular Nexus cancellation).
+                item = failure("IDA error: " + str(exc))
             entry = {"address": hex(ea)}
             entry.update(item["value"] if item["ok"] else {"error": item["error"]})
             results.append(entry)
@@ -242,7 +264,17 @@ def invoke(method, params):
             func = ida_funcs.get_func(ea)
             if not func:
                 return failure(f"Function not found at address {ea:#x}")
-            code = str(ida_hexrays.decompile(func))
+            try:
+                problem = ida_hexrays.hexrays_failure_t()
+                result = ida_hexrays.decompile(func, problem,
+                    ida_hexrays.DECOMP_NO_WAIT | ida_hexrays.DECOMP_NO_CACHE)
+                if result is None:
+                    return failure("IDA error: " + problem.desc())
+                import ida_lines
+                code = "".join(ida_lines.tag_remove(line.line) + "\n"
+                               for line in result.get_pseudocode())
+            except Exception as exc:
+                return failure("IDA error: " + str(exc))
             signature = next((line for line in code.splitlines() if line.strip()
                               and not line.strip().startswith(("//", "/*")) and "(" in line), "")
             if not params.get("_multiple") and any(name in signature for name in ("sub_", "nullsub_", "j_sub_")):
@@ -265,7 +297,7 @@ def invoke(method, params):
                 exec("\n" * 10 + "exec(_mcp_code_input)", __main__.__dict__)
             except Exception as exc:
                 message = str(exc)
-                success = not bool(message)  # N0 treats an empty error string as success.
+                success = not bool(message.split("\0", 1)[0])  # Native C-string test.
             except (SystemExit, KeyboardInterrupt) as exc:
                 success = False
                 message = "failed to execute wrapper: " + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__.tb_next))
@@ -280,9 +312,10 @@ def invoke(method, params):
 
         out, err = truncate(stdout.getvalue()), truncate(stderr.getvalue())
         value = {"success": success, "stdout": out, "stderr": err}
+        message = truncate(message) if message else None
         summary = message.strip() if message and message.strip() else next((line.strip() for line in reversed(err.splitlines()) if line.strip()), None)
         if message:
-            value["error"] = truncate(message)
+            value["error"] = message
         elif not success and summary:
             value["error"] = summary
         if summary:

@@ -2233,6 +2233,9 @@ impl RouterState {
         dedupe_key: Option<String>,
     ) -> Result<serde_json::Value, crate::error::ToolError> {
         use crate::error::ToolError;
+        if self.uses_nexus() {
+            nexus_tools::Tools::require(crate::tool_registry::primary_name_for(method))?;
+        }
 
         let tenant_id = Self::normalize_tenant(tenant_id.as_deref());
         let mut queue = self.route_queue.lock().await;
@@ -2326,6 +2329,9 @@ impl RouterState {
         dedupe_key: Option<String>,
     ) -> Result<serde_json::Value, crate::error::ToolError> {
         use crate::error::ToolError;
+        if self.uses_nexus() {
+            nexus_tools::Tools::require(crate::tool_registry::primary_name_for(method))?;
+        }
 
         let tenant_id = Self::normalize_tenant(tenant_id.as_deref());
         let nodes = self.federation_nodes_snapshot().await;
@@ -2650,7 +2656,7 @@ impl RouterState {
 
             let state = self.clone();
             tokio::spawn(async move {
-                let result = async {
+                let work = async {
                     let (handle, token) = state
                         .ensure_worker_prepared(
                             &task.path,
@@ -2668,8 +2674,15 @@ impl RouterState {
                             task.preparation.clone(),
                         )
                         .await
-                }
-                .await;
+                };
+                let result = if state.uses_nexus() {
+                    match crate::nexus::TaskId::new(task.task_id.clone()) {
+                        Ok(task_id) => nexus_tools::CURRENT_TASK_ID.scope(task_id, work).await,
+                        Err(error) => Err(error.into()),
+                    }
+                } else {
+                    work.await
+                };
 
                 let mut queue = state.route_queue.lock().await;
                 queue.active.remove(&task.task_id);
@@ -2709,6 +2722,10 @@ impl RouterState {
         }
     }
 
+    pub async fn shutdown_nexus(&self) -> Result<(), crate::error::ToolError> {
+        self.nexus_tools.shutdown(self).await
+    }
+
     async fn prune_caches(&self) {
         let warm_pool = self.warm_pool.lock().await;
         let pinned_groups: HashSet<String> = warm_pool
@@ -2720,8 +2737,12 @@ impl RouterState {
 
         let idb_limit = self.config.max_idb_cache_bytes;
         let response_limit = self.config.max_response_cache_bytes;
+        let nexus = self.uses_nexus();
         if let Err(e) = crate::blocking::run(crate::blocking::WorkClass::Metadata, move || {
-            let _ = crate::idb_store::IdbStore::new().evict_to_limit(idb_limit, &pinned_groups);
+            // N7 must coordinate ownership and database locks before IDB GC.
+            if !nexus {
+                let _ = crate::idb_store::IdbStore::new().evict_to_limit(idb_limit, &pinned_groups);
+            }
             let _ = crate::server::response_cache::prune_to_limit(response_limit);
         })
         .await
@@ -3344,3 +3365,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../../tests/support/n2_f1_router.rs"]
 pub(crate) mod n2_f1_regressions;
+
+#[cfg(test)]
+#[path = "../../tests/support/n4_router.rs"]
+pub(crate) mod n4_fix_regressions;

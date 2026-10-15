@@ -184,7 +184,7 @@ timeout 210s "$N4_ROOT/venv/bin/python" scripts/verify_nexus_e2e.py \
   --ipc-root /tmp/n4-contract --suite contract --baseline "$N0_BASELINE"
 ```
 
-The suite has four actual tests and four distinct PASS records: E04 compares 33
+The suite has four actual tests and four distinct PASS records: E04 compares 38
 cases across all twelve initial methods; E16 exercises the shared runtime/error
 cases through CLI, stdio MCP and HTTP MCP, including independent HTTP close tokens;
 E17 checks Unicode, separate streams, script errors, concurrent response identity,
@@ -199,6 +199,29 @@ logs and the process ledger provide evidence. The baseline error presentation an
 cache envelopes remain transport-specific: CLI writes large JSON to its cache, while
 MCP retains its existing inline response. Only input path spelling is normalized,
 after verifying identical SHA256; output structure and text are compared exactly.
+
+N4-F1 also runs `timeout 30s python3 tests/test_nexus_n4_fix.py -v` for
+per-item decompiler exceptions, script C-string/truncation behavior, unverified
+processor ABI availability and recursive JSON type equality. Rust regressions
+cover zero-limit Nexus GC, rejected shutdown, enqueue admission/task identity,
+lossless open delivery under injected broadcast lag, result allocation ownership,
+and both event orders. The event helper buffers unmatched events; startup/barrier
+budgets (15s) are distinct from response budgets (5s). Each verification records
+`uptime`; failures are retained instead of being hidden by retries.
+
+E04 includes N0 binary comparisons for NUL-leading and over-limit script errors,
+and a public Hexrays_Hooks fault on an existing function: that item must fail while
+a second valid function still decompiles. JSON scalar types and nested types must
+match exactly. Only the already documented verified input path is normalized.
+
+Known limits: run_script uses process-level __main__; clients and leases sharing
+an owner share script globals, which closing a lease does not clear. This matches
+the old per-IDB worker and is intended for trusted scripts, without client
+isolation. E22's last original-IDB hash check and final open are not atomic;
+the local path gate does not cover external openers. N7 owns that coordination.
+Nexus disables old automatic IDB GC and conservatively refuses explicit deletion
+without ownership/lock absence proof. Unverified processor ABIs use the public
+short name with an IDA-version warning; the verified 9.5 E04 stays exact.
 
 ## Nexus N0 isolation and baseline
 
@@ -361,4 +384,4 @@ future Nexus bridge.
 - `timeout 30s cargo test --locked --test nexus_bridge_regressions -- --test-threads=1`：4 条基线失败，覆盖 ACK 早于断流、停止先于 uncertain、单 lease 断连、CLI 控制容量耗尽。
 - `timeout 30s cargo test --locked --lib router::nexus_bridge::cache::f1_regressions -- --test-threads=1`：3 条基线失败，覆盖取消赢得发布、路径/内容快照不一致、已有 IDB 无输入证明。
 
-后续 F1 获授权增加结构化公开取消结果，补齐 P1-1/P2-6 双通道贯通回归；F2 再覆盖早到 open 断连和到期后停止证明。当前预期为上文 gate 13 的十项全部通过。旧 `n3-fix1/check-env.sh` 的 `F1_PYTHON` 指向旧补丁 baseline-env，仅用于基线诊断；F1 最终验证命令显式覆盖为 continuation/probe-final-root 指向的新补丁 venv（早期绿例为 probe-v2-root）。F2 重新 prepare 新环境，不能直接 source 旧脚本充当最终验证。
+后续 F1 获授权增加结构化公开取消结果，补齐 P1-1/P2-6 双通道贯通回归；F2 再覆盖早到 open 断连和到期后停止证明。当前预期为上文 gate 13 的原十项回归保留；N4-F1 另加两项确定性事件助手回归。旧 `n3-fix1/check-env.sh` 的 `F1_PYTHON` 指向旧补丁 baseline-env，仅用于基线诊断；F1 最终验证命令显式覆盖为 continuation/probe-final-root 指向的新补丁 venv（早期绿例为 probe-v2-root）。F2 重新 prepare 新环境，不能直接 source 旧脚本充当最终验证。

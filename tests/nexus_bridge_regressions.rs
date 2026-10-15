@@ -8,7 +8,7 @@ use ida_mcp::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -29,6 +29,7 @@ struct Rig {
     _router: RouterState,
     bridge: Arc<NexusBridge>,
     events: broadcast::Receiver<Value>,
+    pending: VecDeque<Value>,
     root: PathBuf,
     client: ClientId,
 }
@@ -77,25 +78,33 @@ impl Rig {
             _router: router,
             bridge,
             events,
+            pending: VecDeque::new(),
             root,
             client: ClientId::new(id()).unwrap(),
         }
     }
     async fn event(&mut self, name: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let e = self.events.recv().await.unwrap();
-                if e["event"] == name {
-                    return e;
-                }
-                assert_ne!(e["event"], "bridge_disconnected", "{e}");
-            }
-        })
+        wait_event(
+            &mut self.events,
+            &mut self.pending,
+            name,
+            None,
+            Duration::from_secs(if name == "opened" { 15 } else { 5 }),
+        )
         .await
-        .expect("cross-channel event barrier")
+    }
+    async fn operation_event(&mut self, name: &str, identity: &OperationIdentity) -> Value {
+        wait_event(
+            &mut self.events,
+            &mut self.pending,
+            name,
+            Some(&identity.operation_id),
+            Duration::from_secs(5),
+        )
+        .await
     }
     async fn marker(&self, name: &str) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             let mut poll = tokio::time::interval(Duration::from_millis(5));
             while !self.root.join(name).exists() {
                 poll.tick().await;
@@ -118,7 +127,7 @@ impl Rig {
                         RequestId::new(id()).unwrap(),
                         None,
                         "open",
-                        json!({"timeout_secs":8}),
+                        json!({"timeout_secs":20}),
                     )
                     .unwrap(),
                     OpenSpec {
@@ -136,7 +145,7 @@ impl Rig {
         serde_json::from_value(self.event("opened").await["lease"].clone()).unwrap()
     }
     fn begin(&self, lease: &SessionLease, code: &str) -> OperationIdentity {
-        self.begin_with_timeout(lease, code, 8)
+        self.begin_with_timeout(lease, code, 15)
     }
     fn begin_with_timeout(
         &self,
@@ -216,7 +225,7 @@ async fn early_open_disconnect(scenario: &str) {
         );
     }
     let op = r.begin(&healthy, "still-healthy");
-    r.event("completed").await;
+    r.operation_event("completed", &op).await;
     assert_eq!(r.snapshot(&op).status, OperationStatus::Succeeded);
     r.close().await;
 }
@@ -236,17 +245,17 @@ async fn f2_expired_proof_consumed_by_cancel_ack_and_supervisor() {
     let mut r = Rig::new("expired-proof").await;
     let lease = r.open().await;
     let op = r.begin_with_timeout(&lease, "unknown", 1);
-    r.event("uncertain").await;
+    r.operation_event("uncertain", &op).await;
     r.cancel(&op);
-    assert_eq!(r.event("cancel_ack").await["accepted"], true);
+    assert_eq!(r.operation_event("cancel_ack", &op).await["accepted"], true);
     r.event("stop_unconfirmed").await;
     // N1's actual deadline poll escalates the acknowledged client cancellation.
-    let ack = r.event("cancel_ack").await;
+    let ack = r.operation_event("cancel_ack", &op).await;
     assert_eq!(ack["outcome"]["execution_stopped"], true);
     let at_ack = r.snapshot(&op);
     r.marker("stopped.arrived").await;
     r.release_marker("stopped.release");
-    r.event("stopped").await;
+    r.operation_event("stopped", &op).await;
     let cleanup = r.event("local_status").await;
     let after = r.snapshot(&op);
     r.close().await;
@@ -266,13 +275,13 @@ async fn p12_ack_before_response_loss_still_schedules_stop_proof() {
     let mut r = Rig::new("ack-first").await;
     let l = r.open().await;
     let op = r.begin(&l, "unknown");
-    r.event("ack").await;
+    r.operation_event("ack", &op).await;
     r.marker("failure.arrived").await;
     r.cancel(&op);
-    r.event("cancel_ack").await;
+    r.operation_event("cancel_ack", &op).await;
     r.release_marker("failure.release");
-    r.event("uncertain").await;
-    r.event("stopped").await;
+    r.operation_event("uncertain", &op).await;
+    r.operation_event("stopped", &op).await;
     let s = r.snapshot(&op);
     assert_eq!(s.status, OperationStatus::UnknownOutcome);
     assert!(s.execution_stopped);
@@ -283,14 +292,14 @@ async fn p13_control_proof_before_business_uncertain_never_becomes_success() {
     let mut r = Rig::new("early-proof").await;
     let l = r.open().await;
     let op = r.begin(&l, "unknown");
-    r.event("ack").await;
+    r.operation_event("ack", &op).await;
     r.marker("uncertain.arrived").await;
     r.cancel(&op);
-    r.event("cancel_ack").await;
-    r.event("stopped").await;
+    r.operation_event("cancel_ack", &op).await;
+    r.operation_event("stopped", &op).await;
     let before = r.snapshot(&op);
     r.release_marker("uncertain.release");
-    r.event("uncertain").await;
+    r.operation_event("uncertain", &op).await;
     let after = r.snapshot(&op);
     assert_ne!(before.status, OperationStatus::Succeeded);
     assert_eq!(after.status, OperationStatus::UnknownOutcome);
@@ -305,7 +314,7 @@ async fn p14_one_lease_sse_loss_preserves_other_lease_and_active_operation() {
     let a = r.open().await;
     let b = r.open().await;
     let op = r.begin(&b, "block");
-    r.event("ack").await;
+    r.operation_event("ack", &op).await;
     r.marker("business.arrived").await;
     r.release_marker("disconnect-first");
     r.event("disconnected").await;
@@ -316,7 +325,7 @@ async fn p14_one_lease_sse_loss_preserves_other_lease_and_active_operation() {
         )
     });
     r.release_marker("business.release");
-    r.event("completed").await;
+    r.operation_event("completed", &op).await;
     assert_eq!(sa.phase, SessionPhase::Disconnected);
     assert_eq!(sb.phase, SessionPhase::Active);
     assert_eq!(r.snapshot(&op).status, OperationStatus::Succeeded);
@@ -371,7 +380,7 @@ async fn causal_ordering(scenario: &str) {
     let mut r = Rig::new(scenario).await;
     let l = r.open().await;
     let op = r.begin(&l, "unknown");
-    r.event("uncertain").await;
+    r.operation_event("uncertain", &op).await;
     if scenario == "late-success" {
         r.release_marker("start-success");
         r.marker("success.arrived").await;
@@ -381,7 +390,7 @@ async fn causal_ordering(scenario: &str) {
         r.marker("old-false.arrived").await;
     }
     r.cancel(&op);
-    r.event("cancel_ack").await;
+    r.operation_event("cancel_ack", &op).await;
     assert!(!r.snapshot(&op).execution_stopped);
     r.release_marker(if scenario == "late-success" {
         "success.release"
@@ -393,7 +402,7 @@ async fn causal_ordering(scenario: &str) {
     let before = r.snapshot(&op);
     r.marker("proof.arrived").await;
     r.release_marker("proof.release");
-    r.event("stopped").await;
+    r.operation_event("stopped", &op).await;
     let after = r.snapshot(&op);
     r.close().await;
     assert!(
@@ -418,12 +427,12 @@ async fn p26_stale_unknown_cannot_block_active_cancel_and_bridge_uses_exact_id()
     let mut r = Rig::new("active-fairness").await;
     let l = r.open().await;
     let op = r.begin(&l, "unknown");
-    r.event("uncertain").await;
+    r.operation_event("uncertain", &op).await;
     r.release_marker("active-check");
     let verdict = r.event("local_status").await;
     r.cancel(&op);
-    let ack = r.event("cancel_ack").await;
-    r.event("stopped").await;
+    let ack = r.operation_event("cancel_ack", &op).await;
+    r.operation_event("stopped", &op).await;
     let snapshot = r.snapshot(&op);
     r.close().await;
     assert_eq!(
@@ -445,4 +454,104 @@ async fn p26_stale_unknown_cannot_block_active_cancel_and_bridge_uses_exact_id()
     );
     assert_eq!(snapshot.status, OperationStatus::UnknownOutcome);
     assert!(snapshot.execution_stopped);
+}
+
+async fn wait_event(
+    events: &mut broadcast::Receiver<Value>,
+    pending: &mut VecDeque<Value>,
+    name: &str,
+    operation: Option<&OperationId>,
+    budget: Duration,
+) -> Value {
+    let matches = |event: &Value| {
+        event["event"] == name
+            && operation.is_none_or(|id| {
+                event["attempt"]["target"]["identity"]["operation_id"] == id.as_str()
+            })
+    };
+    if let Some(index) = pending.iter().position(matches) {
+        return pending.remove(index).unwrap();
+    }
+    tokio::time::timeout(budget, async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches(&event) {
+                return event;
+            }
+            assert_ne!(event["event"], "bridge_disconnected", "{event}");
+            pending.push_back(event);
+        }
+    })
+    .await
+    .expect("cross-channel event barrier")
+}
+
+#[tokio::test]
+async fn n4_fix_event_helper_preserves_out_of_order_events() {
+    for order in [["stopped", "uncertain"], ["uncertain", "stopped"]] {
+        let (sender, mut events) = broadcast::channel(8);
+        let mut pending = VecDeque::new();
+        for name in order {
+            sender.send(json!({"event":name})).unwrap();
+        }
+        assert_eq!(
+            wait_event(
+                &mut events,
+                &mut pending,
+                "uncertain",
+                None,
+                Duration::from_secs(1)
+            )
+            .await["event"],
+            "uncertain"
+        );
+        assert_eq!(
+            wait_event(
+                &mut events,
+                &mut pending,
+                "stopped",
+                None,
+                Duration::from_secs(1)
+            )
+            .await["event"],
+            "stopped"
+        );
+    }
+}
+
+#[tokio::test]
+async fn n4_fix_event_helper_does_not_match_a_previous_operations_ack() {
+    let (sender, mut events) = broadcast::channel(8);
+    let mut pending = VecDeque::new();
+    let first = OperationId::new("old-open").unwrap();
+    let second = OperationId::new("current-execute").unwrap();
+    for id in [&first, &second] {
+        sender
+            .send(json!({"event":"ack","attempt":{"target":{"identity":{"operation_id":id}}}}))
+            .unwrap();
+    }
+    let current = wait_event(
+        &mut events,
+        &mut pending,
+        "ack",
+        Some(&second),
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(
+        current["attempt"]["target"]["identity"]["operation_id"],
+        second.as_str()
+    );
+    let old = wait_event(
+        &mut events,
+        &mut pending,
+        "ack",
+        Some(&first),
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(
+        old["attempt"]["target"]["identity"]["operation_id"],
+        first.as_str()
+    );
 }

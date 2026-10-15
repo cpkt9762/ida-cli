@@ -25,6 +25,8 @@ pub const METHODS: &[&str] = &[
     "decompile_function",
     "run_script",
 ];
+tokio::task_local! { pub(crate) static CURRENT_TASK_ID: TaskId; }
+
 static IDS: AtomicU64 = AtomicU64::new(1);
 fn id() -> String {
     format!(
@@ -103,7 +105,7 @@ impl Tools {
                 });
             worker.ref_count += 1;
             worker.pending_requests += operations.iter().filter(|identity| identity.lease == db.lease).filter(|identity| {
-                match endpoint.transition(|s,_|s.operation_status(&identity.lease.client_id,identity)) {
+                match endpoint.transition(|s,_|s.operation_progress(&identity.lease.client_id,identity)) {
                     Ok(snapshot) => !snapshot.status.is_terminal() || !snapshot.execution_stopped,
                     Err(error) => { tracing::warn!(%error,"Nexus status could not confirm tracked operation stopped"); true }
                 }
@@ -184,9 +186,14 @@ impl Tools {
         // A dropped caller still has a bounded supervisor owning its open attempt.
         let mut cancelled = preparation.cancel_on_drop();
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        let task_id = CURRENT_TASK_ID.try_with(Clone::clone).ok();
         tokio::spawn(async move {
             let _permit = permit;
-            let result = tools.open_owned(&router, path, preparation).await;
+            let work = tools.open_owned(&router, path, preparation);
+            let result = match task_id {
+                Some(task_id) => CURRENT_TASK_ID.scope(task_id, work).await,
+                None => work.await,
+            };
             let reference = result
                 .as_ref()
                 .ok()
@@ -234,32 +241,49 @@ impl Tools {
         )
         .await?;
         let bridge = Self::bridge(router).await?;
-        let mut events = bridge.subscribe();
         let client = ClientId::new(id())?;
+        let operation_id = OperationId::new(id())?;
+        let mut reply = bridge.open_reply(&operation_id).map_err(diagnostic)?;
         let identity = bridge.endpoint().transition(|s, t| {
             s.open(
                 &client,
                 accepted,
                 OpenSpec {
-                    operation_id: OperationId::new(id())?,
+                    operation_id: operation_id.clone(),
                     path: prepared.path.to_string_lossy().into_owned(),
                     options: prepared.options.clone(),
                 },
                 t,
             )
-        })?;
+        });
+        let identity = match identity {
+            Ok(identity) => identity,
+            Err(error) => {
+                bridge.forget_open_reply(&operation_id);
+                return Err(error.into());
+            }
+        };
         prepared.handed_off();
         let mut cancelled = false;
         loop {
             tokio::select! {
                 biased;
                 _ = preparation.cancel.cancelled(), if !cancelled => {
-                    bridge.endpoint().transition(|s,_| s.cancel_open(&client, &identity))?;
+                    let cancellation = bridge.endpoint().transition(|s,_| s.cancel_open(&client, &identity));
+                    match cancellation {
+                        Ok(_) => {},
+                        // N1 may already have acquired the lease before its
+                        // reliable reply is polled. Keep responsibility here.
+                        Err(error) if error.code == NexusErrorCode::InvalidTransition => {},
+                        Err(error) => return Err(error.into()),
+                    }
                     cancelled = true;
                 }
-                event = events.recv() => {
-                    let event = receive(event)?;
-                    if event["attempt"]["target"]["identity"]["operation_id"] != identity.operation_id.as_str() { continue; }
+                event = &mut reply => {
+                    let event = event.map_err(diagnostic)?;
+                    if event["event"] == "bridge_disconnected" {
+                        return Err(diagnostic("bridge disconnected; open outcome retained by N1; never replay"));
+                    }
                     match event["event"].as_str() {
                         Some("opened") => {
                             let lease: SessionLease = serde_json::from_value(event["lease"].clone()).map_err(diagnostic)?;
@@ -269,7 +293,10 @@ impl Tools {
                             }
                             let handle = id();
                             let token = id();
-                            let idb = event["idb_path"].as_str().ok_or_else(|| diagnostic("open missing IDB path"))?.to_string();
+                            let idb = match event["idb_path"].as_str() {
+                                Some(path) => path.to_string(),
+                                None => { release(&bridge, &lease).await?; return Err(diagnostic("open missing IDB path; lease released")); }
+                            };
                             let pid = event["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
                             self.records().insert(handle.clone(), Database { path: canonical, lease, idb, token: token.clone(), pid, opened_at: Instant::now() });
                             return Ok((handle,token));
@@ -353,7 +380,7 @@ impl Tools {
         }
         loop {
             let snapshot = endpoint
-                .transition(|s, _| s.operation_status(&database.lease.client_id, &identity))?;
+                .transition(|s, _| s.operation_progress(&database.lease.client_id, &identity))?;
             if snapshot.status.is_terminal() {
                 guard.identity.take();
                 if snapshot.execution_stopped {
@@ -368,12 +395,14 @@ impl Tools {
                         .map(ToolError::Nexus)
                         .unwrap_or_else(|| diagnostic("operation ended without a result")));
                 }
-                let result = snapshot
-                    .result
+                let mut result = endpoint
+                    .transition(|s, _| {
+                        s.take_operation_result(&database.lease.client_id, &identity)
+                    })?
                     .ok_or_else(|| diagnostic("operation result missing"))?;
-                let value = &result["result"];
+                let value = &mut result["result"];
                 if value["ok"] == true {
-                    return Ok(value["value"].clone());
+                    return Ok(value["value"].take());
                 }
                 return Err(business_error(
                     value["error"]
@@ -384,11 +413,11 @@ impl Tools {
             tokio::select! {
                 biased;
                 _ = preparation.cancel.cancelled() => {
-                    endpoint.transition(|s,t| s.cancel(&database.lease.client_id,&identity,CancelReason::Client,t))?;
+                    cancel_pending(&endpoint, &identity, CancelReason::Client)?;
                     return Err(diagnostic("cancel requested; execution_stopped=false; never replay"));
                 }
                 _ = tokio::time::sleep_until(preparation.deadline.into()) => {
-                    endpoint.transition(|s,t| s.expire(&database.lease.client_id,&identity,t))?;
+                    cancel_pending(&endpoint, &identity, CancelReason::Deadline)?;
                     return Err(diagnostic("total deadline expired; execution_stopped=false; never replay"));
                 }
                 event = events.recv() => { receive(event)?; }
@@ -556,6 +585,9 @@ fn normalize_addresses(value: &Value) -> Result<Value, ToolError> {
 }
 
 fn business_error(message: &str) -> ToolError {
+    if let Some(message) = message.strip_prefix("IDA error: ") {
+        return ToolError::IdaError(message.into());
+    }
     if let Some(name) = message.strip_prefix("Function not found: ") {
         return ToolError::FunctionNameNotFound(name.into());
     }
@@ -610,17 +642,34 @@ fn accepted(
     Ok(AcceptedRequest::new(
         &AcceptedAt(start),
         RequestId::new(id())?,
-        None,
+        CURRENT_TASK_ID.try_with(Clone::clone).ok(),
         method,
         params,
     )?)
 }
 fn receive(event: Result<Value, broadcast::error::RecvError>) -> Result<Value, ToolError> {
-    let event = event.map_err(diagnostic)?;
+    let event = match event {
+        Ok(event) => event,
+        Err(broadcast::error::RecvError::Lagged(_)) => return Ok(Value::Null),
+        Err(error) => return Err(diagnostic(error)),
+    };
     if event["event"] == "bridge_disconnected" {
         return Err(diagnostic("bridge disconnected; never replay"));
     }
     Ok(event)
+}
+fn cancel_pending(
+    endpoint: &super::nexus_transport::NexusEndpoint,
+    identity: &OperationIdentity,
+    reason: CancelReason,
+) -> Result<(), NexusError> {
+    endpoint.transition(|s, t| {
+        let progress = s.operation_progress(&identity.lease.client_id, identity)?;
+        if !progress.status.is_terminal() || !progress.execution_stopped {
+            s.cancel(&identity.lease.client_id, identity, reason, t)?;
+        }
+        Ok(())
+    })
 }
 struct CancelOnDrop {
     endpoint: super::nexus_transport::NexusEndpoint,
@@ -631,9 +680,7 @@ impl Drop for CancelOnDrop {
         let Some(identity) = &self.identity else {
             return;
         };
-        if let Err(error) = self.endpoint.transition(|s, t| {
-            s.cancel(&identity.lease.client_id, identity, CancelReason::Client, t)
-        }) {
+        if let Err(error) = cancel_pending(&self.endpoint, identity, CancelReason::Client) {
             tracing::warn!(%error,"Nexus abandoned request cancellation not confirmed");
         }
     }
@@ -684,5 +731,33 @@ impl Drop for ReferenceGuard {
         if let Some(token) = self.token.take() {
             Tools::abandon(self.router.clone(), token);
         }
+    }
+}
+
+#[cfg(test)]
+mod n4_fix_regressions {
+    use super::*;
+    #[tokio::test]
+    async fn n4_fix_accepted_request_keeps_background_task_identity() {
+        let task = TaskId::new("queued-task-42").unwrap();
+        CURRENT_TASK_ID
+            .scope(task.clone(), async {
+                let request = accepted(
+                    "run_script",
+                    json!({}),
+                    &Preparation::new(Duration::from_secs(120)),
+                )
+                .unwrap();
+                assert_eq!(request.task_id, Some(task));
+            })
+            .await;
+        assert!(accepted(
+            "run_script",
+            json!({}),
+            &Preparation::new(Duration::from_secs(120))
+        )
+        .unwrap()
+        .task_id
+        .is_none());
     }
 }
