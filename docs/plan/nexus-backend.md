@@ -474,6 +474,10 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 - 另订阅 `closebase` 使健康状态无效；`database_change_count` 仅作字节/段修改的补充，不能代替重命名、注释、类型通知。公开异步事件订阅没有分片同步水位，故不以消费者进度证明一致性；真实测试故意积压事件至任务中止后才消费。
 - N5-F1：批量 JSON 字符串只在解码成数组时展开，标量仍保留原字符串；batch 与 N4 方法共用严格 Rust u64 地址规则（ASCII 数字、可选正号、0x/0X、Rust Unicode 外围空白、溢出拒绝）。固定 N0 严格对照从 15 扩为 54，错误也按 E04 规则逐字比较。
+- N5-F2/P1：数组字符串由 Rust 的同一 `serde_json::from_str::<Vec<Value>>` 解码，拒绝非 JSON 常量、不可表示的浮点数、孤立代理字符和超限嵌套，失败仍作为原字符串单项处理；保留浮点负零与重复键的旧规则。无效的复杂地址在 Rust 保留，向 owner 传递无效 null 占位，结束后按位置恢复原值，避免 adapter 信封扩大嵌套深度；不扩大容量或解析上限。严格对照 76 项；127 层成功解码值通过既有 MCP 文本结果比较，raw CLI 响应解析器原有递归上限保持不变。
+- N5-F2/P1 隔离：Channel 在写出任何字节前编码；单请求结果的 JSON/UTF-8 失败转成带原 attempt 的 remote_error，N1 记录 Failed、停止确认和 cause，其他 lease/控制连接继续。只有实际 I/O 错误导致整桥断连；无自动重放。
+- N5-F2/P2-a：用 N1 exact target 与最新 attempt 序号识别过期回调，覆盖 dispatch 已发布而 pending 尚未登记的窗口；未知/伪造身份不按过期放行。补契约与真实 event_received 回归。
+- N5-F2/P2-b：startup guard 在 bind/spawn 起拥有专用目录与 Child，跨所有 startup await；丢弃 future 立即向该 Child 请求结束，独立 reaper 确认退出后只清理目录内精确 b/c/l socket。fixture 在初始化前登记父端点，在 lifetime bind 后立即登记精确 inode/owner。12 个阶段组合覆盖 drop、取消、到期；reap 不能确认则显式日志并保留路径，交所属环境精确 journal 清理，不进行名称扫描或跨环境 GC。
 - N5-F1 E18 暂停真实 socketpair 的消费端，真实 Nexus 大响应阻塞于 kernel send 后填满原 512 项输出队列，再阻塞一个 producer；同时要求 router/control/B 响应，恢复后 513 个测试状态事件顺序完整且 A 可再查询。未扩大容量。E10 通过实际 router 取消 Queued 续片并保留 lease，观察自动 `_n5_cleanup` 释放 hook；旧物理 attempt 回调不得污染下一 attempt 或引发共享连接失效。
 - N5-F1 寿命 socket 由 Python 正常退出精确 unlink，Rust 父端在关闭、终止、Drop 和启动失败时清理同一私有目录的精确端点。隔离环境按路径、device/inode 与 owner birth 台账处理强杀残留，拒绝替换文件/活 owner；套件与第 13 门禁分别断言 IPC 根目录 socket 为零。证据与未通过轮次保留于 `n5-fix1/report.md`；不清理其他环境的历史残留。
 - 验收语句：短查询在长批量任务全部完成前得到执行，取消后的下一查询可继续；不可中断场景准确暴露状态。最终结果、实际数量、所有失败与修复原因、命令/退出码/uptime、旧版比较和精确进程审计集中在外部报告。

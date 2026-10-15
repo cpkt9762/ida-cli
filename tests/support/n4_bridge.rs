@@ -209,6 +209,21 @@ async fn n5_old_delivery_callbacks_preserve_second_attempt_and_terminal_state() 
         endpoint
             .transition(|s, t| s.dispatch(&lease.client_id, &op, t))
             .unwrap();
+        if index == 1 {
+            assert!(state.pending.lock().unwrap().is_empty());
+            for event in ["completed", "yielded", "uncertain", "stopped"] {
+                event_received(json!({"event":event,"attempt":attempts[0],"result":"old",
+                    "checkpoint":{"index":999},"error":{"code":"disconnected","message":"dispatch gap"}}), &writer, &state, false)
+                    .await.expect("old callback in real dispatch/pending gap must be harmless");
+            }
+            assert_eq!(
+                endpoint
+                    .transition(|s, _| s.operation_status(&lease.client_id, &op))
+                    .unwrap()
+                    .status,
+                OperationStatus::Running
+            );
+        }
         let mut delivery = lanes.business.recv().await.unwrap();
         delivery.begin().unwrap();
         let attempt = delivery.attempt.clone();

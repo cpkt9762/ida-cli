@@ -56,6 +56,22 @@ def readiness():
         "methods": METHODS}, "client_cancel_patch": True}
 
 
+def validate_response_depth(message):
+    """Match serde_json's existing 127-container envelope budget before writing."""
+    stack = [iter((message,))]
+    while stack:
+        try:
+            value = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+        children = value.values() if isinstance(value, dict) else value
+        if isinstance(value, (dict, list, tuple)):
+            if len(stack) >= 128:
+                raise ValueError("response nesting exceeds receiver limit")
+            stack.append(iter(children))
+
+
 class Channel:
     def __init__(self, address, capacity, handler, stopped):
         self.socket = socket.socket(socket.AF_UNIX)
@@ -75,8 +91,20 @@ class Channel:
         try:
             while not self.stopped.is_set():
                 message = self.output.get()
-                self.socket.sendall(json.dumps(message, ensure_ascii=False).encode() + b"\n")
-        except (OSError, ValueError):
+                try:
+                    validate_response_depth(message)
+                    encoded = json.dumps(message, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+                    # F2/P1: no bytes were written. A returned execute result
+                    # proves this native interval ended; fail only that request.
+                    # Correlation was validated by Rust before entering the lane.
+                    failure = {"event": "remote_error", "attempt": message["attempt"],
+                               "remote_code": "response_encoding_failed",
+                               "error": error("operation_failed",
+                                   f"response encoding failed: {type(exc).__name__}")}
+                    encoded = json.dumps(failure, ensure_ascii=True, allow_nan=False).encode("ascii")
+                self.socket.sendall(encoded + b"\n")
+        except OSError:
             self.stopped.set()
 
     def read(self):

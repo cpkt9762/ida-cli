@@ -370,6 +370,34 @@ impl Tools {
                 .map_err(diagnostic)?,
                 _ => params,
             };
+            // F2/P1: use the same Vec<Value> decoder as the legacy dispatcher.
+            // Python must never reinterpret JSON text (numbers/Unicode/depth differ).
+            if method == "batch_decompile" {
+                let raw = &params["addresses"];
+                params["addresses"] = Value::Array(if let Some(array) = raw.as_array() {
+                    array.clone()
+                } else if let Some(text) = raw.as_str() {
+                    serde_json::from_str::<Vec<Value>>(text).unwrap_or_else(|_| vec![raw.clone()])
+                } else {
+                    vec![raw.clone()]
+                });
+            }
+            // Nested non-address values are echoed only at the external boundary.
+            // Avoid adding adapter envelope depth to legacy-valid nested JSON.
+            // Null remains invalid to the owner, preserving per-item semantics.
+            let batch_addresses = if method == "batch_decompile" {
+                let originals = params["addresses"].as_array().cloned();
+                if let Some(addresses) = params["addresses"].as_array_mut() {
+                    for address in addresses {
+                        if address.is_array() || address.is_object() {
+                            *address = Value::Null;
+                        }
+                    }
+                }
+                originals
+            } else {
+                None
+            };
             params
                 .as_object_mut()
                 .ok_or_else(|| diagnostic("params must be an object"))?
@@ -398,7 +426,7 @@ impl Tools {
                 job,
                 active: true,
             };
-            let result = self
+            let mut result = self
                 .execute_one(
                     router,
                     Some(&target),
@@ -408,6 +436,14 @@ impl Tools {
                     Some(&mut cleanup.active),
                 )
                 .await;
+            if let (Some(originals), Ok(Value::Array(items))) = (batch_addresses, &mut result) {
+                if originals.len() != items.len() {
+                    return Err(diagnostic("batch result count differs from accepted input"));
+                }
+                for (item, address) in items.iter_mut().zip(originals) {
+                    item["address"] = address;
+                }
+            }
             // A normal final slice released its own reference on the owner.
             // Do not race a needless cleanup request against an immediate close.
             if result.is_ok() {

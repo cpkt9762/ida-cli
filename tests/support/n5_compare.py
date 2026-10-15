@@ -54,12 +54,24 @@ def main():
     matrix += [("batch_decompile", {"addresses": addresses})]
     # N4 methods resolve their address inside tools.py, independently of slices.
     matrix += [("get_function_at_address", {"address": value}) for value in addresses[:30]]
+    # F2: run the fixed serde_json baseline for syntax, numbers and Unicode.
+    boundaries = ['[-0]', '[0,-0,0.0,-0.0]', '[{"a":1,"a":2}]',
+        '[1] trailing', '[1,]', '[+1]', '[01]', '["\\ud83d\\ude00"]',
+        '[18446744073709551616]', '[-9223372036854775809]', '[1e-999]',
+        '[' * 127 + '0' + ']' * 127, '[' * 128 + '0' + ']' * 128,
+        '[' * 129 + '0' + ']' * 129, '["\\ud800"]', '["\\udc00"]',
+        '["\\ud800x"]', '[1e999]', '[-1e999]', '[Infinity]', '[-Infinity]', '[NaN]']
+    matrix += [("batch_decompile", {"addresses": value}) for value in boundaries]
     observations=[]
     mismatches=[]
     try:
         for method,params in matrix:
             expected=old.rpc(method,params);expected.pop("jsonrpc",None);expected.pop("id",None)
-            actual=new.direct(method,params)
+            # The existing raw CLI decoder caps total response depth. At the
+            # legacy parser's 127-level boundary, compare the same JSON value
+            # through MCP's existing text result (no parser limit expansion).
+            text_boundary = method == "batch_decompile" and params.get("addresses") == '[' * 127 + '0' + ']' * 127
+            actual = new.mcp(method, params) if text_boundary else new.direct(method,params)
             if "error" in expected:
                 # Same exact CLI presentation rule as N4's strict comparator.
                 equal = actual.get("exit") == 1 and actual.get("error") == "Error: " + expected["error"]["message"]
@@ -70,11 +82,11 @@ def main():
             if method=="batch_decompile" and params.get("addresses")==[ea,other,ea] and len(observations)>11:
                 assert expected["result"][0]["success"] is False
                 assert expected["result"][1]["success"] is True
-            observations.append({"method":method,"params":params,"baseline":expected,"nexus":actual,"status":"PASS" if equal else "FAIL"})
+            observations.append({"method":method,"params":params,"baseline":expected,"nexus":actual,"status":"PASS" if equal else "FAIL", "entrypoint":"mcp" if text_boundary else "raw-cli"})
     finally:
-        (env.root/"n5-comparison.json").write_text(json.dumps({"baseline_sha256":digest(baseline),"observations":observations,"mismatches":mismatches},ensure_ascii=False,indent=2)+"\n")
+        (env.root/"n5-comparison.json").write_text(json.dumps({"baseline_sha256":digest(baseline),"observations":observations,"mismatches":mismatches},ensure_ascii=True,indent=2)+"\n")
         old.rpc("close");old.rpc("shutdown");old.wait();new.stop()
     assert not mismatches, f"strict comparison mismatches: {len(mismatches)}; see n5-comparison.json"
-    assert len(observations)==54
+    assert len(observations)==76
     (env.root/"N5-compare-result.json").write_text(json.dumps({"status":"PASS","case":"N5-compare","comparisons":len(observations)}))
 if __name__=="__main__":main()

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-SPEC = importlib.util.spec_from_file_location("bridge", Path(__file__).resolve().parents[2] / "nexus_bridge/bridge.py")
+SPEC = importlib.util.spec_from_file_location("bridge", Path(os.environ.get("N5_BRIDGE_SOURCE", Path(__file__).resolve().parents[2] / "nexus_bridge/bridge.py")))
 bridge_module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bridge_module)
 
@@ -358,3 +358,41 @@ def test_close_preserves_replacement_at_lifetime_path(harness):
     path.write_text("replacement must survive")
     harness.bridge.close()
     assert path.read_text() == "replacement must survive"
+
+
+_deep = 0
+for _level in range(128):
+    _deep = [_deep]
+
+
+@pytest.mark.parametrize("bad", ["\ud800", float("nan"), object(), {"cycle": None},
+                                _deep],
+                         ids=["utf8-surrogate", "nonfinite", "unsupported", "cycle", "depth"])
+def test_f2_bad_result_is_request_local(harness, monkeypatch, bad):
+    harness.open()
+    first = harness.lease
+    harness.open()
+    second = harness.lease
+    if isinstance(bad, dict):
+        bad["cycle"] = bad
+    original = harness.handle.execute_python
+    def execute(code, **options):
+        if code.endswith("bad-result"):
+            return {"result": bad}
+        return original(code, **options)
+    monkeypatch.setattr(harness.handle, "execute_python", execute)
+    harness.lease = first
+    harness.dispatch(0, harness.execute("bad-result"))
+    assert harness.receive()["event"] == "ack"
+    failure = harness.receive()
+    assert failure["event"] == "remote_error", failure
+    assert failure["error"]["code"] == "operation_failed"
+    assert "response encoding failed" in failure["error"]["message"]
+    assert not harness.bridge.stopped.is_set()
+    for lease in (first, second):
+        harness.lease = lease
+        harness.dispatch(0, harness.execute("healthy", "after-" + lease["lease_id"]))
+        assert harness.receive()["event"] == "ack"
+        assert harness.receive()["result"]["result"] == "healthy"
+    harness.send(1, {"local_status": "encoding-survival"})
+    assert len(harness.receive(1)["held"]) == 2

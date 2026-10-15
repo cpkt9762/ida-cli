@@ -49,6 +49,34 @@ def ledger(env, pids):
 
 
 class SocketRecoveryTests(unittest.TestCase):
+    def test_f2_fixture_journals_before_partial_bridge_initialization(self):
+        import ast
+        # Execute the real registered_init function without starting the fixture.
+        tree = ast.parse(Path(os.environ.get("N5_FIXTURE_SOURCE", REPO / "tests/support/nexus_client_fixture.py")).read_text())
+        function = next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.FunctionDef) and node.name == "registered_init")
+        with environment() as env:
+            sockets = []
+            self.addCleanup(lambda: [endpoint.close() for endpoint in sockets])
+            def bind(path):
+                endpoint = socket.socket(socket.AF_UNIX)
+                endpoint.bind(str(path))
+                sockets.append(endpoint)
+            business, control = env.root / "b", env.root / "c"
+            bind(business); bind(control)
+            def interrupted(_self, business, _control, _capacity):
+                bind(Path(business).with_name("l"))
+                raise RuntimeError("initialization interrupted after lifetime bind")
+            namespace = dict(env=env, bridge_init=interrupted, Path=Path,
+                             os=os, patch=patch)
+            exec(compile(ast.Module(body=[function], type_ignores=[]),
+                         "nexus_client_fixture.py", "exec"), namespace)
+            with self.assertRaisesRegex(RuntimeError, "initialization interrupted"):
+                namespace["registered_init"](SimpleNamespace(), str(business), str(control), 4)
+            records = [json.loads(line) for line in (env.root / "sockets.jsonl").read_text().splitlines()]
+            self.assertEqual([Path(record["path"]).name for record in records], ["b", "c", "l"])
+            self.assertEqual([record["pid"] for record in records], [os.getppid(), os.getppid(), os.getpid()])
+
     def test_exact_journal_removes_dead_owner_socket_only(self):
         with environment() as env, socket.socket(socket.AF_UNIX) as endpoint:
             path = env.root / "owned"

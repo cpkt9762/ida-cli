@@ -651,3 +651,117 @@ async fn n4_fix_event_helper_does_not_match_a_previous_operations_ack() {
         first.as_str()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n5_f2_startup_cancellation_reaps_child_and_sockets() {
+    use std::os::unix::fs::FileTypeExt;
+    let base = PathBuf::from(std::env::var_os("F1_ROOT").expect("private short IPC root"));
+    let python = PathBuf::from(std::env::var_os("F1_PYTHON").expect("prepared Python"));
+    let mut residues = Vec::new();
+    for mode in ["drop", "cancel", "deadline"] {
+        for stage in ["spawn", "ready", "lifetime", "business"] {
+            let root = base.join(id());
+            std::fs::create_dir_all(&root).unwrap();
+            let router = RouterState::new().unwrap();
+            let cfg = BridgeConfig {
+                python: python.clone(),
+                script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/support/nexus_race_fixture.py"),
+                directory: root.join("ipc"),
+                environment: BTreeMap::from([
+                    ("PATH".into(), std::env::var("PATH").unwrap()),
+                    ("F1_ROOT".into(), root.to_string_lossy().into_owned()),
+                    ("F1_SCENARIO".into(), format!("startup-{stage}")),
+                    ("IDA_CLI_HOME".into(), root.to_string_lossy().into_owned()),
+                    (
+                        "IDA_NEXUS_STATE_DIR".into(),
+                        root.join("state").to_string_lossy().into_owned(),
+                    ),
+                ]),
+            };
+            let preparation = ida_mcp::preprocess::Preparation::new(Duration::from_secs(15));
+            let cancel = preparation.cancel.clone();
+            let (expire, expired) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                let mut preparation = preparation;
+                let mut start = Box::pin(NexusBridge::start(&router, cfg));
+                if mode == "deadline" {
+                    tokio::select! {
+                        _ = &mut start => panic!("startup barrier released unexpectedly"),
+                        _ = expired => preparation.deadline = std::time::Instant::now(),
+                    }
+                }
+                preparation
+                    .wait(async {
+                        start
+                            .await
+                            .map_err(|e| ida_mcp::error::ToolError::IdaError(e.to_string()))
+                    })
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !root.join("startup.arrived").exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("deterministic startup phase barrier");
+            let process: Value =
+                serde_json::from_str(&std::fs::read_to_string(root.join("process.json")).unwrap())
+                    .unwrap();
+            let pid = i32::try_from(process["pid"].as_i64().unwrap()).unwrap();
+            match mode {
+                "drop" => {
+                    task.abort();
+                    assert!(matches!(task.await, Err(e) if e.is_cancelled()));
+                }
+                "cancel" => {
+                    cancel.cancel();
+                    assert!(task.await.unwrap().is_err());
+                }
+                _ => {
+                    expire.send(()).unwrap();
+                    assert!(task.await.unwrap().is_err());
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while unsafe { libc::kill(pid, 0) } == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("own startup child must be reaped");
+            // Bounded cleanup completion, independent of child/runtime scheduling.
+            let clean = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let sockets: Vec<_> = std::fs::read_dir(root.join("ipc"))
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .filter(|p| match p.symlink_metadata() {
+                            Ok(metadata) => metadata.file_type().is_socket(),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                            Err(error) => panic!("inspect owned startup socket: {error}"),
+                        })
+                        .collect();
+                    if sockets.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if !clean {
+                residues.push(format!("{mode}/{stage}"));
+                // Red-run cleanup is restricted to this test's fresh exact paths.
+                for name in ["b", "c", "l"] {
+                    let path = root.join("ipc").join(name);
+                    if path.exists() {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+            }
+        }
+    }
+    assert!(residues.is_empty(), "startup socket residues: {residues:?}");
+}

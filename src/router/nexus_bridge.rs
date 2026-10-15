@@ -144,29 +144,80 @@ pub struct NexusBridge {
     directory: PathBuf,
     pub pid: u32,
 }
+// F2/P2-b: acquired before bind/spawn, retained across every startup await.
+// The drop reaper owns the Child (no PID rediscovery) and waits before unlink,
+// so a child cannot recreate l after cleanup. It needs no live Tokio runtime.
+struct StartupGuard {
+    child: Option<Child>,
+    directory: Option<PathBuf>,
+}
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        let Some(directory) = self.directory.take() else {
+            return;
+        };
+        if let Some(mut child) = self.child.take() {
+            if let Err(error) = child.start_kill() {
+                tracing::warn!(%error, "bridge startup kill failed");
+            }
+            std::thread::spawn(move || {
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                        Err(error) => {
+                            tracing::error!(%error, "bridge startup reap unconfirmed; paths retained");
+                            return;
+                        }
+                    }
+                }
+                cleanup_startup_sockets(&directory);
+            });
+        } else {
+            cleanup_startup_sockets(&directory);
+        }
+    }
+}
+fn cleanup_startup_sockets(directory: &std::path::Path) {
+    for name in ["b", "c", "l"] {
+        if let Err(error) = remove_owned_socket(&directory.join(name)) {
+            tracing::error!(%error, path = %directory.join(name).display(), "bridge startup socket cleanup failed");
+        }
+    }
+}
 impl NexusBridge {
     pub async fn start(router: &super::RouterState, config: BridgeConfig) -> anyhow::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir(&config.directory)?;
         std::fs::set_permissions(&config.directory, std::fs::Permissions::from_mode(0o700))?;
+        let mut owner = StartupGuard {
+            child: None,
+            directory: Some(config.directory.clone()),
+        };
         let business_path = config.directory.join("b");
         let control_path = config.directory.join("c");
         let business = UnixListener::bind(&business_path)?;
         let control = UnixListener::bind(&control_path)?;
         let capacity = router.config.max_pending_per_tenant;
         let log = std::fs::File::create(config.directory.join("stderr.log"))?;
-        let mut child = Command::new(&config.python)
-            .arg(&config.script)
-            .arg(&business_path)
-            .arg(&control_path)
-            .arg(capacity.to_string())
-            .env_clear()
-            .envs(&config.environment)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(log))
-            .kill_on_drop(true)
-            .spawn()?;
+        owner.child = Some(
+            Command::new(&config.python)
+                .arg(&config.script)
+                .arg(&business_path)
+                .arg(&control_path)
+                .arg(capacity.to_string())
+                .env_clear()
+                .envs(&config.environment)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::from(log))
+                .kill_on_drop(true)
+                .spawn()?,
+        );
+        let child = owner
+            .child
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("startup child missing"))?;
         let pid = child
             .id()
             .ok_or_else(|| anyhow::anyhow!("bridge exited before PID registration"))?;
@@ -195,11 +246,6 @@ impl NexusBridge {
         let (caps, b, c) = match connected {
             Ok(Ok(value)) => value,
             other => {
-                child.kill().await?;
-                child.wait().await?;
-                std::fs::remove_file(&business_path)?;
-                std::fs::remove_file(&control_path)?;
-                remove_lifetime_socket(&config.directory)?;
                 return Err(match other {
                     Ok(Err(error)) => error,
                     _ => anyhow::anyhow!("bridge readiness deadline expired"),
@@ -269,6 +315,11 @@ impl NexusBridge {
                 });
             }
         });
+        let child = owner
+            .child
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("startup child missing"))?;
+        owner.directory = None; // ownership transfers to the live bridge only now.
         Ok(Self {
             state,
             child: AsyncMutex::new(child),
@@ -352,11 +403,13 @@ impl Drop for NexusBridge {
 // R-sock: the child owns l inside this parent's fresh 0700 directory. Also
 // remove it after waitpid/SIGKILL, when Python cannot run its finally block.
 fn remove_lifetime_socket(directory: &std::path::Path) -> std::io::Result<()> {
+    remove_owned_socket(&directory.join("l"))
+}
+fn remove_owned_socket(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
-    let path = directory.join("l");
-    match std::fs::symlink_metadata(&path) {
+    match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => {}
-        Ok(_) => return Err(std::io::Error::other("lifetime socket was replaced")),
+        Ok(_) => return Err(std::io::Error::other("owned socket was replaced")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     }
@@ -697,7 +750,12 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
         } else {
             false
         };
-        if superseded || stopped_boundary {
+        // F2/P2-a: N1 publishes the attempt atomically with dispatch, before
+        // this physical pump can register pending. Consult that authority too.
+        let dispatched_again = state
+            .endpoint
+            .transition(|s, _| s.delivery_superseded(&attempt));
+        if superseded || dispatched_again || stopped_boundary {
             return Ok(());
         }
         if event["event"] == "stopped" {

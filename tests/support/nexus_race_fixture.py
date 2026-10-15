@@ -223,4 +223,24 @@ def fault():
     handles[0]._mark_disconnected("fixture_sse_failure")
 # No private fields are restored. Only test transport/disconnect injection.
 threading.Thread(target=fault, daemon=True).start()
+# F2: stop actual bridge startup at precise lifecycle boundaries.
+if SCENARIO and SCENARIO.startswith("startup-"):
+    import socket
+    stage = SCENARIO.removeprefix("startup-")
+    original_bind = socket.socket.bind
+    def bind(self, address):
+        original_bind(self, address)
+        if str(address).endswith("/l") and stage == "lifetime":
+            barrier("startup")
+    socket.socket.bind = bind
+    original_channel_init = bridge.Channel.__init__
+    def channel_init(self, address, *args):
+        if stage == "ready":
+            barrier("startup")
+        original_channel_init(self, address, *args)
+        if str(address).endswith("/b") and stage == "business":
+            barrier("startup")
+    bridge.Channel.__init__ = channel_init
+    if stage == "spawn":
+        barrier("startup")
 os._exit(bridge.main())

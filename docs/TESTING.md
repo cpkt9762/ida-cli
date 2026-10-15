@@ -429,7 +429,7 @@ functions for real search fairness. The suite uses marker/FIFO/protocol barriers
 separate 15-second startup and 3-second response budgets, and an inner 180-second
 shell timeout. Announce an outer 210-second timeout for exact cleanup before use.
 
-The comparator saves `n5-comparison.json`: 54 exact scalar-type/shape/value checks
+The comparator saves `n5-comparison.json`: 76 exact scalar-type/shape/value checks
 against the fixed binary include repeated/invalid addresses, batch ordering,
 search limits including zero, no matches, Unicode and injected decompiler errors.
 N5-F1 adds JSON scalar strings and Rust u64 address grammar cases (prefix/case,
@@ -445,7 +445,7 @@ It does not establish arbitrary Hex-Rays GIL behavior.
 
 Run the lifecycle 9 and contract 4 regressions separately with fresh prepared
 roots. Keep E04 at 38 exact comparisons, both patch probes' red/green evidence,
-the 12 standard gates plus gate 13, N0 support 36, bridge pytest 25 and N4 fix 5.
+the 12 standard gates plus gate 13, N0 support 37, bridge pytest 30 and N4 fix 5.
 Run lib at least three consecutive times. Every invocation records uptime and its
 exit status; retain failed runs and explain the changed variable before rerunning.
 Audit each environment with cleanup/assert_clean and exact registered process
@@ -468,3 +468,27 @@ after owned processes exit, cleanup can remove recorded leftovers from SIGKILL.
 It refuses live owners or replacement files and never scans names to authorize
 deletion. The suite-wide scan is an assertion only. Keep the socket journal,
 process ledger and final zero-socket audit alongside the test logs.
+
+N5-F2 adds array-text JSON boundaries (nonfinite/overflow, signed zero, duplicate
+keys, Unicode surrogates, trailing input and the serde recursion boundary). Rust
+uses the legacy `Vec<Value>` decoder before IDA sees the input. Nested invalid
+addresses stay in Rust and are restored by position after the owner returns;
+the intermediate adapter envelope does not consume their nesting budget. The
+127-level accepted value uses the existing MCP text result for strict comparison;
+the raw CLI response decoder's existing recursion limit remains unchanged.
+
+Gate 13 now runs 14 tests: its added startup test exercises 12 combinations of
+dropped future, Preparation cancellation or deadline at pre-readiness, lifetime
+bind, pre-business-connect and pre-control-connect barriers. It waits for the
+exact child to exit and for all three exact endpoints to disappear. Fixture
+journalling precedes Bridge initialization, including a record immediately after
+lifetime bind; N0 support tests interruption inside that initialization. The
+old-attempt lib regression injects callbacks after real N1 dispatch and before
+receiving/registering pending, as well as after pending and terminal completion.
+
+Five offline encoding faults (surrogate, nonfinite, unsupported object, circular
+object and excess response depth) must each return a diagnostic request error, then serve both leases and
+the control lane on the same bridge. E08 repeats the surrogate and depth cases through real
+Nexus, requires Failed plus confirmed stop and the preserved encoding cause,
+then queries both leases without reconnecting. OS I/O failure still disconnects
+the physical channel; encoding failure before any write does not.

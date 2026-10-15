@@ -1046,3 +1046,33 @@ fn abandoned_open_retains_late_lease_and_preserves_not_sent_release_ownership() 
         );
     }
 }
+
+#[test]
+fn n5_f2_superseded_attempt_is_exact_and_available_at_dispatch() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("gap-client", "gap-owner", 1);
+    let op = rig.queue(&lease, "gap", "batch_decompile", 120);
+    rig.dispatch(&op);
+    let old = rig.backend.attempts.last().unwrap().clone();
+    assert!(!rig.sessions.delivery_superseded(&old));
+    rig.sessions
+        .yield_operation(&op, json!({"index":1}))
+        .unwrap();
+    assert!(!rig.sessions.delivery_superseded(&old));
+    rig.dispatch(&op);
+    let new = rig.backend.attempts.last().unwrap().clone();
+    assert!(rig.sessions.delivery_superseded(&old));
+    assert!(!rig.sessions.delivery_superseded(&new));
+    let mut forged = old.clone();
+    if let DeliveryTarget::Execute { identity } = &mut forged.target {
+        identity.lease.client_id = ClientId::new("other-client").unwrap();
+    }
+    assert!(!rig.sessions.delivery_superseded(&forged));
+    forged = old.clone();
+    forged.sequence = std::num::NonZeroU64::new(new.sequence.get() + 1).unwrap();
+    assert!(!rig.sessions.delivery_superseded(&forged));
+    rig.sessions
+        .complete(&op, Completion::Success(json!("second")))
+        .unwrap();
+    assert!(rig.sessions.delivery_superseded(&old));
+}

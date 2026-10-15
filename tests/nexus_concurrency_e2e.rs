@@ -123,6 +123,32 @@ async fn e08_control_router_task_and_other_database_during_long_call() {
         terminal(&a.bridge, &op).await.status,
         OperationStatus::Succeeded
     );
+    // F2: real Nexus result contains a surrogate, then both leases remain usable.
+    let (sibling, _) = a.open(&sample("n5-e08-a"), json!({})).await;
+    for (label, code) in [
+        ("surrogate", "result=chr(0xd800)"),
+        (
+            "depth",
+            "result=0\nfor _ in range(128):\n    result=[result]",
+        ),
+    ] {
+        let bad = a.begin(&la, "execute_python", json!({"code":code}));
+        let failed = terminal(&a.bridge, &bad).await;
+        assert_eq!(failed.status, OperationStatus::Failed);
+        assert!(failed.execution_stopped);
+        let encoding_error = failed.error.unwrap();
+        assert!(encoding_error
+            .cause
+            .expect("N1 retains request-local cause")
+            .message
+            .contains("response encoding failed"));
+        response(a.value(&la, "database_info", json!({}))).await;
+        response(a.value(&sibling, "database_info", json!({}))).await;
+        record(
+            json!({"event":"F2-encoding-isolated","fault":label,"operation":bad,"same_bridge_two_leases":true}),
+        );
+    }
+    a.release(&sibling).await;
     close(&mut a, &la).await;
     close(&mut b, &lb).await;
     passed(
@@ -755,6 +781,6 @@ fn n5_batch_and_search_match_fixed_legacy_binary() {
         &std::fs::read_to_string(root().join("N5-compare-result.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(evidence["comparisons"], 54);
+    assert_eq!(evidence["comparisons"], 76);
     passed("N5-compare", evidence);
 }

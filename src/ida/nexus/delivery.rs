@@ -154,6 +154,18 @@ impl<C: Clock> NexusSessions<C> {
         Ok(record)
     }
 
+    /// True only for an exact target replaced by a strictly newer N1 attempt.
+    /// Physical adapters may receive its late callback before registering the
+    /// successor locally. Unknown/forged identities are never classified stale.
+    pub fn delivery_superseded(&self, attempt: &DeliveryAttempt) -> bool {
+        self.deliveries
+            .get(&attempt.target.key())
+            .is_some_and(|record| {
+                record.snapshot.attempt.target == attempt.target
+                    && record.snapshot.attempt.sequence > attempt.sequence
+            })
+    }
+
     pub fn delivery_status(
         &self,
         client: &ClientId,

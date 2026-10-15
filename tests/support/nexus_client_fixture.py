@@ -96,10 +96,19 @@ else:
     runtime = runpy.run_path(str(REPO / "nexus_bridge/bridge.py"), run_name="n4_fixture")
     bridge_init = runtime["Bridge"].__init__
     def registered_init(self, business, control, capacity):
-        bridge_init(self, business, control, capacity)
-        for path, pid in ((business, os.getppid()), (control, os.getppid()),
-                          (self.lifetime_path, os.getpid())):
-            env.record_socket(path, pid)
+        # F2/P2-b: parent endpoints predate initialization. Record before any
+        # child import/connect can block; l is journalled at its actual bind.
+        for path in (business, control):
+            env.record_socket(path, os.getppid())
+        import socket
+        original_bind = socket.socket.bind
+        lifetime = str(Path(business).with_name("l"))
+        def registered_bind(endpoint, address):
+            original_bind(endpoint, address)
+            if address == lifetime:
+                env.record_socket(address, os.getpid())
+        with patch.object(socket.socket, "bind", registered_bind):
+            bridge_init(self, business, control, capacity)
     runtime["Bridge"].__init__ = registered_init
     send = runtime["Channel"].send
     def boundary_send(self, message):

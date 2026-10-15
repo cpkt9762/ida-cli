@@ -193,16 +193,9 @@ def step(method, params, context, decompile, parse_address):
         index = state["index"]
         done = False
         if method == "batch_decompile":
-            import json
+            # F2/P1: the Rust router already applied legacy serde_json Vec<Value>
+            # decoding. Do not decode strings again: fallback text must stay text.
             addresses = params["addresses"]
-            if isinstance(addresses, str):
-                try:
-                    decoded = json.loads(addresses)
-                    # P2-1: Rust decodes into Vec<Value>, accepting only arrays.
-                    if isinstance(decoded, list):
-                        addresses = decoded
-                except ValueError:
-                    addresses = [addresses]
             if not isinstance(addresses, list):
                 addresses = [addresses]
             if index < len(addresses):
