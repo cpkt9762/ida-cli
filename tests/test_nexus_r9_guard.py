@@ -261,6 +261,10 @@ class GuardTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location('test_slices_cleanup', path)
         slices = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(slices)
+        spec = importlib.util.spec_from_file_location('test_cleanup_lifecycle',
+                                                     path.with_name('lifecycle.py'))
+        lifecycle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lifecycle)
         context = ['bridge', 'lease', 'owner', 1, '/lifetime']
         self.guard.begin({'method': 'open'})
         with patch.dict(sys.modules, {'_ida_cli_save_guard_v1': self.guard}):
@@ -298,7 +302,7 @@ class GuardTests(unittest.TestCase):
                             patch.object(sys.modules['ida_netnode'].netnode, 'exist', root):
                         with self.assertRaises(RuntimeError):
                             slices.cleanup_disconnected(handle, context, slices.incarnation,
-                                                        __import__('lifecycle').release_handle)
+                                                        lifecycle.release_handle)
                     if branch in ('healthy', 'confirmed'):
                         handle.close_outcome.assert_called_once()
                         handle.close.assert_not_called()

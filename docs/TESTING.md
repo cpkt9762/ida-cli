@@ -617,6 +617,36 @@ N7a-F1 外部差异逐字段登记（旧行为、新行为、影响和验证范�
 
 special_inputs 的实际数量为 8，新增 F3-cold：A 在真实 opened 事件交给 router 发布索引前暂停，B 并发冷开；验证内容键 EX 正被持有、同一个 IDB/owner、写入互读、保存重开与重复预热命中。F1/F2/F7 回归见 `tests/test_nexus_n7_fix1.py`；F3/F4/F5/F6 的 Rust 回归名含 `n7_fix1`。S1 单独的 `nexus_n7_fix1` target 使用真实 bridge 和确定性客户端协议 fixture；短回归不额外 close/shutdown 即消费迟到 Released，长回归让 120s observer 实际结束后才投递证明，验证下次 open 收敛旧 guard（该 target 需提前说明并使用 150s shell timeout）。这些协议 fixture 不等同真实 IDA E2E。
 
+S1 复跑前在仓库根目录，先用 `scripts/prepare_nexus_env.py` 完成全新离线 prepare，
+并把 `S1_PYTHON` 改为该环境的绝对 `venv/bin/python`（含固定客户端补丁）。
+本机需已安装 Rust、`timeout`、IDA 9.5 和匹配 SDK。下面每个用例独占短目录，
+分别给 150s；两个 122s observer 用例串行合计需要约四分钟。不得用 lib 或 gate13 代替。
+
+```bash
+S1_PYTHON=/absolute/fresh-env/venv/bin/python
+for S1_CASE in s1_dropped_close_releases_root_without_another_close s1_expired_observer_next_open_consumes_exact_proof s1_expired_uncertain_open_observer_consumes_exact_proof; do
+  S1_ROOT=$(mktemp -d /tmp/n7s1.XXXXXX)
+  mkdir -p "$S1_ROOT"/home "$S1_ROOT"/state "$S1_ROOT"/tmp "$S1_ROOT"/proof
+  uptime
+  env -i HOME="$HOME" USER="$USER" PATH="$PATH" LANG=C.UTF-8 IDADIR='/Applications/IDA Professional 9.5.app/Contents/MacOS' IDASDKDIR=/Users/pingzi/Developer/tools/ida-sdk-9.5/src CARGO_TARGET_DIR=/tmp/ida-nexus-run-20261015.98rmfb/n1/target IDA_CLI_NEXUS_DEV=1 IDA_NEXUS_PYTHON="$S1_PYTHON" F1_ROOT="$S1_ROOT/proof" IDA_CLI_HOME="$S1_ROOT/home" IDA_NEXUS_STATE_DIR="$S1_ROOT/state" TMPDIR="$S1_ROOT/tmp" timeout 150s cargo test --locked --test nexus_n7_fix1 "$S1_CASE" -- --exact --test-threads=1
+  S1_EXIT=$?; uptime; test "$S1_EXIT" = 0 || break
+done
+```
+
+F10 释放协调：每个自有 handle 新鲜检查保护后至多 release 一次；原/辅助请求
+全部推进后才等待所需公开 owner lifetime。未知 ACK 保留精确责任，第三方 sibling
+仍阻止 owner 证明，不重放或强关；辅助保护无法确认时不关闭。保存拒绝累积返回。
+
+固定 N0 的预建副本对照在编辑前通过 `baseline_prebuilt_open` 检查元数据。
+仅当空 `input_file_path`、size 0、MD5/SHA256 全零同时出现，且预建 seed 元数据
+完整、seed 与副本 packed SHA256 均未变时，允许 N0 额外重开至多两次。
+每次记录时间、uptime、原始打开/元数据响应与关闭前后磁盘哈希到
+`baseline-reopens.jsonl`；磁盘改变或三次仍失败就失败，不恢复坏副本、不跳过比较。
+r9 是 IDA 9.5 idalib 上游缺陷，旧 native 也受影响；此规则只用于 N6/E04-N6、
+N6-tools 的固定 N0 预建副本，不重试刻意缺元数据的 compatibility fixture。
+Nexus 测试侧不加重试，只使用产品自动重开；比较器和两条既有字段例外不变。
+全部 `test_nexus_*.py` 须每文件单独运行，并在 `env -i` 白名单下再各跑一次。
+
 GC 对配置 state 注册只做只读文件名/公开 record_id 集合对照，用于拒绝；不碰 Nexus 锁和状态内容。合法 dead 注册由公开发现 reap，之后仍须 packed、无组件等完整检查；预算选足即停、最终删除也受本轮容量约束。manifest/journal 的数组、null、标量和错误字段类型只拒绝本条目，其他候选继续。
 
 旧平铺缓存一律保留、继续计磁盘且可能长期超限，无自动迁移工具；force 不迁移用户修改、不回收旧空间。N8 全量验收前的 dry-run/可恢复迁移或离线清理途径已登记在计划，最终是否必须实现由用户裁定。本轮不操作真实旧缓存。

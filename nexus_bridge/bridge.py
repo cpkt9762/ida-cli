@@ -21,7 +21,7 @@ from analysis_tools import ANALYSIS_METHODS
 from struct_tools import STRUCT_METHODS
 from query_tools import QUERY_METHODS
 from search_tools import SEARCH_METHODS
-from lifecycle import database_diagnostics, release_handle
+from lifecycle import database_diagnostics, release_handle, release_errors
 from metadata import idb_context
 from open_recovery import open_checked
 
@@ -307,6 +307,14 @@ class Bridge:
                 command = frame["payload"]
                 details['diagnostics'] = database_diagnostics(
                     command.get('options', {}).get('output_database') or command['path'])
+            if frame["payload"]["command"] == "release":
+                key = frame['payload']['lease']['lease_id']
+                with self.lock:
+                    primary = self.handles.get(key)
+                    auxiliary = self.cleanup_handles.get(key)
+                participants = ([primary[1]] if primary else []) + ([auxiliary] if auxiliary else [])
+                messages = dict.fromkeys(message for member in participants for message in release_errors(member))
+                details['save_guard_error'] = '; '.join(messages) or None
             if isinstance(exc, RemoteError):
                 channel.send({"event": "remote_error", "attempt": attempt, "remote_code": exc.code,
                               "error": error("operation_failed", str(exc)), **details})
@@ -571,14 +579,22 @@ class Bridge:
                 channel.send({'event': name, 'attempt': attempt, 'outcome': outcome,
                               'save_guard_error': outcome.get('save_guard_error'),
                               'error': error('cancel_pending', 'lease release unconfirmed; owner retained')})
-            outcome = release_handle(handle, deadline, publish, check=check_primary)
-            if outcome is None:
-                return
+            # Request every own lease before waiting for an owner that those
+            # leases keep alive. The primary check may create the helper.
+            release_handle(handle, deadline, check=check_primary, request_only=True)
+            participants = [handle]
             if cleanup_handle is not None:
-                outcome = release_handle(cleanup_handle, deadline, publish,
-                    errors=(outcome['save_guard_error'],))
-                if outcome is None:
-                    return
+                participants.append(cleanup_handle)
+                release_handle(cleanup_handle, deadline,
+                    errors=release_errors(handle), request_only=True)
+            errors = tuple(message for member in participants for message in release_errors(member))
+            outcomes = [release_handle(member, deadline, publish, errors=errors)
+                        for member in participants]
+            if any(outcome is None for outcome in outcomes):
+                return
+            outcome = next((item for item in reversed(outcomes) if item.get('owner_released')),
+                           outcomes[-1])
+            if cleanup_handle is not None:
                 with self.lock:
                     self.cleanup_handles.pop(lease['lease_id'], None)
             self.drop_lifetime(lease["lease_id"])

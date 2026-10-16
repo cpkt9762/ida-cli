@@ -45,6 +45,10 @@ def save_guard_error(handle):
     return '; '.join(release_state(handle)['errors']) or None
 
 
+def release_errors(handle):
+    return tuple(release_state(handle)['errors'])
+
+
 def close_check(handle, deadline):
     return handle.execute_python(
         "import sys\n_g=sys.modules.get('_ida_cli_save_guard_v1')\n"
@@ -53,8 +57,12 @@ def close_check(handle, deadline):
 
 
 def release_handle(handle, deadline, publish=lambda *_: None, *, check=None,
-                   errors=(), owner_required=False):
-    """One guarded release; retry only public proof, never the release request."""
+                   errors=(), owner_required=False, request_only=False):
+    """One guarded release; groups request all own leases before waiting for proof.
+
+    request_only returns the raw request outcome, never a logical release proof.
+    Subsequent calls coordinate public proof without repeating guard or release.
+    """
     from ida_nexus import wait_database_released
     state = release_state(handle)
     if not state['lock'].acquire(timeout=max(0, deadline-time.monotonic())):
@@ -83,6 +91,8 @@ def release_handle(handle, deadline, publish=lambda *_: None, *, check=None,
                                     'failure': type(exc).__name__}
         outcome = dict(state['outcome'], save_guard_error=save_guard_error(handle),
                        release_acknowledged=state['outcome'].get('lease_released') is True)
+        if request_only:
+            return outcome
         if state.get('owner_proved'):
             return dict(outcome, status='owner_released', owner_released=True,
                         lease_released=True, failure=None, proof='public_owner_lifetime')

@@ -9,6 +9,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 
 sys.dont_write_bytecode = True
 from compare_nexus_baseline import (Environment, Process, Candidate, BASELINE_SHA,
@@ -190,16 +191,86 @@ print(json.dumps({{"input_file_path":ida_nalt.get_input_file_path(),
     return samples
 
 
+def baseline_prebuilt_open(env, baseline, sample, label, *, native=False):
+    """Only the frozen N0 side may reopen twice for the exact upstream r9 signature.
+
+    The analyzed seed and unchanged packed bytes are prerequisites, not fields
+    fabricated for the comparator. A corrupt/changed file is never restored here.
+    This runs before any comparison edits and never retries a Nexus operation.
+    """
+    assert digest(baseline) == BASELINE_SHA, 'not the fixed N0 baseline'
+    records = [json.loads(path.read_text()) for path in env.root.glob('*-prebuilt-idb.json')]
+    record, = [item for item in records if str(sample) in item['copies']]
+    metadata = record['analyzed_seed_metadata']
+    original = Path(metadata['input_file_path'])
+    assert metadata['input_file_size'] == original.stat().st_size > 0
+    assert metadata['sha256'] == digest(original) != '0' * 64
+    assert len(metadata['md5']) == 32 and metadata['md5'] != '0' * 32
+    packed_hash = record['sha256'][0]
+    assert digest(record['seed']) == digest(sample) == packed_hash
+
+    def stop(client):
+        if native:
+            assert 'result' in client.rpc('close')
+            assert 'result' in client.rpc('shutdown')
+            client.wait()
+        else:
+            client.stop()
+
+    for attempt in range(3):
+        client = None
+        row = {'label': label, 'attempt': attempt, 'time_ns': time.time_ns(),
+               'uptime': subprocess.check_output(['timeout', '5s', 'uptime'], text=True).strip(),
+               'sample': str(sample), 'verified_packed_sha256': packed_hash}
+        try:
+            assert digest(record['seed']) == digest(sample) == packed_hash
+            if native:
+                home = env.root / f'{label}-home-{attempt}'
+                home.mkdir(mode=0o700)
+                variables = env.variables() | {'TMPDIR': os.environ['TMPDIR'], 'IDA_CLI_HOME': str(home)}
+                client = Process(env, [str(baseline), 'serve-worker'], variables, f'{label}-{attempt}')
+                row['open_response'] = client.rpc('open', {'path': str(sample)})
+                assert 'result' in row['open_response'], row
+                response = client.rpc('get_database_info')
+            else:
+                client = Candidate(env, baseline, sample, f'{label}-{attempt}', transport='stdio', inline='8000000')
+                row['open_response'] = client.open_result
+                response = client.call('get_database_info', {})
+            row['metadata_response'] = response
+            value = response.get('result', {})
+            missing = (value.get('input_file_path') == '' and value.get('input_file_size') == 0
+                       and value.get('md5') == '0' * 32 and value.get('sha256') == '0' * 64)
+            row['r9_signature'] = missing
+            if not missing:
+                return client
+            row['disk_sha256_before_close'] = digest(sample)
+            assert row['disk_sha256_before_close'] == packed_hash, 'baseline disk changed; no reopen'
+            closing, client = client, None
+            stop(closing)
+            row['disk_sha256_after_close'] = digest(sample)
+            assert row['disk_sha256_after_close'] == packed_hash, 'baseline close changed disk; no reopen'
+            assert attempt < 2, 'baseline r9 persists after two extra opens; comparison fails'
+            row['reopen_scheduled'] = True
+        except BaseException as exc:
+            row['error'] = type(exc).__name__ + ': ' + str(exc)
+            if client is not None:
+                try:
+                    stop(client)
+                except Exception as cleanup_error:
+                    row['cleanup_error'] = type(cleanup_error).__name__ + ': ' + str(cleanup_error)
+            raise
+        finally:
+            with (env.root / 'baseline-reopens.jsonl').open('a') as output:
+                output.write(json.dumps(row) + '\n')
+
+
 def comparison(env, baseline, binary):
     assert digest(baseline) == BASELINE_SHA
     old = new = None
     records = []
     samples = prebuilt_pair(env, binary)
     try:
-        variables = env.variables() | {"TMPDIR":os.environ["TMPDIR"], "IDA_CLI_HOME":str(env.root/"n6-old-home")}
-        Path(variables["IDA_CLI_HOME"]).mkdir(mode=0o700)
-        old = Process(env, [str(baseline), "serve-worker"], variables, "n6-baseline")
-        assert "result" in old.rpc("open", {"path":str(samples[0])})
+        old = baseline_prebuilt_open(env, baseline, samples[0], 'n6-baseline', native=True)
         funcs = old.rpc("list_functions", {})["result"]["functions"]
         ea = next(x["address"] for x in funcs if x["name"] in ("main", "_main"))
         new = Candidate(env, binary, samples[1], "n6-candidate", transport="stdio", inline="8000000")
@@ -387,7 +458,7 @@ def tool_contracts(env, baseline, binary):
     old = new = None
     records = []
     try:
-        old = Candidate(env, baseline, samples[0], "n6-tool-baseline", transport="stdio", inline="8000000")
+        old = baseline_prebuilt_open(env, baseline, samples[0], 'n6-tool-baseline')
         new = Candidate(env, binary, samples[1], "n6-tool-nexus", transport="stdio", inline="8000000")
         metadata_checkpoint(env, old, new, "reopened prebuilt copies")
         funcs = old.call("list_functions", {})["result"]["functions"]
