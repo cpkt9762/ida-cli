@@ -17,6 +17,10 @@ def load(name, path):
 
 
 tools = load("n4_tools", "nexus_bridge/tools.py")
+# The owner evaluates metadata.py and tools.py in one namespace, as bridge.py
+# does. Keep this isolated business fixture faithful to that composition.
+metadata = load("n4_metadata", "nexus_bridge/metadata.py")
+tools.warn_missing_input_metadata = metadata.warn_missing_input_metadata
 compare = load("n4_compare", "scripts/compare_nexus_baseline.py")
 
 
