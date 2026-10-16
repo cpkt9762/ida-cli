@@ -104,7 +104,9 @@ class OpenFingerprints(unittest.TestCase):
     def check_open(self, enabled):
         with tempfile.TemporaryDirectory() as directory, patch.object(
                 sys, 'path', [str(SOURCE), *sys.path]), patch.dict(
-                    sys.modules, {'ida_nexus': types.SimpleNamespace(discover_databases=lambda: [])}):
+                    sys.modules, {'ida_nexus': types.SimpleNamespace(discover_databases=lambda: [],
+                        probe_database_state=lambda path, **_: {'idb_path': str(path), 'state': 'packed'},
+                        wait_database_released=lambda *a, **kw: self.fail('healthy open must not release'))}):
             bridge = load('bridge')
             path = Path(directory)/'normal.i64'
             payload = b'private packed fixture'
