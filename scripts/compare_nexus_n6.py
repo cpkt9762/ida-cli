@@ -400,6 +400,9 @@ def tool_contracts(env, baseline, binary):
             assert c.call("run_script", {"code":setup})["result"]["success"]
         metadata_checkpoint(env, old, new, "after equivalent analysis and type setup")
         overrides = {
+          # The frozen N0 binary predates line_addresses. Compare its original
+          # plain request; the new option has separate live CLI/MCP coverage.
+          "decompile_function":{"address":ea},
           "get_function_by_name":{"name":"main"}, "batch_lookup_functions":{"queries":[ea,"main","missing"]},
           "build_xref_matrix":{"addrs":[ea,other]}, "build_callgraph":{"address":ea,"max_depth":2},
           "find_control_flow_paths":{"start":ea,"end":ea}, "read_global_variable":{"query":ea},
