@@ -85,7 +85,7 @@ def release_handle(handle, deadline, publish=lambda *_: None, *, check=None,
                        release_acknowledged=state['outcome'].get('lease_released') is True)
         if state.get('owner_proved'):
             return dict(outcome, status='owner_released', owner_released=True,
-                        lease_released=True, proof='public_owner_lifetime')
+                        lease_released=True, failure=None, proof='public_owner_lifetime')
         if (not owner_required and outcome.get('status') == 'lease_released'
                 and outcome.get('lease_released') is True
                 and outcome.get('shutdown_pending') is False):
@@ -94,7 +94,7 @@ def release_handle(handle, deadline, publish=lambda *_: None, *, check=None,
         if wait_database_released(handle.instance, timeout=max(0, deadline-time.monotonic())):
             state['owner_proved'] = True
             return dict(outcome, status='owner_released', owner_released=True,
-                        lease_released=True, proof='public_owner_lifetime')
+                        lease_released=True, failure=None, proof='public_owner_lifetime')
         publish('release_unconfirmed', outcome)
         return None
     finally:

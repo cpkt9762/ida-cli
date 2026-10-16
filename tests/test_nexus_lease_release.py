@@ -175,7 +175,8 @@ class ReleaseTests(unittest.TestCase):
     def test_shared_protocol_accumulates_errors_across_healthy_retry(self):
         from lifecycle import release_handle
         handle = types.SimpleNamespace(instance=object(), close_outcome=Mock(return_value={
-            'status': 'lease_released', 'lease_released': True, 'shutdown_pending': True}))
+            'status': 'uncertain', 'lease_released': True, 'shutdown_pending': True,
+            'failure': 'lifetime_unconfirmed'}))
         check = Mock(return_value={'close_safe': True, 'save_guard_error': 'saving refused: first'})
         with patch.object(ida_nexus, 'wait_database_released', side_effect=[False, True]):
             self.assertIsNone(release_handle(handle, time.monotonic()+1, check=check))
@@ -185,6 +186,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn('saving refused: first', result['save_guard_error'])
         self.assertIn('saving refused: second', result['save_guard_error'])
         self.assertTrue(result['owner_released'])
+        self.assertIsNone(result['failure'])
         handle.close_outcome.assert_called_once()
         check.assert_called_once()
 
