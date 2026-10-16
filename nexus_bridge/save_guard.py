@@ -176,6 +176,10 @@ def sample(stage, context=None, refuse=True):
                     'probes': delayed}, ensure_ascii=True))
         state['last_sample'] = {'time': now, 'stage': stage, 'root_present': present,
                                 'operation': dict(context or state['operation'])}
+        if failure:
+            state['close_safe'] = False
+            raise RuntimeError('Root Node save protection unavailable: ' + ERROR
+                               + '; current Root query failed; owner and exact lease retained; no default close')
         message = ('Root Node save protection unavailable: ' + state['install_error']
                    if state.get('install_error') else ERROR)
         if refuse:
@@ -244,19 +248,19 @@ def save_database(outfile=None, flags=0):
 
 
 def close_status():
-    """Read-only guard evidence; missing/failed protection never authorizes close."""
+    """Re-sample on the owner immediately before permitting a saving release."""
     state = _state or _failed_state
-    evidence = state.get('first_failure') if state else None
-    safe = bool(state and state['close_safe'])
-    if safe and state['poisoned']:
+    safe, protection_error = False, 'not installed'
+    if state:
         try:
-            import ida_loader
-            safe = all(ida_loader.is_database_flag(flag)
-                       for flag in (ida_loader.DBFL_TEMP, ida_loader.DBFL_KILL))
-        except Exception:
-            safe = False
+            sample('before-close', refuse=False)
+            safe = state['close_safe']
+            protection_error = state.get('protection_error')
+        except Exception as exc:
+            protection_error = type(exc).__name__ + ': ' + str(exc)
+    evidence = state.get('first_failure') if state else None
     return {'close_safe': safe,
             'initial': bool(evidence and evidence['previous_sample'] is None
                             and not state.get('install_error')),
             'evidence': evidence,
-            'protection_error': state.get('protection_error') if state else 'not installed'}
+            'protection_error': protection_error}

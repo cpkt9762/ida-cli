@@ -548,6 +548,7 @@ class Bridge:
                      operation_id=command.get('identity', {}).get('operation_id',
                          'release:' + str(attempt['sequence'])), lease=lease), refuse=False)
             guard_error = None
+            cleanup_handle = None
             if handle.connected:
                 checked = handle.execute_python(cleanup_code, timeout=max(0.001, deadline - time.monotonic()))
                 guard_error = checked['result']['save_guard_error']
@@ -567,9 +568,6 @@ class Bridge:
                     checked = cleanup_handle.execute_python(cleanup_code,
                         timeout=max(0.001, deadline - time.monotonic()))
                     guard_error = checked['result']['save_guard_error']
-                    cleanup_handle.close(wait_for_database=False)
-                    with self.lock:
-                        self.cleanup_handles.pop(lease['lease_id'], None)
                 else:
                     from ida_nexus import wait_database_released
                     if not wait_database_released(handle.instance,
@@ -581,6 +579,17 @@ class Bridge:
             outcome = release_handle(handle, deadline, publish)
             if outcome is None:
                 return
+            if cleanup_handle is not None:
+                # The original release is a separate owner boundary. Recheck
+                # before closing the auxiliary lease, which may now be last.
+                cleanup_handle.execute_python(guarded_source('pass',
+                    dict(self.metadata_contexts.get(lease['lease_id'], {}),
+                         method='auxiliary-close', lease=lease), refuse=False),
+                    timeout=max(0.001, deadline - time.monotonic()))
+                cleanup_handle.close(wait_for_database=False,
+                    timeout=max(0, deadline - time.monotonic()))
+                with self.lock:
+                    self.cleanup_handles.pop(lease['lease_id'], None)
             self.drop_lifetime(lease["lease_id"])
             with self.lock:
                 self.handles.pop(lease["lease_id"], None)

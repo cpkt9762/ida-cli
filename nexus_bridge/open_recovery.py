@@ -262,7 +262,7 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                 try:
                     proof = failure_state(handle, deadline)
                 except Exception as diagnostic:
-                    # An already disconnected client cannot run the read-only
+                    # An already disconnected client cannot run the fresh
                     # guard query. It is never permission to reopen the owner.
                     proof = {'initial': False, 'evidence_error': type(diagnostic).__name__}
                 if proof.get('close_safe') is not True:
@@ -278,6 +278,9 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                         observed = snapshot.failed(number)
                     except Exception as error:
                         observation_error = error
+                # Snapshot collection can take time or fail. Its earlier proof
+                # classifies the failure; only a new owner sample permits close.
+                require_safe_close(handle, deadline)
                 outcome = handle.close_outcome(wait_for_database=True, timeout=remaining(deadline))
                 if proof['initial']:
                     lifetime = wait_database_released(handle.instance, timeout=remaining(deadline))

@@ -27,6 +27,7 @@ class OpenTests(unittest.TestCase):
         self.losses, self.initial, self.lifetime, self.lease = 0, True, True, True
         self.recovering, self.tamper = False, lambda: None
         self.wait_calls, self.unreadable = 0, False
+        self.close_safe = True
         self.mocks = [patch.dict(os.environ, {'IDA_CLI_HOME': str(self.root/'home')}),
             patch.object(recovery, 'public_owner_probe', return_value=None),
             patch.dict(sys.modules, {'ida_nexus': types.SimpleNamespace(
@@ -62,7 +63,8 @@ class OpenTests(unittest.TestCase):
                     return {'result': '9.5'}
                 if parent.unreadable:
                     raise RuntimeError('disconnected guard query')
-                return {'result': {'close_safe': True, 'initial': parent.initial, 'evidence': {'open_attempt': number}}}
+                return {'result': {'close_safe': parent.close_safe, 'initial': parent.initial,
+                                   'evidence': {'open_attempt': number}}}
 
             def close_outcome(self, **_options):
                 parent.calls.append('close')
@@ -147,6 +149,28 @@ class OpenTests(unittest.TestCase):
         data = json.loads(next((self.root/'home/idb/recovery').glob('*/recovery.json')).read_text())
         self.assertEqual(data['status'], 'opened')
         self.assertEqual(len(data['attempts']), 1)
+
+    def test_snapshot_collection_cannot_reuse_earlier_close_proof(self):
+        original = recovery.Snapshot.failed
+        for fails in (False, True):
+            with self.subTest(snapshot_error=fails):
+                self.make_crashed()
+                self.losses, self.close_safe = 1, True
+                self.handles.clear()
+                self.calls.clear()
+                def collect(snapshot, number):
+                    observed = original(snapshot, number)
+                    self.close_safe = False
+                    if fails:
+                        raise OSError('injected snapshot collection failure')
+                    return observed
+                with patch.object(recovery.Snapshot, 'failed', collect):
+                    with self.assertRaisesRegex(RuntimeError, 'exact lease retained'):
+                        self.run_open()
+                self.assertNotIn('close', self.calls)
+                self.assertEqual(self.released, [])
+                self.assertEqual(len(self.handles), 1)
+                self.assertEqual(self.target.read_bytes(), b'bad recovered packed')
 
     def test_no_lifetime_or_no_lease_proof_never_rolls_back(self):
         for lease, lifetime in ((True, False), (False, True)):

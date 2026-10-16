@@ -59,7 +59,9 @@ class GuardTests(unittest.TestCase):
         def unavailable(_):
             raise RuntimeError('probe unavailable')
         sys.modules['ida_netnode'].netnode.exist = unavailable
-        self.assertIn('saving refused', self.guard.finish({'method': 'close'}, refuse=False))
+        with self.assertRaisesRegex(RuntimeError, 'current Root query failed'):
+            self.guard.finish({'method': 'close'}, refuse=False)
+        self.assertFalse(self.guard.close_status()['close_safe'])
         self.assertEqual(self.flags, {1, 8})
         self.assertEqual(self.logs[0]['probe_error'], 'RuntimeError')
 
@@ -240,6 +242,68 @@ class GuardTests(unittest.TestCase):
                 handle.close_outcome.assert_not_called()
                 self.assertIs(owner.handles['lease'][1], handle)
 
+    def test_close_confirmation_samples_current_root_and_preserves_first_failure(self):
+        self.guard.begin({'method': 'open'})
+        self.present = False
+        proof = self.guard.close_status()
+        self.assertTrue(proof['close_safe'])
+        self.assertFalse(proof['initial'], 'a later loss must not authorize initial-open retry')
+        self.assertEqual(proof['evidence']['stage'], 'before-close')
+        first = proof['evidence']
+        self.flags.clear()
+        self.assertTrue(self.guard.close_status()['close_safe'])
+        self.assertEqual(self.flags, {1, 8}, 're-arm flags, never reuse a prior confirmation')
+        self.assertIs(self.guard.close_status()['evidence'], first)
+
+    def test_slice_disconnect_cleanup_retains_auxiliary_handle_on_unsafe_close(self):
+        from unittest.mock import Mock
+        path = Path(__file__).resolve().parents[1] / 'nexus_bridge/slices.py'
+        spec = importlib.util.spec_from_file_location('test_slices_cleanup', path)
+        slices = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(slices)
+        context = ['bridge', 'lease', 'owner', 1, '/lifetime']
+        self.guard.begin({'method': 'open'})
+        with patch.dict(sys.modules, {'_ida_cli_save_guard_v1': self.guard}):
+            for branch in ('set', 'readback', 'read-error', 'query', 'healthy', 'confirmed'):
+                with self.subTest(branch=branch):
+                    self.guard._state = None
+                    self.flags.clear()
+                    self.present = True
+                    self.guard.begin({'method': 'open'})
+                    def execute(source, **kwargs):
+                        if 'release_lease' in source:
+                            self.present = branch == 'healthy'
+                            raise RuntimeError('injected slice cleanup failure')
+                        namespace = {}
+                        exec(source, namespace)
+                        return {'result': namespace['result']}
+                    handle = Mock()
+                    handle.execute_python.side_effect = execute
+                    loader = sys.modules['ida_loader']
+                    def set_flag(flag):
+                        if branch == 'set':
+                            raise OSError('cannot set flag')
+                        self.flags.add(flag)
+                    def read_flag(flag):
+                        if branch == 'read-error':
+                            raise OSError('cannot query flag')
+                        return branch != 'readback' and flag in self.flags
+                    def root(_):
+                        if branch == 'query' and not self.present:
+                            raise OSError('cannot query Root')
+                        return self.present
+                    with patch.object(loader, 'set_database_flag', set_flag), \
+                            patch.object(loader, 'is_database_flag', read_flag), \
+                            patch.object(sys.modules['ida_netnode'].netnode, 'exist', root):
+                        with self.assertRaises(RuntimeError):
+                            slices.cleanup_disconnected(handle, context, slices.incarnation)
+                    if branch in ('healthy', 'confirmed'):
+                        handle.close.assert_called_once_with(wait_for_database=False)
+                        self.assertNotIn(tuple(context), slices.cleanup_handles)
+                    else:
+                        handle.close.assert_not_called()
+                        self.assertIs(slices.cleanup_handles[tuple(context)], handle)
+
     def test_unverifiable_root_refuses_open_and_explicit_save(self):
         def unavailable(_):
             raise RuntimeError('Root Node probe unavailable')
@@ -249,6 +313,61 @@ class GuardTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'saving refused'):
             self.guard.save_database()
         self.assertEqual(self.flags, {1, 8})
+
+    def test_disconnected_release_rechecks_before_last_auxiliary_close(self):
+        import threading
+        import time
+        from unittest.mock import Mock
+        directory = Path(__file__).resolve().parents[1] / 'nexus_bridge'
+        with patch.object(sys, 'path', [str(directory), *sys.path]):
+            import bridge
+        lease = {'lease_id': 'exact', 'instance_id': 'owner', 'generation': 1}
+        instance = types.SimpleNamespace(record_id='owner')
+        for loss in (False, True):
+            with self.subTest(root_loss_after_primary_release=loss):
+                self.guard._state = None
+                self.present = True
+                self.flags.clear()
+                self.guard.begin({'method': 'open'})
+                primary = Mock(connected=False, instance=instance)
+                auxiliary = Mock(connected=True, instance=instance)
+                def execute(source, **kwargs):
+                    namespace = {}
+                    exec(source, namespace)
+                    return {'result': namespace.get('result')}
+                auxiliary.execute_python.side_effect = execute
+                def release(**kwargs):
+                    self.assertTrue(self.present, 'original release must be checked while healthy')
+                    self.present = not loss
+                    return {'status': 'lease_released', 'lease_released': True}
+                primary.close_outcome.side_effect = release
+                owner = bridge.Bridge.__new__(bridge.Bridge)
+                owner.identity, owner.lifetime_path = 'bridge', '/lifetime'
+                owner.lock = threading.Lock()
+                owner.handles = {'exact': (lease, primary)}
+                owner.cleanup_handles, owner.metadata_contexts = {}, {}
+                owner.Handle = types.SimpleNamespace(attach=lambda _: auxiliary)
+                owner.drop_lifetime = Mock()
+                api = types.SimpleNamespace(
+                    discover_databases=lambda: [types.SimpleNamespace(instance=instance)],
+                    wait_database_released=Mock(side_effect=AssertionError('unexpected lifetime wait')))
+                loader = sys.modules['ida_loader']
+                with patch.dict(sys.modules, {'ida_nexus': api, '_ida_cli_save_guard_v1': self.guard}), \
+                        patch.object(loader, 'set_database_flag', side_effect=OSError('cannot protect close')):
+                    args = (Mock(), {'sequence': 1}, {'command': 'release', 'lease': lease},
+                            time.monotonic()+2, [False])
+                    if loss:
+                        with self.assertRaisesRegex(RuntimeError, 'exact lease retained'):
+                            owner.invoke(*args)
+                        auxiliary.close.assert_not_called()
+                        self.assertIs(owner.cleanup_handles['exact'], auxiliary)
+                        self.assertIs(owner.handles['exact'][1], primary)
+                    else:
+                        owner.invoke(*args)
+                        auxiliary.close.assert_called_once()
+                        self.assertEqual(owner.cleanup_handles, {})
+                        self.assertEqual(owner.handles, {})
+                primary.close_outcome.assert_called_once()
 
     def test_failure_captures_actual_components_before_protection(self):
         import tempfile

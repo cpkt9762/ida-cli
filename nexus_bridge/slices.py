@@ -36,7 +36,34 @@ NOTIFICATIONS = (
 counter = None
 jobs = {}
 watchers = {}
+cleanup_handles = {}
 incarnation = uuid.uuid4().hex
+
+
+def cleanup_disconnected(handle, context, expected_incarnation):
+    """Close an auxiliary lease only after a fresh owner protection check."""
+    key = tuple(context)
+    cleanup_handles[key] = handle
+    cleanup_error = None
+    try:
+        # Serialized after any in-flight native call on the same owner.
+        handle.execute_python(
+            "import sys\n"
+            "m=sys.modules.get('_ida_cli_nexus_slices_v1')\n"
+            f"result=m.release_lease({context!r}, {expected_incarnation!r}) if m else None",
+            timeout=600)
+    except Exception as exc:
+        cleanup_error = exc
+    proof = handle.execute_python(
+        "import sys\n"
+        "g=sys.modules.get('_ida_cli_save_guard_v1')\n"
+        "result=g.close_status() if g else {'close_safe': False}", timeout=5)
+    if proof['result'].get('close_safe') is not True:
+        uncertain('save protection unavailable; exact auxiliary lease retained; no default close')
+    handle.close(wait_for_database=False)
+    cleanup_handles.pop(key, None)
+    if cleanup_error:
+        raise cleanup_error
 
 
 def watch_lease(context):
@@ -68,15 +95,7 @@ def watch_lease(context):
                        if item.instance.record_id == context[2]]
             if entries:
                 handle = DatabaseHandle.attach(entries[0])
-                try:
-                    # Public execution is serialized after an in-flight native
-                    # call. Never release a job while that call may still run.
-                    handle.execute_python(
-                        "import sys\n"
-                        "m=sys.modules.get('_ida_cli_nexus_slices_v1')\n"
-                        f"result=m.release_lease({context!r}, {incarnation!r}) if m else None", timeout=600)
-                finally:
-                    handle.close(wait_for_database=False)
+                cleanup_disconnected(handle, context, incarnation)
         except Exception:
             import logging
             logging.getLogger(__name__).exception("Nexus slice disconnect cleanup unconfirmed")
