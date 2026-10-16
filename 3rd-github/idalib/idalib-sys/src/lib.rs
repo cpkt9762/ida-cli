@@ -535,11 +535,12 @@ pub mod hexrays {
         idalib_hexrays_cblock_iter_next, idalib_hexrays_cblock_len,
         idalib_hexrays_cfunc_find_stmts_at, idalib_hexrays_cfunc_get_stmt_bounds,
         idalib_hexrays_cfunc_has_eamap, idalib_hexrays_cfunc_pseudocode,
-        idalib_hexrays_cfuncptr_inner, idalib_hexrays_cinsn_ea, idalib_hexrays_cinsn_op,
-        idalib_hexrays_cinsn_print, idalib_hexrays_decompile_func, idalib_hexrays_eamap_result_len,
-        idalib_hexrays_eamap_result_next, idalib_hexrays_eamap_result_reset,
-        idalib_hexrays_rename_lvar, idalib_hexrays_set_decompiler_comment,
-        idalib_hexrays_set_lvar_type,
+        idalib_hexrays_cfunc_pseudocode_plain_lines, idalib_hexrays_cfunc_pseudocode_tagged_lines,
+        idalib_hexrays_cfunc_treeitem_ea, idalib_hexrays_cfuncptr_inner, idalib_hexrays_cinsn_ea,
+        idalib_hexrays_cinsn_op, idalib_hexrays_cinsn_print, idalib_hexrays_decompile_func,
+        idalib_hexrays_eamap_result_len, idalib_hexrays_eamap_result_next,
+        idalib_hexrays_eamap_result_reset, idalib_hexrays_rename_lvar,
+        idalib_hexrays_set_decompiler_comment, idalib_hexrays_set_lvar_type,
     };
 
     unsafe impl cxx::ExternType for cfunc_t {
@@ -943,6 +944,13 @@ mod ffix {
             f: *const qrefcnt_t_cfunc_t_AutocxxConcrete,
         ) -> *mut cfunc_t;
         unsafe fn idalib_hexrays_cfunc_pseudocode(f: *mut cfunc_t) -> String;
+        unsafe fn idalib_hexrays_cfunc_pseudocode_tagged_lines(
+            f: *mut cfunc_t,
+        ) -> Result<Vec<String>>;
+        unsafe fn idalib_hexrays_cfunc_pseudocode_plain_lines(
+            f: *mut cfunc_t,
+        ) -> Result<Vec<String>>;
+        unsafe fn idalib_hexrays_cfunc_treeitem_ea(f: *mut cfunc_t, index: usize) -> u64;
 
         unsafe fn idalib_hexrays_decompile_func(
             f: *mut func_t,

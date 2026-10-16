@@ -427,6 +427,13 @@ fn dispatch_request(worker: &mut CompatWorker, req: &RpcRequest) -> RpcResponse 
                 .disasm_function_at(addr, name, offset, count)
                 .map(|text| json!({ "disasm": text }))
         }
+        "decompile_function" if params["line_addresses"].as_bool() == Some(true) => {
+            Err(ToolError::NotSupported(
+                "decompile_function line_addresses needs the native-linked backend; \
+                 the idat backend only returns the pseudocode text"
+                    .to_string(),
+            ))
+        }
         "decompile_function" => {
             let address = params
                 .get("address")

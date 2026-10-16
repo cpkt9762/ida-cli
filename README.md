@@ -43,6 +43,11 @@ requires an IDA SDK because the vendored native layer is linked against it;
 at runtime the CLI opens IDA itself from `IDADIR` or a normalised common
 install path.
 
+Release binaries are built against the IDA 9.5 SDK (`releases/9.5` of
+`HexRaysSA/ida-sdk`, matching IDA 9.5.261001), so they use `native-linked`
+on IDA 9.5 and `idat-compat` elsewhere. Build from source with the matching
+SDK to get `native-linked` on IDA 9.3.
+
 ## Current Capabilities
 
 On supported IDA 9.x runtimes, `ida-cli` can:
@@ -141,6 +146,40 @@ Streamable-HTTP server bound to a random port and writes
 ./target/debug/ida-cli --path /path/to/sample.bin list-functions --limit 20
 ./target/debug/ida-cli --path /path/to/sample.bin decompile --addr 0x140001000
 ./target/debug/ida-cli --path /path/to/sample.bin raw '{"method":"get_xrefs_to","params":{"address":"0x140001000"}}'
+```
+
+To see which databases the daemon currently holds open, and which clients
+hold them, run `list-idbs` (MCP tool: `list_idbs`). Run it before rebuilding
+or replacing an `.i64`, for example with `idat`: a database that is still
+listed is held open by the daemon, and `idat` fails on a database that is
+open elsewhere. The answer is `{"count": N, "idbs": [...]}`; each entry has
+the `db_handle`, the input path and the `.i64` path, an opaque id of the
+client that opened it, when it was opened, the worker process, whether it is
+the active database, and the clients that still hold references. Close
+tokens are never returned.
+
+```bash
+./target/debug/ida-cli list-idbs --json
+```
+
+To get the address behind each line of pseudocode, add `--line-addresses` to
+`decompile` (MCP and RPC: `line_addresses: true` on `decompile_function`). The
+answer becomes `{"code": ..., "lines": [...]}`: `code` is the usual text and
+each `lines` entry is `{"line", "text", "addresses"}`. `line` counts from 1,
+`text` is that line of `code`, and `addresses` are the IDA addresses (hex
+strings, ascending, no duplicates) of the ctree items Hex-Rays anchored on the
+line. A line can map to several non-contiguous addresses, and the list is not
+every instruction of the statement. The signature and local declarations have
+none; `{`, `}`, `else` and blank lines can carry the address of the block or
+`if` that owns them (the function entry for the outermost braces). The `sub_`
+rename hint is not added in this mode. Hex-Rays can print a very large function
+differently from one call to the next, so use `code` and `lines` from the same
+answer only. Only the native-linked backend can do this; the idat backend
+answers `NotSupported`. Over the CLI socket a large
+answer is stored in the response cache like any other (`IDA_MCP_MAX_INLINE_BYTES`).
+
+```json
+{"line": 6, "text": "  while ( a1 != 1 )", "addresses": ["0x10000033c", "0x100000340"]}
 ```
 
 Commands whose first argument is a service subcommand (`serve`,

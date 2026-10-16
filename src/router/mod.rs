@@ -5,6 +5,7 @@
 //! - Requests are routed to workers via JSON-RPC over stdin/stdout
 //! - Router maintains an "active" handle for backward compatibility
 
+pub mod listing;
 pub mod nexus_bridge;
 pub mod nexus_tools;
 pub mod nexus_transport;
@@ -13,14 +14,17 @@ pub mod transport;
 pub mod worker_io;
 
 use crate::ida::{RuntimeProbeResult, WorkerBackendKind};
+use crate::router::listing::{
+    ClientIdentity, DbRecord, IdbListing, ListedHolder, ListedIdb, ListedWorker, OpenOutcome,
+};
 use crate::router::protocol::RpcRequest;
 use crate::server::task::{TaskRegistry, TaskState, TaskStatus};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 #[cfg(test)]
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
@@ -45,6 +49,11 @@ pub struct WorkerProcess {
     pub close_token: Option<String>,
     pub open_path: Option<PathBuf>,
     pub last_active: Instant,
+    pub spawned_at: SystemTime,
+    /// The client whose request spawned this worker.
+    pub opener: ClientIdentity,
+    /// What the worker holds, as confirmed by its `open` responses.
+    pub db: DbRecord,
 }
 
 #[derive(Debug, Clone)]
@@ -381,10 +390,22 @@ struct RouterInner {
 struct ReferenceTokens {
     token_to_handle: HashMap<String, DbHandle>,
     ref_tokens: HashMap<DbHandle, HashSet<String>>,
+    clients: HashMap<String, ClientIdentity>,
 }
 impl ReferenceTokens {
+    fn insert_ref(&mut self, handle: &str, token: String, client: &ClientIdentity) {
+        self.token_to_handle
+            .insert(token.clone(), handle.to_string());
+        self.clients.insert(token.clone(), client.clone());
+        self.ref_tokens
+            .entry(handle.to_string())
+            .or_default()
+            .insert(token);
+    }
+
     fn release(&mut self, token: &str) -> Option<(DbHandle, usize)> {
         let handle = self.token_to_handle.remove(token)?;
+        self.clients.remove(token);
         let remaining = self
             .ref_tokens
             .get_mut(&handle)
@@ -674,10 +695,22 @@ impl RouterState {
 
     /// Spawn a new worker subprocess for the given IDB path.
     /// Returns the db_handle (existing handle if file already open).
+    /// `client` is recorded as the opener of a new worker and as the holder of
+    /// the returned reference token.
     pub async fn spawn_worker(
         &self,
         path: &str,
         tenant_id: Option<&str>,
+    ) -> Result<(DbHandle, Option<String>), anyhow::Error> {
+        self.spawn_worker_for_client(path, tenant_id, &ClientIdentity::rpc_tenant(tenant_id))
+            .await
+    }
+
+    pub async fn spawn_worker_for_client(
+        &self,
+        path: &str,
+        tenant_id: Option<&str>,
+        client: &ClientIdentity,
     ) -> Result<(DbHandle, Option<String>), anyhow::Error> {
         // Expand `~/...` before canonicalising; see ensure_worker_with_ref_idb
         // for the detailed rationale.
@@ -710,14 +743,7 @@ impl RouterState {
                 let ref_token = format!("{now:x}-{pid:x}-{nonce:x}");
 
                 let mut references = self.references.lock().unwrap_or_else(|e| e.into_inner());
-                references
-                    .token_to_handle
-                    .insert(ref_token.clone(), existing_handle.clone());
-                references
-                    .ref_tokens
-                    .entry(existing_handle.clone())
-                    .or_default()
-                    .insert(ref_token.clone());
+                references.insert_ref(&existing_handle, ref_token.clone(), client);
 
                 return Ok((existing_handle, Some(ref_token)));
             }
@@ -828,14 +854,7 @@ impl RouterState {
             let ref_token = format!("{now:x}-{pid:x}-{nonce:x}");
 
             let mut references = self.references.lock().unwrap_or_else(|e| e.into_inner());
-            references
-                .token_to_handle
-                .insert(ref_token.clone(), existing_handle.clone());
-            references
-                .ref_tokens
-                .entry(existing_handle.clone())
-                .or_default()
-                .insert(ref_token.clone());
+            references.insert_ref(&existing_handle, ref_token.clone(), client);
 
             return Ok((existing_handle, Some(ref_token)));
         }
@@ -893,6 +912,9 @@ impl RouterState {
             close_token: Some(close_token.clone()),
             open_path: Some(canonical_path.clone()),
             last_active: Instant::now(),
+            spawned_at: SystemTime::now(),
+            opener: client.clone(),
+            db: DbRecord::new(),
         };
 
         let mut inner = self.inner.lock().await;
@@ -915,22 +937,14 @@ impl RouterState {
             worker.connection.close();
             let mut child = worker.child;
             child.kill().await?;
-            let token = self.issue_ref_for_handle(&existing).await;
+            let token = self.issue_ref_for_client(&existing, client).await;
             return Ok((existing, Some(token)));
         }
         inner.path_to_handle.insert(worker_key, handle.clone());
         self.references
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .token_to_handle
-            .insert(close_token.clone(), handle.clone());
-        let mut init_refs = HashSet::new();
-        init_refs.insert(close_token.clone());
-        self.references
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .ref_tokens
-            .insert(handle.clone(), init_refs);
+            .insert_ref(&handle, close_token.clone(), client);
         let connection = worker.connection.clone();
         inner.workers.insert(handle.clone(), worker);
         inner.active = Some(handle.clone());
@@ -1035,11 +1049,55 @@ impl RouterState {
                 .ok_or(ToolError::WorkerClosed)?;
             let waiting = worker.connection.enqueue(req_id, bytes, deadline)?;
             worker.last_active = Instant::now();
+            if method == "open" {
+                worker.db.begin_open();
+            }
             waiting
         };
-        waiting
+        let outcome = waiting
             .wait_prepared(timeout_secs, &preparation.cancel)
-            .await
+            .await;
+        if method == "open" {
+            self.record_open_outcome(&target_handle, &outcome).await;
+        }
+        outcome
+    }
+
+    /// Fold the result of a worker `open` request into the listing state.
+    async fn record_open_outcome(
+        &self,
+        handle: &str,
+        outcome: &Result<serde_json::Value, crate::error::ToolError>,
+    ) {
+        use crate::error::ToolError;
+
+        let outcome = match outcome {
+            Ok(value) => OpenOutcome::Opened {
+                reported_path: value
+                    .get("path")
+                    .and_then(|path| path.as_str())
+                    .map(|path| {
+                        let path = PathBuf::from(path);
+                        std::fs::canonicalize(&path).unwrap_or(path)
+                    }),
+            },
+            Err(
+                ToolError::Timeout(_)
+                | ToolError::RequestOutcome { .. }
+                | ToolError::Preparation {
+                    execution_stopped: false,
+                    ..
+                },
+            ) => OpenOutcome::TimedOut,
+            Err(_) => OpenOutcome::Failed,
+        };
+        let mut inner = self.inner.lock().await;
+        if let Some(worker) = inner.workers.get_mut(handle) {
+            let input = worker.open_path.clone();
+            worker
+                .db
+                .finish_open(outcome, input.as_deref(), SystemTime::now());
+        }
     }
 
     pub async fn close_worker(&self, handle: &str) -> Result<(), crate::error::ToolError> {
@@ -1074,6 +1132,7 @@ impl RouterState {
                 if let Some(tokens) = references.ref_tokens.remove(handle) {
                     for token in tokens {
                         references.token_to_handle.remove(&token);
+                        references.clients.remove(&token);
                     }
                 }
                 if inner.active.as_deref() == Some(handle) {
@@ -1207,6 +1266,140 @@ impl RouterState {
         }
         let inner = self.inner.lock().await;
         inner.workers.len()
+    }
+
+    /// List the databases the daemon holds open, oldest first.
+    ///
+    /// `caller` marks the entries and holders that belong to the asking
+    /// client. This reads registry state only: it never spawns, probes, or
+    /// talks to a worker, so it cannot block behind a slow `open`. Close
+    /// tokens are never part of the result.
+    pub(crate) fn set_nexus_client(&self, handle: &str, client: &ClientIdentity) {
+        self.nexus_tools.set_client(handle, client);
+    }
+
+    pub async fn list_idbs(&self, caller: Option<&ClientIdentity>) -> IdbListing {
+        if self.uses_nexus() {
+            return self.nexus_tools.list_idbs(caller);
+        }
+        let inner = self.inner.lock().await;
+        let references = self.references.lock().unwrap_or_else(|e| e.into_inner());
+        let mut holders: HashMap<&str, BTreeMap<&str, ListedHolder>> = HashMap::new();
+        for (token, handle) in &references.token_to_handle {
+            let Some(client) = references.clients.get(token) else {
+                continue;
+            };
+            holders
+                .entry(handle.as_str())
+                .or_default()
+                .entry(client.client_id.as_str())
+                .and_modify(|holder| holder.refs += 1)
+                .or_insert_with(|| ListedHolder {
+                    client: client.clone(),
+                    refs: 1,
+                    is_caller: caller == Some(client),
+                });
+        }
+
+        let mut workers: Vec<(&DbHandle, &WorkerProcess)> = inner
+            .workers
+            .iter()
+            .filter(|(_, worker)| worker.db.is_listed())
+            .collect();
+        workers.sort_by_key(|(handle, worker)| {
+            (
+                worker.db.opened_at.unwrap_or(worker.spawned_at),
+                (*handle).clone(),
+            )
+        });
+
+        let idbs = workers
+            .into_iter()
+            .map(|(handle, worker)| ListedIdb {
+                db_handle: handle.clone(),
+                state: worker.db.state,
+                input_path: worker.open_path.as_ref().map(|p| p.display().to_string()),
+                idb_path: worker.db.idb_path.as_ref().map(|p| p.display().to_string()),
+                opened_by: worker.opener.clone(),
+                opened_by_caller: caller == Some(&worker.opener),
+                opened_at: worker
+                    .db
+                    .opened_at
+                    .map(crate::server::task::iso_from_system_time),
+                open_secs: worker
+                    .db
+                    .opened_at
+                    .and_then(|opened_at| opened_at.elapsed().ok())
+                    .map(|elapsed| elapsed.as_secs()),
+                idle_secs: worker.last_active.elapsed().as_secs(),
+                worker: ListedWorker {
+                    pid: worker.child.id(),
+                    backend: worker.backend.to_string(),
+                },
+                active: inner.active.as_deref() == Some(handle.as_str()),
+                ref_count: references
+                    .ref_tokens
+                    .get(handle)
+                    .map(HashSet::len)
+                    .unwrap_or(0),
+                holders: holders
+                    .remove(handle.as_str())
+                    .map(|by_client| by_client.into_values().collect())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        IdbListing::new(idbs)
+    }
+
+    /// Register a stand-in worker (a `cat` process that never answers) so
+    /// tests can exercise the registry without IDA. Returns its handle and
+    /// first reference token.
+    #[cfg(test)]
+    pub(crate) async fn register_test_worker(
+        &self,
+        path: &str,
+        client: &ClientIdentity,
+    ) -> (DbHandle, String) {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "while IFS= read -r line; do :; done"]);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawn stand-in worker");
+        let stdin = child.stdin.take().expect("stand-in worker stdin");
+        let stdout = child.stdout.take().expect("stand-in worker stdout");
+
+        let mut inner = self.inner.lock().await;
+        let counter = inner.req_counter;
+        inner.req_counter += 1;
+        let handle: DbHandle = format!("{counter:016x}");
+        let token = format!("test-close-token-{counter:x}");
+        let key = Self::worker_key(PathBuf::from(path), "default");
+        let worker = WorkerProcess {
+            backend: WorkerBackendKind::NativeLinked,
+            tenant_id: "default".to_string(),
+            child,
+            connection: transport::RpcConnection::start(
+                stdout,
+                stdin,
+                self.config.max_pending_per_worker,
+            ),
+            close_token: Some(token.clone()),
+            open_path: Some(PathBuf::from(path)),
+            last_active: Instant::now(),
+            spawned_at: SystemTime::now(),
+            opener: client.clone(),
+            db: DbRecord::new(),
+        };
+        inner.path_to_handle.insert(key, handle.clone());
+        self.references
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert_ref(&handle, token.clone(), client);
+        inner.workers.insert(handle.clone(), worker);
+        inner.active = Some(handle.clone());
+        (handle, token)
     }
 
     async fn status_snapshot_inner(&self, include_federation: bool) -> RouterStatus {
@@ -1501,7 +1694,23 @@ impl RouterState {
         self.issue_ref_locked(&mut inner, handle)
     }
 
+    pub async fn issue_ref_for_client(&self, handle: &str, client: &ClientIdentity) -> String {
+        let mut inner = self.inner.lock().await;
+        self.issue_ref_locked_for_client(&mut inner, handle, client)
+    }
+
     fn issue_ref_locked(&self, inner: &mut RouterInner, handle: &str) -> String {
+        let client =
+            ClientIdentity::rpc_tenant(inner.workers.get(handle).map(|w| w.tenant_id.as_str()));
+        self.issue_ref_locked_for_client(inner, handle, &client)
+    }
+
+    fn issue_ref_locked_for_client(
+        &self,
+        inner: &mut RouterInner,
+        handle: &str,
+        client: &ClientIdentity,
+    ) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -1511,14 +1720,7 @@ impl RouterState {
         let token = format!("cli-{now:x}-{nonce:x}");
 
         let mut references = self.references.lock().unwrap_or_else(|e| e.into_inner());
-        references
-            .token_to_handle
-            .insert(token.clone(), handle.to_string());
-        references
-            .ref_tokens
-            .entry(handle.to_string())
-            .or_default()
-            .insert(token.clone());
+        references.insert_ref(handle, token.clone(), client);
         token
     }
 
@@ -3177,6 +3379,9 @@ mod tests {
                 close_token: None,
                 open_path: None,
                 last_active: Instant::now(),
+                spawned_at: std::time::SystemTime::now(),
+                opener: crate::router::listing::ClientIdentity::rpc_tenant(Some("fixture")),
+                db: crate::router::listing::DbRecord::new(),
             },
         );
         let cloned = router.clone();
@@ -3344,6 +3549,268 @@ mod tests {
         assert_eq!(value["remote"], true);
         assert_eq!(value["node"], "node-a");
         assert_eq!(value["remote_task_id"], "task-9");
+    }
+
+    fn by_handle<'a>(listing: &'a IdbListing, handle: &str) -> &'a ListedIdb {
+        listing
+            .idbs
+            .iter()
+            .find(|idb| idb.db_handle == handle)
+            .expect("handle is listed")
+    }
+
+    #[tokio::test]
+    async fn test_list_idbs_is_empty_without_workers() {
+        let router = RouterState::new().expect("router");
+        let listing = router.list_idbs(None).await;
+        assert_eq!(listing.count, 0);
+        assert!(listing.idbs.is_empty());
+        let value = listing.to_json().expect("serialize");
+        assert_eq!(value["idbs"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_list_idbs_reports_each_clients_database() {
+        let router = RouterState::new().expect("router");
+        let alice = ClientIdentity::mcp_session();
+        let bob = ClientIdentity::mcp_session();
+        let (a, _) = router.register_test_worker("/db/a.so", &alice).await;
+        let (b, _) = router.register_test_worker("/db/b.so", &bob).await;
+        router
+            .record_open_outcome(&a, &Ok(serde_json::json!({"path": "/db/a.so.i64"})))
+            .await;
+        router
+            .record_open_outcome(&b, &Ok(serde_json::json!({"path": "/db/b.so.i64"})))
+            .await;
+
+        let listing = router.list_idbs(Some(&alice)).await;
+        assert_eq!(listing.count, 2);
+
+        let first = by_handle(&listing, &a);
+        assert_eq!(first.input_path.as_deref(), Some("/db/a.so"));
+        assert_eq!(first.idb_path.as_deref(), Some("/db/a.so.i64"));
+        assert_eq!(first.opened_by, alice);
+        assert!(first.opened_by_caller);
+        assert_eq!(first.state, listing::DbState::Open);
+        assert!(first.opened_at.as_deref().is_some_and(|t| t.ends_with('Z')));
+        assert!(first.worker.pid.is_some());
+        assert_eq!(first.worker.backend, "native-linked");
+        assert_eq!(first.ref_count, 1);
+        assert!(!first.active, "the newest worker is the active one");
+
+        let second = by_handle(&listing, &b);
+        assert_eq!(second.opened_by, bob);
+        assert!(!second.opened_by_caller);
+        assert!(second.active);
+        assert_ne!(first.opened_by.client_id, second.opened_by.client_id);
+    }
+
+    #[tokio::test]
+    async fn test_opening_the_same_database_again_keeps_its_database_path() {
+        let router = RouterState::new().expect("router");
+        let alice = ClientIdentity::mcp_session();
+        let bob = ClientIdentity::mcp_session();
+        let (handle, _) = router.register_test_worker("/in/sample.so", &alice).await;
+        router
+            .record_open_outcome(&handle, &Ok(serde_json::json!({"path": "/db/sample.i64"})))
+            .await;
+        let opened_at = by_handle(&router.list_idbs(None).await, &handle)
+            .opened_at
+            .clone();
+
+        // A second client opens the same input; the worker answers from its
+        // open session and names the input file, not the database.
+        router.issue_ref_for_client(&handle, &bob).await;
+        router
+            .record_open_outcome(&handle, &Ok(serde_json::json!({"path": "/in/sample.so"})))
+            .await;
+
+        let listing = router.list_idbs(None).await;
+        let entry = by_handle(&listing, &handle);
+        assert_eq!(entry.idb_path.as_deref(), Some("/db/sample.i64"));
+        assert_eq!(entry.input_path.as_deref(), Some("/in/sample.so"));
+        assert_eq!(entry.opened_at, opened_at);
+        assert_eq!(entry.ref_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_idbs_is_ordered_oldest_open_first() {
+        let router = RouterState::new().expect("router");
+        let client = ClientIdentity::mcp_session();
+        let (first, _) = router.register_test_worker("/db/first", &client).await;
+        let (second, _) = router.register_test_worker("/db/second", &client).await;
+        router
+            .record_open_outcome(&second, &Ok(serde_json::json!({"path": "/db/second.i64"})))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        router
+            .record_open_outcome(&first, &Ok(serde_json::json!({"path": "/db/first.i64"})))
+            .await;
+
+        let listing = router.list_idbs(None).await;
+        let order: Vec<&str> = listing.idbs.iter().map(|i| i.db_handle.as_str()).collect();
+        assert_eq!(order, vec![second.as_str(), first.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn test_list_idbs_shows_every_holder_of_a_shared_database() {
+        let router = RouterState::new().expect("router");
+        let alice = ClientIdentity::mcp_session();
+        let bob = ClientIdentity::mcp_session();
+        let (handle, _) = router.register_test_worker("/db/shared.so", &alice).await;
+        router
+            .record_open_outcome(&handle, &Ok(serde_json::json!({"path": "/db/shared.i64"})))
+            .await;
+        router.issue_ref_for_client(&handle, &bob).await;
+        router.issue_ref_for_client(&handle, &bob).await;
+
+        let as_bob = router.list_idbs(Some(&bob)).await;
+        let entry = by_handle(&as_bob, &handle);
+        assert_eq!(as_bob.count, 1);
+        assert_eq!(entry.opened_by, alice);
+        assert!(!entry.opened_by_caller);
+        assert_eq!(entry.ref_count, 3);
+        assert_eq!(entry.holders.len(), 2);
+        let alice_holder = entry
+            .holders
+            .iter()
+            .find(|h| h.client == alice)
+            .expect("alice holds a ref");
+        let bob_holder = entry
+            .holders
+            .iter()
+            .find(|h| h.client == bob)
+            .expect("bob holds refs");
+        assert_eq!((alice_holder.refs, alice_holder.is_caller), (1, false));
+        assert_eq!((bob_holder.refs, bob_holder.is_caller), (2, true));
+    }
+
+    #[tokio::test]
+    async fn test_list_idbs_drops_a_database_once_its_last_ref_is_closed() {
+        let router = RouterState::new().expect("router");
+        let alice = ClientIdentity::mcp_session();
+        let bob = ClientIdentity::mcp_session();
+        let (kept, kept_token) = router.register_test_worker("/db/kept", &alice).await;
+        let (gone, gone_token) = router.register_test_worker("/db/gone", &bob).await;
+        let extra = router.issue_ref_for_client(&gone, &alice).await;
+        assert_eq!(router.list_idbs(None).await.count, 2);
+
+        // A release that leaves other holders keeps the database listed.
+        let (handle, remaining) = router
+            .release_ref_token(&gone_token)
+            .await
+            .expect("token is live");
+        assert_eq!((handle.as_str(), remaining), (gone.as_str(), 1));
+        let listing = router.list_idbs(None).await;
+        assert_eq!(by_handle(&listing, &gone).holders.len(), 1);
+
+        // Releasing the last reference and closing the worker removes it.
+        let (handle, remaining) = router
+            .release_ref_token(&extra)
+            .await
+            .expect("token is live");
+        assert_eq!(remaining, 0);
+        router.close_worker(&handle).await.expect("close worker");
+        let listing = router.list_idbs(None).await;
+        assert_eq!(listing.count, 1);
+        assert_eq!(listing.idbs[0].db_handle, kept);
+
+        let (handle, remaining) = router
+            .release_ref_token(&kept_token)
+            .await
+            .expect("token is live");
+        assert_eq!(remaining, 0);
+        router.close_worker(&handle).await.expect("close worker");
+        assert_eq!(router.list_idbs(None).await.count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_idbs_lists_opening_but_not_failed_databases() {
+        let router = RouterState::new().expect("router");
+        let client = ClientIdentity::mcp_session();
+        let (opening, _) = router.register_test_worker("/db/opening", &client).await;
+        let (failed, _) = router.register_test_worker("/db/failed", &client).await;
+        router
+            .record_open_outcome(
+                &failed,
+                &Err(crate::error::ToolError::OpenFailed("no such file".into())),
+            )
+            .await;
+
+        let listing = router.list_idbs(None).await;
+        assert_eq!(listing.count, 1);
+        let entry = by_handle(&listing, &opening);
+        assert_eq!(entry.state, listing::DbState::Opening);
+        assert!(entry.idb_path.is_none());
+        assert!(entry.opened_at.is_none());
+        assert!(entry.open_secs.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_a_retried_open_that_times_out_is_listed_as_opening() {
+        let router = RouterState::new().expect("router");
+        let client = ClientIdentity::mcp_session();
+        // The stand-in worker never answers, so the request times out.
+        let (handle, _) = router.register_test_worker("/db/slow", &client).await;
+        router
+            .record_open_outcome(
+                &handle,
+                &Err(crate::error::ToolError::OpenFailed("first try".into())),
+            )
+            .await;
+        assert_eq!(router.list_idbs(None).await.count, 0);
+
+        let result = router
+            .route_request(
+                Some(&handle),
+                "open",
+                serde_json::json!({"path": "/db/slow", "timeout_secs": 1}),
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::ToolError::RequestOutcome { seconds: 1 })
+            ),
+            "a sent open remains an unknown outcome at its deadline: {result:?}"
+        );
+
+        // The open request is still in flight, so the files may be held.
+        let listing = router.list_idbs(None).await;
+        assert_eq!(
+            by_handle(&listing, &handle).state,
+            listing::DbState::Opening
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_idbs_never_exposes_close_tokens() {
+        let router = RouterState::new().expect("router");
+        let alice = ClientIdentity::mcp_session();
+        let bob = ClientIdentity::rpc_tenant(Some("tenant-with-a-name"));
+        let (handle, first_token) = router.register_test_worker("/db/a", &alice).await;
+        let second_token = router.issue_ref_for_client(&handle, &bob).await;
+        let (other, other_token) = router.register_test_worker("/db/b", &bob).await;
+        for h in [&handle, &other] {
+            router
+                .record_open_outcome(h, &Ok(serde_json::json!({"path": "/db/x.i64"})))
+                .await;
+        }
+
+        let value = router
+            .list_idbs(Some(&alice))
+            .await
+            .to_json()
+            .expect("serialize");
+        let text = serde_json::to_string(&value).expect("render");
+        for token in [&first_token, &second_token, &other_token] {
+            assert!(!text.contains(token.as_str()), "token leaked: {text}");
+        }
+        assert!(!text.contains("token"), "token field leaked: {text}");
+        assert!(
+            !text.contains("tenant-with-a-name"),
+            "raw tenant id leaked: {text}"
+        );
     }
 
     #[test]

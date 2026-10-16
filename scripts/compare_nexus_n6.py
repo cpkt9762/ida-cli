@@ -382,7 +382,7 @@ def tool_contracts(env, baseline, binary):
         example = json.loads(re.search(r'example: r#"(.*?)"#',block,re.S)[1])
         aliases = re.findall(r'"([^"]+)"', re.search(r'aliases: &\[(.*?)\]',block,re.S)[1])
         tools.append((name,example,aliases))
-    assert len(tools) == 106
+    assert len(tools) == 107
     samples = prebuilt_pair(env, binary, "n6-tools")
     old = new = None
     records = []
@@ -429,7 +429,9 @@ def tool_contracts(env, baseline, binary):
                 if value.startswith('0x'): return ea
                 if value in ('interesting_function','process_swap'): return 'main'
             return value
-        excluded = {"open_idb","close_idb","open_dsc","dsc_add_dylib","dsc_add_region"}
+        # list_idbs was added on master after the frozen N0 baseline; its live
+        # ownership contract is covered by list_idbs_e2e, not baseline equality.
+        excluded = {"open_idb","close_idb","open_dsc","dsc_add_dylib","dsc_add_region","list_idbs"}
         for name,example,aliases in tools:
             if name in excluded or name.startswith('dbg_'):
                 continue

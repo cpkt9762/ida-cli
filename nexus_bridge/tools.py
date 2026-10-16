@@ -152,6 +152,34 @@ def processor_name():
         return ida_ida.inf_get_procname()
 
 
+def pseudocode_line_addresses(cfunc, tagged):
+    """Resolve only plain ctree-item anchors, matching the native line contract."""
+    import string
+    addresses, offset = set(), 0
+    while offset < len(tagged):
+        if tagged[offset] == "\x03":
+            offset += 2
+        elif tagged.startswith("\x01\x36", offset):
+            offset += 3
+        elif tagged.startswith("\x01\x28", offset):
+            digits = tagged[offset + 2:offset + 18]
+            if len(digits) != 16 or any(c not in string.hexdigits for c in digits):
+                offset += 2
+                continue
+            anchor = int(digits, 16)
+            offset += 18
+            if anchor > 0xFFFFFFFF or anchor & 0xE0000000:
+                continue
+            index = anchor & 0x1FFFFFFF
+            if index < len(cfunc.treeitems):
+                ea = cfunc.treeitems[index].ea
+                if ea != 0xFFFFFFFFFFFFFFFF:
+                    addresses.add(ea)
+        else:
+            offset += 2 if tagged[offset] == "\x01" else 1
+    return [hex(ea) for ea in sorted(addresses)]
+
+
 def invoke(method, params):
     if method == 'get_database_info' and _metadata_warning is None:
         raise RuntimeError('tools metadata capability not installed; call install_tools')
@@ -379,8 +407,14 @@ def invoke(method, params):
                 if result is None:
                     return failure("IDA error: " + problem.desc())
                 import ida_lines
-                code = "".join(ida_lines.tag_remove(line.line) + "\n"
-                               for line in result.get_pseudocode())
+                tagged = [line.line for line in result.get_pseudocode()]
+                plain = [ida_lines.tag_remove(line) for line in tagged]
+                code = "".join(line + "\n" for line in plain)
+                if params.get("line_addresses"):
+                    lines = [{"line": index + 1, "text": text,
+                              "addresses": pseudocode_line_addresses(result, raw)}
+                             for index, (text, raw) in enumerate(zip(plain, tagged))]
+                    return {"ok": True, "value": {"code": code, "lines": lines}}
             except Exception as exc:
                 return failure("IDA error: " + str(exc))
             signature = next((line for line in code.splitlines() if line.strip()

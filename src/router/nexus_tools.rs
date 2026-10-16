@@ -106,6 +106,10 @@ struct Database {
     pid: Option<u32>,
     opened_at: Instant,
     cache_hit: bool,
+    client: super::listing::ClientIdentity,
+    opener: super::listing::ClientIdentity,
+    origin: String,
+    opened_wall: std::time::SystemTime,
     _cache_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
 }
 pub struct Tools {
@@ -177,6 +181,82 @@ impl Tools {
         }
         workers.into_values().collect()
     }
+    pub fn set_client(&self, handle: &str, client: &super::listing::ClientIdentity) {
+        let mut records = self.records();
+        let origin = records
+            .get(handle)
+            .filter(|db| db.origin == handle)
+            .map(|db| db.origin.clone());
+        if let Some(db) = records.get_mut(handle) {
+            db.client = client.clone();
+        }
+        if let Some(origin) = origin {
+            for db in records.values_mut().filter(|db| db.origin == origin) {
+                db.opener = client.clone();
+            }
+        }
+    }
+
+    pub fn list_idbs(
+        &self,
+        caller: Option<&super::listing::ClientIdentity>,
+    ) -> super::listing::IdbListing {
+        use super::listing::{DbState, IdbListing, ListedHolder, ListedIdb, ListedWorker};
+        let records = self.records();
+        let mut groups = BTreeMap::<&str, Vec<(&String, &Database)>>::new();
+        for (handle, db) in records.iter() {
+            groups
+                .entry(db.lease.instance_id.as_str())
+                .or_default()
+                .push((handle, db));
+        }
+        let active = records.keys().max();
+        let mut idbs = Vec::new();
+        for mut group in groups.into_values() {
+            group.sort_by_key(|(handle, db)| (db.opened_at, *handle));
+            let (handle, db) = group[0];
+            let mut holders = BTreeMap::<&str, ListedHolder>::new();
+            for (_, lease) in &group {
+                holders
+                    .entry(lease.client.client_id.as_str())
+                    .and_modify(|h| h.refs += 1)
+                    .or_insert_with(|| ListedHolder {
+                        client: lease.client.clone(),
+                        refs: 1,
+                        is_caller: caller == Some(&lease.client),
+                    });
+            }
+            idbs.push(ListedIdb {
+                db_handle: handle.clone(),
+                state: DbState::Open,
+                input_path: Some(db.path.display().to_string()),
+                idb_path: Some(db.idb.clone()),
+                opened_by: db.opener.clone(),
+                opened_by_caller: caller == Some(&db.opener),
+                opened_at: Some(crate::server::task::iso_from_system_time(db.opened_wall)),
+                open_secs: db
+                    .opened_wall
+                    .elapsed()
+                    .ok()
+                    .map(|elapsed| elapsed.as_secs()),
+                idle_secs: db.opened_at.elapsed().as_secs(),
+                worker: ListedWorker {
+                    pid: db.pid,
+                    backend: "nexus".into(),
+                },
+                active: group.iter().any(|(h, _)| Some(*h) == active),
+                ref_count: group.len(),
+                holders: holders.into_values().collect(),
+            });
+        }
+        idbs.sort_by(|a, b| {
+            a.opened_at
+                .cmp(&b.opened_at)
+                .then_with(|| a.db_handle.cmp(&b.db_handle))
+        });
+        IdbListing::new(idbs)
+    }
+
     pub fn active(&self) -> Option<String> {
         self.handles().into_iter().max()
     }
@@ -256,6 +336,9 @@ impl Tools {
         }
     }
     pub fn require_tool(method: &str) -> Result<(), ToolError> {
+        if method == "list_idbs" {
+            return Ok(());
+        }
         // These existing MCP adapters generate Python and route run_script.
         // Database execution still passes the same Execute capability check.
         if matches!(method, "decompile_structured" | "search_structs")
@@ -495,7 +578,11 @@ impl Tools {
                                 None => return Err(diagnostic("open missing IDB path; lease retained for bridge cleanup")),
                             };
                             let pid = event["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
-                            self.records().insert(handle.clone(), Database { path: canonical, lease, idb, token: token.clone(), pid, opened_at: Instant::now(), cache_hit:prepared.cache_hit, _cache_guard:cache_guard.clone() });
+                            let mut records=self.records();
+                            let previous=records.values().find(|db|db.lease.instance_id==lease.instance_id);
+                            let (opener,origin,opened_wall)=previous.map(|db|(db.opener.clone(),db.origin.clone(),db.opened_wall))
+                                .unwrap_or_else(||(super::listing::ClientIdentity::rpc_tenant(None),handle.clone(),std::time::SystemTime::now()));
+                            records.insert(handle.clone(), Database { path: canonical, lease, idb, token: token.clone(), pid, opened_at: Instant::now(), cache_hit:prepared.cache_hit, client:super::listing::ClientIdentity::rpc_tenant(None), opener, origin, opened_wall, _cache_guard:cache_guard.clone() });
                             ownership.transferred = true;
                             return Ok((handle,token));
                         }
@@ -1444,7 +1531,7 @@ mod n4_fix_regressions {
                 }
             }
         }
-        assert_eq!(count, 106);
+        assert_eq!(count, 107);
         for backend in [
             WorkerBackendKind::NativeLinked,
             WorkerBackendKind::IdatCompat,

@@ -11,6 +11,7 @@ pub mod install;
 pub mod lock;
 mod loop_impl;
 pub mod nexus;
+pub mod pseudocode_lines;
 pub mod request;
 pub mod runtime;
 pub mod types;

@@ -60,6 +60,51 @@ rust::String idalib_hexrays_cfunc_pseudocode(cfunc_t *f) {
   return rust::String(sb.str());
 }
 
+// ============================================================================
+// Pseudocode line anchors
+// ============================================================================
+
+/// The pseudocode lines of `f` with their color tags (COLOR_ON/COLOR_ADDR
+/// anchors) kept. One entry per `cfunc_t::get_pseudocode()` line. Tagged
+/// lines can contain '\n' as a color code, so they are returned as a vector
+/// rather than joined.
+rust::Vec<rust::String> idalib_hexrays_cfunc_pseudocode_tagged_lines(cfunc_t *f) {
+  auto &sv = f->get_pseudocode();
+  rust::Vec<rust::String> out;
+  out.reserve(sv.size());
+  for (size_t i = 0; i < sv.size(); i++) {
+    out.push_back(rust::String(sv[i].line.c_str()));
+  }
+  return out;
+}
+
+/// The same lines as `idalib_hexrays_cfunc_pseudocode`, one entry per line,
+/// cleaned with the same `tag_remove` call.
+rust::Vec<rust::String> idalib_hexrays_cfunc_pseudocode_plain_lines(cfunc_t *f) {
+  auto &sv = f->get_pseudocode();
+  rust::Vec<rust::String> out;
+  out.reserve(sv.size());
+  qstring buf;
+  for (size_t i = 0; i < sv.size(); i++) {
+    tag_remove(&buf, sv[i].line);
+    out.push_back(rust::String(buf.c_str()));
+  }
+  return out;
+}
+
+/// Address of the ctree item that a pseudocode anchor index refers to
+/// (`cfunc_t::treeitems`). BADADDR when the index is out of range, the slot is
+/// empty, or the item has no address.
+ea_t idalib_hexrays_cfunc_treeitem_ea(cfunc_t *f, std::size_t index) {
+  // treeitems is filled while the pseudocode text is generated.
+  f->get_pseudocode();
+  if (index >= f->treeitems.size()) {
+    return BADADDR;
+  }
+  const citem_t *item = f->treeitems[index];
+  return item != nullptr ? item->ea : BADADDR;
+}
+
 std::unique_ptr<cblock_iter> idalib_hexrays_cblock_iter(cblock_t *b) {
   return std::unique_ptr<cblock_iter>(new cblock_iter(b));
 }

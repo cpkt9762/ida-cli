@@ -32,6 +32,16 @@ class Business(unittest.TestCase):
         self.context.start()
         self.addCleanup(self.context.stop)
 
+    def test_line_addresses_resolve_only_valid_ctree_items(self):
+        cfunc = types.SimpleNamespace(treeitems=[types.SimpleNamespace(ea=0x1010),
+            types.SimpleNamespace(ea=0x1000), types.SimpleNamespace(ea=2**64-1)])
+        tag = lambda value: "\x01\x28" + f"{value:016x}"
+        tagged = "".join(tag(n) for n in (0, 1, 0, 2, 99, 0x80000000, 0x20000000, 2**64-1))
+        self.assertEqual(tools.pseudocode_line_addresses(cfunc, tagged), ["0x1000", "0x1010"])
+        self.assertEqual(tools.pseudocode_line_addresses(cfunc, "\x03"+tag(0)), [])
+        self.assertEqual(tools.pseudocode_line_addresses(cfunc, "\x01\x36"+tag(0)), [])
+        self.assertEqual(tools.pseudocode_line_addresses(cfunc, "\x01\x28xyz"), [])
+
     def test_p25_decompile_array_retains_per_item_failure(self):
         self.modules["ida_hexrays"].init_hexrays_plugin = lambda: True
         self.modules["ida_funcs"].get_func = lambda ea: ea

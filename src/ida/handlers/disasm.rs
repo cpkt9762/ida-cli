@@ -2,6 +2,9 @@
 
 use crate::disasm::generate_disasm_line;
 use crate::error::ToolError;
+use crate::ida::pseudocode_lines;
+use crate::ida::types::DecompiledLines;
+use idalib::decompiler::CFunction;
 use idalib::{Address, IDB};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -106,7 +109,33 @@ pub fn handle_disasm_function_at(
 
 pub fn handle_decompile(idb: &Option<IDB>, addr: u64) -> Result<String, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let cfunc = decompile_at(db, addr)?;
 
+    // Get the pseudocode as string
+    Ok(cfunc.pseudocode())
+}
+
+/// Decompile the function containing `addr` and pair every pseudocode line
+/// with the addresses Hex-Rays anchored to it.
+///
+/// `code` is the same text `handle_decompile` returns; `lines` are its lines.
+pub fn handle_decompile_lines(idb: &Option<IDB>, addr: u64) -> Result<DecompiledLines, ToolError> {
+    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let cfunc = decompile_at(db, addr)?;
+
+    let code = cfunc.pseudocode();
+    let plain = cfunc
+        .pseudocode_plain_lines()
+        .map_err(|e| ToolError::IdaError(e.to_string()))?;
+    let tagged = cfunc
+        .pseudocode_tagged_lines()
+        .map_err(|e| ToolError::IdaError(e.to_string()))?;
+    let lines =
+        pseudocode_lines::build_lines(plain, &tagged, |index| cfunc.treeitem_address(index))?;
+    Ok(DecompiledLines { code, lines })
+}
+
+fn decompile_at(db: &IDB, addr: u64) -> Result<CFunction<'_>, ToolError> {
     // Check if decompiler is available
     if !db.decompiler_available() {
         return Err(ToolError::DecompilerUnavailable);
@@ -118,12 +147,8 @@ pub fn handle_decompile(idb: &Option<IDB>, addr: u64) -> Result<String, ToolErro
         .ok_or(ToolError::FunctionNotFound(addr))?;
 
     // Decompile function
-    let cfunc = db
-        .decompile(&func)
-        .map_err(|e| ToolError::IdaError(e.to_string()))?;
-
-    // Get the pseudocode as string
-    Ok(cfunc.pseudocode())
+    db.decompile(&func)
+        .map_err(|e| ToolError::IdaError(e.to_string()))
 }
 
 /// Search decompiled pseudocode of all functions for a text pattern.

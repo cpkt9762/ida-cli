@@ -378,9 +378,13 @@ fn prune_terminal_tasks(entries: &mut HashMap<String, TaskEntry>) {
 
 /// ISO-8601 timestamp for the current time (UTC).
 pub fn iso_now() -> String {
-    use std::time::SystemTime;
-    let duration = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
+    iso_from_system_time(std::time::SystemTime::now())
+}
+
+/// Format `time` as `YYYY-MM-DDTHH:MM:SSZ` (UTC, whole seconds).
+pub fn iso_from_system_time(time: std::time::SystemTime) -> String {
+    let duration = time
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = duration.as_secs();
     // Manual UTC formatting to avoid adding chrono dependency.
@@ -541,6 +545,19 @@ mod tests {
                 "path": "/tmp/sample.bin",
                 "remote": false,
             }))
+        );
+    }
+
+    #[test]
+    fn iso_from_system_time_formats_known_instants() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(
+            super::iso_from_system_time(UNIX_EPOCH),
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            super::iso_from_system_time(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            "2023-11-14T22:13:20Z"
         );
     }
 }

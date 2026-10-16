@@ -90,6 +90,8 @@ pub trait WorkerDispatch {
 
     async fn decompile(&self, addr: u64) -> Result<String, ToolError>;
 
+    async fn decompile_lines(&self, addr: u64) -> Result<DecompiledLines, ToolError>;
+
     async fn pseudocode_at(&self, addr: u64, end_addr: Option<u64>) -> Result<Value, ToolError>;
 
     // ── Segments ────────────────────────────────────────────────────────

@@ -26,6 +26,7 @@
 //! - `load_debug_info`: Load external debug info (e.g., dSYM/DWARF)
 //! - `analysis_status`: Report auto-analysis status (auto_is_ok, auto_state)
 //! - `close_idb`: Close the currently open database
+//! - `list_idbs`: List the databases the daemon holds open and who opened them
 //!
 //! ## Function Analysis
 //! - `list_functions`: List all functions (paginated)

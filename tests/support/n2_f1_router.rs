@@ -273,6 +273,9 @@ async fn sbpf_post_open_queries_and_rename_share_preparation_cancellation() {
                 close_token: None,
                 open_path: None,
                 last_active: Instant::now(),
+                spawned_at: std::time::SystemTime::now(),
+                opener: crate::router::listing::ClientIdentity::rpc_tenant(Some("fixture")),
+                db: crate::router::listing::DbRecord::new(),
             },
         );
         let preparation = crate::preprocess::Preparation::new(Duration::from_secs(2));

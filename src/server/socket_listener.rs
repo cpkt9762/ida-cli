@@ -1,3 +1,4 @@
+use crate::router::listing::ClientIdentity;
 use crate::router::protocol::{RpcRequest, RpcResponse};
 use crate::router::RouterState;
 use crate::tool_registry::primary_name_for;
@@ -95,13 +96,12 @@ async fn handle_cli_connection(
     let control = parsed.as_ref().is_ok_and(|request| {
         matches!(
             primary_name_for(&request.method),
-            "status" | "list_tasks" | "task_status" | "cancel_task"
+            "status" | "list_idbs" | "list_tasks" | "task_status" | "cancel_task"
         ) || (router.uses_nexus() && primary_name_for(&request.method) == "get_task_status")
     });
-    let nexus_shutdown = router.uses_nexus()
-        && parsed
-            .as_ref()
-            .is_ok_and(|req| primary_name_for(&req.method) == "shutdown");
+    let shutdown_request = parsed
+        .as_ref()
+        .is_ok_and(|req| primary_name_for(&req.method) == "shutdown");
     let gate = if control { control_gate } else { business_gate };
     let execution_permit = gate.try_acquire_owned();
     let resp = match parsed {
@@ -111,7 +111,7 @@ async fn handle_cli_connection(
         Ok(req) => {
             drop(input_permit); // Classified work now owns its independent lane capacity.
             let (mut response, ref_guard) = dispatch_cli_request(&req, router, shutdown).await;
-            if !control {
+            if !control && !always_inline(&req.method) {
                 if let Some(result) = response.result.take() {
                     response.result =
                         Some(super::response_cache::cache_or_inline(&req.method, result).await);
@@ -123,7 +123,7 @@ async fn handle_cli_connection(
         Err(e) => RpcResponse::err("null", -32700, format!("Parse error: {e}")),
     };
 
-    let shutdown_accepted = nexus_shutdown && resp.error.is_none();
+    let shutdown_accepted = shutdown_request && resp.error.is_none();
     let json = if control {
         crate::blocking::run(crate::blocking::WorkClass::Control, move || {
             serde_json::to_vec(&resp)
@@ -142,6 +142,14 @@ async fn handle_cli_connection(
         shutdown.cancel();
     }
     Ok(())
+}
+
+/// Methods whose answer is the point of the call and is bounded by the worker
+/// limit, so it is never swapped for a response-cache stub. Caching
+/// `list_idbs` would also copy database paths and client ids into the shared
+/// response-cache directory.
+fn always_inline(method: &str) -> bool {
+    primary_name_for(method) == "list_idbs"
 }
 
 struct CliRefGuard {
@@ -166,7 +174,7 @@ impl Drop for CliRefGuard {
 async fn dispatch_cli_request(
     req: &RpcRequest,
     router: &RouterState,
-    shutdown: &CancellationToken,
+    _shutdown: &CancellationToken,
 ) -> (RpcResponse, Option<CliRefGuard>) {
     let method = match (router.uses_nexus(), primary_name_for(&req.method)) {
         (true, "get_task_status") => "task_status",
@@ -211,11 +219,7 @@ async fn dispatch_cli_request(
             } else {
                 router.shutdown_all().await;
             }
-            // Trip the service-wide cancel token so the outer transport loop
-            // (stdio or HTTP) also exits instead of leaving a zombie server.
-            if !router.uses_nexus() {
-                shutdown.cancel();
-            }
+            // The connection signals service shutdown after flushing this reply.
             let resp = RpcResponse::ok(
                 &req.id,
                 serde_json::json!({"ok": true, "message": "server shutting down"}),
@@ -229,6 +233,21 @@ async fn dispatch_cli_request(
                 &req.id,
                 serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({})),
             );
+            (resp, None)
+        }
+        "list_idbs" => {
+            // Tenant-scoped like every other socket call: the tenant picks
+            // which entries are reported as the caller's own.
+            let caller = ClientIdentity::rpc_tenant(tenant_id.as_deref());
+            let listing = router.list_idbs(Some(&caller)).await;
+            let resp = match listing.to_json() {
+                Ok(value) => RpcResponse::ok(&req.id, value),
+                Err(e) => RpcResponse::err(
+                    &req.id,
+                    -32603,
+                    format!("failed to serialize database list: {e}"),
+                ),
+            };
             (resp, None)
         }
         "list_tasks" => {
@@ -487,3 +506,111 @@ mod n2_tests {
 #[cfg(test)]
 #[path = "../../tests/support/n4_socket.rs"]
 mod n4_fix_regressions;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use tokio::io::AsyncBufReadExt;
+    use tokio::net::UnixStream;
+
+    /// Send one request line through `handle_cli_connection` and parse the reply.
+    async fn call(router: &RouterState, method: &str, params: Value) -> Value {
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let shutdown = CancellationToken::new();
+        let router = router.clone();
+        let handler = tokio::spawn(async move {
+            handle_cli_connection(
+                server,
+                &router,
+                &shutdown,
+                std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .expect("input permit"),
+                std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+                std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            )
+            .await
+        });
+        let request = RpcRequest::new("1", method, params);
+        let mut line = serde_json::to_vec(&request).expect("serialize request");
+        line.push(b'\n');
+        client.write_all(&line).await.expect("write request");
+        let mut reply = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut reply)
+            .await
+            .expect("read reply");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handler result");
+        serde_json::from_str(reply.trim()).expect("JSON reply")
+    }
+
+    #[tokio::test]
+    async fn shutdown_prepares_reply_before_cancelling_the_service() {
+        let router = RouterState::new().expect("router");
+        let shutdown = CancellationToken::new();
+        let request = RpcRequest::new("stop", "shutdown", json!({}));
+        let (reply, _guard) = dispatch_cli_request(&request, &router, &shutdown).await;
+        assert!(reply.error.is_none());
+        assert_eq!(reply.result.expect("shutdown reply")["ok"], true);
+        assert!(
+            !shutdown.is_cancelled(),
+            "connection must flush before service cancellation"
+        );
+    }
+
+    #[test]
+    fn only_list_idbs_skips_the_response_cache() {
+        assert!(always_inline("list_idbs"));
+        assert!(!always_inline("status"));
+        assert!(!always_inline("list_functions"));
+    }
+
+    #[tokio::test]
+    async fn list_idbs_rpc_answers_with_the_full_listing_for_any_size() {
+        let router = RouterState::new().expect("router");
+        let empty = call(&router, "list_idbs", json!({})).await;
+        assert_eq!(empty["result"], json!({"count": 0, "idbs": []}));
+
+        // Many entries push the answer far past the inline cache threshold.
+        for n in 0..6 {
+            let client = ClientIdentity::mcp_session();
+            let path = format!("/db/some/rather/long/directory/name/sample-{n}.so");
+            router.register_test_worker(&path, &client).await;
+        }
+        let reply = call(&router, "list_idbs", json!({})).await;
+        let result = &reply["result"];
+        assert!(reply["error"].is_null(), "unexpected error: {reply}");
+        assert!(result.get("cached").is_none(), "answer was cached: {reply}");
+        assert_eq!(result["count"], 6);
+        assert_eq!(result["idbs"].as_array().expect("idbs array").len(), 6);
+        // The CLI caller opened nothing, so none of the entries are its own.
+        assert!(result["idbs"]
+            .as_array()
+            .expect("idbs array")
+            .iter()
+            .all(|idb| idb["opened_by_caller"] == false));
+    }
+
+    #[tokio::test]
+    async fn list_idbs_rpc_flags_entries_opened_by_the_callers_tenant() {
+        let router = RouterState::new().expect("router");
+        let team = ClientIdentity::rpc_tenant(Some("team-a"));
+        let other = ClientIdentity::rpc_tenant(Some("team-b"));
+        router.register_test_worker("/db/mine", &team).await;
+        router.register_test_worker("/db/theirs", &other).await;
+
+        let reply = call(&router, "list_idbs", json!({"tenant_id": "team-a"})).await;
+        let idbs = reply["result"]["idbs"].as_array().expect("idbs array");
+        let mine: Vec<&str> = idbs
+            .iter()
+            .filter(|idb| idb["opened_by_caller"] == true)
+            .filter_map(|idb| idb["input_path"].as_str())
+            .collect();
+        assert_eq!(mine, vec!["/db/mine"]);
+    }
+}

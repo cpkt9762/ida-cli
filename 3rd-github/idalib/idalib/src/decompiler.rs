@@ -2,17 +2,20 @@ use std::ffi::CString;
 use std::fmt;
 use std::marker::PhantomData;
 
-use crate::Address;
 use crate::ffi::hexrays::{
     addr_range, cblock_iter, cblock_t, cfunc_t, cfuncptr_t, cinsn_t, eamap_result,
     idalib_hexrays_cblock_iter, idalib_hexrays_cblock_iter_next, idalib_hexrays_cblock_len,
     idalib_hexrays_cfunc_find_stmts_at, idalib_hexrays_cfunc_get_stmt_bounds,
-    idalib_hexrays_cfunc_has_eamap, idalib_hexrays_cfunc_pseudocode, idalib_hexrays_cfuncptr_inner,
-    idalib_hexrays_cinsn_ea, idalib_hexrays_cinsn_op, idalib_hexrays_cinsn_print,
-    idalib_hexrays_eamap_result_len, idalib_hexrays_eamap_result_next, idalib_hexrays_rename_lvar,
+    idalib_hexrays_cfunc_has_eamap, idalib_hexrays_cfunc_pseudocode,
+    idalib_hexrays_cfunc_pseudocode_plain_lines, idalib_hexrays_cfunc_pseudocode_tagged_lines,
+    idalib_hexrays_cfunc_treeitem_ea, idalib_hexrays_cfuncptr_inner, idalib_hexrays_cinsn_ea,
+    idalib_hexrays_cinsn_op, idalib_hexrays_cinsn_print, idalib_hexrays_eamap_result_len,
+    idalib_hexrays_eamap_result_next, idalib_hexrays_rename_lvar,
     idalib_hexrays_set_decompiler_comment, idalib_hexrays_set_lvar_type,
 };
+use crate::ffi::{BADADDR, from_ea};
 use crate::idb::IDB;
+use crate::{Address, IDAError};
 
 pub use crate::ffi::hexrays::{HexRaysError, HexRaysErrorCode};
 
@@ -146,6 +149,31 @@ impl<'a> CFunction<'a> {
     /// Get the full pseudocode for this function as a string.
     pub fn pseudocode(&self) -> String {
         unsafe { idalib_hexrays_cfunc_pseudocode(self.ptr) }
+    }
+
+    /// The pseudocode, one entry per line, with the color tags removed.
+    ///
+    /// Same lines as [`CFunction::pseudocode`], cleaned with the same
+    /// `tag_remove` call.
+    pub fn pseudocode_plain_lines(&self) -> Result<Vec<String>, IDAError> {
+        unsafe { idalib_hexrays_cfunc_pseudocode_plain_lines(self.ptr) }.map_err(IDAError::ffi)
+    }
+
+    /// The pseudocode, one entry per line, with the color tags kept.
+    ///
+    /// The tags carry Hex-Rays' `COLOR_ADDR` anchors: indices into the ctree
+    /// items, resolved with [`CFunction::treeitem_address`].
+    pub fn pseudocode_tagged_lines(&self) -> Result<Vec<String>, IDAError> {
+        unsafe { idalib_hexrays_cfunc_pseudocode_tagged_lines(self.ptr) }.map_err(IDAError::ffi)
+    }
+
+    /// Address of the ctree item at `index` in `cfunc_t::treeitems`, the index
+    /// a `COLOR_ADDR` anchor in the pseudocode refers to.
+    ///
+    /// `None` when the index is out of range or the item has no address.
+    pub fn treeitem_address(&self, index: usize) -> Option<Address> {
+        let ea = unsafe { idalib_hexrays_cfunc_treeitem_ea(self.ptr, index) };
+        (ea != from_ea(BADADDR)).then_some(ea)
     }
 
     fn as_cfunc(&self) -> &cfunc_t {

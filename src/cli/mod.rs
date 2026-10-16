@@ -50,6 +50,9 @@ pub enum CliCommand {
     Decompile {
         #[arg(long)]
         addr: String,
+        /// Also return one {line, text, addresses} entry per pseudocode line
+        #[arg(long)]
+        line_addresses: bool,
     },
     Disasm {
         #[arg(long)]
@@ -166,6 +169,9 @@ pub enum CliCommand {
     },
     Close,
     Status,
+    /// List the databases the daemon holds open and the clients holding them
+    /// (run it before rebuilding an .i64 to confirm no other client uses it)
+    ListIdbs,
     Shutdown,
     Raw {
         json_str: String,
@@ -374,8 +380,14 @@ fn build_rpc_params(
             }
             "list_functions"
         }
-        CliCommand::Decompile { addr } => {
+        CliCommand::Decompile {
+            addr,
+            line_addresses,
+        } => {
             params.insert("address".to_string(), serde_json::json!(addr));
+            if *line_addresses {
+                params.insert("line_addresses".to_string(), serde_json::json!(true));
+            }
             "decompile_function"
         }
         CliCommand::Disasm { addr, name, count } => {
@@ -453,6 +465,7 @@ fn build_rpc_params(
         }
         CliCommand::Close => "close",
         CliCommand::Status => "status",
+        CliCommand::ListIdbs => "list_idbs",
         CliCommand::Shutdown => "shutdown",
         // The variants below are dispatched in `run()` before `build_rpc_params`
         // is ever called, so reaching them here would be a programmer mistake.
@@ -472,6 +485,122 @@ fn build_rpc_params(
     };
 
     (method.to_string(), serde_json::Value::Object(params))
+}
+
+#[cfg(test)]
+mod listing_and_lines_tests {
+    use super::{build_rpc_params, CliArgs, CliCommand};
+    use clap::Parser;
+
+    #[test]
+    fn build_rpc_params_for_cli_surface_methods() {
+        let (method, params) = build_rpc_params(
+            &CliCommand::ListImports {
+                limit: 5,
+                offset: 2,
+            },
+            Some("/tmp/a.bin"),
+            None,
+        );
+        assert_eq!(method, "list_imports");
+        assert_eq!(params["path"], "/tmp/a.bin");
+        assert_eq!(params["limit"], 5);
+        assert_eq!(params["offset"], 2);
+
+        let (method, params) = build_rpc_params(
+            &CliCommand::XrefsToString {
+                query: "malloc".to_string(),
+                limit: 4,
+                max_xrefs: 3,
+                exact: false,
+                case_insensitive: true,
+            },
+            Some("/tmp/a.bin"),
+            None,
+        );
+        assert_eq!(method, "get_xrefs_to_string");
+        assert_eq!(params["query"], "malloc");
+        assert_eq!(params["limit"], 4);
+        assert_eq!(params["max_xrefs"], 3);
+        assert_eq!(params["case_insensitive"], true);
+
+        let (method, params) = build_rpc_params(
+            &CliCommand::Callers {
+                addr: "0x1000".to_string(),
+            },
+            None,
+            None,
+        );
+        assert_eq!(method, "get_callers");
+        assert_eq!(params["address"], "0x1000");
+
+        let (method, params) = build_rpc_params(
+            &CliCommand::AddressInfo {
+                addr: "0x2000".to_string(),
+            },
+            None,
+            None,
+        );
+        assert_eq!(method, "get_address_info");
+        assert_eq!(params["address"], "0x2000");
+    }
+
+    #[test]
+    fn decompile_sends_line_addresses_only_when_asked() {
+        let (method, params) = build_rpc_params(
+            &CliCommand::Decompile {
+                addr: "0x1000".to_string(),
+                line_addresses: false,
+            },
+            Some("/tmp/a.bin"),
+            None,
+        );
+        assert_eq!(method, "decompile_function");
+        assert_eq!(params["address"], "0x1000");
+        assert!(params.get("line_addresses").is_none());
+
+        let (method, params) = build_rpc_params(
+            &CliCommand::Decompile {
+                addr: "0x1000".to_string(),
+                line_addresses: true,
+            },
+            Some("/tmp/a.bin"),
+            None,
+        );
+        assert_eq!(method, "decompile_function");
+        assert_eq!(params["line_addresses"], true);
+    }
+
+    #[test]
+    fn decompile_line_addresses_flag_parses() {
+        let plain =
+            CliArgs::try_parse_from(["ida-cli", "decompile", "--addr", "0x10"]).expect("parse");
+        assert!(matches!(
+            plain.command,
+            CliCommand::Decompile {
+                line_addresses: false,
+                ..
+            }
+        ));
+        let with =
+            CliArgs::try_parse_from(["ida-cli", "decompile", "--addr", "0x10", "--line-addresses"])
+                .expect("parse");
+        assert!(matches!(
+            with.command,
+            CliCommand::Decompile {
+                line_addresses: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn list_idbs_needs_no_path_and_forwards_the_tenant() {
+        let (method, params) = build_rpc_params(&CliCommand::ListIdbs, None, Some("team-a"));
+        assert_eq!(method, "list_idbs");
+        assert!(params.get("path").is_none());
+        assert_eq!(params["tenant_id"], "team-a");
+    }
 }
 
 fn admin_url(path: &str) -> String {

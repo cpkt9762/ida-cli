@@ -63,6 +63,8 @@ just test-http    # HTTP / SSE integration test
 just test-script  # IDAPython script execution test
 just test-dsc /path/to/dyld_shared_cache_arm64e  # DSC loading test
 just cargo-test   # Unit tests (no IDA required)
+just test-list-idbs  # list_idbs against a real, isolated daemon
+just test-decompile-line-addresses  # decompile_function line_addresses, same setup
 ```
 
 All integration tests require IDA Pro with a valid license. Run
@@ -94,6 +96,33 @@ binary as a worker subprocess.
 - `tools/list` returns the full tool list
 - Database operations work over HTTP (`open_idb`, `list_functions`,
   `close_idb` with `close_token`)
+
+**list_idbs test** (`just test-list-idbs`, `tests/list_idbs_e2e.rs`)
+
+- Starts a temporary `serve-http` daemon under an isolated `IDA_CLI_HOME`
+  (never `~/.ida`) and stops it with `shutdown` through that home
+- Two MCP sessions over the daemon's Unix socket each open one database;
+  `list_idbs` (MCP and `ida-cli list-idbs`) lists both with distinct client
+  ids, paths and worker pids, never a close token
+- Closing one database removes only its entry; a shared database stays listed
+  until its last reference is released
+- Needs `IDA_TEST=1`, an IDA runtime and a C compiler; `IDA_CLI_E2E_BIN`
+  tests another build (for example the release binary) and
+  `LIST_IDBS_E2E_OUT` writes the transcript of every answer
+
+**decompile line_addresses test** (`just test-decompile-line-addresses`,
+`tests/decompile_line_addresses_e2e.rs`)
+
+- Starts a temporary `serve-http` daemon under an isolated `IDA_CLI_HOME`,
+  opens a small compiled fixture over MCP and decompiles one function with
+  and without `line_addresses`, over MCP and over `ida-cli decompile`
+- Checks that the default answer is still only `{code}`, that `lines` has one
+  entry per pseudocode line with the same text as `code`, that addresses are
+  ascending, unique and inside the function, and that every address on a line
+  is one the decompiler maps to a statement (`get_pseudocode_at`)
+- Needs `IDA_TEST=1`, an IDA runtime with Hex-Rays and a C compiler;
+  `IDA_CLI_E2E_BIN` tests another build and `DECOMPILE_LINES_E2E_OUT` writes
+  the answers
 
 **Script test** (`just test-script`)
 

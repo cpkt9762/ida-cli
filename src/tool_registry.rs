@@ -367,6 +367,32 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         aliases: &[],
     },
     ToolInfo {
+        name: "list_idbs",
+        category: ToolCategory::Core,
+        short_desc: "List open databases and the clients holding them",
+        full_desc: "List the databases the daemon currently holds open. \
+                    Per database: db_handle, the input path and the .i64 it was opened from, \
+                    an opaque id of the client that opened it, when it was opened, the worker \
+                    process, whether it is the active database, and which clients still hold \
+                    references (ref_count and per-client holders). \
+                    Use it before rebuilding or replacing an .i64 (for example with idat) to \
+                    confirm no other client has it open: an .i64 that appears here is still \
+                    held by the daemon, and idat fails on a database that is open elsewhere. \
+                    state is 'open', or 'opening' while an open request is still in flight. \
+                    Returns {\"count\": 0, \"idbs\": []} when nothing is open. \
+                    close_token values are never returned; client ids tell clients apart and \
+                    are not credentials. opened_by_caller and holders[].is_caller mark the \
+                    asking client's own entries. \
+                    CLI: ida-cli list-idbs. Requires the multi-database daemon (serve-http or serve).",
+        example: r#"{}"#,
+        default: true,
+        keywords: &[
+            "list", "open", "databases", "idb", "i64", "clients", "holders", "lock", "busy",
+            "rebuild", "in use",
+        ],
+        aliases: &[],
+    },
+    ToolInfo {
         name: "tool_catalog",
         category: ToolCategory::Core,
         short_desc: "Discover available tools by query or category",
@@ -526,10 +552,23 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "decompile_function",
         category: ToolCategory::Decompile,
-        short_desc: "Decompile function to C pseudocode",
+        short_desc: "Decompile function to C pseudocode (line_addresses adds per-line addresses)",
         full_desc: "Decompile a function using Hex-Rays decompiler (if available). \
-                    Returns C-like pseudocode. Accepts address or function name.",
-        example: r#"{"address": "0x1000"}"#,
+                    Returns C-like pseudocode. Accepts address or function name. \
+                    With line_addresses=true the answer is {code, lines}: `code` is the same text \
+                    and `lines` has one {line, text, addresses} entry per pseudocode line. `line` \
+                    counts from 1, `text` is that line of `code`, and `addresses` are the IDA \
+                    addresses (hex strings, ascending, no duplicates) of the ctree items Hex-Rays \
+                    anchored on the line. Limits: a line can map to several non-contiguous \
+                    addresses and the list is not every instruction of the statement; the \
+                    function signature and local declarations have none; `{`, `}`, `else` and \
+                    blank lines can carry the address of the block or `if` that owns them (the \
+                    function entry for the outermost braces). The sub_ rename hint is not added in \
+                    this mode. Hex-Rays can print a very large function differently from one call \
+                    to the next, so use `code` and `lines` from the same answer only. Needs the \
+                    native-linked backend (the idat backend answers NotSupported). Default is off \
+                    and the answer is unchanged.",
+        example: r#"{"address": "0x1000", "line_addresses": true}"#,
         default: false,
         keywords: &["decompile", "pseudocode", "c", "source", "hex-rays"],
         aliases: &["decompile"],
@@ -1659,6 +1698,16 @@ mod tests {
         assert!(!results.is_empty());
         // Should find "get_callers" tool
         assert!(results.iter().any(|(t, _)| t.name == "get_callers"));
+    }
+
+    #[test]
+    fn test_list_idbs_is_a_default_core_tool_found_by_search() {
+        let tool = get_tool("list_idbs").expect("list_idbs is registered");
+        assert_eq!(tool.category, ToolCategory::Core);
+        assert!(tool.default);
+        assert!(tool.short_desc.len() < 100);
+        let results = search_tools("which databases are open", 5);
+        assert!(results.iter().any(|(t, _)| t.name == "list_idbs"));
     }
 
     #[test]

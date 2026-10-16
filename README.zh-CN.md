@@ -29,6 +29,8 @@
 
 后端选择由 `probe-runtime` 在运行时决定。只有运行时的 IDA 与编译所用 SDK 版本一致时（例如用 9.5 SDK 编译、跑在 IDA 9.5 上）且该组合经过验证，才会选 `native-linked`，因为 vendored native 层调用了 IDA 的私有结构，其布局在 9.4 和 9.5 都变过。IDA 9.4 保持 `idat-compat`：公开的 9.4 SDK 的 Hex-Rays API 魔数是 5，而 9.4.260610 构建仍是 4，native 下会没有反编译器。编译期仍然需要 IDA SDK，因为 vendored native 层要参与编译；运行时实际加载的 IDA 本体来自 `IDADIR` 或常见安装路径。
 
+Release 预编译包用 IDA 9.5 SDK（`HexRaysSA/ida-sdk` 的 `releases/9.5`，对应 IDA 9.5.261001）编译，因此在 IDA 9.5 上走 `native-linked`，其他版本走 `idat-compat`。想在 IDA 9.3 上用 `native-linked`，请用对应 SDK 从源码编译。
+
 ## 当前已经可用的能力
 
 在支持的 IDA 9.x 运行时上，`ida-cli` 可以：
@@ -116,6 +118,30 @@ cargo build --bin ida-cli
 ./target/debug/ida-cli --path /path/to/sample.bin list-functions --limit 20
 ./target/debug/ida-cli --path /path/to/sample.bin decompile --addr 0x140001000
 ./target/debug/ida-cli --path /path/to/sample.bin raw '{"method":"get_xrefs_to","params":{"address":"0x140001000"}}'
+```
+
+查看 daemon 当前打开了哪些数据库、由哪些客户端持有，用 `list-idbs`（MCP 工具：`list_idbs`）。
+重建或替换 `.i64`（例如用 `idat`）之前先跑一次：仍出现在列表里的库就是被 daemon 持有的，
+`idat` 对已在别处打开的库会失败。返回 `{"count": N, "idbs": [...]}`，每项包含 `db_handle`、
+输入文件与 `.i64` 路径、打开它的客户端的不可逆标识、打开时间、所在 worker、是否为活动库，
+以及仍持有引用的客户端。不会返回 `close_token`。
+
+```bash
+./target/debug/ida-cli list-idbs --json
+```
+
+需要每一行伪代码对应的地址时，给 `decompile` 加 `--line-addresses`（MCP / RPC：`decompile_function` 的
+`line_addresses: true`）。返回变为 `{"code": ..., "lines": [...]}`：`code` 与平时相同，`lines` 每项是
+`{"line", "text", "addresses"}`。`line` 从 1 开始，`text` 是 `code` 里的同一行，`addresses` 是 Hex-Rays
+挂在这一行上的 ctree 项的 IDA 地址（十六进制字符串，升序、去重）。一行可能对应多个不连续的地址，
+列表也不是该语句的全部指令；函数签名和局部变量声明没有地址；`{`、`}`、`else` 和空行可能带着所属块或
+`if` 的地址（最外层大括号是函数入口）。该模式不加 `sub_` 改名提示。Hex-Rays 对很大的函数，
+两次调用打印出的文本可能不同，所以 `code` 与 `lines` 只能取自同一次应答。只有 native-linked 后端支持，
+idat 后端返回 `NotSupported`。经 CLI socket 时，大结果与其他命令一样落到响应缓存
+（`IDA_MCP_MAX_INLINE_BYTES`）。
+
+```json
+{"line": 6, "text": "  while ( a1 != 1 )", "addresses": ["0x10000033c", "0x100000340"]}
 ```
 
 第一个参数是服务端子命令（`serve` / `serve-http` / `serve-worker` / `probe-runtime`）时，进入服务端模式：
