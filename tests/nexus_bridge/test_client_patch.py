@@ -43,6 +43,54 @@ def client(monkeypatch):
         handle.close()
 
 
+@pytest.mark.parametrize("pending,proof,status", [(False, False, "lease_released"),
+    (True, True, "owner_released"), (True, False, "uncertain")])
+def test_close_requires_final_lifetime_proof(client, monkeypatch, pending, proof, status):
+    connection = Connection({"ok": True, "result": {"released": True, "shutdown_pending": pending}})
+    monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: connection)
+    waits = []
+    def wait(instance, timeout):
+        waits.append(timeout)
+        return proof
+    monkeypatch.setattr("ida_nexus.handle.wait_database_released", wait)
+    outcome = client.close_outcome(timeout=0.5)
+    assert outcome["status"] == status
+    assert outcome["owner_released"] is (pending and proof)
+    assert bool(waits) is pending, "nonfinal ACK must not wait for peer leases"
+    assert client.close_outcome(timeout=0.5) == outcome
+    assert client.close() is None
+    assert len(connection.requests) == 1, "close must never replay release"
+
+
+@pytest.mark.parametrize("payload", [[], {}, {"ok": True, "result": {"released": True}},
+    {"ok": True, "result": {"released": True, "shutdown_pending": 0}},
+    {"ok": False, "result": {"released": True, "shutdown_pending": False}}])
+def test_bad_close_ack_is_uncertain(client, monkeypatch, payload):
+    connection = Connection()
+    connection.payload = payload
+    monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: connection)
+    assert client.close_outcome()["status"] == "uncertain"
+    assert len(connection.requests) == 1
+
+
+def test_lost_close_ack_and_concurrent_close_are_not_success(client, monkeypatch):
+    connection = Connection(failure=True)
+    monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: connection)
+    with client._close_lock:
+        assert client.close_outcome(timeout=0)["failure"] == "close_in_progress"
+    outcome = client.close_outcome(timeout=0.5)
+    assert outcome["status"] == "uncertain" and outcome["failure"] == "transport"
+    assert client.close_outcome() == outcome
+    assert len(connection.requests) == 1
+
+
+def test_zero_budget_close_never_sends_release(client, monkeypatch):
+    connection = Connection()
+    monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: connection)
+    assert client.close_outcome(timeout=0)["status"] == "uncertain"
+    assert not connection.requests
+
+
 def fail_request(client, monkeypatch, operation):
     connection = Connection(failure=True)
     monkeypatch.setattr(client, "_rpc_connection_for", lambda *_a: connection)

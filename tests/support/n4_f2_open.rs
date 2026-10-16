@@ -66,6 +66,70 @@ async fn run_case(fault: &str) {
         10
     }));
     let cancellation = preparation.cancel.clone();
+    if fault.starts_with("release-") && fault != "release-busy" {
+        let opened = tools
+            .open(&router, &path.display().to_string(), preparation)
+            .await
+            .unwrap();
+        let token = opened.1;
+        let owner_tools = tools.clone();
+        let owner_router = router.clone();
+        let mut closing =
+            tokio::spawn(async move { owner_tools.close_token(&owner_router, &token).await });
+        let marker = path.parent().unwrap().join("release-uncertain");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !marker.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if fault == "release-proof" {
+            assert!(
+                !closing.is_finished(),
+                "uncertainty must not complete close"
+            );
+            std::fs::write(path.parent().unwrap().join("release-proof"), b"").unwrap();
+            tokio::time::timeout(Duration::from_secs(3), &mut closing)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(tools.records().is_empty());
+        } else {
+            let error = tokio::time::timeout(Duration::from_secs(3), &mut closing)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains("owner retained"), "{error}");
+            assert_eq!(tools.records().len(), 1);
+            let error = tools
+                .open(
+                    &router,
+                    &path.display().to_string(),
+                    Preparation::new(Duration::from_secs(3)),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("new open blocked"), "{error}");
+            assert_eq!(tools.records().len(), 1);
+            // A retained uncertain owner must not block another IDB.
+            let other = path.with_file_name("other.i64");
+            std::fs::write(&other, b"independent IDB").unwrap();
+            tools
+                .open(
+                    &router,
+                    &other.display().to_string(),
+                    Preparation::new(Duration::from_secs(3)),
+                )
+                .await
+                .unwrap();
+            assert_eq!(tools.records().len(), 2);
+        }
+        bridge.shutdown().await.unwrap();
+        return;
+    }
     let mut events = bridge.subscribe();
     let mut control = if fault == "release-busy" {
         Some(bridge.endpoint().transition(|_, t| t.test_hold_control()))
@@ -221,4 +285,13 @@ async fn open_zero_byte() {
 #[tokio::test]
 async fn open_release_busy() {
     run_case("release-busy").await;
+}
+
+#[tokio::test]
+async fn open_release_proof() {
+    run_case("release-proof").await;
+}
+#[tokio::test]
+async fn open_release_unconfirmed() {
+    run_case("release-unconfirmed").await;
 }

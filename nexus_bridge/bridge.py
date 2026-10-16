@@ -21,10 +21,11 @@ from analysis_tools import ANALYSIS_METHODS
 from struct_tools import STRUCT_METHODS
 from query_tools import QUERY_METHODS
 from search_tools import SEARCH_METHODS
+from lifecycle import database_diagnostics, release_handle
 
 TOOL_METHODS = (*TOOL_METHODS, *TYPE_METHODS, *EDIT_METHODS, *ANALYSIS_METHODS, *STRUCT_METHODS, *QUERY_METHODS, *SEARCH_METHODS, "batch_rename")
 
-HANDLE_SHA = "4cd1a9c27e969504eed4ae55d7cbd0e2b4b5a6ba67f0c2529ccb6006a8d67b76"
+HANDLE_SHA = "aa5d7ea42caaa922ef494d7d8a1406396537a4ea88d9e833825e08c8d279025e"
 METHODS = {"execute_python": "may_write", "database_info": "read_only",
            "rename_address": "may_write", "read_name": "read_only"}
 METHODS.update({method: "may_write" if method in WRITE_METHODS else "read_only"
@@ -47,7 +48,7 @@ def readiness():
             raise ValueError(f"requires pinned Nexus 0.13.4/Domain 0.5.1; got {versions}")
         source = Path(ida_nexus.__file__).parent / "handle.py"
         if hashlib.sha256(source.read_bytes()).hexdigest() != HANDLE_SHA:
-            raise ValueError("Nexus client cancellation patch missing or incompatible handle.py")
+            raise ValueError("Nexus client cancellation/close proof patch missing or incompatible handle.py")
     except (ImportError, importlib.metadata.PackageNotFoundError, ValueError, OSError) as exc:
         return {"ready": False, "error": error("dependency_unavailable", exc)}
     try:
@@ -266,20 +267,25 @@ class Bridge:
             self.invoke(channel, attempt, payload, deadline, public_started)
         except Exception as exc:
             from ida_nexus import NexusConnectionError, RemoteError
+            details = {}
+            if frame["payload"]["command"] == "open":
+                command = frame["payload"]
+                details['diagnostics'] = database_diagnostics(
+                    command.get('options', {}).get('output_database') or command['path'])
             if isinstance(exc, RemoteError):
                 channel.send({"event": "remote_error", "attempt": attempt, "remote_code": exc.code,
-                              "error": error("operation_failed", str(exc))})
+                              "error": error("operation_failed", str(exc)), **details})
             elif isinstance(exc, NexusConnectionError):
                 if frame["payload"]["command"] == "execute":
                     self.mark_unknown(frame["payload"]["identity"]["operation_id"], attempt)
                 channel.send({"event": "uncertain", "attempt": attempt,
-                              "error": error("disconnected", str(exc))})
+                              "error": error("disconnected", str(exc)), **details})
             else:
                 uncertain = public_started[0]
                 if uncertain and frame["payload"]["command"] == "execute":
                     self.mark_unknown(frame["payload"]["identity"]["operation_id"], attempt)
                 channel.send({"event": "uncertain" if uncertain else "failed", "attempt": attempt,
-                              "error": error("operation_failed", f"{type(exc).__name__}: {exc}")})
+                              "error": error("operation_failed", f"{type(exc).__name__}: {exc}"), **details})
         finally:
             with self.lock:
                 self.grants.pop(key, None)
@@ -373,13 +379,20 @@ class Bridge:
                 if wait_analysis:
                     handle.wait_autoanalysis(timeout=max(0.001, deadline - time.monotonic()))
             except Exception as exc:
-                handle.close(wait_for_database=True, timeout=5)
+                outcome = handle.close_outcome(wait_for_database=True,
+                    timeout=max(0, deadline - time.monotonic()))
+                if outcome["status"] not in ("lease_released", "owner_released"):
+                    from ida_nexus import wait_database_released
+                    if not wait_database_released(handle.instance,
+                            timeout=max(0, deadline - time.monotonic())):
+                        raise TimeoutError("open runtime check cleanup unconfirmed; lease retained") from exc
                 with self.lock:
                     self.handles.pop(lease["lease_id"], None)
                 # Close confirmed this unannounced lease is gone. If close
                 # itself fails, run() retains the uncertain open outcome.
                 channel.send({"event": "failed", "attempt": attempt,
-                              "error": error("disconnected", f"open runtime check failed: {type(exc).__name__}")})
+                              "error": error("disconnected", f"open runtime check failed: {type(exc).__name__}"),
+                              "diagnostics": database_diagnostics(instance.idb_path)})
                 return
             caps = readiness()["capabilities"]
             ida = [int(x) for x in actual["result"].split(".")[:3]]
@@ -467,11 +480,16 @@ class Bridge:
                             timeout=max(0.001, deadline - time.monotonic()))
                     finally:
                         cleanup_handle.close(wait_for_database=False)
-            handle.close(wait_for_database=True, timeout=max(0.001, deadline - time.monotonic()))
+            def publish(name, outcome):
+                channel.send({"event": name, "attempt": attempt, "outcome": outcome,
+                              "error": error("cancel_pending", "lease release unconfirmed; owner retained")})
+            outcome = release_handle(handle, deadline, publish)
+            if outcome is None:
+                return
             self.drop_lifetime(lease["lease_id"])
             with self.lock:
                 self.handles.pop(lease["lease_id"], None)
-            channel.send({"event": "released", "attempt": attempt})
+            channel.send({"event": "released", "attempt": attempt, "outcome": outcome})
         elif kind == "shutdown":
             public_started[0] = True
             handle.shutdown_database(save=command["save"])

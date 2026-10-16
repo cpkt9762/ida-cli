@@ -28,7 +28,19 @@ def serve(path):
                     identity=command['identity']
                     lease={'client_id':identity['client_id'],'lease_id':identity['operation_id'],'instance_id':'fixture-owner','generation':1,'owner':'managed'}
                     send(stream,{'event':'opened','attempt':attempt,'lease':lease,'capabilities':caps,'idb_path':command['path'],'pid':os.getpid()})
-                elif kind=='release':send(stream,{'event':'released','attempt':attempt})
+                elif kind=='release':
+                    if fault in ('release-proof','release-unconfirmed'):
+                        send(stream,{'event':'uncertain','attempt':attempt,'error':{'code':'cancel_pending','message':'injected lost release ACK'}})
+                        (root/'release-uncertain').touch()
+                        if fault=='release-proof':
+                            end=time.monotonic()+5
+                            while not (root/'release-proof').exists():
+                                assert time.monotonic()<end,'missing release proof barrier'
+                                time.sleep(.005)
+                        else:
+                            send(stream,{'event':'release_unconfirmed','attempt':attempt})
+                            continue
+                    send(stream,{'event':'released','attempt':attempt})
                 else:raise AssertionError(kind)
                 continue
             attempt=frame['attempt'];kind=frame['payload']['command']

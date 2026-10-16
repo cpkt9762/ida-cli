@@ -124,9 +124,28 @@ IDA auto-analyses it and writes an `.i64` alongside.
 ## Nexus N3 bridge, patch and lifecycle
 
 N3 uses the fixed public Nexus client with the user-approved local
-`client-cancel-unknown.patch`. Preparation verifies the patched `handle.py`
+`client-cancel-unknown.patch`, then `client-close-proof.patch`. Preparation verifies the patched `handle.py`
 SHA-256 and records patch status. Only a validated upstream fix passing the
-probe and N0/N3 gates permits removal; N9 packages must carry both local patches.
+probe and N0/N3 gates permits removal; N9 packages must carry all three local patches, including `loopback-bind.patch`.
+
+Close proof uses `close_outcome`: nonfinal lease ACK, final owner lifetime proof,
+or uncertainty. On uncertainty the bridge reports it before one bounded public
+`wait_database_released` check; an unconfirmed release retains router tracking and
+blocks another open of that path. Existing `close()` retains its legacy contract.
+Prepare a fresh close red environment with `--without-client-close-patch` (cancel
+patch still applied), then run the command below with `--expect-unpatched`: exit 2.
+The fully patched fresh environment must exit 0; `close-proof.json` records the
+real ACK, lost-ACK uncertainty, one release request and owned cleanup.
+
+```sh
+timeout 30s "$N0_ROOT/venv/bin/python" scripts/nexus/probe_close_release.py --root "$N0_ROOT"
+```
+
+Open failures emit warn diagnostics with component sizes/mtime and public owner
+state/lifetime, without registry secrets. E22 failure evidence is saved before
+candidate cleanup as `E22-<kind>-failure-diagnostics.json`. Run ten complete
+contract suites on final HEAD in distinct fresh environments (inner 180s, outer
+210s, each with uptime); no recurrence means only “未复现，取证已就位”.
 
 Prepare separate fresh external environments using the N0 command below.
 The red control alone adds `--without-client-cancel-patch` to preparation and

@@ -65,6 +65,7 @@ impl State {
                 category = event["error"]["code"].as_str(),
                 reason = event["error"]["message"].as_str(),
                 operation = event["attempt"]["target"]["identity"]["operation_id"].as_str(),
+                diagnostics = ?event.get("diagnostics"),
                 "Nexus open failed"
             );
         }
@@ -885,7 +886,7 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
                 };
                 s.complete(identity, completion)?;
             }
-            "stop_unconfirmed" => {}
+            "stop_unconfirmed" | "release_unconfirmed" => {}
             "uncertain" => {
                 s.delivery_failed(&attempt, DispatchFailure::Uncertain(take_error()?))?;
                 if let DeliveryTarget::Execute { identity } = &attempt.target {

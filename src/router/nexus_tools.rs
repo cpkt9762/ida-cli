@@ -319,6 +319,31 @@ impl Tools {
         }
         let gate = self.path_gate(&canonical);
         let _path = preparation.wait(async { Ok(gate.lock().await) }).await?;
+        let endpoint = router.nexus_endpoint();
+        let retained: Vec<_> = self
+            .records()
+            .values()
+            .filter(|db| db.path == canonical)
+            .map(|db| db.lease.clone())
+            .collect();
+        for lease in retained {
+            let status = endpoint.transition(|s, _| s.status(&lease.client_id, &lease))?;
+            if status.control_delivery.is_some_and(|delivery| {
+                matches!(delivery.attempt.target, DeliveryTarget::Release { .. })
+                    && matches!(
+                        delivery.state,
+                        DeliveryState::Queued
+                            | DeliveryState::Acknowledged
+                            | DeliveryState::Uncertain
+                    )
+            }) {
+                return Err(NexusError::new(
+                    NexusErrorCode::CancelPending,
+                    "owner release unconfirmed; new open blocked and tracking retained",
+                )
+                .into());
+            }
+        }
         let mut prepared = super::nexus_bridge::cache::prepare_n4_open(
             canonical.clone(),
             crate::idb_store::idb_root(),
@@ -1100,10 +1125,21 @@ async fn release(
             if state.phase == SessionPhase::Released {
                 return Ok(());
             }
-            if let Some(error) = state.control_delivery.and_then(|d| d.error) {
-                return Err(ToolError::Nexus(error));
+            if let Some(delivery) = state.control_delivery {
+                if delivery.state != DeliveryState::Uncertain {
+                    if let Some(error) = delivery.error {
+                        return Err(ToolError::Nexus(error));
+                    }
+                }
             }
-            receive(events.recv().await)?;
+            let event = receive(events.recv().await)?;
+            if event["event"] == "release_unconfirmed"
+                && event["attempt"]["target"]["lease"]["lease_id"] == lease.lease_id.as_str()
+            {
+                return Err(diagnostic(
+                    "lease release proof deadline expired; owner retained; new open blocked",
+                ));
+            }
         }
     })
     .await

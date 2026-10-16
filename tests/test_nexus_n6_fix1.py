@@ -1,8 +1,11 @@
 """N6-F1 edge contracts; real IDA counterparts live in the N6 comparison."""
 import importlib.util
+import json
+import os
 from pathlib import Path
 import sys
 import types
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -17,6 +20,28 @@ def load(name):
 
 
 class Compatibility(unittest.TestCase):
+    def test_e22_failure_always_persists_public_diagnostics(self):
+        spec = importlib.util.spec_from_file_location('compare_failure', REPO / 'scripts/compare_nexus_baseline.py')
+        comparison = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(comparison)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / 'home-e22-match-1/idb/copy.i64'
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b'isolated')
+            diagnostics = types.SimpleNamespace(database_diagnostics=lambda path: {'target': str(path), 'lifetime': 'held'})
+            args = ['compare', '--root', str(root), '--baseline', 'baseline', '--binary', 'binary', '--case', 'E22']
+            with patch.object(sys, 'argv', args), patch.dict(os.environ, {'IDA_TEST': '1'}), \
+                    patch.object(comparison, 'digest', return_value=comparison.BASELINE_SHA), \
+                    patch.object(comparison, 'Environment', return_value=types.SimpleNamespace(root=root)), \
+                    patch.object(comparison, 'legacy_cache', side_effect=RuntimeError('injected WorkerStartError')), \
+                    patch.dict(sys.modules, {'lifecycle': diagnostics}):
+                with self.assertRaisesRegex(RuntimeError, 'WorkerStartError'):
+                    comparison.main()
+            self.assertEqual(json.loads((root / 'E22-result.json').read_text())['status'], 'FAIL')
+            saved = json.loads((root / 'E22-failure-diagnostics.json').read_text())
+            self.assertEqual(saved['targets'], [{'target': str(target), 'lifetime': 'held'}])
+
     def test_handler_address_uses_rust_whitespace_and_u64_grammar(self):
         query = load('query_tools')
         parse = load('tools').parse_address

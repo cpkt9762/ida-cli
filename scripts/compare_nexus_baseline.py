@@ -560,6 +560,17 @@ def legacy_cache(env,baseline,binary):
                 assert not client.seed.with_suffix("").exists(),"rejected input was published"
             assert digest(idb)==original_hash,"N0 source IDB changed"
             results.append({"kind":kind,"status":"PASS","source_sha256":original_hash})
+        except BaseException:
+            # Capture before stopping the candidate so the public lifetime and
+            # owner states still describe the failing boundary. No environment
+            # values, registry payloads or lease tokens enter this evidence.
+            sys.path.insert(0, str(REPO / "nexus_bridge"))
+            from lifecycle import database_diagnostics
+            diagnostics = {"kind": kind, "source": database_diagnostics(idb),
+                           "candidate": database_diagnostics(client.seed)}
+            (env.root / f"E22-{kind}-failure-diagnostics.json").write_text(
+                json.dumps(diagnostics, indent=2) + "\n")
+            raise
         finally:
             client.stop()
         assert not list((client.home/"idb").glob(".nexus-*")),"staging/verification residue"
@@ -586,6 +597,15 @@ def main():
         result["status"]="PASS"
         print(json.dumps(result))
     finally:
+        if args.case == "E22" and result["status"] != "PASS":
+            sys.path.insert(0, str(REPO / "nexus_bridge"))
+            from lifecycle import database_diagnostics
+            targets = sorted({*env.root.glob("home-e22-*/idb/*.i64"),
+                              *env.root.glob("legacy-*/idb/*.i64")})
+            (env.root / "E22-failure-diagnostics.json").write_text(json.dumps(
+                {"targets": [database_diagnostics(path) for path in targets],
+                 "detail_files": sorted(path.name for path in env.root.glob("E22-*-failure-diagnostics.json"))},
+                indent=2) + "\n")
         (env.root/f"{args.case}-result.json").write_text(json.dumps(result,indent=2)+"\n")
 
 

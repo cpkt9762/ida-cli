@@ -1,0 +1,159 @@
+Nexus 0.13.4 public close proof, applied after client-cancel-unknown.patch.
+Upstream d60ff582fde90c59726336c0dbdf3e8286e9df7a; N6-F1 continuation approved 2026-10-16.
+Client handle.py only. Uses existing /release_lease and public wait_database_released.
+close() keeps its legacy None/exception behavior. close_outcome distinguishes
+lease_released, owner_released, uncertain; no replay and no absence-as-success.
+Probe: scripts/nexus/probe_close_release.py (old cancel patch red / new green).
+N9 packaging MUST carry both client patches until equivalent upstream validation.
+
+--- a/ida_nexus/handle.py
++++ b/ida_nexus/handle.py
+@@ -282,6 +282,8 @@
+         self._on_disconnect = on_disconnect
+         self._lock = threading.Lock()
+         self._request_lock = threading.Lock()
++        self._close_lock = threading.Lock()
++        self._close_outcome: dict[str, Any] | None = None
+         self._closed = threading.Event()
+         self._disconnected = threading.Event()
+         self._disconnect_reason: str | None = None
+@@ -969,12 +971,83 @@
+         finally:
+             connection.close()
+ 
+-    def close(
++    def _release_remote_lease_outcome(self, timeout: float) -> dict[str, Any]:
++        """One public release request; an absent or malformed ACK is never proof."""
++        outcome: dict[str, Any] = {
++            "status": "uncertain", "lease_released": False,
++            "owner_released": False, "failure": "transport",
++        }
++        if timeout <= 0:
++            outcome["failure"] = "deadline"
++            return outcome
++        connection = http.client.HTTPConnection(HOST, self.instance.port, timeout=timeout)
++        try:
++            connection.request("POST", "/release_lease",
++                body=json.dumps({"lease_id": self._lease_id}).encode("utf-8"),
++                headers={"Accept": "application/json", "Content-Type": "application/json",
++                         "Authorization": f"Bearer {self.instance._token}"})
++            response = connection.getresponse()
++            try:
++                payload = json.loads(response.read())
++                result = payload.get("result") if isinstance(payload, dict) else None
++                if (response.status != 200 or payload.get("ok") is not True
++                    or not isinstance(result, dict) or result.get("released") is not True
++                    or type(result.get("shutdown_pending")) is not bool):
++                    outcome["failure"] = "invalid_response"
++                else:
++                    outcome.update(status="final_pending" if result["shutdown_pending"] else "lease_released",
++                                   lease_released=True, shutdown_pending=result["shutdown_pending"], failure=None)
++            finally:
++                response.close()
++        except (TimeoutError, OSError, http.client.HTTPException, UnicodeDecodeError,
++                json.JSONDecodeError, AttributeError, TypeError) as exc:
++            outcome.update(status="uncertain", lease_released=False,
++                           failure="transport" if isinstance(exc, (OSError, http.client.HTTPException)) else "invalid_response")
++        finally:
++            try:
++                connection.close()
++            except Exception as exc:
++                outcome.update(cleanup_failure="transport", cleanup_failure_type=type(exc).__name__)
++        return outcome
++
++    def close_outcome(self, *, wait_for_database: bool = True,
++                      timeout: float = DATABASE_CLOSE_TIMEOUT_SECONDS) -> dict[str, Any]:
++        """Release once and return lease_released, owner_released, or uncertain.
++
++        An uncertain result must be reconciled with public owner lifetime proof;
++        this method never retries a release. Repeated calls retain that outcome.
++        """
++        if (not isinstance(wait_for_database, bool) or isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout < 0):
++            raise ValueError("close options require boolean wait and finite non-negative timeout")
++        deadline = time.monotonic() + float(timeout)
++        if not self._close_lock.acquire(timeout=float(timeout)):
++            return {"status": "uncertain", "owner_released": False,
++                    "lease_released": False, "failure": "close_in_progress"}
++        try:
++            return self._close(wait_for_database=wait_for_database, timeout=max(0.0, deadline - time.monotonic()), structured=True)
++        except Exception as exc:
++            outcome = {"status": "uncertain", "owner_released": False,
++                       "lease_released": False, "failure": "cleanup",
++                       "failure_type": type(exc).__name__}
++            self._close_outcome = outcome
++            return dict(outcome)
++        finally:
++            self._close_lock.release()
++
++    def close(self, *, wait_for_database: bool = False,
++              timeout: float = DATABASE_CLOSE_TIMEOUT_SECONDS) -> None:
++        """Retain the original None/exception contract for existing callers."""
++        with self._close_lock:
++            self._close(wait_for_database=wait_for_database, timeout=timeout)
++
++    def _close(
+         self,
+         *,
++        structured: bool = False,
+         wait_for_database: bool = False,
+         timeout: float = DATABASE_CLOSE_TIMEOUT_SECONDS,
+-    ) -> None:
++    ) -> dict[str, Any] | None:
+         """Release this lease and optionally wait for a final managed IDB close."""
+ 
+         if not isinstance(wait_for_database, bool):
+@@ -987,8 +1060,12 @@
+         ):
+             raise ValueError("timeout must be a finite non-negative number")
+         if self._closed.is_set():
+-            return
++            return dict(self._close_outcome or {"status": "uncertain", "owner_released": False,
++                                               "lease_released": False, "failure": "legacy_close"})
++        deadline = time.monotonic() + float(timeout)
+         self._closed.set()
++        self._close_outcome = {"status": "uncertain", "owner_released": False,
++                               "lease_released": False, "failure": "close_incomplete"}
+         with self._lock:
+             self._uncertain_operations.clear()
+             self._active_cancel_state = None
+@@ -996,7 +1073,13 @@
+             self._idb_subscriptions.clear()
+         for subscription in subscriptions:
+             subscription._close(detach=False)
+-        shutdown_pending = self._release_remote_lease()
++        if structured:
++            outcome = self._release_remote_lease_outcome(max(0.0, min(2.0, deadline - time.monotonic())))
++            shutdown_pending = outcome.get("shutdown_pending") is True
++        else:
++            shutdown_pending = self._release_remote_lease()
++            outcome = dict(self._close_outcome)
++        self._close_outcome = outcome
+         with self._lock:
+             response = self._lease_response
+             connection = self._lease_connection
+@@ -1028,7 +1111,7 @@
+         if rpc_connection is not None:
+             rpc_connection.close()
+         if thread is not None and thread is not threading.current_thread():
+-            thread.join(timeout=2.0)
++            thread.join(timeout=max(0.0, min(2.0, deadline - time.monotonic())) if structured else 2.0)
+         if response is not None:
+             try:
+                 response.close()
+@@ -1039,6 +1122,15 @@
+         if connection is not None:
+             connection.close()
+ 
++        if structured:
++            if shutdown_pending:
++                released = wait_for_database and wait_database_released(
++                    self.instance, timeout=max(0.0, deadline - time.monotonic()))
++                outcome.update(status="owner_released" if released else "uncertain",
++                               owner_released=bool(released),
++                               failure=None if released else "lifetime_unconfirmed")
++            self._close_outcome = outcome
++            return dict(outcome)
+         if (
+             wait_for_database
+             and shutdown_pending

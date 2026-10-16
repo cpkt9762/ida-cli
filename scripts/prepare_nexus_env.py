@@ -13,7 +13,8 @@ import sys
 
 REPO = Path(__file__).resolve().parents[1]
 NEXUS_SHA = "d60ff582fde90c59726336c0dbdf3e8286e9df7a"
-PATCHED_HANDLE_SHA256 = "4cd1a9c27e969504eed4ae55d7cbd0e2b4b5a6ba67f0c2529ccb6006a8d67b76"
+CANCEL_HANDLE_SHA256 = "4cd1a9c27e969504eed4ae55d7cbd0e2b4b5a6ba67f0c2529ccb6006a8d67b76"
+PATCHED_HANDLE_SHA256 = "aa5d7ea42caaa922ef494d7d8a1406396537a4ea88d9e833825e08c8d279025e"
 
 
 def accepted_eula_entries(data: bytes) -> list[str]:
@@ -86,8 +87,15 @@ def prepare(args: argparse.Namespace) -> None:
     if cancel_applied:
         run(root, "cancel-patch-check", ["git", "apply", "--check", str(cancel_patch)], cwd=source)
         run(root, "cancel-patch", ["git", "apply", str(cancel_patch)], cwd=source)
-        if digest(source / "ida_nexus/handle.py") != PATCHED_HANDLE_SHA256:
+        if digest(source / "ida_nexus/handle.py") != CANCEL_HANDLE_SHA256:
             raise RuntimeError("client cancellation patch output hash mismatch; BLOCKED")
+    close_patch = REPO / "scripts/nexus/client-close-proof.patch"
+    close_applied = cancel_applied and not args.without_client_close_patch
+    if close_applied:
+        run(root, "close-patch-check", ["git", "apply", "--check", str(close_patch)], cwd=source)
+        run(root, "close-patch", ["git", "apply", str(close_patch)], cwd=source)
+        if digest(source / "ida_nexus/handle.py") != PATCHED_HANDLE_SHA256:
+            raise RuntimeError("client close proof patch output hash mismatch; BLOCKED")
     run(root, "nexus-wheel", [*pip, "wheel", "--no-deps", "--no-build-isolation",
                               "--no-cache-dir", "-w", str(root / "wheels"), str(source)])
     run(root, "nexus-install", [*pip, "install", "--no-deps", "--no-index", "--find-links", str(root / "wheels"),
@@ -114,6 +122,8 @@ def prepare(args: argparse.Namespace) -> None:
                 "patch_sha256": digest(patch), "python": sys.version,
                 "client_cancel_patch_applied": cancel_applied,
                 "client_cancel_patch_sha256": digest(cancel_patch) if cancel_applied else None,
+                "client_close_patch_applied": close_applied,
+                "client_close_patch_sha256": digest(close_patch) if close_applied else None,
                 "client_handle_sha256": digest(source / "ida_nexus/handle.py"),
                 "eula_entries_copied": len(eula), "checksums": checksums}
     (root / "environment.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -127,6 +137,8 @@ def main() -> None:
     parser.add_argument("--eula-registry", type=Path, required=True, help="existing legally prepared ida.reg")
     parser.add_argument("--without-client-cancel-patch", action="store_true",
                         help="diagnostic red control only; not a supported bridge environment")
+    parser.add_argument("--without-client-close-patch", action="store_true",
+                        help="diagnostic old cancel-only red control; unsupported bridge environment")
     args = parser.parse_args()
     try:
         prepare(args)

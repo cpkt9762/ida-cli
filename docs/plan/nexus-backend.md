@@ -413,6 +413,8 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 ### N3：常驻 Python bridge 和 Nexus 生命周期
 
 - 2026-10-15 用户裁定采用本地客户端补丁；编排者在同一授权范围追加允许公开结构化取消方法。`DatabaseHandle.cancel_operation_outcome` 新增 `cancelled/not_pending/failed`、失败类别、每 handle 取消序号和因果停止证明；原 `cancel_operation/cancel_active` 保留 bool 与异常语义。歧义 probe 区分服务端明确 false、连接故障和解析失败，后两者不证明停止。
+- N6-F1 续派授权 `client-close-proof.patch`，在 cancel 补丁之后仅修改公开客户端 handle.py。`close_outcome` 区分 `lease_released`（非最后 lease 的有效 ACK）、`owner_released`（最后 owner lifetime 已释放）、`uncertain`；原 `close()` 保持 None/异常契约。ACK 丢失或格式无效不证明释放，也不重放 release。bridge 先上报不确定，再在原期限内用公开 `wait_database_released` 确认；无证明保留 lease/路径记录、明确报错并阻止同 IDB 新 open，独立 IDB 不受阻。
+- 新 `scripts/nexus/probe_close_release.py` 用真实 owner 的关闭 barrier 和测试侧丢 ACK 复现证明缺口：旧 cancel-only 环境 `--without-client-close-patch` / probe `--expect-unpatched` 应 exit 2，新环境 exit 0，释放请求仅一次。此缺口不是原始 E22 WorkerStartError 的已证根因；open 失败 warn 记录组件 size/mtime、公开 owner 状态/lifetime，E22 失败另存诊断；最终 HEAD contract 十轮未复现时仅报告“未复现，取证已就位”。
 - 补丁在执行连接异常后保留本 handle 的精确 operation ID（最多 64 项，满时拒绝新执行），取消继续走原有独立控制连接；不读取 token、不恢复私有字段、不重放。正常完成/明确错误不进入未知集合；`cancel_active` 恢复官方 active-only 选择，bridge 始终按精确 operation_id 调用新方法。
 - 官方 `_server._run_operation` 在释放 backend lock 之后才移除精确 pending key，取消过的排队操作会在取得锁前被拒绝。补丁删除“后继成功即清理”：第一次 true ACK 记录当时所有已发取消请求的序号上界；只有此后才发出的另一次取消得到 HTTP 200、`cancelled=false`，才能移除未知 ID并证明停止。先发后到的 false、晚解析的成功响应及任何控制失败均不作数；handle close 清空记账。
 - bridge 独立停止证明池保留 2 槽，失败轮转重试，容量满时保留待办；ACK 先于执行断流仍补安排证明，到原操作期限保留 UnknownOutcome/原 cause，不伪造停止。控制 `stopped` 早于业务 `uncertain` 时先缓冲，再经 N1 `execution_stopped` 仅补停止证据，绝不改变业务结果为成功。N1 `lease_disconnected` 仅影响精确 lease；整桥 EOF 才按 owner/generation 标记断连。Rust 控制解码使用独立等待式单槽，不争用 CLI 的 Control try许可；lane 容量不变。
@@ -499,7 +501,7 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 - 批准比较规则二：仅 `get_xrefs_to_struct_field.result.tid` 为公开SDK分配的成员ID；旧Nexus建库多一次 `$ debugger application` 节点导致偏移，证据 `n6/tid-diagnosis.json`。优先第一步：公开auto_wait完成seed分析、校验元数据、显式save/close后复制同一IDB，三份SHA相等（r13-n6中的n6/n6-tools/n6-x86-prebuilt-idb.json）。r6及r13数值严格相等；r7同份副本仍出现会话内分配偏移，已按批准第二步验证合法非BADADDR、成员ID唯一、重复查询稳定、可作为公开get_udm_by_tid输入、实体名称/类型/成员关系/偏移/大小全部严格一致。实际例外和完整witness逐项落盘，不能全局忽略tid；9项单测含正反例。地址、偏移、大小与端口始终严格。
 - 已有 IDB 默认打开后的 get_analysis_status.auto_enabled：native 为 true、Nexus 为 false，来源 src/router/nexus_bridge/cache.rs:138–141 的 auto_analysis=false；这不是时序解释。工具矩阵用公开inf_set_auto_enabled/enable_auto/auto_wait显式启用分析并设置两边相同已完成分析状态之后才对照；dbg attach的真实错误含端口，测试在同一OS选择端口顺序启动两边，不规范化端口。MCP少数写工具保留旧版重复IDA error前缀，raw结构不变。
 - 历史60项59PASS/1tid失败由第二次续派的身份规则解除；中断运行不计PASS。r3弃用注释API警告/旧N4拒绝rename断言和r5错误前缀/分析状态/端口差异均保留失败并修正。r7新E20断言误用固定宽度is_uint32，改官方is_uint/is_unsigned及size4。r8 首先在 baseline 一侧因空路径规范化为当前目录失败，不能称该轮 N0 正常；r9 的两边原始响应证实仅 Nexus 元数据为空。r10 使用新建 seed，r11/r12 才使用 r9 seed，受控诊断未复现，不能据后续 PASS 宣称已确定其根因；最终fixture增加分析完成后保存及重开/setup后完整元数据断言，r13严格通过，未增加字段例外或自动重试。该未定位的历史异常列入报告限制供复核。
-- N6-F1 修复轮：缺失输入元数据序列化、查询地址词法/长前导零、无栈帧错误结果、写续片 dispatch 到期文案分别有先失败后通过的回归。真实 IDA 增加 18 项严格边界对照，未新增比较例外。r9 的历史元数据异常和编排者 E22 close→reopen 偶发失败仍须分别闭合；单次后续 PASS 不能替代根因证明，N6 尚未验收。本轮报告位于 `/tmp/ida-nexus-run-20261015.98rmfb/n6-fix1/report.md`。
+- N6-F1 修复轮：缺失输入元数据序列化、查询地址词法/长前导零、无栈帧错误结果、写续片 dispatch 到期文案分别有先失败后通过的回归。真实 IDA 增加 18 项严格边界对照，未新增比较例外。已知限制：r9 运行时元数据丢失根因未定，本轮按编排者裁定不再深挖；缺失分支格式已对齐旧版，工具矩阵保留元数据 checkpoint 断言。保留 seed `/tmp/ida-nexus-run-20261015.98rmfb/n6-fix1/diag/fixtures/r9-seed.i64`（SHA256 `788c48888be40754ca931ed23410c4ca12c930eaf30374617bd219b62f8774c8`）及 `diag/r9-diagnosis.json` 中双方各 13 个 checkpoint（本轮前的诊断均完整），不能据此关闭历史异常。原始 E22 WorkerStartError 按续派要求以失败取证和最终 HEAD 十轮完整 contract 复验处理；单次 PASS 不替代根因证明，N6 尚未验收。本轮报告位于 `/tmp/ida-nexus-run-20261015.98rmfb/n6-fix1/report.md`。
 - 验收语句对应证据：写入、类型和高级输出的上述E2E通过，保存重开保留；同一IDB上没有隐式native fallback。N5已接受的非事务快照、未订阅通知、受信任脚本以及不可抢占native调用边界不扩大。
 
 ### N7：GUI、缓存和专用输入
@@ -519,7 +521,7 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N9 与 R：旧后端清理、唯一后端打包和最终复验
 
-- 发布包必须携带 N0 loopback DNS 补丁及用户 2026-10-15 批准的客户端未知操作取消补丁、固定依赖和哈希校验；上游修复经 probe 与 N0/N3 重新验收后才可移除。
+- 发布包必须携带 N0 `loopback-bind.patch`、用户 2026-10-15 批准的客户端未知操作取消补丁 `client-cancel-unknown.patch`、2026-10-16 续派批准的客户端关闭证明补丁 `client-close-proof.patch`、固定依赖和哈希校验；上游修复经 probe 与 N0/N3 重新验收后才可移除。
 
 - 删除 `native-linked`、`idat-compat` 数据库执行路径，以及迁移期的后端选择入口、自动分流和 fallback。常规启动、CLI、MCP 和后台任务统一走 Nexus。
 - 清点并移除仅为旧后端服务的 Rust idalib/FFI、SDK 构建要求、Cargo 依赖/锁文件项、vendored 代码及旧 worker 启动分支；先确认引用已迁移，不能通过删工具来消除依赖。

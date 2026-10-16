@@ -72,6 +72,8 @@ class Connection:
     def getresponse(self):
         return self
     def read(self):
+        if self.endpoint == "/release_lease":
+            return json.dumps({"ok": True, "result": {"released": True, "shutdown_pending": False}}).encode()
         if self.control:
             op = self.payload["operation_id"]
             index = counts.get(op, 0)

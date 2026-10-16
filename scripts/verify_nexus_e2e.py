@@ -45,8 +45,8 @@ def main():
         if env.ledger.exists():
             parser.error("use a fresh prepared environment")
         patch_status = env.client_patch_status()
-        if not patch_status["applied"]:
-            parser.error("client cancellation patch required; BLOCKED")
+        if not patch_status["applied"] or not patch_status["close_applied"]:
+            parser.error("client cancellation and close proof patches required; BLOCKED")
         variables = env.variables()
         if args.tmp_root:
             if args.tmp_root.resolve(strict=True) != env.root / "tmp":

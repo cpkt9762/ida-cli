@@ -97,6 +97,7 @@ class Environment:
         if actual != self.manifest.get("client_handle_sha256"):
             raise RuntimeError("installed Nexus client hash differs from environment manifest")
         return {"applied": self.manifest.get("client_cancel_patch_applied", False),
+                "close_applied": self.manifest.get("client_close_patch_applied", False),
                 "handle_sha256": actual}
 
     @contextmanager

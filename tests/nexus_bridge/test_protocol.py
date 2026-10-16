@@ -66,6 +66,10 @@ class Handle:
     def close(self, **_options):
         self.closed = True
 
+    def close_outcome(self, **options):
+        self.close(**options)
+        return {"status": "lease_released", "lease_released": True, "owner_released": False}
+
 
 class Harness:
     def __init__(self, directory, monkeypatch):
@@ -216,6 +220,24 @@ def test_release_only_closes_held_exact_lease(harness):
     harness.dispatch(1, {"command": "release", "lease": harness.lease})
     assert harness.receive(1)["event"] == "released"
     assert harness.handle.closed
+
+
+@pytest.mark.parametrize("proven", [True, False])
+def test_release_uncertainty_retains_handle_until_public_proof(harness, monkeypatch, proven):
+    harness.open()
+    handle = harness.handle
+    monkeypatch.setattr(handle, "close_outcome", lambda **_kw: {"status": "uncertain"})
+    waits = []
+    def wait(instance, timeout):
+        assert instance is handle.instance
+        waits.append(timeout)
+        return proven
+    monkeypatch.setattr("ida_nexus.wait_database_released", wait)
+    harness.dispatch(1, {"command": "release", "lease": harness.lease})
+    assert harness.receive(1)["event"] == "uncertain"
+    assert harness.receive(1)["event"] == ("released" if proven else "release_unconfirmed")
+    assert len(waits) == 1 and 0 <= waits[0] <= 2
+    assert (harness.lease["lease_id"] in harness.bridge.handles) is not proven
 
 
 def test_proof_failure_retries_without_losing_unknown_or_claiming_stop(harness, monkeypatch):
@@ -396,3 +418,28 @@ def test_f2_bad_result_is_request_local(harness, monkeypatch, bad):
         assert harness.receive()["result"]["result"] == "healthy"
     harness.send(1, {"local_status": "encoding-survival"})
     assert len(harness.receive(1)["held"]) == 2
+
+
+def test_open_diagnostics_records_only_public_owner_and_component_metadata(tmp_path, monkeypatch):
+    from enum import Enum
+    import ida_nexus
+    from lifecycle import database_diagnostics
+    target = tmp_path / 'diagnostic.i64'
+    target.write_bytes(b'packed')
+    (tmp_path / 'diagnostic.id0').write_bytes(b'index')
+    (tmp_path / 'unrelated.i64').write_bytes(b'private')
+    class State(Enum):
+        BLOCKED = 'blocked'
+    instance = SimpleNamespace(idb_path=str(target), record_id='owned-record', pid=123,
+                               _token='must-not-be-serialized')
+    monkeypatch.setattr(ida_nexus, 'discover_databases', lambda **_kw: [SimpleNamespace(instance=instance, state=State.BLOCKED)])
+    monkeypatch.setattr(ida_nexus, 'wait_database_released', lambda _instance, timeout: False)
+    diagnostic = database_diagnostics(target)
+    assert diagnostic['lifetime'] == 'held'
+    assert diagnostic['owners'] == [{'instance_id': 'owned-record', 'pid': 123,
+        'state': 'blocked', 'lifetime_released': False}]
+    assert {Path(item['path']).name for item in diagnostic['components']} == {'diagnostic.i64', 'diagnostic.id0'}
+    assert all(item['size'] > 0 and item['mtime_ns'] > 0 for item in diagnostic['components'])
+    assert 'must-not-be-serialized' not in json.dumps(diagnostic)
+    monkeypatch.setattr(ida_nexus, 'discover_databases', lambda **_kw: [])
+    assert database_diagnostics(target)['lifetime'] == 'no_registered_owner_proof'
