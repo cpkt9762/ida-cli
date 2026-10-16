@@ -250,16 +250,17 @@ def save_database(outfile=None, flags=0):
 def close_status():
     """Re-sample on the owner immediately before permitting a saving release."""
     state = _state or _failed_state
-    safe, protection_error = False, 'not installed'
+    safe, protection_error, guard_error = False, 'not installed', None
     if state:
         try:
-            sample('before-close', refuse=False)
+            guard_error = sample('before-close', refuse=False)
             safe = state['close_safe']
             protection_error = state.get('protection_error')
         except Exception as exc:
             protection_error = type(exc).__name__ + ': ' + str(exc)
     evidence = state.get('first_failure') if state else None
     return {'close_safe': safe,
+            'save_guard_error': guard_error,
             'initial': bool(evidence and evidence['previous_sample'] is None
                             and not state.get('install_error')),
             'evidence': evidence,

@@ -83,6 +83,10 @@ class Connection:
     def read(self):
         if self.endpoint == "/release_lease":
             (ROOT / 'default-release-requested').touch()
+            if SCENARIO == 'n9-aux-refusal':
+                pending = self.payload['lease_id'] != handles[0]._lease_id
+                return json.dumps({'ok': True, 'result': {
+                    'released': True, 'shutdown_pending': pending}}).encode()
             return json.dumps({"ok": True, "result": {"released": True, "shutdown_pending": False}}).encode()
         if self.control:
             op = self.payload["operation_id"]
@@ -107,6 +111,10 @@ class Connection:
                 cancelled = index == 0
             return json.dumps({"result": {"cancelled": cancelled}}).encode()
         code = self.payload.get("code", "")
+        if '_g.close_status()' in code:
+            refusal = 'Root Node missing; saving refused' if SCENARIO == 'n9-aux-refusal' else None
+            return json.dumps({'ok': True, 'result': {'result': {
+                'close_safe': True, 'save_guard_error': refusal}}}).encode()
         if code == 'r9-fixture-release':
             return json.dumps({'ok': True, 'result': {'result': {'save_guard_error': None}}}).encode()
         if code.startswith("import time as _n5_time\n"):
@@ -229,6 +237,10 @@ def opened(path, **_options):
     return result
 DatabaseHandle.open = opened
 ida_nexus.discover_databases = lambda **_k: []
+if SCENARIO == 'n9-aux-refusal':
+    ida_nexus.discover_databases = lambda **_k: [SimpleNamespace(instance=handles[0].instance)]
+    DatabaseHandle.attach = lambda entry: opened(entry.idb_path)
+    ida_nexus.wait_database_released = lambda *_a, **_k: True
 bridge.readiness = lambda: {"ready": True, "capabilities": {
     "runtime": {"ida": [9, 5, 0], "python": [3, 11, 0], "nexus": [0, 13, 4], "domain": [0, 5, 1]},
     "methods": bridge.METHODS}}

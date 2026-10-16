@@ -70,7 +70,8 @@ class OpenTests(unittest.TestCase):
                 parent.calls.append('close')
                 if parent.recovering:
                     parent.target.with_suffix('.id0').unlink(missing_ok=True)
-                return {'lease_released': parent.lease}
+                return {'status': 'lease_released' if parent.lease else 'uncertain',
+                        'lease_released': parent.lease, 'shutdown_pending': False}
 
         handle = Handle()
         self.handles.append(handle)

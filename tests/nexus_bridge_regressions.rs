@@ -374,6 +374,27 @@ async fn p14_one_lease_sse_loss_preserves_other_lease_and_active_operation() {
     assert_eq!(r.snapshot(&op).status, OperationStatus::Succeeded);
     r.close().await;
 }
+
+#[tokio::test]
+async fn n9_auxiliary_save_refusal_reaches_close_caller() {
+    let mut r = Rig::new("n9-aux-refusal").await;
+    let lease = r.open().await;
+    r.release_marker("disconnect-first");
+    r.event("disconnected").await;
+    let result =
+        ida_mcp::router::nexus_tools::n7_fix2_publish::release_result(&r.bridge, &lease).await;
+    let sideband = r.event("released").await;
+    assert!(sideband["save_guard_error"]
+        .as_str()
+        .expect("auxiliary saving refusal sideband")
+        .contains("saving refused"));
+    assert!(sideband["outcome"]["owner_released"] == true);
+    assert!(result
+        .expect_err("close caller must receive the saving refusal")
+        .to_string()
+        .contains("saving refused"));
+    r.close().await;
+}
 // A failed event wait must return the two occupied Control slots as well.
 #[derive(Clone)]
 struct ControlRelease {

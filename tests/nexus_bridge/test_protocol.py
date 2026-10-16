@@ -29,6 +29,8 @@ class Handle:
         self.disconnect = False
 
     def execute_python(self, code, **options):
+        if '_g.close_status()' in code:
+            return {'result': {'close_safe': True, 'save_guard_error': None}}
         if code == 'r9-fixture-release':
             return {'result': {'save_guard_error': None}}
         if code.startswith("import time as _n5_time\n"):
@@ -70,7 +72,8 @@ class Handle:
 
     def close_outcome(self, **options):
         self.close(**options)
-        return {"status": "lease_released", "lease_released": True, "owner_released": False}
+        return {"status": "lease_released", "lease_released": True, "owner_released": False,
+                "shutdown_pending": False}
 
 
 class Harness:

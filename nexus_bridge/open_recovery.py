@@ -11,6 +11,7 @@ import time
 import uuid
 
 from cache_store import atomic_json, public_owner_probe, rename_group, sync_directory
+from lifecycle import release_handle
 
 
 def remaining(deadline):
@@ -223,23 +224,10 @@ def failure_state(handle, deadline):
         timeout=remaining(deadline))['result']
 
 
-def require_safe_close(handle, deadline):
-    """Fail without releasing the exact lease if guard safety is indeterminate."""
-    try:
-        proof = failure_state(handle, deadline)
-    except Exception as exc:
-        raise RuntimeError('save protection unavailable; owner and exact lease retained; '
-                           'no default close') from exc
-    if proof.get('close_safe') is not True:
-        raise RuntimeError('save protection unavailable; owner and exact lease retained; '
-                           'no default close')
-    return proof
-
-
 def open_checked(Handle, Options, path, options, deadline, guarded_source, context,
                  acquired=lambda *_: None, released=lambda *_: None, starting=lambda: None):
     """Retry only a guard-confirmed *first* sample failure, never a business call."""
-    from ida_nexus import probe_database_state, wait_database_released
+    from ida_nexus import probe_database_state
     root = Path(os.environ['IDA_CLI_HOME']).resolve()/'idb'
     state = probe_database_state(path, output_database=options.get('output_database'))
     target = Path(state['idb_path']).resolve()
@@ -280,20 +268,15 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                         observation_error = error
                 # Snapshot collection can take time or fail. Its earlier proof
                 # classifies the failure; only a new owner sample permits close.
-                require_safe_close(handle, deadline)
-                outcome = handle.close_outcome(wait_for_database=True, timeout=remaining(deadline))
-                if proof['initial']:
-                    lifetime = wait_database_released(handle.instance, timeout=remaining(deadline))
-                    if not outcome.get('lease_released') or not lifetime:
-                        raise RuntimeError('open cleanup release unconfirmed; snapshot/scene retained') from exc
-                elif not outcome.get('lease_released'):
-                    if not wait_database_released(handle.instance, timeout=remaining(deadline)):
-                        raise RuntimeError('open runtime check cleanup unconfirmed; lease retained') from exc
+                outcome = release_handle(handle, deadline, owner_required=proof['initial'])
+                if outcome is None or (proof['initial'] and not outcome['release_acknowledged']):
+                    raise RuntimeError('open cleanup release unconfirmed; snapshot/scene retained') from exc
                 released(handle)
                 if observation_error:
                     raise observation_error from exc
                 if not proof['initial']:
-                    raise RuntimeError('open runtime check failed; no initial Root retry: ' + str(exc)) from exc
+                    raise RuntimeError('open runtime check failed; no initial Root retry: ' + str(exc)
+                                       + '; ' + (outcome['save_guard_error'] or '')) from exc
                 if snapshot:
                     snapshot.rollback(observed)
                 if number == 3:

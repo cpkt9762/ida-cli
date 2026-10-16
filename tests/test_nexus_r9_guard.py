@@ -115,7 +115,7 @@ class GuardTests(unittest.TestCase):
                     if not guard.close_status()['close_safe']:
                         raise AssertionError('unsafe saving close')
                     live.remove(self.lease)
-                    return {'lease_released': True}
+                    return {'status': 'lease_released', 'lease_released': True, 'shutdown_pending': False}
             sibling = Handle('sibling')
             def open_handle(*args, **kwargs):
                 return Handle('open-'+str(len(acquired)))
@@ -191,7 +191,7 @@ class GuardTests(unittest.TestCase):
                         return {'result': namespace.get('result')}
                     def close_outcome(self, **kwargs):
                         calls.append('default-save-close')
-                        return {'lease_released': True}
+                        return {'status': 'lease_released', 'lease_released': True, 'shutdown_pending': False}
                 handle = Handle()
                 loader = sys.modules['ida_loader']
                 def set_flag(flag):
@@ -278,6 +278,7 @@ class GuardTests(unittest.TestCase):
                         exec(source, namespace)
                         return {'result': namespace['result']}
                     handle = Mock()
+                    handle.close_outcome.return_value = {'status': 'lease_released', 'lease_released': True, 'shutdown_pending': False}
                     handle.execute_python.side_effect = execute
                     loader = sys.modules['ida_loader']
                     def set_flag(flag):
@@ -296,9 +297,11 @@ class GuardTests(unittest.TestCase):
                             patch.object(loader, 'is_database_flag', read_flag), \
                             patch.object(sys.modules['ida_netnode'].netnode, 'exist', root):
                         with self.assertRaises(RuntimeError):
-                            slices.cleanup_disconnected(handle, context, slices.incarnation)
+                            slices.cleanup_disconnected(handle, context, slices.incarnation,
+                                                        __import__('lifecycle').release_handle)
                     if branch in ('healthy', 'confirmed'):
-                        handle.close.assert_called_once_with(wait_for_database=False)
+                        handle.close_outcome.assert_called_once()
+                        handle.close.assert_not_called()
                         self.assertNotIn(tuple(context), slices.cleanup_handles)
                     else:
                         handle.close.assert_not_called()
@@ -331,6 +334,7 @@ class GuardTests(unittest.TestCase):
                 self.guard.begin({'method': 'open'})
                 primary = Mock(connected=False, instance=instance)
                 auxiliary = Mock(connected=True, instance=instance)
+                auxiliary.close_outcome.return_value = {'status': 'lease_released', 'lease_released': True, 'shutdown_pending': False}
                 def execute(source, **kwargs):
                     namespace = {}
                     exec(source, namespace)
@@ -339,7 +343,7 @@ class GuardTests(unittest.TestCase):
                 def release(**kwargs):
                     self.assertTrue(self.present, 'original release must be checked while healthy')
                     self.present = not loss
-                    return {'status': 'lease_released', 'lease_released': True}
+                    return {'status': 'lease_released', 'lease_released': True, 'shutdown_pending': False}
                 primary.close_outcome.side_effect = release
                 owner = bridge.Bridge.__new__(bridge.Bridge)
                 owner.identity, owner.lifetime_path = 'bridge', '/lifetime'
@@ -364,7 +368,8 @@ class GuardTests(unittest.TestCase):
                         self.assertIs(owner.handles['exact'][1], primary)
                     else:
                         owner.invoke(*args)
-                        auxiliary.close.assert_called_once()
+                        auxiliary.close_outcome.assert_called_once()
+                        auxiliary.close.assert_not_called()
                         self.assertEqual(owner.cleanup_handles, {})
                         self.assertEqual(owner.handles, {})
                 primary.close_outcome.assert_called_once()

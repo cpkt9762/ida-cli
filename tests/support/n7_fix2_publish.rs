@@ -2,6 +2,13 @@ use super::*;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 
+pub async fn release_result(
+    bridge: &super::super::nexus_bridge::NexusBridge,
+    lease: &SessionLease,
+) -> Result<(), ToolError> {
+    super::release(bridge, lease).await
+}
+
 async fn until(mut ready: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(10), async {
         while !ready() {

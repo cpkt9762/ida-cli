@@ -40,30 +40,36 @@ cleanup_handles = {}
 incarnation = uuid.uuid4().hex
 
 
-def cleanup_disconnected(handle, context, expected_incarnation):
+def cleanup_disconnected(handle, context, expected_incarnation, release_handle):
     """Close an auxiliary lease only after a fresh owner protection check."""
     key = tuple(context)
     cleanup_handles[key] = handle
-    cleanup_error = None
-    try:
+    def check():
         # Serialized after any in-flight native call on the same owner.
-        handle.execute_python(
+        try:
+            handle.execute_python(
             "import sys\n"
             "m=sys.modules.get('_ida_cli_nexus_slices_v1')\n"
             f"result=m.release_lease({context!r}, {expected_incarnation!r}) if m else None",
-            timeout=600)
-    except Exception as exc:
-        cleanup_error = exc
-    proof = handle.execute_python(
+                timeout=600)
+        except Exception as exc:
+            vars(handle)['_ida_cli_slice_cleanup_error'] = exc
+            import logging
+            logging.getLogger(__name__).exception('Nexus slice job cleanup failed')
+        return handle.execute_python(
         "import sys\n"
         "g=sys.modules.get('_ida_cli_save_guard_v1')\n"
-        "result=g.close_status() if g else {'close_safe': False}", timeout=5)
-    if proof['result'].get('close_safe') is not True:
-        uncertain('save protection unavailable; exact auxiliary lease retained; no default close')
-    handle.close(wait_for_database=False)
+        "result=g.close_status() if g else {'close_safe': False}", timeout=5)['result']
+    import time
+    outcome = release_handle(handle, time.monotonic()+605, check=check)
+    if outcome is None:
+        uncertain('auxiliary lease release unconfirmed; exact handle retained')
     cleanup_handles.pop(key, None)
-    if cleanup_error:
-        raise cleanup_error
+    if outcome['save_guard_error']:
+        raise RuntimeError(outcome['save_guard_error'])
+    if vars(handle).get('_ida_cli_slice_cleanup_error'):
+        raise vars(handle)['_ida_cli_slice_cleanup_error']
+    return outcome
 
 
 def watch_lease(context):
@@ -95,7 +101,8 @@ def watch_lease(context):
                        if item.instance.record_id == context[2]]
             if entries:
                 handle = DatabaseHandle.attach(entries[0])
-                cleanup_disconnected(handle, context, incarnation)
+                from _ida_cli_release_protocol_v1 import release_handle
+                cleanup_disconnected(handle, context, incarnation, release_handle)
         except Exception:
             import logging
             logging.getLogger(__name__).exception("Nexus slice disconnect cleanup unconfirmed")
