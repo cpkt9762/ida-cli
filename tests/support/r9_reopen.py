@@ -1,6 +1,7 @@
 """Isolated public-API save/close/new-owner experiment; JSONL keeps all trials."""
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -25,12 +26,17 @@ def main():
     parser.add_argument('--count', type=int, default=25)
     parser.add_argument('--raw-first', action='store_true',
                         help='probe public Nexus before installing any adapter guard')
+    parser.add_argument('--product-reopen', action='store_true',
+                        help='exercise the product initial-open retry and rollback helper')
     args = parser.parse_args()
+    if args.product_reopen and args.raw_first:
+        parser.error('--raw-first cannot run with the product guard')
     env = Environment(args.root)
     os.environ.update(env.variables())
     import ida_nexus._resolver as resolver
     from ida_nexus import DatabaseHandle, DatabaseOpenOptions, wait_database_released
     from bridge import guarded_source
+    from open_recovery import open_checked
 
     # Account only our resolver's child creation; no client/server semantics change.
     original_popen = subprocess.Popen
@@ -42,6 +48,26 @@ def main():
     directory = env.root / 'trials' / (args.mode + '-' + str(args.start))
     directory.mkdir(parents=True, exist_ok=False)
     rows = []
+    retry_events = []
+    class RetryCapture(logging.Handler):
+        def emit(self, record):
+            marker = 'Root Node initial-open failure: '
+            message = record.getMessage()
+            if message.startswith(marker):
+                retry_events.append(json.loads(message[len(marker):]))
+                with (env.root/'retry-events.jsonl').open('a') as out:
+                    out.write(json.dumps(retry_events[-1])+'\n')
+    logging.getLogger('ida_cli.open').addHandler(RetryCapture())
+
+    def opening(path):
+        options = dict(auto_analysis=False, worker_env=env.variables(), worker_cwd=env.root)
+        if args.product_reopen:
+            handle, _, attempts = open_checked(DatabaseHandle, DatabaseOpenOptions,
+                str(path), options, time.monotonic()+15, guarded_source,
+                {'method': 'open-reopen-loop', 'requested_path': str(path)})
+            return handle, attempts
+        return DatabaseHandle.open(str(path), options=DatabaseOpenOptions(
+            startup_timeout=10, **options)), 1
 
     def snapshot(path, pid=None):
         files = []
@@ -101,8 +127,7 @@ def main():
             handle = None
             try:
                 row['before_a'] = snapshot(path)
-                handle = DatabaseHandle.open(str(path), options=DatabaseOpenOptions(
-                    startup_timeout=10, auto_analysis=False, worker_env=env.variables(), worker_cwd=env.root))
+                handle, row['a_open_attempts'] = opening(path)
                 first_pid = handle.instance.pid
                 row['a_pid'] = first_pid
                 row['a'] = observe(handle, path, 'open-a')
@@ -118,8 +143,7 @@ def main():
                         assert time.monotonic() < deadline, 'previous owner/components did not disappear'
                         time.sleep(.005)
                 row['before_b'] = snapshot(path, first_pid)
-                handle = DatabaseHandle.open(str(path), options=DatabaseOpenOptions(
-                    startup_timeout=10, auto_analysis=False, worker_env=env.variables(), worker_cwd=env.root))
+                handle, row['b_open_attempts'] = opening(path)
                 row['b_pid'] = handle.instance.pid
                 assert row['b_pid'] != first_pid, 'new owner was not created'
                 row['b'] = observe(handle, path, 'open-b')
@@ -160,10 +184,16 @@ def main():
         env.assert_clean()
         result = dict(mode=args.mode, start=args.start, trials=len(rows),
                       root_failures=sum(r['status']=='ROOT_FAILURE' for r in rows),
-                      errors=sum(r['status']=='ERROR' for r in rows), cleanup=cleanup)
+                      errors=sum(r['status']=='ERROR' for r in rows), cleanup=cleanup,
+                      product_reopen=args.product_reopen,
+                      natural_initial_failures=len(retry_events),
+                      failures_after_retries=sum(r['status'] != 'PASS' for r in rows),
+                      successful_opens=sum('a' in r for r in rows)+sum('b' in r for r in rows))
         (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')
         print(json.dumps(result), flush=True)
     assert len(rows)==args.count and not result['errors'], result
+    if args.product_reopen:
+        assert not result['failures_after_retries'], result
 
 
 if __name__ == '__main__':

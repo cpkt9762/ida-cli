@@ -23,6 +23,7 @@ from query_tools import QUERY_METHODS
 from search_tools import SEARCH_METHODS
 from lifecycle import database_diagnostics, release_handle
 from metadata import idb_context
+from open_recovery import open_checked
 
 GUARD_SOURCE = Path(__file__).with_name('save_guard.py').read_text(encoding='utf-8')
 
@@ -370,11 +371,20 @@ class Bridge:
                 with self.lock:
                     self.verification_probes[verification] = None
                 public_started[0] = True
-                probe = self.Handle.open(str(verification), options=self.Options(
-                    startup_timeout=max(0.001, deadline - time.monotonic()), auto_analysis=False,
-                    worker_env=dict(os.environ), worker_cwd=os.environ["IDA_CLI_HOME"]))
-                with self.lock:
-                    self.verification_probes[verification] = probe
+                def track_probe(probe, _context):
+                    with self.lock:
+                        self.verification_probes[verification] = probe
+
+                def release_probe(_probe):
+                    public_started[0] = False
+                    with self.lock:
+                        self.verification_probes.pop(verification, None)
+
+                probe, _, _ = open_checked(self.Handle, self.Options, str(verification),
+                    {'auto_analysis': False, 'worker_env': dict(os.environ),
+                     'worker_cwd': os.environ['IDA_CLI_HOME']}, deadline, guarded_source,
+                    dict(metadata_context, method='verification-open'), track_probe, release_probe,
+                    lambda: public_started.__setitem__(0, True))
                 try:
                     proof = probe.execute_python(guarded_source(
                         "import ida_nalt\nsha = ida_nalt.retrieve_input_file_sha256()\nresult = sha.hex() if sha else None",
@@ -392,30 +402,47 @@ class Bridge:
                 if hashlib.sha256(original.read_bytes()).digest() != copy_hash:
                     raise ValueError("legacy cache changed during Nexus verification; refusing reuse")
                 options["startup_timeout"] = max(0.001, deadline - time.monotonic())
+            lease_box = []
+
+            def track_open(handle, context):
+                instance = handle.instance
+                with self.lock:
+                    generation = self.generations.setdefault(instance.record_id, 1)
+                    lease = {"client_id": command["identity"]["client_id"], "lease_id": uuid.uuid4().hex,
+                             "instance_id": instance.record_id, "generation": generation,
+                             "owner": "gui" if instance.backend == "gui" else "managed"}
+                    self.handles[lease["lease_id"]] = (lease, handle)
+                    self.metadata_contexts[lease["lease_id"]] = dict(context, record_id=instance.record_id)
+                    lease_box[:] = [lease]
+                context.update(lease=lease, operation_id=command['identity'].get('operation_id'))
+
+            def release_open(_handle):
+                public_started[0] = False
+                with self.lock:
+                    lease = lease_box[0]
+                    self.handles.pop(lease['lease_id'], None)
+                    self.metadata_contexts.pop(lease['lease_id'], None)
+
             if attach:
                 instances = [x.instance for x in discover_databases() if x.instance.record_id == attach]
                 if len(instances) != 1:
                     raise ValueError("attach instance is not available")
                 public_started[0] = True
                 handle = self.Handle.attach(instances[0], idle_timeout=options.get("idle_timeout"))
+                track_open(handle, metadata_context)
             else:
-                public_started[0] = True
-                handle = self.Handle.open(command["path"], options=self.Options(**options))
-            instance = handle.instance
-            with self.lock:
-                generation = self.generations.setdefault(instance.record_id, 1)
-                lease = {"client_id": command["identity"]["client_id"], "lease_id": uuid.uuid4().hex,
-                         "instance_id": instance.record_id, "generation": generation,
-                         "owner": "gui" if instance.backend == "gui" else "managed"}
-                self.handles[lease["lease_id"]] = (lease, handle)
-                self.metadata_contexts[lease["lease_id"]] = dict(metadata_context, record_id=instance.record_id)
+                handle, actual, _ = open_checked(self.Handle, self.Options, command['path'], options,
+                    deadline, guarded_source, dict(metadata_context, method='open'),
+                    track_open, release_open, lambda: public_started.__setitem__(0, True))
+            instance, lease = handle.instance, lease_box[0]
             # Verify actual owner runtime without importing IDA in this process.
             try:
+                if attach:
+                    actual = handle.execute_python(guarded_source(
+                        "import ida_kernwin\nresult = ida_kernwin.get_kernel_version()",
+                        dict(metadata_context, method='open', lease=lease_box[0])),
+                        timeout=max(0.001, deadline-time.monotonic()))
                 handle.set_disconnect_callback(lambda _handle, reason: self.disconnected(lease, reason, attempt))
-                actual = handle.execute_python(guarded_source(
-                    "import ida_kernwin\nresult = ida_kernwin.get_kernel_version()",
-                    dict(metadata_context, method='open', lease=lease,
-                         operation_id=command['identity'].get('operation_id'), record_id=instance.record_id)), timeout=None)
                 if wait_analysis:
                     handle.wait_autoanalysis(timeout=max(0.001, deadline - time.monotonic()))
                     handle.execute_python(guarded_source('pass', dict(metadata_context,

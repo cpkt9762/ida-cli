@@ -803,5 +803,30 @@ N7a-F5/r9root：r9 根因调查现为 N7b 前的关键路径。首次 Root 失�
 消失后重开均已捕获故障；全新副本首次打开也可发作，不能将关闭残留作为全部根因。
 不经过 Nexus/adapter 的独立 Domain.open 主线程进程也复现，失败时活动 ID0 的 Root 记录仍在；
 裸 idapro.open_database 同样复现，且有实例在元数据 getter 之前就失败，Domain 也非必要条件。
-具体上游触发点尚未定位，不据此添加 sleep、重试、补造元数据或放宽 E22；取证和复现驱动见
+F5 时具体上游触发点尚未定位，未添加 sleep 或重试，也未补造元数据或放宽 E22；取证和复现驱动见
 TESTING.md 的 r9 root visibility investigation，完整结论以本次委托报告为准。
+
+
+N7a-F6 用户裁定更新：r9 定性为 IDA 9.5 idalib 上游缺陷，暂不准备上游报告。
+正常 packed 初开只对首次 Root 判定失败执行不保存关闭、lease 与公开 lifetime 双释放
+证明后自动重开，最多总计三次，所有步骤占原 open 总期限。每次 warning 含 attempt、
+owner 和完整取证，成功重开另记最终次数；不会重放业务。中途丢失继续保存拒绝，不重开。
+E22 verification 同样复用初开检查；GUI attach 不以重开兜底。
+
+恢复采用编排者批准的事后回滚边界，不改 Nexus 服务端、不拒绝恢复崩溃库：公开 probe
+识别 crashed/unpacked，N7a 根 SH 与同库 recovery-open EX 锁内先生成只读不可变快照，
+包含组件及可有 packed 的大小、哈希、inode/device、mode 与完整父目录身份。
+允许 Nexus 内部恢复/保存；首次 Root 失败先保留失败组件字节，再 TEMP|KILL 关闭；
+只有 lease 释放及公开 owner lifetime 都确认后，检查原目录身份与外部占用、隔离恢复产物，
+再恢复原组件内容和 mode（新 inode 记录在 journal），按同一上限重试。
+三次失败仍还原原组件，快照和失败产物保留；无法证明释放、文件变化、额外文件、
+外部 opener、未知注册或部分文件系统失败均保留现场拒绝继续还原。
+这是事后回滚，不是在恢复保存之前拦截：原位置短暂存在缺 Root 产物；外部 opener
+不受 ida-cli 锁约束，在公开复核与文件操作间仍有窗口。其他客户端及用户脚本直接保存
+也未纳入保护，不以本兜底宣称修复 IDA 本身。
+
+恢复证据位于 idb/recovery/<id>（snapshot、failed-files-N、quarantine-N、recovery.json）。
+GC 在同一根锁下计入容量并报告保留，因不能证明取证/回滚用途结束，不自动删除；即使
+恢复成功也保留。磁盘占用随恢复和失败次数增长，暂无自动迁移或清理命令；只能在明确
+人工维护、停止客户端且独立确认原/隔离库无占用后归档或清理审阅过的恢复证据目录。
+普通 packed 打开无额外副本或全库哈希；验证见 TESTING 的 r9 initial-open retry 小节。

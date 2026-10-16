@@ -63,8 +63,8 @@ def rename_group(source, destination):
         raise OSError(ctypes.get_errno(), 'atomic non-replacing group rename failed')
 
 
-def public_probe(path):
-    from ida_nexus import discover_databases, find_database_owner, get_state_dir, probe_database_state
+def public_owner_probe(path):
+    from ida_nexus import discover_databases, find_database_owner, get_state_dir
     try:
         if find_database_owner(path, timeout=0.2) is not None:
             return 'public owner holds database'
@@ -87,6 +87,17 @@ def public_probe(path):
         if any(Path(item.instance.idb_path).resolve() == path.resolve()
                for item in discovered):
             return 'discovered owner holds database'
+    except Exception as error:
+        return 'public occupancy proof failed: ' + type(error).__name__
+    return None
+
+
+def public_probe(path):
+    from ida_nexus import probe_database_state
+    reason = public_owner_probe(path)
+    if reason:
+        return reason
+    try:
         state = probe_database_state(path)
         if state['unpacked_files']:
             return 'unpacked component files remain'
@@ -252,6 +263,10 @@ class Store:
                 raise ValueError('symlink cache container')
             directory.mkdir(exist_ok=True)
         rejected = result['rejected']
+        recovery = self.root/'recovery'
+        if recovery.exists() or recovery.is_symlink():
+            rejected.append({'path':str(recovery), 'reason':
+                'recovery snapshots and failed products retained; no automatic deletion proof'})
         total = sum(p.stat().st_size for p in self.root.rglob('*') if p.is_file() and not p.is_symlink())
         budget = max(0, total - limit)
         planned = 0

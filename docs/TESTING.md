@@ -672,14 +672,14 @@ reconnect and replacement owner all execute the same checked installation.
 
 ### r9 owner save protection
 
-Root Node loss remains unexplained. `save_guard.py` samples the public netnode
+r9 is classified as an IDA 9.5 idalib upstream defect; its exact native trigger remains unknown. `save_guard.py` samples the public netnode
 name before/after each owner operation and before close. Missing or unverifiable
 Root Node permanently poisons that owner, refuses operations/adapter saves, and
 sets public `DBFL_TEMP | DBFL_KILL`. Final close discards abnormal unpacked state;
 the packed file remains at its last successful save and unsaved edits are lost.
 Close still establishes the exact N1 release proof and returns an explicit error.
 An owner hook checks automatic save/close as well; it does not rely on notification
-return values as a veto. Opening a missing-root owner also fails and discards it.
+return values as a veto. Initial-open failures now use the bounded retry below.
 
 `tests/support/n7_r9_guard.py` takes a fresh prepared root, current binary and
 private seed. It kills Root Node via public IDAPython in isolated owners, checks
@@ -694,7 +694,8 @@ are added to healthy requests.
 
 User scripts directly calling IDA save APIs and independent clients' explicit
 saves are outside coverage; TEMP/KILL only prevents automatic close writeback.
-The owner guard cannot intercept Nexus startup/recovery before its installation.
+The owner guard cannot intercept Nexus startup/recovery before its installation;
+the recovery protection below is explicitly post-recovery rollback.
 Sampling bounds the first loss interval; it does not establish r9's root cause.
 
 ### Optional metadata diagnostics
@@ -748,3 +749,50 @@ copy in the main thread with a complete active ID0. Direct idapro opens without
 Domain or Nexus also fail, including before metadata getters. Waiting for
 components is not an established fix. The precise upstream trigger is unresolved;
 do not close r9 using a later PASS or relax E22-missing's unavailable assertion.
+
+### r9 initial-open retry and post-recovery rollback
+
+The approved product mitigation retries only a guard-confirmed first Root
+sample failure, before any business request: TEMP|KILL, lease close plus public
+owner-lifetime release proof, then a fresh open. There are at most three attempts,
+all within the original open deadline. A mid-session loss never retries or
+replays edits. Every failed attempt logs `Root Node initial-open failure` with
+attempt/max, owner and full guard evidence; successful recovery logs
+`automatic reopen succeeded after N attempts`. Owner evidence includes
+`open_attempt`. Three failures explicitly report the count and retain originals.
+GUI attachment does not automatically reopen or terminate the GUI owner.
+
+All adapter opens take the N7a shared root lock and a database-specific exclusive
+recovery-open lock. Public probe selects crashed/unpacked inputs before open.
+Only these inputs create `$IDA_CLI_HOME/idb/recovery/<id>/snapshot`: immutable
+0400 component/packed copies, original inode/device/size/SHA256 and a durable
+journal. Normal packed opens do not copy/hash the IDB for this mitigation.
+Nexus is allowed to recover and save internally. If the first Root check fails,
+failed component bytes are captured before TEMP|KILL close removes them; after
+lease AND public owner release, surviving products move to `quarantine-N`, and
+original component contents/modes are restored with new recorded inodes.
+This is post-recovery rollback: a bad packed product can briefly exist at the
+original path before isolation. External openers do not honor our locks; public
+occupancy rechecks narrow but cannot close that remaining race window.
+
+Unknown release, changed inode/size/hash, unexpected directory entries, symlinks,
+unexplained registrations or an external owner veto restoration. Preserve the
+snapshot and scene and report the error; never overwrite uncertain files.
+Partial filesystem/timeout failures also retain their journal and artifacts.
+Snapshots, failed bytes and quarantined products are conservatively retained,
+including after successful recovery. N7a GC counts their disk usage, reports
+retention, and never deletes them automatically; it has no proof that their
+forensic/rollback purpose has ended. Space grows with recovery events and failed
+attempts. There is no automated migration/cleanup: archive or remove a reviewed
+recovery directory only during explicit operator maintenance with all clients
+stopped and original/isolated database occupancy independently established.
+User scripts saving directly and other clients remain outside the guard.
+
+`tests/test_nexus_open_recovery.py` tests ownership, identities, extra files,
+external openers, deadlines, immutable snapshots, locks and GC retention.
+`tests/support/n7_open_recovery.py --root <fresh-root>` runs six real bridge
+scenarios including a malformed recovery packed saved before guard installation.
+Use `--bridge <efbee3c-bridge-copy>` for the unchanged red assertions.
+`r9_reopen.py --product-reopen` runs the product helper in both groups; JSON
+reports natural initial failures separately from failures after retries. Run
+at least 100 trials per group in bounded batches (each trial opens A and B).

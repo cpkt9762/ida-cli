@@ -182,7 +182,12 @@ def test_status_and_cancel_have_independent_connection_and_executor(harness):
     harness.dispatch(1, {"command": "cancel", "identity": {"lease": harness.lease, "operation_id": "op-0"}})
     assert harness.receive(1)["event"] == "cancel_ack"
     assert harness.handle.cancelled == "op-0"
-    assert all(options["timeout"] is None for code, options in harness.handle.calls)
+    # Initial-open checks use the remaining total open budget; business
+    # execution keeps its independent causal cancellation/unknown contract.
+    initial = [(code, options) for code, options in harness.handle.calls if "get_kernel_version" in code]
+    assert initial and all(options["timeout"] > 0 for _, options in initial)
+    assert all(options["timeout"] is None for code, options in harness.handle.calls
+               if "get_kernel_version" not in code)
     harness.handle.resume.set()
     assert [harness.receive()["event"] for _ in range(4)] == ["completed"] * 4
 
