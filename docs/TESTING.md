@@ -309,10 +309,9 @@ checks that the lock descriptor does not survive exec.
 Known limits: run_script uses process-level __main__; clients and leases sharing
 an owner share script globals, which closing a lease does not clear. This matches
 the old per-IDB worker and is intended for trusted scripts, without client
-isolation. E22's last original-IDB hash check and final open are not atomic;
-the local path gate does not cover external openers. N7 owns that coordination.
-Nexus disables old automatic IDB GC and conservatively refuses explicit deletion
-without ownership/lock absence proof. Unverified processor ABIs use the public
+isolation. N7a adds cross-router open locks around E22 verification/open and
+coordinated generation GC (see below); independent external writers remain
+outside the hash/open transaction. Deletion requires ownership/lock absence proof. Unverified processor ABIs use the public
 short name with an IDA-version warning; the verified 9.5 E04 stays exact.
 
 ## Nexus N0 isolation and baseline
@@ -564,3 +563,65 @@ the control lane on the same bridge. E08 repeats the surrogate and depth cases t
 Nexus, requires Failed plus confirmed stop and the preserved encoding cause,
 then queries both leases without reconnecting. OS I/O failure still disconnects
 the physical channel; encoding failure before any write does not.
+
+
+## Nexus N7a cache and preprocessing acceptance
+
+Use a fresh prepared environment, `IDA_TEST=1`, short `--ipc-root`, private
+`IDA_CLI_HOME` / `IDA_NEXUS_STATE_DIR`, and the fixed N0 binary. Run
+`verify_nexus_e2e.py --suite special_inputs` with the existing root/target/sdk
+arguments under an announced outer 210s timeout (inner suite timeout 180s).
+Exactly 7 tests and seven PASS case files are required: E19, E21-held,
+E21-before-rename, E21-after-rename, E21-before-delete, E21-release, E21-lock.
+Each Python driver uses 30s. The lock case exercises the actual Rust IdbStore
+maintenance subprocess while a real router owns a lease, then releases and
+reclaims after repeated checks. The suite alone configures GC grace to zero;
+the release driver additionally checks a nonzero grace without guessing timing.
+
+E19 queues a real router open through the optional trusted
+`IDA_NEXUS_INPUT_PREPROCESSOR` executable, whose two arguments are input and a
+private staging output. A marker confirms its descendant started; status and
+another real database remain responsive before cancellation. Require cancelled
+with confirmed stop, both exact process identities gone, no output or staging,
+and another successful query. No real sbx/DSC sample is used here (N7b).
+
+E21 uses independent public Nexus clients and real IDBs. Occupancy refuses GC;
+force-refresh from the original input publishes a different directory and keeps
+the held database's bytes/hash unchanged. Deterministic callbacks in the shared
+maintenance implementation insert an opener after precheck, after rename and
+before final delete. Original-path opens after isolation must fail explicitly;
+they do not target the excluded quarantine-path scenario. After release/grace,
+reclaim and normal reopening must succeed. Synthetic public-probe injections in
+`timeout 30s python3 tests/test_nexus_n7_cache.py -v` separately exercise rollback,
+corrupt journal, restart epoch, symlink refusal and all conservative states.
+Keep the baseline missing-protection red evidence alongside green results.
+
+Nexus cache layout is `generations/<id>/{input,input.i64,generation.json}` with a
+content-key index. Root shared flock spans product preparation/publication and
+tracked leases; GC uses exclusive nonblocking flock and an atomic non-replacing
+whole-directory rename into `quarantine/`. Failed/cancelled opens retain both
+locks until N1 confirms no lease was acquired or the exact lease is Released;
+unknown outcomes retain protection. Same-IDB open locks cover bridge
+verification through final open. GC rechecks original and isolated paths, then
+waits `IDA_NEXUS_GC_GRACE_MS` (default 60000), with at least two observations and
+a final check. Restart epoch/time rollback resets grace; invalid journals are
+retained, restoration collisions retain both paths. Explicit IdbStore clean and
+remove follow these checks. `nexus_bridge/cache_store.py --root <cache> --epoch
+<router-incarnation> --limit 0` is the same maintenance entrypoint; an epoch must
+be stable across one router's passes and new after restart. Low-level explicit
+cleanup reports refusals in JSON; router GC logs them. Legacy flat groups lack an
+atomic directory container and remain untouched with a refusal reason.
+
+Protection is conservative: any tracked lease postpones GC for the whole cache.
+No finite-space guarantee exists for externally busy/unknown/legacy groups.
+Public discovery sees only the configured state directory. An independent
+opener directly using the quarantine path, or holding an unregistered FD at the
+last check, remains outside protection. E22's external-writer hash/open window
+remains; cooperating router opens/publications/GC use the shared lock family.
+These are accepted limitations, not a claim of global external mutual exclusion.
+
+After final commit run the 12+13 standard gates, three consecutive lib rounds,
+N0 support, bridge pytest, n*_fix* tests and all three patch probes red/green.
+Run fresh lifecycle 9, contract 4, concurrency 14, N6 4 and special 7 suites.
+Record current HEAD, full commands, exits and uptime; assert cleanup CLEAN,
+all registered process identities exited and zero residual sockets.

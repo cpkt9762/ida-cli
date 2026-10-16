@@ -1,5 +1,7 @@
 //! Persistent public Python client adapter. Neither lane shares a physical stream.
 pub mod cache;
+pub mod cache_lock;
+pub mod generations;
 use super::nexus_transport::{Delivery, NexusEndpoint, NexusWireFrame};
 use crate::nexus::*;
 use serde_json::{json, Value};

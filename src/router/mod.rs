@@ -2725,6 +2725,15 @@ impl RouterState {
     pub async fn shutdown_nexus(&self) -> Result<(), crate::error::ToolError> {
         self.nexus_tools.shutdown(self).await
     }
+    pub async fn refresh_nexus_cache(
+        &self,
+        path: &str,
+        preparation: crate::preprocess::Preparation,
+    ) -> Result<(DbHandle, String), crate::error::ToolError> {
+        self.nexus_tools
+            .open_refresh(self, path, preparation, true)
+            .await
+    }
 
     async fn prune_caches(&self) {
         let warm_pool = self.warm_pool.lock().await;
@@ -2737,12 +2746,8 @@ impl RouterState {
 
         let idb_limit = self.config.max_idb_cache_bytes;
         let response_limit = self.config.max_response_cache_bytes;
-        let nexus = self.uses_nexus();
         if let Err(e) = crate::blocking::run(crate::blocking::WorkClass::Metadata, move || {
-            // N7 must coordinate ownership and database locks before IDB GC.
-            if !nexus {
-                let _ = crate::idb_store::IdbStore::new().evict_to_limit(idb_limit, &pinned_groups);
-            }
+            let _ = crate::idb_store::IdbStore::new().evict_to_limit(idb_limit, &pinned_groups);
             let _ = crate::server::response_cache::prune_to_limit(response_limit);
         })
         .await

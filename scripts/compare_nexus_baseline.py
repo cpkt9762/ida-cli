@@ -129,7 +129,7 @@ class Http:
 
 
 class Candidate:
-    def __init__(self, env, binary, sample, label, transport="http", inline="512", seed=None, allow_open_error=False):
+    def __init__(self, env, binary, sample, label, transport="http", inline="512", seed=None, allow_open_error=False, extra=None):
         label = f"{label}-{os.getpid()}"
         self.env, self.binary, self.sample, self.transport = env, binary, sample, transport
         self.home = env.root / f"home-{label}"
@@ -146,6 +146,7 @@ class Candidate:
             "N3_ENV_ROOT":str(env.root), "IDA_CLI_NEXUS_DEV":"1", "IDA_NEXUS_PYTHON":str(env.root/"venv/bin/python"),
             "IDA_NEXUS_IPC_ROOT":str(ipc), "IDA_NEXUS_BRIDGE_SCRIPT":str(REPO/"tests/support/nexus_client_fixture.py"),
             "IDA_MCP_MAX_INLINE_BYTES":inline}
+        self.variables.update(extra or {})
         self.process = Process(env, [str(binary), "serve"] if transport == "stdio" else
             [str(binary), "serve-http", "--bind", "127.0.0.1:0"], self.variables, label)
         if transport == "stdio":

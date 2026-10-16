@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--ipc-root", type=Path, help="short private directory for per-router Unix sockets")
     parser.add_argument("--tmp-root", type=Path, help="short alias of the prepared environment's tmp directory")
     parser.add_argument("--cleanup", action="store_true")
-    parser.add_argument("--suite", choices=("lifecycle", "contract", "concurrency", "n6"), default="lifecycle")
+    parser.add_argument("--suite", choices=("lifecycle", "contract", "concurrency", "n6", "special_inputs"), default="lifecycle")
     parser.add_argument("--baseline", type=Path, help="fixed independently hashed N0 binary for N4")
     parser.add_argument("--case", choices=("E22",), help="run only E22 in a fresh contract environment")
     args = parser.parse_args()
@@ -64,11 +64,13 @@ def main():
                           "CARGO_TARGET_DIR": str(args.target.resolve(strict=True)),
                           "IDA_TEST": "1", "RUSTC_WRAPPER": "", "N3_ENV_ROOT": str(env.root),
                           "N3_IPC_ROOT": str(ipc_root)})
-        if args.suite in {"concurrency", "n6"}:
+        if args.suite in {"concurrency", "n6", "special_inputs"}:
             variables.update({"IDA_CLI_NEXUS_DEV": "1",
                 "IDA_NEXUS_PYTHON": str(env.root / "venv/bin/python"),
                 "IDA_NEXUS_IPC_ROOT": str(ipc_root),
                 "IDA_NEXUS_BRIDGE_SCRIPT": str(REPO / "tests/support/nexus_client_fixture.py")})
+        if args.suite == "special_inputs":
+            variables["IDA_NEXUS_GC_GRACE_MS"] = "0"
         if args.suite in {"contract", "concurrency", "n6"}:
             if args.baseline is None or not args.baseline.is_file():
                 parser.error("contract suite requires --baseline")
@@ -103,7 +105,7 @@ def main():
             if child.returncode and re.search(r"license.*(?:invalid|failed|not found|unavailable|expired)|no valid license", text, re.IGNORECASE):
                 result["status"] = "BLOCKED"
             assert child.returncode == 0, f"{result['status']}: lifecycle command failed: {child.returncode}"
-            count = 1 if args.case else {"lifecycle": 9, "contract": 4, "concurrency": 14, "n6": 4}[args.suite]
+            count = 1 if args.case else {"lifecycle": 9, "contract": 4, "concurrency": 14, "n6": 4, "special_inputs": 7}[args.suite]
             assert summary == [(str(count), "0", "0")], f"wrong actual test count: {summary}"
             if args.suite == "lifecycle":
                 events = [json.loads(line) for line in (env.root / "rust-evidence.jsonl").read_text().splitlines()]
@@ -111,6 +113,10 @@ def main():
                 expected = ["E02", "E03", "E05", "E06-client", "E06-bridge", "E07-packed", "E07-unpacked", "E05-concurrent-open", "E06-lease-fault"]
             elif args.suite == "contract":
                 expected = [args.case] if args.case else ["E04", "E16", "E17", "E22"]
+                events = [json.loads((env.root/f"{case}-result.json").read_text()) for case in expected]
+                cases = [event["case"] for event in events if event["status"] == "PASS"]
+            elif args.suite == "special_inputs":
+                expected = ["E19", "E21-held", "E21-before-rename", "E21-after-rename", "E21-before-delete", "E21-release", "E21-lock"]
                 events = [json.loads((env.root/f"{case}-result.json").read_text()) for case in expected]
                 cases = [event["case"] for event in events if event["status"] == "PASS"]
             elif args.suite == "n6":

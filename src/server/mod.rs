@@ -770,21 +770,26 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         if req.load_debug_info == Some(true)
             || req.debug_info_path.is_some()
-            || req.force == Some(true)
             || req.file_type.is_some()
         {
             return Ok(ToolError::NotSupported(
-                "Nexus N4 debug-info, force and custom loader options are not implemented".into(),
+                "Nexus debug-info and custom loader options are not implemented".into(),
             )
             .to_tool_result());
         }
         let preparation = crate::preprocess::current().unwrap_or_else(|| {
             crate::preprocess::Preparation::new(std::time::Duration::from_secs(120))
         });
-        let (handle, token) = match router
-            .ensure_worker_prepared(&req.path, None, None, preparation.clone())
-            .await
-        {
+        let opened = if req.force == Some(true) {
+            router
+                .refresh_nexus_cache(&req.path, preparation.clone())
+                .await
+        } else {
+            router
+                .ensure_worker_prepared(&req.path, None, None, preparation.clone())
+                .await
+        };
+        let (handle, token) = match opened {
             Ok(value) => value,
             Err(error) => return Ok(error.to_tool_result()),
         };

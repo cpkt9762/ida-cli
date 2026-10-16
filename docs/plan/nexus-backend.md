@@ -511,6 +511,16 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N7：GUI、缓存和专用输入
 
+N7 分为 N7a（缓存协调与 E19/E21）、N7b（sBPF/DSC 真实 E24/E25）和 N7c（GUI E23）。以下为 N7a 组合方案实现范围，是否验收由编排者决定，不表示 N7b/N7c 完成。
+
+- 2026-10-16 用户裁定：不修改 Nexus 服务端或三个既有客户端补丁；接受“新代际 + 跨 router flock + 隔离区 + 宽限期”。新 native 产物位于 `idb/generations/<unique>/input.i64`；完整目录从 sibling staging 原子非覆盖发布，成功 open 后内容键的 `nexus-index.json` 指向当前代际。普通 open 复用有效代际，`open_idb(force=true)` 仅由源输入生成新代际，不覆盖旧库或用户修改；直接 IDB 不接受 force 重建。
+- 缓存根 `.cache.lock`：所有产品 open、发布与活动 lease 持共享锁；GC 非阻塞取得独占锁，拿不到即保留并报告。独立文件描述符的 flock 覆盖其他 router；共享锁允许不同库并发。原始准备/索引 blocking job 自持共享锁直至实际结束。相同目标的 `.open-<canonical-idb-hash>.lock` 从验证后交付 bridge 前持独占至最终 open 完成，串行化协作 router 的同库 opener；根锁同时排斥 GC。不确定 open 额外保留保护和 N1 cleanup 责任；只有 N1 确定未获取 lease 的失败或匹配 lease 的 Released 证明才释放锁。每个有界观察者最多等待 120s，超时后保护留在有界 registry，下次 open 再复查；仍未知则 GC 等待 router 恢复，达到既有容量阈值拒绝新 open，不宣称已释放。
+- GC 仅处理带有效 manifest 的新代际目录。公开 find/discover owner 和 probe 必须无占用，候选必须 packed，任何未知、in_use、崩溃、unpacked、组件/陌生文件或 symlink 均保留。整组目录非覆盖原子 rename 到同文件系统的 `quarantine/`，原路径和隔离路径复查；出现占用即还原，原处已被重新创建则两份均保留并报告，绝不覆盖。
+- 宽限期 `IDA_NEXUS_GC_GRACE_MS` 默认 60000；至少两轮检查及最终删除前再查全阴性，才锁内删除。journal 记录 epoch、起点与次数；router 重启/时间回拨重置宽限证明，损坏/缺失 journal 保留，不直接删除。GC 的单次公共探测/执行进程有 10s shell timeout，异常保留并告警；下一轮先恢复隔离状态。旧平铺 `.i64` 没有可原子搬移的整组目录，保留且解释原因，不擅自移动用户旧库。默认旧后端 GC 行为不变；显式 IdbStore clean/remove 使用同一机制。
+- 已接受的剩余窗口：不经过 ida-cli 的 opener 若直接打开隔离路径，或最后检查时已持 FD 但尚未登记/解包，不在保护范围内；发现仅覆盖配置的 `IDA_NEXUS_STATE_DIR`，组件/IDA 锁探测是兜底。E22 最后 hash 到 open 对协作 router 的 GC/open 有锁覆盖，对独立外部写入者仍非原子。活动用户代码/已有 owner 的任意写操作不构成事务快照。
+- `IDA_NEXUS_INPUT_PREPROCESSOR` 是可选受信任本地可执行文件，接收源输入和任务独占 staging 输出两参数；失败暴露错误，子进程由既有 Preparation supervisor 管理，取消等待自有进程树清理。默认不执行外部处理器；本阶段不接通真实 sBPF/DSC。
+- 验证组织：`tests/test_nexus_n7_cache.py` 确定性覆盖占用、三个 barrier 的恢复/拒绝、epoch/宽限、碰撞、坏 journal、状态错误与 symlink；`nexus_special_inputs_e2e` 预期 7 项（E19、E21-held/三个 barrier/release/lock），核对完整 PASS case 集和实际数量。最终运行命令、退出码、uptime、资源审计见委托报告，未运行的项目不得由这些实现说明计作通过。
+
 - 实现全局占用检查和缓存/重建协调，覆盖其他工具持有的 lease。
 - 接通 sBPF 现有 sbx 流程和 DSC 构建/加载，复用完成的 `.i64`，保持配置与错误可诊断。
 - 在独立测试 GUI 数据库上验证附加、修改可见性和释放后 GUI 继续存在。

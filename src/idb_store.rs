@@ -86,7 +86,7 @@ pub fn socket_is_live() -> bool {
 
 pub fn clean_stale_imcp_locks() {
     if std::env::var("IDA_CLI_NEXUS_DEV").as_deref() == Ok("1") {
-        tracing::warn!("IDB lock cleanup skipped: Nexus/external owner absence cannot be proven; deferred to N7");
+        tracing::warn!("Legacy flat IDB lock cleanup refused in Nexus mode; generation GC uses quarantine checks");
         return;
     }
     if let Ok(entries) = std::fs::read_dir(idb_root()) {
@@ -125,7 +125,7 @@ pub struct IdbStoreStats {
     pub total_size_bytes: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IdbEvictionStats {
     pub evicted_groups: usize,
     pub evicted_files: usize,
@@ -151,13 +151,57 @@ impl Default for IdbStore {
 }
 
 impl IdbStore {
-    fn nexus_gc_deferred(&self) -> bool {
-        if std::env::var("IDA_CLI_NEXUS_DEV").as_deref() == Ok("1") {
-            tracing::warn!(root = %self.root.display(),
-                "IDB GC skipped: Nexus lease/external owner/database lock absence cannot be proven; deferred to N7");
-            true
-        } else {
-            false
+    fn nexus_selected() -> bool {
+        std::env::var("IDA_CLI_NEXUS_DEV").as_deref() == Ok("1")
+    }
+    fn nexus_gc(&self, max_bytes: u64, key: Option<&str>) -> IdbEvictionStats {
+        let result = (|| {
+            static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            let epoch =
+                EPOCH.get_or_init(|| format!("{}-{:?}", std::process::id(), SystemTime::now()));
+            let python = std::env::var_os("IDA_NEXUS_PYTHON")
+                .ok_or_else(|| anyhow::anyhow!("IDA_NEXUS_PYTHON missing"))?;
+            let mut command = std::process::Command::new("timeout");
+            command
+                .args(["10s"])
+                .arg(python)
+                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("nexus_bridge/cache_store.py"))
+                .arg("--root")
+                .arg(&self.root)
+                .arg("--limit")
+                .arg(max_bytes.to_string())
+                .arg("--epoch")
+                .arg(epoch);
+            if let Some(key) = key {
+                command.arg("--key").arg(key);
+            }
+            let output = command.output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "cache maintenance failed: {}; {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            if value["rejected"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+            {
+                tracing::warn!(rejected = %value["rejected"], "Nexus cache candidates retained");
+            }
+            Ok::<_, anyhow::Error>(serde_json::from_value::<IdbEvictionStats>(value)?)
+        })();
+        match result {
+            Ok(stats) => stats,
+            Err(error) => {
+                tracing::warn!(%error, root = %self.root.display(), "Nexus GC proof failed; candidates retained");
+                IdbEvictionStats {
+                    evicted_groups: 0,
+                    evicted_files: 0,
+                    evicted_bytes: 0,
+                    remaining_bytes: self.stats().total_size_bytes,
+                }
+            }
         }
     }
 
@@ -365,11 +409,38 @@ impl IdbStore {
                 total_size_bytes = total_size_bytes.saturating_add(meta.len());
             }
         }
-        let entry_count = match std::fs::read(self.root.join("index.json")) {
+        if Self::nexus_selected() {
+            let mut directories = vec![self.root.join("generations"), self.root.join("quarantine")];
+            while let Some(directory) = directories.pop() {
+                if !directory.exists() {
+                    continue;
+                }
+                for entry in std::fs::read_dir(directory)? {
+                    let entry = entry?;
+                    let meta = entry.path().symlink_metadata()?;
+                    if meta.is_dir() {
+                        directories.push(entry.path());
+                    } else if meta.is_file() {
+                        file_count += 1;
+                        total_size_bytes = total_size_bytes.saturating_add(meta.len());
+                    }
+                }
+            }
+        }
+        let mut entry_count = match std::fs::read(self.root.join("index.json")) {
             Ok(bytes) => serde_json::from_slice::<HashMap<String, IdbEntry>>(&bytes)?.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => return Err(e),
         };
+        if Self::nexus_selected() {
+            match std::fs::read(self.root.join("nexus-index.json")) {
+                Ok(bytes) => {
+                    entry_count += serde_json::from_slice::<HashMap<String, String>>(&bytes)?.len()
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
         Ok(IdbStoreStats {
             root: self.root.display().to_string(),
             file_count,
@@ -379,6 +450,14 @@ impl IdbStore {
     }
 
     pub fn stats(&self) -> IdbStoreStats {
+        if Self::nexus_selected() {
+            match self.try_stats() {
+                Ok(stats) => return stats,
+                Err(error) => {
+                    tracing::warn!(%error, "Nexus cache usage unavailable; reporting partial flat-file usage")
+                }
+            }
+        }
         let mut file_count = 0usize;
         let mut total_size_bytes = 0u64;
 
@@ -408,13 +487,8 @@ impl IdbStore {
         max_bytes: u64,
         pinned_group_stems: &HashSet<String>,
     ) -> IdbEvictionStats {
-        if self.nexus_gc_deferred() {
-            return IdbEvictionStats {
-                evicted_groups: 0,
-                evicted_files: 0,
-                evicted_bytes: 0,
-                remaining_bytes: self.stats().total_size_bytes,
-            };
+        if Self::nexus_selected() {
+            return self.nexus_gc(max_bytes, None);
         }
         struct Group {
             files: Vec<PathBuf>,
@@ -504,8 +578,8 @@ impl IdbStore {
     ///
     /// Returns `true` if the entry was found and removed.
     pub fn remove(&self, hash: &str) -> bool {
-        if self.nexus_gc_deferred() {
-            return false;
+        if Self::nexus_selected() {
+            return self.nexus_gc(0, Some(hash)).evicted_groups > 0;
         }
         let index_path = self.root.join("index.json");
         let mut index: HashMap<String, IdbEntry> = std::fs::read_to_string(&index_path)
@@ -545,7 +619,8 @@ impl IdbStore {
     ///
     /// Returns the removed entries.
     pub fn clean(&self) -> Vec<IdbEntry> {
-        if self.nexus_gc_deferred() {
+        if Self::nexus_selected() {
+            let _ = self.nexus_gc(0, None);
             return Vec::new();
         }
         let index_path = self.root.join("index.json");

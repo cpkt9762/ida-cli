@@ -15,6 +15,8 @@ pub struct PreparedOpen {
     pub options: serde_json::Value,
     verification: Option<PathBuf>,
     verification_handed_off: bool,
+    generation: Option<(PathBuf, String, PathBuf)>,
+    cache_guard: Option<std::sync::Arc<super::cache_lock::CacheGuard>>,
 }
 impl Drop for PreparedOpen {
     fn drop(&mut self) {
@@ -37,13 +39,26 @@ impl PreparedOpen {
     /// closure. Retain that exact input snapshot before exposing the lease, so
     /// another open need not copy a packed IDB owned by a running instance.
     pub async fn publish_verified_input(&self, preparation: &Preparation) -> Result<(), ToolError> {
+        if let Some((root, key, idb)) = self.generation.clone() {
+            let guard = self.cache_guard.clone();
+            let preparing = preparation.clone();
+            preparation
+                .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+                    let _guard = guard;
+                    super::generations::publish_index(&root, &key, &idb, &preparing)
+                }))
+                .await?
+                .map_err(|e| ToolError::IdaError(format!("publish generation index: {e:#}")))?;
+        }
         let Some(directory) = self.verification.clone() else {
             return Ok(());
         };
         let destination = self.path.with_extension("");
         let preparing = preparation.clone();
+        let guard = self.cache_guard.clone();
         preparation
             .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+                let _guard = guard;
                 anyhow::ensure!(
                     directory.join("closed").is_file(),
                     "legacy verification close unconfirmed"
@@ -74,6 +89,8 @@ impl PreparedOpen {
             options: serde_json::json!({"wait_analysis":true}),
             verification: None,
             verification_handed_off: false,
+            generation: None,
+            cache_guard: None,
         }
     }
 }
@@ -82,13 +99,35 @@ pub async fn prepare_n4_open(
     cache: PathBuf,
     preparation: &Preparation,
 ) -> Result<PreparedOpen, ToolError> {
+    prepare_n7_open(path, cache, preparation, false).await
+}
+pub async fn prepare_n7_open(
+    path: PathBuf,
+    cache: PathBuf,
+    preparation: &Preparation,
+    refresh: bool,
+) -> Result<PreparedOpen, ToolError> {
+    let guard = super::cache_lock::acquire(&cache, preparation).await?;
+    let processed =
+        super::generations::preprocess(path.clone(), cache.clone(), preparation).await?;
+    let source = processed
+        .as_ref()
+        .map_or(path, |stage| stage.output.clone());
     let preparing = preparation.clone();
-    preparation
+    let result = preparation
         .wait(blocking::run(blocking::WorkClass::Prepare, move || {
-            prepare_impl(path, cache, &preparing, true)
+            let mut prepared = prepare_impl_inner(source, cache, &preparing, true, refresh)?;
+            prepared.cache_guard = Some(guard);
+            Ok::<_, anyhow::Error>(prepared)
         }))
         .await?
-        .map_err(|error| ToolError::IdaError(format!("Nexus cache preparation: {error:#}")))
+        .map_err(|error| ToolError::IdaError(format!("Nexus cache preparation: {error:#}")));
+    if let Some(processed) = processed {
+        let receipt = processed.cleanup_receipt();
+        drop(processed);
+        receipt.wait().await?;
+    }
+    result
 }
 
 /// Existing IDBs retain their canonical identity. Raw input is published without
@@ -133,9 +172,22 @@ fn prepare_impl(
     preparation: &Preparation,
     allow_legacy: bool,
 ) -> anyhow::Result<PreparedOpen> {
+    prepare_impl_inner(path, cache, preparation, allow_legacy, false)
+}
+fn prepare_impl_inner(
+    path: PathBuf,
+    cache: PathBuf,
+    preparation: &Preparation,
+    allow_legacy: bool,
+    refresh: bool,
+) -> anyhow::Result<PreparedOpen> {
     preparation.check()?;
     let path = path.canonicalize()?;
     if path.extension().is_some_and(|x| x == "i64" || x == "idb") {
+        anyhow::ensure!(
+            !refresh,
+            "refresh requires the source input, never an existing IDB"
+        );
         let mut prepared = PreparedOpen::plain(path);
         prepared.options = serde_json::json!({"auto_analysis":false});
         return Ok(prepared);
@@ -179,6 +231,20 @@ fn prepare_impl(
     #[cfg(test)]
     hook("snapshot_hashed");
     let short = &hash.to_hex()[..12];
+    if allow_legacy && !refresh {
+        if let Some(idb) = super::generations::current(&cache, short)? {
+            let input = idb.with_extension("");
+            anyhow::ensure!(
+                digest(&input, preparation)? == hash,
+                "generation input hash mismatch"
+            );
+            let mut prepared = PreparedOpen::plain(if idb.exists() { idb } else { input });
+            if prepared.path.extension().is_some_and(|e| e == "i64") {
+                prepared.options = serde_json::json!({"auto_analysis":false});
+            }
+            return Ok(prepared);
+        }
+    }
     let mut existing = None;
     for entry in std::fs::read_dir(&cache)? {
         let entry = entry?;
@@ -193,6 +259,12 @@ fn prepare_impl(
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("input has no basename"))?
         .to_string_lossy();
+    if allow_legacy && (refresh || existing.is_none()) {
+        let input = super::generations::create(&cache, short, &staging, preparation)?;
+        let mut prepared = PreparedOpen::plain(input.clone());
+        prepared.generation = Some((cache.clone(), short.into(), input.with_extension("i64")));
+        return Ok(prepared);
+    }
     let idb = existing.unwrap_or_else(|| cache.join(format!("{basename}.{short}.dylib.i64")));
     let input = idb.with_extension("");
     #[cfg(test)]
@@ -224,6 +296,8 @@ fn prepare_impl(
                     "verify_input_snapshot":directory.join("input"),"auto_analysis":false}),
                 verification: Some(directory.clone()),
                 verification_handed_off: false,
+                generation: None,
+                cache_guard: None,
             };
             std::fs::copy(&idb, directory.join("probe.i64"))?;
             std::fs::rename(&staging, directory.join("input"))?;

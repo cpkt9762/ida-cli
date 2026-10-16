@@ -67,6 +67,27 @@ impl StagedArtifact {
         self.cleanup.clone()
     }
     pub fn publish(&self, preparation: &Preparation) -> Result<(), ToolError> {
+        self.commit(preparation, || {
+            std::fs::hard_link(&self.output, &self.destination)
+        })
+    }
+    /// Publish one entire generation group at its unique, previously absent path.
+    pub fn publish_directory(&self, preparation: &Preparation) -> Result<(), ToolError> {
+        self.commit(preparation, || {
+            if self.destination.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "generation already exists",
+                ));
+            }
+            rename_group(&self.output, &self.destination)
+        })
+    }
+    pub(crate) fn commit(
+        &self,
+        preparation: &Preparation,
+        publish: impl FnOnce() -> std::io::Result<()>,
+    ) -> Result<(), ToolError> {
         preparation.check()?;
         preparation
             .cancel
@@ -79,7 +100,7 @@ impl StagedArtifact {
         // This is the artifact commit point. Later cancellation keeps this file
         // and still prevents subsequent work.
         // The blocking job retains its permit and stage until the syscall returns.
-        let result = std::fs::hard_link(&self.output, &self.destination).map_err(|e| {
+        let result = publish().map_err(|e| {
             ToolError::IdaError(format!(
                 "publish {} without overwrite: {e}",
                 self.destination.display()
@@ -90,6 +111,36 @@ impl StagedArtifact {
             .publication
             .fetch_and(!2, Ordering::SeqCst);
         result
+    }
+}
+fn rename_group(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let source = std::ffi::CString::new(source.as_os_str().as_encoded_bytes())?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_encoded_bytes())?;
+    #[cfg(target_os = "macos")]
+    // SAFETY: both C strings are valid and live through this non-replacing rename.
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(target_os = "linux")]
+    // SAFETY: absolute paths, valid live C strings; kernel enforces no replacement.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic non-replacing group rename unavailable",
+    ));
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 static CLEANUP_GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));

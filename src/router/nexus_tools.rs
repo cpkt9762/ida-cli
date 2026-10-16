@@ -105,6 +105,7 @@ struct Database {
     token: String,
     pid: Option<u32>,
     opened_at: Instant,
+    _cache_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
 }
 pub struct Tools {
     selected: bool,
@@ -112,6 +113,7 @@ pub struct Tools {
     capacity: Arc<Semaphore>,
     paths: Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     operations: Mutex<Vec<OperationIdentity>>,
+    uncertain_cache: Arc<Mutex<Vec<Arc<RetainedOpen>>>>,
 }
 impl Tools {
     pub fn new(capacity: usize) -> anyhow::Result<Self> {
@@ -127,6 +129,7 @@ impl Tools {
             capacity: Arc::new(Semaphore::new(capacity)),
             paths: Mutex::new(HashMap::new()),
             operations: Mutex::new(Vec::new()),
+            uncertain_cache: Arc::default(),
         })
     }
     pub fn selected(&self) -> bool {
@@ -249,6 +252,28 @@ impl Tools {
         path: &str,
         preparation: Preparation,
     ) -> Result<(String, String), ToolError> {
+        self.open_refresh(router, path, preparation, false).await
+    }
+    pub async fn open_refresh(
+        self: &Arc<Self>,
+        router: &RouterState,
+        path: &str,
+        preparation: Preparation,
+        refresh: bool,
+    ) -> Result<(String, String), ToolError> {
+        self.uncertain_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|opening| !opening.cleanup_confirmed());
+        if self
+            .uncertain_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+            >= router.config.max_pending_per_tenant
+        {
+            return Err(diagnostic("cache maintenance guards retained for uncertain opens; restart after owner recovery"));
+        }
         let permit = self
             .capacity
             .clone()
@@ -263,7 +288,7 @@ impl Tools {
         let task_id = CURRENT_TASK_ID.try_with(Clone::clone).ok();
         tokio::spawn(async move {
             let _permit = permit;
-            let work = tools.open_owned(&router, path, preparation);
+            let work = tools.open_owned(&router, path, preparation, refresh);
             let result = match task_id {
                 Some(task_id) => CURRENT_TASK_ID.scope(task_id, work).await,
                 None => work.await,
@@ -299,6 +324,7 @@ impl Tools {
         router: &RouterState,
         path: PathBuf,
         preparation: Preparation,
+        refresh: bool,
     ) -> Result<(String, String), ToolError> {
         let accepted = accepted("open", json!({"timeout_secs":120}), &preparation)?;
         let (canonical, sbpf) = preparation
@@ -319,6 +345,9 @@ impl Tools {
         }
         let gate = self.path_gate(&canonical);
         let _path = preparation.wait(async { Ok(gate.lock().await) }).await?;
+        let cache_guard =
+            super::nexus_bridge::cache_lock::acquire(&crate::idb_store::idb_root(), &preparation)
+                .await?;
         let endpoint = router.nexus_endpoint();
         let retained: Vec<_> = self
             .records()
@@ -344,9 +373,16 @@ impl Tools {
                 .into());
             }
         }
-        let mut prepared = super::nexus_bridge::cache::prepare_n4_open(
+        let mut prepared = super::nexus_bridge::cache::prepare_n7_open(
             canonical.clone(),
             crate::idb_store::idb_root(),
+            &preparation,
+            refresh,
+        )
+        .await?;
+        let open_guard = super::nexus_bridge::cache_lock::acquire_open(
+            &crate::idb_store::idb_root(),
+            &prepared.path,
             &preparation,
         )
         .await?;
@@ -378,6 +414,9 @@ impl Tools {
             bridge: bridge.clone(),
             identity: identity.clone(),
             transferred: false,
+            cache_guard: cache_guard.clone(),
+            uncertain_cache: self.uncertain_cache.clone(),
+            open_guard,
         };
         let mut cancelled = false;
         loop {
@@ -429,11 +468,13 @@ impl Tools {
                                 None => return Err(diagnostic("open missing IDB path; lease retained for bridge cleanup")),
                             };
                             let pid = event["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
-                            self.records().insert(handle.clone(), Database { path: canonical, lease, idb, token: token.clone(), pid, opened_at: Instant::now() });
+                            self.records().insert(handle.clone(), Database { path: canonical, lease, idb, token: token.clone(), pid, opened_at: Instant::now(), _cache_guard:cache_guard.clone() });
                             ownership.transferred = true;
                             return Ok((handle,token));
                         }
-                        Some("failed" | "uncertain") => return Err(diagnostic(event["error"].to_string())),
+                        Some("failed" | "uncertain") => {
+                            return Err(diagnostic(event["error"].to_string()));
+                        }
                         _ => {}
                     }
                 }
@@ -1149,9 +1190,38 @@ async fn release(
 // Installed before awaiting an opening outcome. Every error/deadline/drop
 // transfers cleanup to the bounded N1/bridge lease registry, including late opens.
 struct OpeningGuard {
+    open_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
     bridge: Arc<super::nexus_bridge::NexusBridge>,
     identity: OpenIdentity,
     transferred: bool,
+    cache_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
+    uncertain_cache: Arc<Mutex<Vec<Arc<RetainedOpen>>>>,
+}
+struct RetainedOpen {
+    bridge: Arc<super::nexus_bridge::NexusBridge>,
+    identity: OpenIdentity,
+    _cache_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
+    _open_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
+}
+impl RetainedOpen {
+    fn cleanup_confirmed(&self) -> bool {
+        self.bridge.endpoint().transition(|sessions, _| {
+            let Ok((lease, failure)) =
+                sessions.open_progress(&self.identity.client_id, &self.identity)
+            else {
+                return false;
+            };
+            if let Some(lease) = lease {
+                return sessions
+                    .status(&lease.client_id, &lease)
+                    .is_ok_and(|status| status.phase == SessionPhase::Released);
+            }
+            // N1 wraps every uncertain delivery in UnknownOutcome. A failure
+            // without a lease is releasable only when N1 confirms it was not sent
+            // or the bridge confirmed acquisition failed.
+            failure.is_some_and(|error| error.code != NexusErrorCode::UnknownOutcome)
+        })
+    }
 }
 impl Drop for OpeningGuard {
     fn drop(&mut self) {
@@ -1164,6 +1234,37 @@ impl Drop for OpeningGuard {
             {
                 tracing::error!(%error, "Nexus open cleanup ownership could not be reconciled");
             }
+            let retained = Arc::new(RetainedOpen {
+                bridge: self.bridge.clone(),
+                identity: self.identity.clone(),
+                _cache_guard: self.cache_guard.clone(),
+                _open_guard: self.open_guard.clone(),
+            });
+            if retained.cleanup_confirmed() {
+                return;
+            }
+            self.uncertain_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(retained.clone());
+            let registry = self.uncertain_cache.clone();
+            // One bounded observer per retained opening; no remote work or
+            // replay. After the observation budget, protection stays registered
+            // and the next open checks the same authoritative N1 proof again.
+            tokio::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(120);
+                while Instant::now() < deadline {
+                    if retained.cleanup_confirmed() {
+                        registry
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .retain(|item| !Arc::ptr_eq(item, &retained));
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                tracing::warn!("cache guards retained after unconfirmed open cleanup; router recovery required");
+            });
         }
     }
 }
