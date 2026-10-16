@@ -93,7 +93,7 @@ else:
     if os.environ.get("N3_WRONG_VERSION"):
         original_version = importlib.metadata.version
         importlib.metadata.version = lambda name: "0.13.3" if name == "ida-nexus" else original_version(name)
-    runtime = runpy.run_path(str(REPO / "nexus_bridge/bridge.py"), run_name="n4_fixture")
+    runtime = runpy.run_path(os.environ.get("N6_TEST_BRIDGE_SOURCE", str(REPO / "nexus_bridge/bridge.py")), run_name="n4_fixture")
     bridge_init = runtime["Bridge"].__init__
     def registered_init(self, business, control, capacity):
         # F2/P2-b: parent endpoints predate initialization. Record before any

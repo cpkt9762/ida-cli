@@ -193,10 +193,12 @@ impl<C: Clock> NexusSessions<C> {
         let remaining_ms = match op.request.remaining(&self.clock) {
             Ok(budget) => budget,
             Err(_) => {
-                let error = NexusError::new(
-                    NexusErrorCode::QueueExpired,
-                    "total deadline expired before execution",
-                );
+                let message = if op.request.params.get("_n5_checkpoint").is_some() {
+                    "total deadline expired after completed slices; effects may remain"
+                } else {
+                    "total deadline expired before execution"
+                };
+                let error = NexusError::new(NexusErrorCode::QueueExpired, message);
                 self.terminal(
                     identity,
                     OperationStatus::TimedOut,

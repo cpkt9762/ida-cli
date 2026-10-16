@@ -4,17 +4,11 @@ QUERY_METHODS = ("batch_lookup_functions", "export_functions", "list_globals", "
                  "diff_pseudocode", "get_pseudocode_at", "load_debug_info")
 
 
-def handler_address(raw):
+def handler_address(raw, parse_address):
     """Legacy handler grammar additionally accepts 0b/0o (RPC grammar does not)."""
     if not isinstance(raw, str):
         return None
-    import re
-    raw = raw.strip()
-    base, digits = (16, raw[2:]) if raw.startswith(('0x', '0X')) else ((2, raw[2:]) if raw.startswith(('0b', '0B')) else ((8, raw[2:]) if raw.startswith(('0o', '0O')) else (10, raw)))
-    if not re.fullmatch({2:r'\+?[01]+',8:r'\+?[0-7]+',10:r'\+?[0-9]+',16:r'\+?[0-9a-fA-F]+'}[base], digits):
-        return None
-    value = int(digits, base)
-    return value if value < 2**64 else None
+    return parse_address(raw, handler=True)
 
 
 def invoke_query(method, params, resolve, parse_address, invoke):
@@ -50,7 +44,7 @@ def invoke_query(method, params, resolve, parse_address, invoke):
         funcs = [function_info(ida_funcs.getn_func(i)) for i in range(ida_funcs.get_func_qty())]
         results = []
         for query in params["queries"]:
-            ea = handler_address(query)
+            ea = handler_address(query, parse_address)
             func = ida_funcs.get_func(ea) if ea is not None else None
             item = function_info(func) if func else (next((f for f in funcs if query == f["name"] or query in f["name"]), None) if ea is None else None)
             results.append({"query": query, "result": item} if item else {"query": query, "error": "Function not found"})
@@ -64,7 +58,7 @@ def invoke_query(method, params, resolve, parse_address, invoke):
         return {"globals": page, "total": len(items), "next_offset": offset+len(page) if offset+len(page)<len(items) else None}
     if method == "read_global_variable":
         query = params["query"]
-        ea = handler_address(query)
+        ea = handler_address(query, parse_address)
         if ea is None:
             ea = next((ea for ea, name in idautils.Names() if name == query), None)
         if ea is None:

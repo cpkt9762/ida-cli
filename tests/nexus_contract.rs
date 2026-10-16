@@ -13,6 +13,30 @@ mod compatibility;
 mod lifecycle;
 
 #[test]
+fn n6_expired_write_continuation_reports_completed_effects() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("n6-expire", "n6-expire-owner", 1);
+    let write = rig.queue(&lease, "rename", "batch_rename", 1);
+    rig.dispatch(&write);
+    rig.sessions
+        .yield_operation(&write, json!({"index":1}))
+        .expect("first write slice completed");
+    rig.clock.advance(1001);
+    let error = rig
+        .sessions
+        .dispatch(&lease.client_id, &write, &mut rig.backend)
+        .expect_err("expired continuation cannot dispatch");
+    assert_eq!(error.code, NexusErrorCode::QueueExpired);
+    assert!(error.message.contains("effects may remain"), "{error}");
+    assert!(!error.message.contains("before execution"), "{error}");
+    let snapshot = rig.snapshot(&write);
+    assert_eq!(snapshot.status, OperationStatus::TimedOut);
+    assert!(snapshot.execution_stopped);
+    assert_eq!(snapshot.error, Some(error));
+    assert_eq!(rig.backend.writes, 1, "only the first slice wrote");
+}
+
+#[test]
 fn n6_write_slices_resume_at_checkpoint_and_cancel_never_replays() {
     let mut rig = Rig::new();
     let lease = rig.connect("n6", "n6-owner", 1);

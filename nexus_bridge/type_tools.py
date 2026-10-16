@@ -81,7 +81,10 @@ def stack_edit(method, ea, params):
         if parsed is not None and ida_frame.define_stkvar(pfn, name or None, offset, tif):
             result.update(code=ti.TERR_OK, status="ok", name=name or ida_frame.build_stkvar_name(pfn, offset) or "")
         return result
-    _, frame, udt = frame_data(ea)
+    frame, udt = ti.tinfo_t(), ti.udt_type_data_t()
+    if not ida_frame.get_func_frame(frame, pfn) or not frame.get_udt_details(udt, ti.GTD_CALC_LAYOUT):
+        result["code"] = ti.TERR_BAD_ARG if method == "delete_stack_variable" else ti.TERR_BAD_TYPE
+        return result
     use_offset = params.get("stack_offset") if method == "apply_type" else params.get("offset")
     index = frame_member(pfn, udt, name, use_offset)
     if index is None:
@@ -143,6 +146,11 @@ def invoke_type(method, params, resolve):
         return value
     if method in ("rename_stack_variable", "set_stack_variable_type"):
         ea = resolve(params.get("func_address"), params.get("func_name"))
+        if method == "set_stack_variable_type":
+            edited = stack_edit("apply_type", ea, {"stack_name": params["name"], "decl": params["type_decl"], "relaxed": True})
+            if edited["code"] < 0:
+                raise ValueError(f"IDA error: Failed to set type for '{params['name']}': code {edited['code']}")
+            return {"func_address": hex(ea), "variable": edited["name"], "type": params["type_decl"]}
         pfn, _, udt = frame_data(ea)
         index = frame_member(pfn, udt, params["name"], None)
         if index is None:
@@ -157,10 +165,6 @@ def invoke_type(method, params, resolve):
             if edited["code"] < 0:
                 raise ValueError(f"IDA error: Failed to rename stack variable: code {edited['code']}")
             return {"func_address": hex(ea), "old_name": params["name"], "new_name": edited["name"], "offset": offset}
-        edited = stack_edit("apply_type", ea, {"stack_name": params["name"], "decl": params["type_decl"], "relaxed": True})
-        if edited["code"] < 0:
-            raise ValueError(f"IDA error: Failed to set type for '{params['name']}': code {edited['code']}")
-        return {"func_address": hex(ea), "variable": edited["name"], "type": params["type_decl"]}
     ea = resolve(params.get("address"), params.get("target_name", params.get("name")),
                  params.get("offset") or 0 if method not in ("create_stack_variable", "delete_stack_variable") else 0)
     if method == "get_stack_frame":

@@ -11,7 +11,7 @@ METHODS = ("get_database_info", "get_analysis_status", "list_functions",
            "batch_decompile", "search_pseudocode", "run_auto_analysis", "_n5_cleanup")
 
 
-def parse_address(raw):
+def parse_address(raw, *, handler=False):
     """P2-2: rpc_dispatch::parse_address_value (Rust u64 + str::trim)."""
     import re
     if type(raw) is int:
@@ -21,14 +21,19 @@ def parse_address(raw):
     # Rust char::is_whitespace excludes Python's extra U+001C..U+001F.
     raw = raw.strip("\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003"
                     "\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000")
-    hexadecimal = raw.startswith(("0x", "0X"))
-    digits = raw[2:] if hexadecimal else raw
-    if not re.fullmatch(r"\+?[0-9a-fA-F]+" if hexadecimal else r"\+?[0-9]+", digits):
+    base = 10
+    prefixes = {"0x": 16, "0X": 16}
+    if handler:
+        prefixes.update({"0b": 2, "0B": 2, "0o": 8, "0O": 8})
+    if raw[:2] in prefixes:
+        base, raw = prefixes[raw[:2]], raw[2:]
+    if not re.fullmatch({2: r"\+?[01]+", 8: r"\+?[0-7]+",
+                         10: r"\+?[0-9]+", 16: r"\+?[0-9a-fA-F]+"}[base], raw):
         return None
-    digits = digits.lstrip("+").lstrip("0") or "0"
-    if len(digits) > (16 if hexadecimal else 20):
+    digits = raw.lstrip("+").lstrip("0") or "0"
+    if len(digits) > {2: 64, 8: 22, 10: 20, 16: 16}[base]:
         return None
-    value = int(digits, 16 if hexadecimal else 10)
+    value = int(digits, base)
     return value if value < 2**64 else None
 
 
@@ -277,9 +282,10 @@ def invoke(method, params):
                  "processor": processor, "bits": 64 if ida_ida.inf_is_64bit() else
                  (32 if ida_ida.inf_is_32bit_exactly() else 16),
                  "function_count": ida_funcs.get_func_qty(),
-                 "input_file_path": ida_nalt.get_input_file_path(),
+                 "input_file_path": ida_nalt.get_input_file_path() or "",
                  "input_file_size": ida_nalt.retrieve_input_file_size(),
-                 "md5": md5.hex() if md5 else "", "sha256": sha256.hex() if sha256 else "",
+                 "md5": (md5 if md5 is not None else bytes(16)).hex(),
+                 "sha256": (sha256 if sha256 is not None else bytes(32)).hex(),
                  "base_address": hex(base) if base != ida_idaapi.BADADDR else None,
                  "min_address": hex(ida_ida.inf_get_min_ea()), "max_address": hex(ida_ida.inf_get_max_ea()),
                  "main_address": hex(main) if main != ida_idaapi.BADADDR else None}

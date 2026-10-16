@@ -201,7 +201,7 @@
 
 后备比较器只登记上述 tid 字段，要求合法非 BADADDR、全成员 ID 唯一、同会话重复稳定、把 tid 作为公开 get_udm_by_tid 输入成功，实体名称/类型/成员/偏移/大小完整严格一致。真实运行同时保存了这些 witness，后备比较器有 9 项单元测试中的正反例；地址、偏移、大小、端口均不规范化。
 
-3. 默认打开会话中，Nexus analysis 启动异步，native 同步打开，不能用某一时刻状态当等价输入。工具矩阵通过公开 inf_set_auto_enabled/enable_auto/auto_wait 设置两边相同已完成状态，再严格比较 get_analysis_status；未修改产品状态或删除字段。
+3. 已有 IDB 默认打开后，`get_analysis_status.auto_enabled` 在 native 为 true、Nexus 为 false；明确配置来源是 `src/router/nexus_bridge/cache.rs:138–141` 的 `auto_analysis=false`，不是仅因某个瞬间分析未完成。工具矩阵通过公开 inf_set_auto_enabled/enable_auto/auto_wait 显式启用两边分析并设置相同已完成状态之后才严格对照；不能据此宣称默认打开状态相同。未修改产品状态或删除字段。
 
 4. dbg_attach_process 的错误含实际监听端口；测试在相同 OS 选择端口顺序运行两侧 server，保留完整错误字符串严格比较，无端口例外。MCP 写工具保留 N0 既有的重复 IDA error 前缀，raw 结构不变。
 
@@ -211,4 +211,4 @@
 
 N7 的 3 个 DSC 注册工具当前明确拒绝；open_idb 的 GUI/sBPF、专用输入流程，以及缓存 GC/重建也留 N7。旧自动 GC 暂停、开发选择入口 IDA_CLI_NEXUS_DEV 必须在 N9 删除。N9 会删除旧后端，永久不支持的工具届时失效；本轮永久不支持工具为 0，因此该类“需用户裁定”清单为空。
 
-23 个 dbg_* 均经 Nexus 的 run_script 适配并完成逐项严格对照；本机只验证空闲状态、断点和失败契约，没有把活动 debuggee 的启动、attach、单步或寄存器/内存成功路径标成已验证。该测试覆盖限制供编排者验收判断，不代表永久弃用工具。
+23 个 dbg_* 均经 Nexus 的 run_script 适配并完成逐项严格对照；本机只验证空闲状态、断点和失败契约，没有把活动 debuggee 的启动、attach、单步或寄存器/内存成功路径标成已验证。活动 debuggee 的成功启动、停止事件、attach、单步、寄存器/内存修改与清理，必须在 N8 全量验收前补齐；本轮不实现，不代表永久弃用工具。

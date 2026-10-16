@@ -6,11 +6,12 @@ N6 的完整工具与能力覆盖见 [能力对照表](plan/nexus-n6-capabilitie
 `/tmp/ida-nexus-run-20261015.98rmfb/n6/report.md`。
 
 `--suite n6` 必须指定固定 N0 `--baseline`，检查 E04-N6、E20、N6-tools、E20-cancel
-四个实际 PASS 场景。E04-N6 包含 73 项方法/写后读回对照及 x86 汇编成功/读回两项；
+四个实际 PASS 场景。E04-N6 包含 73 项方法/写后读回对照（57 个方法）、x86 汇编成功/读回两项，
+另有 N6-F1 的 18 项缺失元数据/地址边界/无栈帧严格对照；
 N6-tools 从当前注册表生成工具及所有 aliases 对照，另检查 N7 明确拒绝和 backend_counts。
 E20 对七类写入显式保存、关闭、重开并严格读回，还检查部分 batch、异常脚本及取消的
 已发生副作用。普通/函数注释使用官方读取 API，保留 stderr 为空的断言。
-23 个 dbg_* 覆盖真实 IDA 空闲调试器、断点及错误契约；活动 debuggee 的成功路径未覆盖。
+23 个 dbg_* 覆盖真实 IDA 空闲调试器、断点及错误契约；活动 debuggee 的成功路径未覆盖，必须在 N8 全量验收前补齐。
 
 使用新的 prepared root、独立 home/state/profile、样本副本与短 TMPDIR/IPC。
 `--tmp-root` 必须解析到该环境的 tmp；不能复用已有 process ledger 的环境。
@@ -28,8 +29,10 @@ result=$?; uptime; test "$result" -eq 0
 
 `compare_nexus_n6.py` 先通过公开 auto_wait 完成分析、验证输入元数据、显式保存并关闭
 seed IDB，再复制三份 SHA256 相同的文件。工具对照在重开后、等价分析/类型 setup 后
-再次严格检查完整元数据，原始响应先于比较落盘；缺失路径/大小/哈希必须失败。
-不在产品中恢复字段，不通过重复运行挑选通过结果。
+再次严格检查该完整 fixture 的元数据，原始响应先于比较落盘；意外缺失路径/大小/哈希必须失败。
+独立的 n6-edges fixture 则通过公开 SDK delinf 删除存储字段，并用真实无栈帧函数
+对照合法缺失分支的空路径、零大小、零哈希与 -4/-5 错误结构；两类前提分别断言。
+产品按旧 native 契约序列化缺失值，不恢复原始输入信息；不通过重复运行挑选通过结果。
 
 比较器只登记两条批准规则：`build_callgraph.result.nodes` 按唯一 `address` 配对，
 证据为 N0 同库8次出现两种顺序的 `n6/dev/preflight-result.json`；

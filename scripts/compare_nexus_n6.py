@@ -206,7 +206,8 @@ def comparison(env, baseline, binary):
     assert not failures, json.dumps(failures)
     return {"comparisons":len(records), "methods":sorted({r["method"] for r in records}),
             "allocated_id_exceptions":[r["method"] for r in records if r["allocated_id_exception"]],
-            "assembly":assembly(env, baseline, binary)}
+            "assembly":assembly(env, baseline, binary),
+            **compatibility_edges(env, baseline, binary)}
 
 
 def assembly(env, baseline, binary):
@@ -520,6 +521,89 @@ assert ida_dbg.load_debugger('arm_mac', True)
     assert not failures, json.dumps(failures)
     return {'tool_comparisons':len(records),'tools':sorted({r['tool'] for r in records}),
             'debug_comparison_port':debug_port}
+
+
+
+def compatibility_edges(env, baseline, binary):
+    """Strict F1/F2/F3 real IDA comparisons, including an incomplete stored IDB."""
+    assert digest(baseline) == BASELINE_SHA
+    samples = prebuilt_pair(env, binary, "n6-edges")
+    variables = env.variables() | {"TMPDIR":os.environ["TMPDIR"], "IDA_CLI_HOME":str(env.root/"edges-native")}
+    Path(variables["IDA_CLI_HOME"]).mkdir(mode=0o700)
+    seed = Process(env, [str(baseline), "serve-worker"], variables, "edges-seed")
+    try:
+        assert "result" in seed.rpc("open", {"path":str(samples[0])})
+        setup = seed.rpc("run_script", {"code":"""import ctypes, ida_ida, ida_nalt, ida_funcs, ida_frame, ida_typeinf as ti, ida_auto, json
+ida_auto.enable_auto(False)
+ea = ida_funcs.get_func_ea_by_num(0)
+if ida_frame.get_func_frame_ea(ti.tinfo_t(), ea):
+    assert ida_frame.del_frame_ea(ea)
+assert ida_funcs.get_func_start(ea) == ea
+assert not ida_frame.get_func_frame_ea(ti.tinfo_t(), ea)
+delinf = ctypes.CDLL(None).delinf
+delinf.argtypes = [ctypes.c_int]
+delinf.restype = ctypes.c_bool
+for key in (ida_ida.INF_MD5, ida_ida.INF_SHA256, ida_ida.INF_INPUT_FILE_PATH):
+    assert delinf(key)
+setinf = ctypes.CDLL(None).setinf
+setinf.argtypes = [ctypes.c_int, ctypes.c_uint64]
+setinf.restype = ctypes.c_bool
+assert setinf(ida_ida.INF_FSIZE, 0)
+assert ida_nalt.get_input_file_path() in (None, '')
+assert ida_nalt.retrieve_input_file_md5() is None
+assert ida_nalt.retrieve_input_file_sha256() is None
+assert ida_nalt.retrieve_input_file_size() == 0
+print(json.dumps({'function':hex(ea), 'frame':False, 'metadata_missing':True}))
+"""})
+        fixture = script_result(setup)
+        assert "result" in seed.rpc("close")
+        assert "result" in seed.rpc("shutdown")
+        seed.wait()
+    finally:
+        if seed.child.poll() is None:
+            seed.child.stdin.close()
+            seed.wait()
+    shutil.copyfile(samples[0], samples[1])
+    hashes = [digest(p) for p in samples]
+    assert hashes[0] == hashes[1]
+    old = new = None
+    rows = []
+    try:
+        old = Process(env, [str(baseline), "serve-worker"], variables, "edges-baseline")
+        assert "result" in old.rpc("open", {"path":str(samples[0])})
+        new = Candidate(env, binary, samples[1], "n6-edges", transport="stdio", inline="8000000")
+        ea = fixture['function']
+        cases = [("get_database_info", {}),
+            ("delete_stack_variable", {"address":ea,"var_name":"slot"}),
+            ("apply_type", {"address":ea,"stack_name":"slot","decl":"int"}),
+            ("set_stack_variable_type", {"func_address":ea,"name":"slot","type_decl":"int"})]
+        for text in [*(char+ea for char in '\x1c\x1d\x1e\x1f'), '0'*5000+str(int(ea,16)), '0b'+bin(int(ea,16))[2:], '0o'+oct(int(ea,16))[2:]]:
+            cases += [("batch_lookup_functions", {"queries":[text]}), ("read_global_variable", {"query":text})]
+        for method, params in cases:
+            expected = old.rpc(method, params)
+            expected.pop('jsonrpc', None); expected.pop('id', None)
+            actual = new.direct(method, params)
+            actual.pop('cache', None)
+            equal = (actual.get('exit') == 1 and actual.get('error') == 'Error: ' + expected['error']['message']) if 'error' in expected else json_equal(expected, actual, method)
+            rows.append({'method':method,'params':params,'baseline':expected,'nexus':actual,'status':'PASS' if equal else 'FAIL'})
+            (env.root/'n6-edge-comparison.json').write_text(json.dumps({'fixture':fixture,'input_hashes':hashes,'rows':rows},indent=2)+'\n')
+        assert rows[0]['baseline']['result']['input_file_path'] == ''
+        assert rows[0]['baseline']['result']['md5'] == '0'*32
+        assert rows[0]['baseline']['result']['sha256'] == '0'*64
+        assert rows[0]['baseline']['result']['input_file_size'] == 0
+        assert rows[1]['baseline']['result']['code'] == -4
+        assert rows[2]['baseline']['result']['code'] == -5
+        assert "code -5" in rows[3]['baseline']['error']['message']
+    finally:
+        try:
+            if old:
+                assert "result" in old.rpc("close")
+                old.rpc("shutdown"); old.wait()
+        finally:
+            if new: new.stop()
+    failures = sum(row['status']!='PASS' for row in rows)
+    assert not failures, f'{failures} N6 edge comparisons failed; see n6-edge-comparison.json'
+    return {'edge_comparisons':len(rows),'edge_failures':failures}
 
 
 def main():
