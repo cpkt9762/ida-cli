@@ -62,7 +62,7 @@ class OpenTests(unittest.TestCase):
                     return {'result': '9.5'}
                 if parent.unreadable:
                     raise RuntimeError('disconnected guard query')
-                return {'result': {'initial': parent.initial, 'evidence': {'open_attempt': number}}}
+                return {'result': {'close_safe': True, 'initial': parent.initial, 'evidence': {'open_attempt': number}}}
 
             def close_outcome(self, **_options):
                 parent.calls.append('close')
@@ -108,9 +108,9 @@ class OpenTests(unittest.TestCase):
 
     def test_disconnected_guard_query_never_retries_or_waits_on_sibling(self):
         self.losses, self.unreadable, self.lifetime = 1, True, False
-        with self.assertRaisesRegex(RuntimeError, 'no initial Root retry'):
+        with self.assertRaisesRegex(RuntimeError, 'exact lease retained'):
             self.run_open()
-        self.assertEqual(self.calls, ['open', 'guard', 'close'])
+        self.assertEqual(self.calls, ['open', 'guard'])
         self.assertEqual(self.wait_calls, 0)
 
     def test_normal_does_not_snapshot_or_reopen(self):

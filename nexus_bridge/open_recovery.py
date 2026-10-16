@@ -219,10 +219,21 @@ class Snapshot:
 def failure_state(handle, deadline):
     return handle.execute_python(
         "import sys\n_g=sys.modules.get('_ida_cli_save_guard_v1')\n"
-        "result = {'initial': bool(_g and _g._state and _g._state['first_failure'] "
-        "and _g._state['first_failure']['previous_sample'] is None), "
-        "'evidence': _g._state['first_failure'] if _g and _g._state else None}",
+        "result = _g.close_status() if _g else {'close_safe': False, 'initial': False}",
         timeout=remaining(deadline))['result']
+
+
+def require_safe_close(handle, deadline):
+    """Fail without releasing the exact lease if guard safety is indeterminate."""
+    try:
+        proof = failure_state(handle, deadline)
+    except Exception as exc:
+        raise RuntimeError('save protection unavailable; owner and exact lease retained; '
+                           'no default close') from exc
+    if proof.get('close_safe') is not True:
+        raise RuntimeError('save protection unavailable; owner and exact lease retained; '
+                           'no default close')
+    return proof
 
 
 def open_checked(Handle, Options, path, options, deadline, guarded_source, context,
@@ -254,6 +265,9 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                     # An already disconnected client cannot run the read-only
                     # guard query. It is never permission to reopen the owner.
                     proof = {'initial': False, 'evidence_error': type(diagnostic).__name__}
+                if proof.get('close_safe') is not True:
+                    raise RuntimeError('save protection unavailable; owner and exact lease retained; '
+                                       'no default close') from exc
                 if proof['initial']:
                     logging.getLogger('ida_cli.open').warning('Root Node initial-open failure: %s',
                         json.dumps(dict(attempt=number, maximum=3, record_id=handle.instance.record_id,

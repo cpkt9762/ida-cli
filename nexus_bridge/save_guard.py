@@ -8,6 +8,7 @@ import time
 ERROR = ('database state abnormal: Root Node is missing or its presence cannot be confirmed; '
          'saving refused; original file retained at the last successful save')
 _state = None
+_failed_state = None
 _history = []
 
 
@@ -107,9 +108,9 @@ def _discard_on_close():
 
 
 def sample(stage, context=None, refuse=True):
-    state = _state
+    state = _state or _failed_state
     if state is None:
-        raise RuntimeError('Root Node save guard is not installed')
+        raise RuntimeError('Root Node save protection unavailable: guard is not installed')
     now = time.monotonic()
     try:
         import ida_netnode
@@ -120,20 +121,32 @@ def sample(stage, context=None, refuse=True):
     except Exception as exc:
         present, failure = False, type(exc).__name__
     previous = state['last_sample']
-    if not present or state['poisoned']:
+    if not present or state['poisoned'] or state.get('install_error'):
         flags_before_protection = _optional(_database_flags)
-        # Arm close protection before directory IO or delayed diagnostics.
-        _discard_on_close()
+        # Latch failure before arming: a flag exception must never look healthy.
+        first = state['first_failure'] is None
+        state['poisoned'] = True
+        state['close_safe'] = False
+        if first:
+            state['first_failure'] = {'stage': stage, 'previous_sample': previous,
+                'operation': dict(context or state['operation']), 'sample_time': now,
+                'root_present': present, 'probe_error': failure}
+        try:
+            _discard_on_close()
+        except Exception as exc:
+            state['protection_error'] = type(exc).__name__ + ': ' + str(exc)
+            raise RuntimeError('Root Node save protection unavailable; owner and exact lease retained: '
+                               + state['protection_error']) from exc
+        state['close_safe'] = True
         database = _optional(database_context)
         state['last_failure_boundary'] = {'stage': stage, 'sample_time': now,
             'root_present': present, 'operation': dict(context or state['operation']),
             'database': database}
-        if state['poisoned']:
+        if not first:
             logging.getLogger('ida_cli.save_guard').error(
                 'Root Node protected boundary: %s',
                 json.dumps(state['last_failure_boundary'], ensure_ascii=True))
-        if not state['poisoned']:
-            state['poisoned'] = True
+        if first:
             import ida_loader
             evidence = {'stage': stage, 'operation': dict(context or state['operation']),
                         'owner_pid': os.getpid(), 'root_present': present,
@@ -163,28 +176,32 @@ def sample(stage, context=None, refuse=True):
                     'probes': delayed}, ensure_ascii=True))
         state['last_sample'] = {'time': now, 'stage': stage, 'root_present': present,
                                 'operation': dict(context or state['operation'])}
+        message = ('Root Node save protection unavailable: ' + state['install_error']
+                   if state.get('install_error') else ERROR)
         if refuse:
-            raise RuntimeError(ERROR)
-        return ERROR
+            raise RuntimeError(message)
+        return message
     state['last_sample'] = {'time': now, 'stage': stage, 'root_present': True,
                             'operation': dict(context or state['operation'])}
     return None
 
 
 def install(context):
-    global _state
+    global _state, _failed_state
     import ida_idp
     import ida_loader
     path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+    if _failed_state is not None:
+        return
     if _state is not None:
         if _state['path'] != path:
             # A changed active database in a live owner is itself uncertain.
             _state['identity_error'] = 'active database path changed within owner'
         return
     now = time.monotonic()
-    _state = {'path': path, 'context': dict(context), 'opened_at': now,
+    candidate = {'path': path, 'context': dict(context), 'opened_at': now,
               'operation': dict(context), 'last_sample': None, 'poisoned': False,
-              'initial_metadata': _metadata(), 'first_failure': None}
+              'initial_metadata': _metadata(), 'first_failure': None, 'close_safe': False}
     _history.append(path)
 
     class CloseGuard(ida_idp.IDB_Hooks):
@@ -196,16 +213,22 @@ def install(context):
         def closebase(self):
             sample('automatic-close', refuse=False)
 
-    hook = CloseGuard()
-    if not hook.hook():
-        _discard_on_close()
-        raise RuntimeError('could not install Root Node close protection')
-    _state['hook'] = hook
+    try:
+        hook = CloseGuard()
+        if not hook.hook():
+            raise RuntimeError('IDB_Hooks.hook returned false')
+    except Exception as exc:
+        candidate['install_error'] = type(exc).__name__ + ': ' + str(exc)
+        _failed_state = candidate
+        return
+    candidate['hook'] = hook
+    candidate['close_safe'] = True
+    _state = candidate
 
 
 def begin(context, refuse=True):
     install(context)
-    _state['operation'] = dict(context)
+    (_state or _failed_state)['operation'] = dict(context)
     return sample('before', context, refuse=refuse)
 
 
@@ -218,3 +241,22 @@ def save_database(outfile=None, flags=0):
     import ida_loader
     sample('explicit-save')
     return ida_loader.save_database(outfile, flags)
+
+
+def close_status():
+    """Read-only guard evidence; missing/failed protection never authorizes close."""
+    state = _state or _failed_state
+    evidence = state.get('first_failure') if state else None
+    safe = bool(state and state['close_safe'])
+    if safe and state['poisoned']:
+        try:
+            import ida_loader
+            safe = all(ida_loader.is_database_flag(flag)
+                       for flag in (ida_loader.DBFL_TEMP, ida_loader.DBFL_KILL))
+        except Exception:
+            safe = False
+    return {'close_safe': safe,
+            'initial': bool(evidence and evidence['previous_sample'] is None
+                            and not state.get('install_error')),
+            'evidence': evidence,
+            'protection_error': state.get('protection_error') if state else 'not installed'}

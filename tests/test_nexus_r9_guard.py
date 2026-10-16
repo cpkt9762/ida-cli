@@ -63,6 +63,183 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(self.flags, {1, 8})
         self.assertEqual(self.logs[0]['probe_error'], 'RuntimeError')
 
+    def test_failed_hook_is_persistent_across_shared_owner_opens(self):
+        for throws in (False, True):
+            with self.subTest(throws=throws):
+                self.guard._state = None
+                self.guard._failed_state = None
+                hooks = []
+                def fail_hook(_hook):
+                    hooks.append('hook')
+                    if throws:
+                        raise OSError('hook unavailable')
+                    return False
+                with patch.object(sys.modules['ida_idp'].IDB_Hooks, 'hook', fail_hook):
+                    # A separate public lease keeps this exact owner alive.
+                    sibling = object()
+                    for method in ('open-first', 'open-again'):
+                        with self.assertRaisesRegex(RuntimeError, 'protection unavailable'):
+                            self.guard.begin({'method': method, 'sibling': id(sibling)})
+                    self.assertIsNone(self.guard._state, 'no usable guard may be published')
+                    self.assertEqual(hooks, ['hook'])
+                    with self.assertRaisesRegex(RuntimeError, 'protection unavailable'):
+                        self.guard.save_database()
+                    self.assertIn('protection unavailable', self.guard.begin({'method': 'close'}, refuse=False))
+                    self.assertEqual(self.flags, {1, 8})
+
+    def test_hook_failure_shared_owner_protocol_reopen_and_final_close(self):
+        import tempfile
+        import time
+        directory = Path(__file__).resolve().parents[1] / 'nexus_bridge'
+        with patch.object(sys, 'path', [str(directory), *sys.path]):
+            import open_recovery
+            from bridge import guarded_source
+        guard = self.guard
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp)/'input.i64'
+            target.write_bytes(b'original packed')
+            live = {'sibling'}
+            acquired, released, hook_calls = [], [], []
+            class Handle:
+                instance = types.SimpleNamespace(record_id='same-owner', idb_path=str(target))
+                def __init__(self, lease):
+                    self.lease = lease
+                    live.add(lease)
+                def execute_python(self, source, **kwargs):
+                    namespace = {}
+                    exec(source, namespace)
+                    return {'result': namespace.get('result')}
+                def close_outcome(self, **kwargs):
+                    if not guard.close_status()['close_safe']:
+                        raise AssertionError('unsafe saving close')
+                    live.remove(self.lease)
+                    return {'lease_released': True}
+            sibling = Handle('sibling')
+            def open_handle(*args, **kwargs):
+                return Handle('open-'+str(len(acquired)))
+            def fail_hook(_hook):
+                hook_calls.append('hook')
+                return False
+            api = types.SimpleNamespace(probe_database_state=lambda *a, **kw: {
+                'idb_path': str(target), 'state': 'packed'},
+                wait_database_released=lambda *a, **kw: False)
+            with patch.dict(sys.modules, {'ida_nexus': api, '_ida_cli_save_guard_v1': guard}), \
+                    patch.dict(__import__('os').environ, {'IDA_CLI_HOME': str(Path(temp)/'home')}), \
+                    patch.object(sys.modules['ida_idp'].IDB_Hooks, 'hook', fail_hook):
+                for _ in range(2):
+                    with self.assertRaisesRegex(RuntimeError, 'protection unavailable'):
+                        open_recovery.open_checked(types.SimpleNamespace(open=open_handle),
+                            lambda **kw: kw, str(target), {}, time.monotonic()+2,
+                            guarded_source, {'method': 'open'},
+                            acquired=lambda h, _: acquired.append(h), released=released.append)
+                    self.assertEqual(live, {'sibling'})
+                result = sibling.execute_python(guarded_source('pass', {'method': 'close'}, refuse=False))
+                self.assertIn('protection unavailable', result['result']['save_guard_error'])
+                sibling.close_outcome()
+                self.assertEqual(live, set())
+                self.assertEqual(hook_calls, ['hook'])
+                self.assertEqual(acquired, released)
+                self.assertEqual(target.read_bytes(), b'original packed')
+
+    def test_flag_failure_records_poison_before_any_cleanup(self):
+        self.present = False
+        loader = sys.modules['ida_loader']
+        for branch in ('set', 'readback', 'read-error'):
+            with self.subTest(branch=branch):
+                self.guard._state = None
+                self.flags.clear()
+                def set_flag(flag):
+                    if branch == 'set':
+                        raise OSError('cannot set flag')
+                    self.flags.add(flag)
+                def read_flag(flag):
+                    if branch == 'read-error':
+                        raise OSError('cannot query flag')
+                    return False
+                with patch.object(loader, 'set_database_flag', set_flag), patch.object(loader, 'is_database_flag', read_flag):
+                    with self.assertRaisesRegex(RuntimeError, 'protection unavailable'):
+                        self.guard.begin({'method': 'open', 'lease': 'exact-lease'})
+                    self.assertTrue(self.guard._state['poisoned'])
+                    self.assertIsNotNone(self.guard._state['first_failure'])
+                    self.assertFalse(self.guard.close_status()['close_safe'])
+                    with self.assertRaisesRegex(RuntimeError, 'protection unavailable'):
+                        self.guard.finish({'method': 'close'}, refuse=False)
+
+    def test_unconfirmed_flags_never_request_default_close(self):
+        import tempfile
+        import time
+        directory = Path(__file__).resolve().parents[1] / 'nexus_bridge'
+        with patch.object(sys, 'path', [str(directory), *sys.path]):
+            import open_recovery
+            from bridge import guarded_source
+        for branch in ('set', 'readback', 'read-error'):
+            with self.subTest(branch=branch), tempfile.TemporaryDirectory() as temp:
+                self.guard._state = None
+                self.guard._failed_state = None
+                self.present = False
+                target = Path(temp)/'input.i64'
+                target.write_bytes(b'original packed')
+                calls, retained = [], []
+                guard = self.guard
+                class Handle:
+                    instance = types.SimpleNamespace(record_id='shared-owner', idb_path=str(target))
+                    def execute_python(self, source, **kwargs):
+                        namespace = {}
+                        exec(source, namespace)
+                        return {'result': namespace.get('result')}
+                    def close_outcome(self, **kwargs):
+                        calls.append('default-save-close')
+                        return {'lease_released': True}
+                handle = Handle()
+                loader = sys.modules['ida_loader']
+                def set_flag(flag):
+                    if branch == 'set':
+                        raise OSError('cannot set flag')
+                def read_flag(flag):
+                    if branch == 'read-error':
+                        raise OSError('cannot query flag')
+                    return False
+                api = types.SimpleNamespace(probe_database_state=lambda *a, **kw: {
+                    'idb_path': str(target), 'state': 'packed'}, wait_database_released=lambda *a, **kw: False)
+                with patch.dict(sys.modules, {'ida_nexus': api, '_ida_cli_save_guard_v1': guard}), \
+                        patch.dict(__import__('os').environ, {'IDA_CLI_HOME': str(Path(temp)/'home')}), \
+                        patch.object(loader, 'set_database_flag', set_flag), \
+                        patch.object(loader, 'is_database_flag', read_flag):
+                    with self.assertRaises(RuntimeError):
+                        open_recovery.open_checked(types.SimpleNamespace(open=lambda *a, **kw: handle),
+                            lambda **kw: kw, str(target), {}, time.monotonic()+2,
+                            guarded_source, {'method': 'open'}, acquired=lambda h, _: retained.append(h))
+                self.assertEqual(calls, [], 'unconfirmed flags must never reach save=True close')
+                self.assertEqual(retained, [handle], 'keep the exact lease cleanup responsibility')
+                self.assertEqual(target.read_bytes(), b'original packed')
+
+    def test_bridge_teardown_never_defaults_to_save_after_guard_failure(self):
+        import threading
+        directory = Path(__file__).resolve().parents[1] / 'nexus_bridge'
+        with patch.object(sys, 'path', [str(directory), *sys.path]):
+            import bridge
+        from unittest.mock import Mock
+        for connected in (True, False):
+            with self.subTest(connected=connected):
+                handle = Mock(connected=connected)
+                handle.execute_python.side_effect = RuntimeError('protection unavailable')
+                owner = bridge.Bridge.__new__(bridge.Bridge)
+                owner.stopped, owner.proof_wakeup = threading.Event(), threading.Event()
+                owner.lock = threading.Lock()
+                owner.handles = {'lease': ({'lease_id': 'lease'}, handle)}
+                owner.verification_probes, owner.cleanup_handles = {}, {}
+                owner.executing, owner.metadata_contexts = {}, {}
+                owner.lifetime_socket = Mock()
+                owner.lifetime_path = '/nonexistent/f7-lifetime'
+                owner.drop_lifetime = Mock()
+                owner.business, owner.control = Mock(), Mock()
+                owner.business_pool, owner.cancel_pool = Mock(), Mock()
+                owner.release_pool, owner.proof_pool = Mock(), Mock()
+                owner.close()
+                handle.close.assert_not_called()
+                handle.close_outcome.assert_not_called()
+                self.assertIs(owner.handles['lease'][1], handle)
+
     def test_unverifiable_root_refuses_open_and_explicit_save(self):
         def unavailable(_):
             raise RuntimeError('Root Node probe unavailable')

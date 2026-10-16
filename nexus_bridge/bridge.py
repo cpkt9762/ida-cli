@@ -23,7 +23,7 @@ from query_tools import QUERY_METHODS
 from search_tools import SEARCH_METHODS
 from lifecycle import database_diagnostics, release_handle
 from metadata import idb_context
-from open_recovery import open_checked
+from open_recovery import open_checked, require_safe_close
 
 GUARD_SOURCE = Path(__file__).with_name('save_guard.py').read_text(encoding='utf-8')
 
@@ -168,6 +168,7 @@ class Bridge:
         self.metadata_contexts = {}
         self.identity = uuid.uuid4().hex
         self.verification_probes = {}
+        self.cleanup_handles = {}
         self.grants = {}
         self.generations = {}
         self.unknown = {}
@@ -450,6 +451,7 @@ class Bridge:
                         operation_id=command['identity'].get('operation_id'), record_id=instance.record_id)),
                         timeout=max(0.001, deadline - time.monotonic()))
             except Exception as exc:
+                require_safe_close(handle, deadline)
                 outcome = handle.close_outcome(wait_for_database=True,
                     timeout=max(0, deadline - time.monotonic()))
                 if outcome["status"] not in ("lease_released", "owner_released"):
@@ -555,13 +557,24 @@ class Bridge:
                 instances = [item.instance for item in discover_databases()
                              if item.instance.record_id == lease["instance_id"]]
                 if instances:
-                    cleanup_handle = self.Handle.attach(instances[0])
-                    try:
-                        checked = cleanup_handle.execute_python(cleanup_code,
-                            timeout=max(0.001, deadline - time.monotonic()))
-                        guard_error = checked['result']['save_guard_error']
-                    finally:
-                        cleanup_handle.close(wait_for_database=False)
+                    with self.lock:
+                        cleanup_handle = self.cleanup_handles.get(lease['lease_id'])
+                    if cleanup_handle is None:
+                        cleanup_handle = self.Handle.attach(instances[0])
+                    # Keep the exact auxiliary lease if its guard cannot arm.
+                    with self.lock:
+                        self.cleanup_handles[lease['lease_id']] = cleanup_handle
+                    checked = cleanup_handle.execute_python(cleanup_code,
+                        timeout=max(0.001, deadline - time.monotonic()))
+                    guard_error = checked['result']['save_guard_error']
+                    cleanup_handle.close(wait_for_database=False)
+                    with self.lock:
+                        self.cleanup_handles.pop(lease['lease_id'], None)
+                else:
+                    from ida_nexus import wait_database_released
+                    if not wait_database_released(handle.instance,
+                            timeout=max(0, deadline - time.monotonic())):
+                        raise RuntimeError('save protection unavailable; exact lease retained; no default close')
             def publish(name, outcome):
                 channel.send({"event": name, "attempt": attempt, "outcome": outcome,
                               "error": error("cancel_pending", "lease release unconfirmed; owner retained")})
@@ -660,6 +673,7 @@ class Bridge:
         with self.lock:
             handles = list(self.handles.values())
             verifications = list(self.verification_probes.items())
+            auxiliary = list(self.cleanup_handles.items())
             operations = list(self.executing.items())
         self.lifetime_socket.close()
         # R-sock: unlink only our own socket, never a replacement at that path.
@@ -675,12 +689,23 @@ class Bridge:
                 record["handle"].cancel_operation_outcome(record.get("native_id", operation_id))
             except Exception as exc:
                 print(f"cancel during cleanup failed: {type(exc).__name__}", file=sys.stderr)
+        for key, handle in auxiliary:
+            try:
+                handle.execute_python(guarded_source('pass', {'method': 'auxiliary-close'},
+                    refuse=False), timeout=5)
+                handle.close(wait_for_database=True, timeout=5)
+                with self.lock:
+                    self.cleanup_handles.pop(key, None)
+            except Exception as exc:
+                print(f'auxiliary lease retained; no default close: {type(exc).__name__}: {exc}', file=sys.stderr)
         for _lease, handle in handles:
             try:
                 if handle.connected:
                     handle.execute_python(guarded_source('pass',
                         dict(self.metadata_contexts.get(_lease['lease_id'], {}),
                              method='bridge-close', lease=_lease), refuse=False), timeout=5)
+                else:
+                    require_safe_close(handle, time.monotonic() + 5)
                 handle.close(wait_for_database=True, timeout=5)
             except Exception as exc:
                 print(f"lease cleanup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
