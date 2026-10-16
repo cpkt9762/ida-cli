@@ -226,7 +226,32 @@ async fn early_open_disconnect(scenario: &str) {
     if scenario == "open-pre-disconnected" {
         r.marker("open-failed.arrived").await;
         r.release_marker("open-failed.release");
-        r.event("failed").await;
+        let failure = r.event("uncertain").await;
+        assert!(
+            failure["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no default close"),
+            "{failure}"
+        );
+        r.bridge.status("guard-failure-retained").await.unwrap();
+        let status = r.event("local_status").await;
+        let held = status["held"].as_array().unwrap();
+        assert_eq!(held.len(), 2, "both exact leases remain tracked: {status}");
+        assert_eq!(
+            held.iter()
+                .filter(|item| item["connected"] == false)
+                .count(),
+            1,
+            "{status}"
+        );
+        assert!(held
+            .iter()
+            .all(|item| item["lease"]["instance_id"] == healthy.instance_id.as_str()));
+        assert!(
+            !r.root.join("default-release-requested").exists(),
+            "unconfirmed guard must not request save=True release"
+        );
     } else {
         r.marker("opened.arrived").await;
         r.release_marker("opened.release");
