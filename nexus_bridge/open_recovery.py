@@ -248,7 +248,12 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                     'import ida_kernwin\nresult = ida_kernwin.get_kernel_version()',
                     attempt_context), timeout=remaining(deadline))
             except Exception as exc:
-                proof = failure_state(handle, deadline)
+                try:
+                    proof = failure_state(handle, deadline)
+                except Exception as diagnostic:
+                    # An already disconnected client cannot run the read-only
+                    # guard query. It is never permission to reopen the owner.
+                    proof = {'initial': False, 'evidence_error': type(diagnostic).__name__}
                 if proof['initial']:
                     logging.getLogger('ida_cli.open').warning('Root Node initial-open failure: %s',
                         json.dumps(dict(attempt=number, maximum=3, record_id=handle.instance.record_id,
@@ -260,9 +265,13 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                     except Exception as error:
                         observation_error = error
                 outcome = handle.close_outcome(wait_for_database=True, timeout=remaining(deadline))
-                lifetime = wait_database_released(handle.instance, timeout=remaining(deadline))
-                if not outcome.get('lease_released') or not lifetime:
-                    raise RuntimeError('open cleanup release unconfirmed; snapshot/scene retained') from exc
+                if proof['initial']:
+                    lifetime = wait_database_released(handle.instance, timeout=remaining(deadline))
+                    if not outcome.get('lease_released') or not lifetime:
+                        raise RuntimeError('open cleanup release unconfirmed; snapshot/scene retained') from exc
+                elif not outcome.get('lease_released'):
+                    if not wait_database_released(handle.instance, timeout=remaining(deadline)):
+                        raise RuntimeError('open runtime check cleanup unconfirmed; lease retained') from exc
                 released(handle)
                 if observation_error:
                     raise observation_error from exc

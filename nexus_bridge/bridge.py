@@ -415,6 +415,7 @@ class Bridge:
                     self.metadata_contexts[lease["lease_id"]] = dict(context, record_id=instance.record_id)
                     lease_box[:] = [lease]
                 context.update(lease=lease, operation_id=command['identity'].get('operation_id'))
+                handle.set_disconnect_callback(lambda _handle, reason: self.disconnected(lease, reason, attempt))
 
             def release_open(_handle):
                 public_started[0] = False
@@ -442,7 +443,6 @@ class Bridge:
                         "import ida_kernwin\nresult = ida_kernwin.get_kernel_version()",
                         dict(metadata_context, method='open', lease=lease_box[0])),
                         timeout=max(0.001, deadline-time.monotonic()))
-                handle.set_disconnect_callback(lambda _handle, reason: self.disconnected(lease, reason, attempt))
                 if wait_analysis:
                     handle.wait_autoanalysis(timeout=max(0.001, deadline - time.monotonic()))
                     handle.execute_python(guarded_source('pass', dict(metadata_context,

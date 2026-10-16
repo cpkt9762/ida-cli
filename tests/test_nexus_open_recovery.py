@@ -26,6 +26,7 @@ class OpenTests(unittest.TestCase):
         self.calls, self.handles, self.released = [], [], []
         self.losses, self.initial, self.lifetime, self.lease = 0, True, True, True
         self.recovering, self.tamper = False, lambda: None
+        self.wait_calls, self.unreadable = 0, False
         self.mocks = [patch.dict(os.environ, {'IDA_CLI_HOME': str(self.root/'home')}),
             patch.object(recovery, 'public_owner_probe', return_value=None),
             patch.dict(sys.modules, {'ida_nexus': types.SimpleNamespace(
@@ -38,6 +39,7 @@ class OpenTests(unittest.TestCase):
         self.Handle = types.SimpleNamespace(open=self.open)
 
     def wait(self, *_args, **_kwargs):
+        self.wait_calls += 1
         self.tamper()
         return self.lifetime
 
@@ -58,6 +60,8 @@ class OpenTests(unittest.TestCase):
                     if number <= parent.losses:
                         raise RuntimeError('injected guard failure')
                     return {'result': '9.5'}
+                if parent.unreadable:
+                    raise RuntimeError('disconnected guard query')
                 return {'result': {'initial': parent.initial, 'evidence': {'open_attempt': number}}}
 
             def close_outcome(self, **_options):
@@ -96,10 +100,18 @@ class OpenTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), b'original packed')
 
     def test_noninitial_loss_never_retries(self):
-        self.losses, self.initial = 1, False
+        self.losses, self.initial, self.lifetime = 1, False, False
         with self.assertRaisesRegex(RuntimeError, 'no initial Root retry'):
             self.run_open()
         self.assertEqual(len(self.handles), 1)
+        self.assertEqual(self.wait_calls, 0, 'ordinary failure must not wait on a sibling owner')
+
+    def test_disconnected_guard_query_never_retries_or_waits_on_sibling(self):
+        self.losses, self.unreadable, self.lifetime = 1, True, False
+        with self.assertRaisesRegex(RuntimeError, 'no initial Root retry'):
+            self.run_open()
+        self.assertEqual(self.calls, ['open', 'guard', 'close'])
+        self.assertEqual(self.wait_calls, 0)
 
     def test_normal_does_not_snapshot_or_reopen(self):
         with patch.object(recovery, 'Snapshot', side_effect=AssertionError('unexpected snapshot')):
