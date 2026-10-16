@@ -1,6 +1,7 @@
 """Deterministic cache maintenance safety, with public probes injected only here."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -87,6 +88,7 @@ class CacheTests(unittest.TestCase):
         for state in ('in_use', 'unpacked', 'crashed', 'unknown'):
             api = types.SimpleNamespace(find_database_owner=lambda *a, **k: None,
                 discover_databases=lambda **k: [],
+                get_state_dir=lambda: Path(os.environ['IDA_NEXUS_STATE_DIR']).expanduser(),
                 probe_database_state=lambda p: {'state':state, 'unpacked_files':[], 'error':None})
             with patch.dict(sys.modules, {'ida_nexus':api}):
                 self.assertTrue(cache.public_probe(self.group/'input.i64'), state)
