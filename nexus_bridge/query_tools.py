@@ -30,9 +30,10 @@ def invoke_query(method, params, resolve, parse_address, invoke):
     if method == "load_debug_info":
         from pathlib import Path
         import ida_kernwin
+        import ida_loader
         path = params.get("path")
         if path is None:
-            base = Path(params["_database_path"])
+            base = Path(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))
             if base.suffix.lower() in ('.i64','.idb'):
                 base = base.with_suffix('')
             candidate = Path(str(base)+'.dSYM')/'Contents/Resources/DWARF'/base.name

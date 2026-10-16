@@ -59,5 +59,57 @@ class FieldOrder(unittest.TestCase):
         self.assertFalse(self.equal())
 
 
+class AllocatedMember(unittest.TestCase):
+    def setUp(self):
+        self.entity = dict(struct_name="Pair", struct_ordinal=41, member_index=0,
+                           member_name="left", member_type="int", member_offset_bits=0,
+                           member_size_bits=32)
+        self.left = {"result": dict(self.entity, tid="0xff00000000000116", xrefs=[], truncated=False)}
+        self.right = copy.deepcopy(self.left)
+        self.right["result"]["tid"] = "0xff00000000000117"
+        self.witnesses = [dict(repeat_tid=r["result"]["tid"], lookup_tid=r["result"]["tid"],
+                               member_ids=[r["result"]["tid"]], entity=copy.deepcopy(self.entity))
+                          for r in (self.left, self.right)]
+
+    def equal(self):
+        return compare.allocated_member_equal(self.left, self.right, "get_xrefs_to_struct_field", self.witnesses)
+
+    def test_allocated_ids_require_complete_runtime_witnesses(self):
+        self.assertFalse(compare.json_equal(self.left, self.right, "get_xrefs_to_struct_field"))
+        self.assertTrue(self.equal())
+        self.assertFalse(compare.allocated_member_equal(self.left, self.right, "other", self.witnesses))
+        self.assertFalse(compare.allocated_member_equal(self.left, self.right, "get_xrefs_to_struct_field", []))
+
+    def test_invalid_duplicate_unstable_or_unusable_ids_fail(self):
+        for field, value in (("repeat_tid", "0x9"), ("lookup_tid", "0x9"),
+                             ("member_ids", []), ("member_ids", ["0x0"]),
+                             ("member_ids", ["0xff00000000000117"] * 2),
+                             ("member_ids", ["0xffffffffffffffff"]),
+                             ("member_ids", [True]), ("member_ids", ["bogus"])):
+            with self.subTest(field=field, value=value):
+                witnesses = copy.deepcopy(self.witnesses)
+                witnesses[1][field] = value
+                self.assertFalse(compare.allocated_member_equal(self.left, self.right, "get_xrefs_to_struct_field", witnesses))
+        for tid in ("0x0", "0xffffffffffffffff", "0x10000000000000000", "bad-id", 10):
+            right = copy.deepcopy(self.right)
+            right["result"]["tid"] = tid
+            self.assertFalse(compare.allocated_member_equal(self.left, right, "get_xrefs_to_struct_field", self.witnesses))
+
+    def test_entity_types_semantic_values_and_unregistered_fields_stay_strict(self):
+        for field, value in (("member_size_bits", 64), ("member_offset_bits", 1),
+                             ("member_index", False), ("member_name", "other"),
+                             ("member_type", "long"), ("struct_name", "Other"),
+                             ("xrefs", [{"address": "0x123"}]), ("extra_tid", "0x9")):
+            with self.subTest(field=field):
+                right = copy.deepcopy(self.right)
+                right["result"][field] = value
+                witnesses = copy.deepcopy(self.witnesses)
+                if field in self.entity:
+                    witnesses[1]["entity"][field] = value
+                self.assertFalse(compare.allocated_member_equal(self.left, right, "get_xrefs_to_struct_field", witnesses))
+        self.witnesses[1]["entity"]["member_name"] = "wrong-lookup"
+        self.assertFalse(self.equal())
+
+
 if __name__ == "__main__":
     unittest.main()

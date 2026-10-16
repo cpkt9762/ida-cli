@@ -488,18 +488,18 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N6：修改数据库与高级分析能力
 
-- 2026-10-16 阻塞预检：输入 `9d71e70fa7e3903f702a158c2aa9229b4367e909` clean，固定 N0 二进制 SHA256 匹配。真实 IDA 同一测试库连续 8 次 `build_callgraph` 的 `nodes` 数组有两种顺序；现有严格比较器有 2 次与首个响应不等，按地址对应的完整节点及 `edges` 均相同。旧实现用 `HashMap::values()` 输出节点，当前 E04 已接受规则只允许规范化已核验的输入路径；新增节点顺序例外需要编排者裁定，未改比较器、旧路径或输出，也未开始 N6 生产接线。
-- 2026-10-16 续派已批准通用规则：仅对有固定 N0 同库同输入多次运行实证顺序不确定的字段，按两边唯一身份键配对；数量、每个元素的所有字段和值类型继续严格比较。每个字段单独登记，其他数组保持原序，不能重试挑选排列。
-- 比较例外清单当前仅一项：方法 `build_callgraph`，字段路径 `result.nodes`，唯一身份键 `address`；同库 8 次原始证据 `n6/dev/preflight-result.json`，独立核验 `n6/preflight-verification.json`。比较器 `scripts/compare_nexus_baseline.py::UNORDERED_FIELDS` 已登记，六项单测覆盖换序相等、内容/类型/重复键/数量不同不等、未登记字段和 edges 严格原序。Nexus nodes 按数值地址稳定排序，edges 保留旧遍历顺序。
-- 续派输入 `5e9931ec9ba5f9871d40549df4f6237b6226ebcd`。已编写 70 个普通 Execute 方法的接线及独立 owner 模块；写方法声明 MayWrite，`batch_rename` 每片一项并沿用 N5 stamp、期限与取消。真实高级/写入对照 `n6/impl3/type-comparison.json` 执行 60 项，59 PASS、1 FAIL，覆盖 50 个不同方法；这不是全部方法验收。
-- 新阻塞是 `get_xrefs_to_struct_field.result.tid` 的值差异：N0 为 `0xff00000000000116`，Nexus 为 `0xff00000000000117`，其他字段严格一致。独立诊断的两个公开 netnode 快照显示 Nexus 打开原始样本后多出 `$ debugger application` 节点，后续共有类型/成员节点整体偏移 1；原始样本 SHA256 相同。证据 `n6/tid/type-comparison.json`、`n6/tid-diagnosis.json`，两轮独立环境复现相同成员 tid 差异。旧打开包装调用 `init_database`，Nexus/IDA Domain 调用公开 `idapro.open_database`；没有修改服务端、删除节点或伪造 tid。
-- 该差异不是数组顺序，未扩大已批准例外。若要按逻辑类型/成员身份比较运行时分配的 tid，需要编排者另行裁定严格规则；也可提出能消除差异的公开 API 方案。当前按委托的语义变更停止要求交付，N6 仍 BLOCKED。此项不是永久放弃工具的决定。
-- [N6 完整能力盘点及当前对照](nexus-n6-capabilities.md) 覆盖全部 106 个注册工具（含 23 个 `dbg_*`）、73 个 native 方法及 34 个 idat 方法。区分本轮方法对照、历史通过、已接线待验和 N7；没有把未验能力标成永久不支持。E20、全部方法无 fallback 验证、三个真实回归套件及完整 N6 E2E 尚未完成，详细门禁、失败和清理记录见外部 `n6/report.md`。
-- 迁移重命名、注释、字节 patch、类型声明/应用、结构体/枚举/栈变量及现有高级分析方法。
-- 从当前 `capabilities.rs` 和工具注册表生成能力对照，逐项记录通过、明确不支持和原因，不能漏项后宣称全量完成。
-- 核对反编译扩展字段；若最终选定基线包含 `line_addresses` 等新增能力，同样列入契约。
-- 验证保存、关闭、重开后修改保留；失败和取消返回已发生副作用的事实，不宣称自动回滚。
-- 验收：写入、类型和高级输出 E2E 通过，没有同 IDB 的隐式 native fallback。
+- 2026-10-16 实现与本轮限定用例验证完成，是否验收、进入 N7 由编排者决定。恢复输入 `7d52bcf23cce02ae80598dd1872509710b5da310`，独立 worktree/分支及固定 N0 SHA256 已核验；原始报告备份和全部失败证据保留。最终命令、退出码、前后 uptime 与审计见外部 `/tmp/ida-nexus-run-20261015.98rmfb/n6/report.md`、`resume-commands.jsonl`、`progress.md`。
+- 70 个普通 worker 方法通过 capability -> N1 Execute -> owner 中的公开 IDAPython 接线；写操作声明 MayWrite，`batch_rename` 每片一项，沿用 N5 期限、取消和 IDB_Hooks stamp。自己的写入刷新 stamp；失败/取消保留已发生副作用，不回滚、不重放。已执行片后取消 Queued 续片明确提示 effects may remain。`decompile_structured`、`search_structs` 和全部23个 `dbg_*` 的既有脚本适配经同一 Nexus run_script 执行。
+- [完整能力对照](nexus-n6-capabilities.md) 由当前注册表和能力声明生成并做集合相等断言：106 工具、全部62个 aliases、native73/idat34 无遗漏；103 工具已迁移并完成表中限定用例对照，3个 DSC 工具属 N7；永久明确不支持0，“永久弃用、N9后失效”的需用户裁定清单为空。23个调试工具仅验证真实 IDA 空闲调试器、断点与失败契约，未验证活动 debuggee 成功启动/attach/单步/寄存器与内存操作，不能视为完整动态调试 E2E。
+- `n6/r13-n6` 的 N6 套件4/4 PASS：E04-N6 73/73（56个方法）、x86汇编成功及读回2/2、101工具及所有aliases共163/163，E20与E20-cancel通过。完整字段与类型严格比较，包括写后读回、ctree include_types/include_addresses 和 get_pseudocode_at 扩展；固定 N0 decompile_function 只有code，无line_addresses。ARM64 NOP基线本身失败的错误文本仍对照，另以x86验证成功patch为90。
+- E20 对重命名、普通/函数注释、patch、类型声明与应用、结构体、枚举、栈变量执行显式保存/关闭/重开，before_close与after_reopen严格相等。枚举值1/7、typedef unsigned int及size4、结构体成员类型/偏移/大小、栈变量名称/类型均读回；部分batch失败与脚本写后抛错的副作用保留。取消场景断言首片保留、第二片未执行、execution_stopped及hook/jobs释放。注释用官方get_func_cmt_ea读取，保留stderr为空断言。
+- 无fallback证据：Rust全106工具/aliases和native73/idat34逐项检查；真实N7三个工具及unknown方法在能力检查拒绝，status仅nexus:1且pending为0。同一IDB没有新旧owner共持；对照双方使用不同路径的副本。旧后端不删除，N7专用流程不实施，开发入口IDA_CLI_NEXUS_DEV留N9必删，旧GC继续暂停。
+- 当前生产代码的真实回归 `n6/r6-life` lifecycle9/9、`n6/r6-contract` contract4/4（E04/E16/E17/E22）、`n6/r6-conc` concurrency14/14均PASS，之后只增强N6测试fixture/断言和文档，没有修改生产代码。env-i的12+13门禁全exit0，lib连续3轮各487PASS/2个既有ignored；N0 support37、bridge pytest30、fix系列5、比较器9均PASS；两probe红2/绿0。全部环境、监督进程与自有socket最终审计见final-audit.json。
+- 批准比较规则一：仅在固定N0同库同输入多次实证顺序不确定后，登记具体字段及唯一身份键。当前仅 `build_callgraph.result.nodes` / `address`，8次两种顺序证据 `n6/dev/preflight-result.json`、`n6/preflight-verification.json`。数量、节点全部值/类型、edges与其他数组保持严格，重复键不等；Nexus按数值地址稳定输出。比较器UNORDERED_FIELDS只登记该字段。
+- 批准比较规则二：仅 `get_xrefs_to_struct_field.result.tid` 为公开SDK分配的成员ID；旧Nexus建库多一次 `$ debugger application` 节点导致偏移，证据 `n6/tid-diagnosis.json`。优先第一步：公开auto_wait完成seed分析、校验元数据、显式save/close后复制同一IDB，三份SHA相等（r13-n6中的n6/n6-tools/n6-x86-prebuilt-idb.json）。r6及r13数值严格相等；r7同份副本仍出现会话内分配偏移，已按批准第二步验证合法非BADADDR、成员ID唯一、重复查询稳定、可作为公开get_udm_by_tid输入、实体名称/类型/成员关系/偏移/大小全部严格一致。实际例外和完整witness逐项落盘，不能全局忽略tid；9项单测含正反例。地址、偏移、大小与端口始终严格。
+- 工具矩阵用公开inf_set_auto_enabled/enable_auto/auto_wait设置两边相同已完成分析状态；dbg attach的真实错误含端口，测试在同一OS选择端口顺序启动两边，不规范化端口。MCP少数写工具保留旧版重复IDA error前缀，raw结构不变。
+- 历史60项59PASS/1tid失败由第二次续派的身份规则解除；中断运行不计PASS。r3弃用注释API警告/旧N4拒绝rename断言和r5错误前缀/分析状态/端口差异均保留失败并修正。r7新E20断言误用固定宽度is_uint32，改官方is_uint/is_unsigned及size4。r8/r9见到输入元数据为空，r10–r12对同失败seed的受控诊断未复现，不能据后续PASS宣称已确定其根因；最终fixture增加分析完成后保存及重开/setup后完整元数据断言，r13严格通过，未增加字段例外或自动重试。该未定位的历史异常列入报告限制供复核。
+- 验收语句对应证据：写入、类型和高级输出的上述E2E通过，保存重开保留；同一IDB上没有隐式native fallback。N5已接受的非事务快照、未订阅通知、受信任脚本以及不可抢占native调用边界不扩大。
 
 ### N7：GUI、缓存和专用输入
 

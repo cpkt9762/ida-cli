@@ -307,6 +307,51 @@ def normalized(response, sample):
     return value
 
 
+def allocated_member_equal(left, right, method, witnesses):
+    """N6 approved allocation-ID exception, requiring runtime identity evidence.
+
+    This applies only to the public SDK's allocated UDT member TID. Witnesses
+    contain repeated lookups and a subsequent get_udm_by_tid call, not trusted
+    success flags. All other output fields still use the strict comparator.
+    """
+    if method != "get_xrefs_to_struct_field" or type(witnesses) is not list or len(witnesses) != 2:
+        return False
+    identities = []
+    for response, witness in zip((left, right), witnesses):
+        if type(response) is not dict or type(witness) is not dict:
+            return False
+        result = response.get("result")
+        if type(result) is not dict or type(result.get("tid")) is not str:
+            return False
+        tid = result["tid"]
+        try:
+            valid = 0 < int(tid, 16) < 2**64 - 1
+        except ValueError:
+            return False
+        ids = witness.get("member_ids")
+        if not valid or type(ids) is not list or not ids or any(type(i) is not str for i in ids):
+            return False
+        try:
+            numbers = [int(i, 16) for i in ids]
+        except ValueError:
+            return False
+        if any(not 0 < i < 2**64 - 1 for i in numbers) or len(set(numbers)) != len(numbers):
+            return False
+        if tid not in ids or witness.get("repeat_tid") != tid or witness.get("lookup_tid") != tid:
+            return False
+        fields = ("struct_name", "struct_ordinal", "member_index", "member_name",
+                  "member_type", "member_offset_bits", "member_size_bits")
+        if any(field not in result for field in fields):
+            return False
+        identity = {field: result[field] for field in fields}
+        if not json_equal(witness.get("entity"), identity):
+            return False
+        identities.append(identity)
+    a, b = json.loads(json.dumps(left)), json.loads(json.dumps(right))
+    a["result"]["tid"] = b["result"]["tid"] = "<verified-allocated-member>"
+    return json_equal(identities[0], identities[1]) and json_equal(a, b, method)
+
+
 def comparison(env, baseline, binary):
     sample = env.root/"fixtures/e04-old"
     shutil.copyfile(env.root/"fixtures/mini", sample)
@@ -400,8 +445,8 @@ def entrypoints(env, binary):
                 actual=stdio.call(method,params)
                 assert json_equal(normalized(actual,std_sample), normalized(baseline,sample), method),(method,baseline,actual)
             for candidate in (http,stdio):
-                refusal=candidate.call("rename_symbol",{"address":functions[0]["address"],"new_name":"FORBIDDEN"})
-                assert "not implemented by Nexus N4" in refusal["error"],refusal
+                refusal=candidate.call("open_dsc",{})
+                assert "not implemented by Nexus; no legacy fallback" in refusal["error"],refusal
         finally:
             stdio.stop()
     finally:

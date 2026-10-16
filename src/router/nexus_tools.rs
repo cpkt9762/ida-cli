@@ -230,7 +230,8 @@ impl Tools {
     pub fn require_tool(method: &str) -> Result<(), ToolError> {
         // These existing MCP adapters generate Python and route run_script.
         // Database execution still passes the same Execute capability check.
-        if matches!(method, "decompile_structured" | "search_structs") || method.starts_with("dbg_")
+        if matches!(method, "decompile_structured" | "search_structs")
+            || (method.starts_with("dbg_") && crate::tool_registry::get_tool(method).is_some())
         {
             Self::require("run_script")
         } else if matches!(
@@ -1157,6 +1158,60 @@ impl Drop for ReferenceGuard {
 #[cfg(test)]
 mod n4_fix_regressions {
     use super::*;
+    #[test]
+    fn n6_every_registered_tool_and_old_capability_has_an_explicit_path() {
+        use crate::ida::{capabilities::supported_methods_for, runtime::WorkerBackendKind};
+        let local = [
+            "open_idb",
+            "close_idb",
+            "tool_catalog",
+            "tool_help",
+            "get_task_status",
+            "convert_number",
+        ];
+        let n7 = ["open_dsc", "dsc_add_dylib", "dsc_add_region"];
+        let mut count = 0;
+        for tool in crate::tool_registry::all_tools() {
+            count += 1;
+            for name in std::iter::once(tool.name).chain(tool.aliases.iter().copied()) {
+                let primary = crate::tool_registry::primary_name_for(name);
+                assert_eq!(primary, tool.name, "alias {name}");
+                if local.contains(&primary) {
+                    continue;
+                }
+                let result = Tools::require_tool(primary);
+                if n7.contains(&primary) {
+                    let error = result.expect_err("N7 must reject before execution");
+                    assert!(
+                        error.to_string().contains("no legacy fallback"),
+                        "{name}: {error}"
+                    );
+                } else {
+                    result.unwrap_or_else(|e| panic!("{name} missing Nexus path: {e}"));
+                }
+            }
+        }
+        assert_eq!(count, 106);
+        for backend in [
+            WorkerBackendKind::NativeLinked,
+            WorkerBackendKind::IdatCompat,
+        ] {
+            for method in supported_methods_for(backend) {
+                if !["open", "close", "shutdown"].contains(method) {
+                    Tools::require(method).unwrap_or_else(|e| panic!("{backend:?}/{method}: {e}"));
+                }
+            }
+        }
+        for method in [
+            "unknown_n6",
+            "dbg_unknown_n6",
+            "open_dsc",
+            "dsc_add_dylib",
+            "dsc_add_region",
+        ] {
+            assert!(Tools::require_tool(method).is_err(), "must reject {method}");
+        }
+    }
     #[tokio::test]
     async fn n4_fix_accepted_request_keeps_background_task_identity() {
         let task = TaskId::new("queued-task-42").unwrap();

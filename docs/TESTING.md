@@ -1,18 +1,54 @@
 # Testing
 
-N6 续派已实现部分迁移，尚未验收，见 [完整能力盘点](plan/nexus-n6-capabilities.md)
-和计划 N6 小节。严格比较器只为已有 N0 同库多次运行证据的
-`build_callgraph.result.nodes` 登记唯一 `address` 配对例外；数量、完整节点值与类型、
-其他字段及 edges 仍严格。六项回归为
-`timeout 30s python3 -B -m unittest discover -s tests -p test_nexus_n6_compare.py -v`。
-Nexus nodes 按数值地址稳定排序。证据为外部 `n6/dev/preflight-result.json`。
+N6 的完整工具与能力覆盖见 [能力对照表](plan/nexus-n6-capabilities.md) 和计划 N6 小节。
+真实验证为四个独立套件：lifecycle 9、contract 4、concurrency 14、n6 4；历史结果
+不能代替改动后的验证。正式结果、每条命令的 exit/uptime、失败历史与审计保存在外部
+`/tmp/ida-nexus-run-20261015.98rmfb/n6/report.md`。
 
-当前真实对照 60 项中 59 项通过，结构体成员 `result.tid` 存在运行时节点分配的
-值差异，未按顺序例外处理。原始响应与节点诊断见外部
-`n6/impl3/type-comparison.json`、`n6/tid/type-comparison.json`、`n6/tid-diagnosis.json`。
-此轮脚本 `n6/advanced_compare.py` 和 `n6/tid_diagnostic.py` 是阻塞诊断，exit 1
-表示严格比较失败，不能称为 N6 E2E 通过。E20 和完整真实回归尚未执行；历史
-N4/N5 记录不能替代当前改动后的验证。恢复实现前须处理值差异的比较语义。
+`--suite n6` 必须指定固定 N0 `--baseline`，检查 E04-N6、E20、N6-tools、E20-cancel
+四个实际 PASS 场景。E04-N6 包含 73 项方法/写后读回对照及 x86 汇编成功/读回两项；
+N6-tools 从当前注册表生成工具及所有 aliases 对照，另检查 N7 明确拒绝和 backend_counts。
+E20 对七类写入显式保存、关闭、重开并严格读回，还检查部分 batch、异常脚本及取消的
+已发生副作用。普通/函数注释使用官方读取 API，保留 stderr 为空的断言。
+23 个 dbg_* 覆盖真实 IDA 空闲调试器、断点及错误契约；活动 debuggee 的成功路径未覆盖。
+
+使用新的 prepared root、独立 home/state/profile、样本副本与短 TMPDIR/IPC。
+`--tmp-root` 必须解析到该环境的 tmp；不能复用已有 process ledger 的环境。
+准备允许180秒，真实套件内层180秒；执行前说明外层210秒用于整套验证及精确清理。
+所有其他检查默认30秒，逐次记录前后 uptime、完整 argv 和 exit；exit124不算通过。
+
+```bash
+ln -s "$N0_ROOT/tmp" "$N6_TMP"
+uptime
+timeout 210s "$N0_ROOT/venv/bin/python" scripts/verify_nexus_e2e.py \
+  --root "$N0_ROOT" --target "$CARGO_TARGET_DIR" --sdk "$IDASDKDIR" \
+  --tmp-root "$N6_TMP" --ipc-root "$N6_TMP/i" --suite n6 --baseline "$N0_BASELINE"
+result=$?; uptime; test "$result" -eq 0
+```
+
+`compare_nexus_n6.py` 先通过公开 auto_wait 完成分析、验证输入元数据、显式保存并关闭
+seed IDB，再复制三份 SHA256 相同的文件。工具对照在重开后、等价分析/类型 setup 后
+再次严格检查完整元数据，原始响应先于比较落盘；缺失路径/大小/哈希必须失败。
+不在产品中恢复字段，不通过重复运行挑选通过结果。
+
+比较器只登记两条批准规则：`build_callgraph.result.nodes` 按唯一 `address` 配对，
+证据为 N0 同库8次出现两种顺序的 `n6/dev/preflight-result.json`；
+`get_xrefs_to_struct_field.result.tid` 优先严格比较同一预建 IDB 副本，仍有分配差异时，
+要求合法且结果内唯一、同会话稳定、可输入公开 get_udm_by_tid、完整实体严格一致。
+实际例外使用与 witness 一并落盘。其他值、类型、edges、未登记数组、地址/偏移/大小
+保持严格；Nexus nodes 按数值地址稳定排序。九项单测保留正反例：
+
+```bash
+uptime
+timeout 30s python3 -B -m unittest discover -s tests -p test_nexus_n6_compare.py -v
+result=$?; uptime; test "$result" -eq 0
+```
+
+结束必须 cleanup/assert_clean、登记文件为空和自有 socket 为零，失败/中断环境也要审计。
+不得按进程名清理或操作其他客户端。无隐式 fallback 的全注册表/能力测试为
+`n6_every_registered_tool_and_old_capability_has_an_explicit_path`，标准 lib 门禁覆盖它。
+12项标准门禁、第13项（F1_PYTHON）、lib连续三轮、N0 support、bridge pytest、fix系列
+与两个probe红绿对照继续保留；不能用N6新套件代替回归套件。
 
 ## Run tests
 

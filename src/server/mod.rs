@@ -578,6 +578,21 @@ impl IdaMcpServer {
                     Err(error) => Ok(error.to_tool_result()),
                 }
             }
+            Err(e)
+                if router.uses_nexus()
+                    && (method == "load_debug_info"
+                        || matches!(
+                            method,
+                            "patch_assembly"
+                                | "rename_local_variable"
+                                | "set_local_variable_type"
+                                | "set_decompiler_comment"
+                        ) && matches!(&e, ToolError::IdaError(_))) =>
+            {
+                // The legacy MCP adapter wraps the worker's business error.
+                // Raw RPC keeps its original error text in nexus_tools.
+                Ok(ToolError::IdaError(e.to_string()).to_tool_result())
+            }
             Err(e) => Ok(e.to_tool_result()),
         }
     }

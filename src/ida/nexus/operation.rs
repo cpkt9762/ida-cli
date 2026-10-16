@@ -290,6 +290,11 @@ impl<C: Clock> NexusSessions<C> {
             return self.operation_status(client, identity);
         }
         if status == OperationStatus::Queued {
+            let message = if op.request.params.get("_n5_checkpoint").is_some() {
+                "continuation removed after completed slices; effects may remain"
+            } else {
+                "request removed before dispatch"
+            };
             let (status, code) = if reason == CancelReason::Deadline {
                 (OperationStatus::TimedOut, NexusErrorCode::QueueExpired)
             } else {
@@ -298,7 +303,7 @@ impl<C: Clock> NexusSessions<C> {
             self.terminal(
                 identity,
                 status,
-                Some(NexusError::new(code, "request removed before dispatch")),
+                Some(NexusError::new(code, message)),
                 None,
                 true,
             );

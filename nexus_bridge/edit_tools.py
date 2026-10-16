@@ -44,37 +44,46 @@ def invoke_edit(method, params, resolve, parse_address):
     import ida_ida
     import ida_idp
     import ida_name
+    import ida_idaapi
+    import ida_segment
 
     if method in ("rename_local_variable", "set_local_variable_type", "set_decompiler_comment"):
         ea = parse_address(params["func_address"]) or 0
         if not ida_hexrays.init_hexrays_plugin():
             raise ValueError("Decompiler not available")
+        func = ida_funcs.get_func(ea)
+        cfunc = ida_hexrays.decompile(func, flags=ida_hexrays.DECOMP_NO_WAIT | ida_hexrays.DECOMP_NO_CACHE) if func else None
         if method == "rename_local_variable":
-            ok = ida_hexrays.rename_lvar(ea, params["lvar_name"], params["new_name"])
+            saved = ida_hexrays.lvar_saved_info_t()
+            ok = cfunc is not None and ida_hexrays.locate_lvar(saved.ll, ea, params["lvar_name"])
+            if ok:
+                saved.name = params["new_name"]
+                ok = ida_hexrays.modify_user_lvar_info(ea, ida_hexrays.MLI_NAME, saved)
             value = {"func_address": hex(ea), "lvar_name": params["lvar_name"], "new_name": params["new_name"]}
         elif method == "set_local_variable_type":
             tif, name = parse_type(params["type_str"], True)
-            cfunc = ida_hexrays.decompile(ea)
-            variable = next((v for v in cfunc.get_lvars() if v.name == params["lvar_name"]), None) if cfunc else None
             saved = ida_hexrays.lvar_saved_info_t()
-            ok = name is not None and variable is not None
+            ok = name is not None and cfunc is not None and ida_hexrays.locate_lvar(saved.ll, ea, params["lvar_name"])
             if ok:
-                saved.ll = ida_hexrays.lvar_locator_t(variable.location, variable.defea)
                 saved.type = tif
                 ok = ida_hexrays.modify_user_lvar_info(ea, ida_hexrays.MLI_TYPE, saved)
             value = {"func_address": hex(ea), "lvar_name": params["lvar_name"], "type_str": params["type_str"]}
         else:
-            cfunc = ida_hexrays.decompile(ea)
             ok = cfunc is not None
             itp = params.get("itp")
             itp = 69 if itp is None else itp
             target = parse_address(params["address"]) or 0
             if ok:
-                cfunc.set_user_cmt(ida_hexrays.treeloc_t(target, itp), params["comment"])
+                location = ida_hexrays.treeloc_t()
+                location.ea, location.itp = target, itp
+                cfunc.set_user_cmt(location, params["comment"] or None)
                 cfunc.save_user_cmts()
             value = {"func_address": hex(ea), "address": hex(target), "itp": itp, "comment": params["comment"]}
         if not ok:
-            raise ValueError(f"IDA error: {method} failed at {ea:#x}")
+            action = {"rename_local_variable": "rename local variable", "set_local_variable_type": "set lvar type",
+                      "set_decompiler_comment": "set decompiler comment"}[method]
+            target = target if method == "set_decompiler_comment" else ea
+            raise ValueError(f"IDA error: failed to {action} at {target:#x}")
         return value
     if method == "read_int":
         ea = parse_address(params.get("address"))
@@ -120,9 +129,18 @@ def invoke_edit(method, params, resolve, parse_address):
             raise ValueError(f"IDA error: failed to set name at {ea:#x}")
         return {"address": hex(ea), "name": params["name"], "flags": flags}
     if method == "patch_assembly":
-        assembled = ida_idp.assemble(ea, 0, ea, ida_ida.inf_is_be(), params["line"])
-        if not isinstance(assembled, bytes):
-            raise ValueError(f"IDA error: failed to assemble at {ea:#x}")
+        ida_idp.set_target_assembler(ida_ida.inf_get_asmtype())
+        segment = ida_segment.getseg(ea)
+        cs = segment.sel if segment else ida_idaapi.BADADDR
+        use32 = segment.bitness == 1 if segment else ida_ida.inf_is_32bit_exactly()
+        assembled = None
+        for selector, bits in ((cs, use32), (ida_idaapi.BADADDR, use32),
+                               (cs, not use32), (ida_idaapi.BADADDR, not use32)):
+            assembled = ida_idp.AssembleLine(ea, selector, ea, bits, params["line"])
+            if assembled:
+                break
+        if not isinstance(assembled, bytes) or not assembled:
+            raise ValueError(f"IDA error: failed to assemble line at {ea:#x}")
         raw = assembled
     else:
         raw = bytes(params["bytes"])
