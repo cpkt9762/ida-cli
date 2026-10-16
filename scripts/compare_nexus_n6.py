@@ -141,7 +141,8 @@ print(json.dumps({{"input_file_path":ida_nalt.get_input_file_path(),
         assert metadata["sha256"] == digest(original), metadata
     finally:
         seed.stop()
-    seeds = list((seed.home/"idb").glob("*.i64"))
+    seeds = [*(seed.home/"idb").glob("*.i64"),
+             *(seed.home/"idb").glob("generations/*/input.i64")]
     assert len(seeds) == 1, seeds
     samples = [env.root/f"fixtures/{label}-old.i64", env.root/f"fixtures/{label}-new.i64"]
     for sample in samples:
@@ -321,7 +322,8 @@ print(json.dumps({{"name":ida_name.get_name({int(ea,16)}),
         assert saved["result"]["success"], saved
         evidence["explicit_save"] = saved
         client.stop()
-        idbs = list((client.home/"idb").glob("*.i64"))
+        idbs = [*(client.home/"idb").glob("*.i64"),
+                *(client.home/"idb").glob("generations/*/input.i64")]
         assert len(idbs) == 1
         evidence["saved_idb_sha256"] = digest(idbs[0])
         client = Candidate(env, binary, idbs[0], "n6-e20-reopen", transport="stdio", inline="8000000")
