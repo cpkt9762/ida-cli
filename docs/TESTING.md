@@ -715,3 +715,36 @@ diagnostic switch. Root Node protection never depends on an IDB file hash.
 
 tests/test_nexus_q1q2.py checks diagnostic failure results/warnings, installation
 and business errors, default stat-only opens and opt-in read/hash counts.
+
+### r9 root visibility investigation
+
+The first failed Root check records the complete IDB/ID0 directory listings
+(including locks), actual PATH_TYPE_CMD/IDB/ID0, flags before protection, packing
+preferences and thread identity. Protection is armed before directory IO;
+`flags_before_protection` retains the preceding flag values, while
+`database_at_failure` and later protected-boundary logs describe the protected
+session. Packing flags describe save preferences, not
+proof of the input source. After arming protection, read-only rechecks target
+50ms, 200ms and 1s within the operation deadline; scheduler delays are recorded.
+Later visibility never clears a poisoned owner or authorizes a save.
+
+`tests/support/r9_reopen.py` uses a private prepared root and seed copy for each
+trial: A opens/edits/saves/releases, then a different owner B reopens. `--mode
+immediate` uses public lifetime proof; `--mode wait` additionally waits for the
+previous process and components to disappear. Use batches of 25 under timeout
+180s, at least 100 trials per group. `--raw-first` probes Nexus before installing
+any adapter guard. JSONL retains every trial and failed active ID0 snapshots;
+exit 0 means the experiment completed, not that its root_failures count is zero.
+
+`tests/support/r9_native.py` opens one private copy in a fresh idalib process,
+without Nexus. It compares direct idapro, Domain, metadata getters, empty args
+and Domain preimport; `--result` retains paths/flags/thread/rechecks and failed
+live on-disk component copies. It discards instead of saving. These copies may
+omit unflushed IDA memory and are not claimed to be memory snapshots.
+
+Current directed evidence includes failures after the previous owner exited
+and components disappeared, and a standalone Domain.open failure on a fresh
+copy in the main thread with a complete active ID0. Direct idapro opens without
+Domain or Nexus also fail, including before metadata getters. Waiting for
+components is not an established fix. The precise upstream trigger is unresolved;
+do not close r9 using a later PASS or relax E22-missing's unavailable assertion.

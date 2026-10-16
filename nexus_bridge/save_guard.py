@@ -28,6 +28,64 @@ def _metadata():
     return result
 
 
+def _database_flags():
+    import ida_loader
+    return {name: _optional(lambda: ida_loader.is_database_flag(getattr(ida_loader, name)))
+            for name in ('DBFL_KILL', 'DBFL_COMP', 'DBFL_BAK', 'DBFL_TEMP')}
+
+
+def database_context():
+    """Read-only paths, packing preferences, flags and directory entries."""
+    from pathlib import Path
+    import ida_ida
+    import ida_loader
+    import threading
+    paths = {name: _optional(lambda: ida_loader.get_path(getattr(ida_loader, name)))
+             for name in ('PATH_TYPE_CMD', 'PATH_TYPE_IDB', 'PATH_TYPE_ID0')}
+    directories = {}
+    for path in paths.values():
+        if not isinstance(path, str) or not path:
+            continue
+        parent = str(Path(path).parent)
+        if parent in directories:
+            continue
+        def entries():
+            result = []
+            for item in sorted(Path(parent).iterdir()):
+                def describe():
+                    value = item.lstat()
+                    return {'name': item.name, 'size': value.st_size,
+                            'mtime_ns': value.st_mtime_ns, 'inode': value.st_ino,
+                            'device': value.st_dev, 'mode': value.st_mode}
+                result.append({'name': item.name, 'stat': _optional(describe)})
+            return result
+        directories[parent] = _optional(entries)
+    return {'observed_at': time.monotonic(), 'paths': paths, 'directories': directories,
+            'thread': {'current': threading.get_ident(), 'main': threading.main_thread().ident,
+                       'name': threading.current_thread().name},
+            'database_flags': _database_flags(),
+            # These are save preferences, not proof of which file was loaded.
+            'packing_preferences': {name: _optional(lambda: getattr(ida_ida, name)())
+                for name in ('inf_pack_idb', 'inf_compress_idb', 'inf_get_lflags')}}
+
+
+def _delayed_probes(context):
+    """Observe once after poisoning; later recovery never authorizes saving."""
+    import ida_netnode
+    started = time.monotonic()
+    deadline = min(started + 1.0, (context or {}).get('deadline', started + 1.0))
+    result = []
+    for delay in (0.05, 0.2, 1.0):
+        target = started + delay
+        if target > deadline:
+            break
+        time.sleep(max(0.0, target - time.monotonic()))
+        result.append({'elapsed': time.monotonic() - started,
+                       'root_present': _optional(lambda: bool(ida_netnode.netnode.exist('Root Node'))),
+                       'metadata': _metadata(), 'database': _optional(database_context)})
+    return result
+
+
 def _log(value):
     logger = logging.getLogger('ida_cli.save_guard')
     if not logger.handlers:
@@ -63,7 +121,17 @@ def sample(stage, context=None, refuse=True):
         present, failure = False, type(exc).__name__
     previous = state['last_sample']
     if not present or state['poisoned']:
+        flags_before_protection = _optional(_database_flags)
+        # Arm close protection before directory IO or delayed diagnostics.
         _discard_on_close()
+        database = _optional(database_context)
+        state['last_failure_boundary'] = {'stage': stage, 'sample_time': now,
+            'root_present': present, 'operation': dict(context or state['operation']),
+            'database': database}
+        if state['poisoned']:
+            logging.getLogger('ida_cli.save_guard').error(
+                'Root Node protected boundary: %s',
+                json.dumps(state['last_failure_boundary'], ensure_ascii=True))
         if not state['poisoned']:
             state['poisoned'] = True
             import ida_loader
@@ -80,9 +148,19 @@ def sample(stage, context=None, refuse=True):
                         'actual_idb_path': _optional(lambda: ida_loader.get_path(ida_loader.PATH_TYPE_IDB)),
                         'requested_path': state['context'].get('requested_path'),
                         'record_id': state['context'].get('record_id'),
+                        'flags_before_protection': flags_before_protection,
+                        'database_at_failure': database,
                         'first_transition': previous is not None and previous['root_present']}
             state['first_failure'] = evidence
             _log(evidence)
+            # Emit the immediate snapshot before any bounded delay, so a killed
+            # operation cannot erase the decisive first-failure evidence.
+            delayed = _optional(lambda: _delayed_probes(context))
+            evidence['delayed_probes'] = delayed
+            logging.getLogger('ida_cli.save_guard').error(
+                'Root Node delayed probes: %s', json.dumps({
+                    'record_id': evidence['record_id'], 'sample_time': now,
+                    'probes': delayed}, ensure_ascii=True))
         state['last_sample'] = {'time': now, 'stage': stage, 'root_present': present,
                                 'operation': dict(context or state['operation'])}
         if refuse:

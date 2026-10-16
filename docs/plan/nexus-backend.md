@@ -796,3 +796,12 @@ IDA_CLI_NEXUS_FORENSIC_HASH=1 显式开启，默认 0（未设置同关闭），
 
 R7：标准 lib 不依赖 F1_ROOT/F1_PYTHON；发布协议用例移入第十三项集成 target，显式启用
 `--features nexus-test-support`，保留全部协议与文件系统断言。该 feature 不用于产品构建。
+
+N7a-F5/r9root：r9 根因调查现为 N7b 前的关键路径。首次 Root 失败补充实际 ID0/IDB 路径、
+目录/锁完整 stat、保护设置前的公开标志、打包保存偏好与线程身份，并在期限内只读延迟复查；
+延迟恢复也不解除异常 owner 的保存拒绝。公开 lifetime 释放后立即重开与等待前进程退出且组件
+消失后重开均已捕获故障；全新副本首次打开也可发作，不能将关闭残留作为全部根因。
+不经过 Nexus/adapter 的独立 Domain.open 主线程进程也复现，失败时活动 ID0 的 Root 记录仍在；
+裸 idapro.open_database 同样复现，且有实例在元数据 getter 之前就失败，Domain 也非必要条件。
+具体上游触发点尚未定位，不据此添加 sleep、重试、补造元数据或放宽 E22；取证和复现驱动见
+TESTING.md 的 r9 root visibility investigation，完整结论以本次委托报告为准。
