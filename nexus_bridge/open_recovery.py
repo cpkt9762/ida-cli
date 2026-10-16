@@ -92,9 +92,11 @@ class Snapshot:
         self.path = container/uuid.uuid4().hex
         self.path.mkdir(mode=0o700)
         (self.path/'snapshot').mkdir(mode=0o700)
+        self.parent_identity = stable_stat(target.parent.lstat())[:3]
         self.before = inventory(target.parent, deadline)
         self.data = {'version': 1, 'target': str(target), 'status': 'snapshotting',
-                     'before': self.before, 'files': {}, 'attempts': []}
+                     'before': self.before, 'parent_identity': self.parent_identity,
+                     'files': {}, 'snapshot_files': {}, 'attempts': []}
         self.journal()
         for name, value in self.before.items():
             if name not in self.names:
@@ -102,6 +104,7 @@ class Snapshot:
             if not stat.S_ISREG(value['mode']):
                 raise RuntimeError('non-regular recovery component refused')
             self.copy(target.parent/name, self.path/'snapshot'/name, value, 0o400)
+            self.data['snapshot_files'][name] = identity(self.path/'snapshot'/name, deadline)
             self.data['files'][name] = value
         self.check_owner()
         self.expect(self.before)
@@ -114,10 +117,18 @@ class Snapshot:
     def check_owner(self):
         remaining(self.deadline)
         reason = self.owner_probe(self.target)
+        if not reason:
+            from ida_nexus import probe_database_state
+            state = probe_database_state(self.target)
+            if state['state'] in ('in_use', 'unknown') or state.get('error'):
+                reason = 'external IDA lock or indeterminate database state: ' + state['state']
+        remaining(self.deadline)
         if reason:
             raise RuntimeError('recovery rollback refused: ' + reason + '; snapshot/scene retained')
 
     def expect(self, expected):
+        if stable_stat(self.target.parent.lstat())[:3] != self.parent_identity:
+            raise RuntimeError('recovery parent directory identity changed; scene retained')
         if inventory(self.target.parent, self.deadline) != expected:
             raise RuntimeError('recovery file identity/directory changed; snapshot/scene retained')
 
@@ -186,6 +197,8 @@ class Snapshot:
             sync_directory(self.target.parent)
             sync_directory(isolated)
         for name, value in self.data['files'].items():
+            if identity(self.path/'snapshot'/name, self.deadline) != self.data['snapshot_files'][name]:
+                raise RuntimeError('recovery snapshot content changed or identity replaced; scene retained')
             self.check_owner()
             self.expect(current)
             self.copy(self.path/'snapshot'/name, self.target.parent/name,

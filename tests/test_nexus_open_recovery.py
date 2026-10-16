@@ -185,6 +185,17 @@ class OpenTests(unittest.TestCase):
                 self.run_open()
         self.assertEqual(self.target.read_bytes(), b'bad recovered packed')
 
+    def test_external_ida_component_lock_refuses_restore(self):
+        self.make_crashed()
+        self.losses = 1
+        module = sys.modules['ida_nexus']
+        def lock_ida():
+            module.probe_database_state = lambda *a, **kw: {'state': 'in_use'}
+        self.tamper = lock_ida
+        with self.assertRaisesRegex(RuntimeError, 'external IDA lock'):
+            self.run_open()
+        self.assertEqual(self.target.read_bytes(), b'bad recovered packed')
+
     def test_snapshot_tampering_and_symlinks_refuse_copy(self):
         self.make_crashed()
         snapshot = recovery.Snapshot(self.root/'home/idb', self.target, time.monotonic()+5)
