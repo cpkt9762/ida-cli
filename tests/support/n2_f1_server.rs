@@ -39,7 +39,7 @@ async fn isolated_c1(name: &str, work: impl std::future::Future<Output = ()>) {
 
 async fn c1_open_case(case: &str) {
     use crate::router::n2_f1_regressions::{first_open_fixture, fixture_reference_count};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     let directory = std::env::temp_dir().join(format!("n2-f5-open-{}-{case}", std::process::id()));
     std::fs::create_dir(&directory).unwrap();
     let blocked = match case {
@@ -75,6 +75,10 @@ async fn c1_open_case(case: &str) {
     let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
     config["case"] = case.into();
     config["fail_open"] = fail_open.into();
+    let startup = blocked.map(|_| {
+        config["startup_socket"] = json!(directory.join("startup.sock"));
+        tokio::net::UnixListener::bind(directory.join("startup.sock")).unwrap()
+    });
     if case == "non-object" {
         config["open_result"] = json!(["opened", 7]);
     }
@@ -101,12 +105,7 @@ async fn c1_open_case(case: &str) {
         ServerMode::Router(router.clone()),
     );
     let request = serde_json::from_value(json!({"path":path})).unwrap();
-    let preparation =
-        crate::preprocess::Preparation::new(Duration::from_secs(if case == "deadline" {
-            2
-        } else {
-            10
-        }));
+    let preparation = crate::preprocess::Preparation::new(Duration::from_secs(10));
     let cancel = preparation.cancel.clone();
     let deadline = preparation.deadline;
     let owned = router.clone();
@@ -120,11 +119,35 @@ async fn c1_open_case(case: &str) {
             server.open_idb_routed(&owned, &request).await
         }
     });
+    // Startup/dispatch has its own budget. A held startup event proves that no
+    // business request was sent; cancellation/expiry responsiveness below still
+    // has the original strict two-second bound. The total deadline includes up
+    // to eight seconds of startup plus two seconds for business dispatch.
+    if let Some(startup) = startup {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::select! {
+                result = startup.accept() => result.unwrap(),
+                result = &mut call => panic!("call ended before startup: {result:?}"),
+            }
+        })
+        .await
+        .expect("MCP fixture startup event");
+        let mut ready = [0; 6];
+        stream.read_exact(&mut ready).await.unwrap();
+        assert_eq!(&ready, b"ready\n");
+        assert!(!directory.join("methods.log").exists());
+        assert!(!call.is_finished());
+        stream.write_all(b"x").await.unwrap();
+    }
     let mut barrier = if let Some(listener) = listener {
-        let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-            .await
-            .unwrap()
-            .unwrap();
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::select! {
+                result = listener.accept() => result.unwrap(),
+                result = &mut call => panic!("call ended before business barrier: {result:?}"),
+            }
+        })
+        .await
+        .expect("MCP fixture business dispatch event");
         let mut stream = BufReader::new(stream);
         let mut line = String::new();
         stream.read_line(&mut line).await.unwrap();

@@ -11,6 +11,11 @@ with open(pathlib.Path(config["methods"]).parent.parent / "n2-process-identities
     audit.write(json.dumps({"pid": os.getpid(), "pgid": None,
                            "kind": "f5-mcp-open-" + config["case"],
                            "owned_spawn": True}) + "\n")
+if config.get("startup_socket"):
+    with socket.socket(socket.AF_UNIX) as startup:
+        startup.connect(config["startup_socket"])
+        startup.sendall(b"ready\n")
+        assert startup.recv(1) == b"x"
 opens = 0
 for line in sys.stdin:
     request = json.loads(line)
