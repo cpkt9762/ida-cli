@@ -22,6 +22,7 @@ from struct_tools import STRUCT_METHODS
 from query_tools import QUERY_METHODS
 from search_tools import SEARCH_METHODS
 from lifecycle import database_diagnostics, release_handle
+from metadata import idb_context
 
 GUARD_SOURCE = Path(__file__).with_name('save_guard.py').read_text(encoding='utf-8')
 
@@ -347,8 +348,10 @@ class Bridge:
         from ida_nexus import discover_databases
         kind = command["command"]
         if kind == "open":
-            # Root sampling does not read or hash packed files on healthy opens.
-            metadata_context = {"requested_path": command["path"], "before_open": None,
+            # The default diagnostic context uses stat, independently of the
+            # owner Root Node protection. Full reads require forensic opt-in.
+            metadata_context = {"requested_path": command["path"],
+                                "before_open": idb_context(command["path"], deadline),
                                 "open_started": time.monotonic()}
             options = dict(command["options"])
             wait_analysis = options.pop("wait_analysis", False)

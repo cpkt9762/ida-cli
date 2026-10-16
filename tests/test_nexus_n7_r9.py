@@ -33,7 +33,7 @@ class MetadataEvidence(unittest.TestCase):
             with patch.dict(sys.modules, modules), self.assertLogs('ida_cli.metadata', level='WARNING') as logs:
                 metadata.warn_missing_input_metadata({'input_file_path':'', 'input_file_size':0,
                     'md5':'0'*32, 'sha256':'0'*64}, {'requested_path':str(path),
-                    'record_id':'owner-1', 'before_open':before})
+                    'record_id':'owner-1', 'before_open':before, 'forensic_hash':True})
             text = logs.output[0].split('missing input metadata: ', 1)[1]
             evidence = json.loads(text)
             self.assertNotIn('NEVER_LOG_TOKEN', text)

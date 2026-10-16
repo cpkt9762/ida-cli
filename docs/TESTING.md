@@ -696,3 +696,22 @@ User scripts directly calling IDA save APIs and independent clients' explicit
 saves are outside coverage; TEMP/KILL only prevents automatic close writeback.
 The owner guard cannot intercept Nexus startup/recovery before its installation.
 Sampling bounds the first loss interval; it does not establish r9's root cause.
+
+### Optional metadata diagnostics
+
+Runtime diagnostic getter/sampler/JSON errors emit a warning and preserve the
+completed get_database_info result; they never replay the business request.
+Missing installation capabilities still fail explicitly. Root Node checks are
+save protection, remain separate, and refuse open/save if missing or unverifiable.
+
+IDA_CLI_NEXUS_FORENSIC_HASH defaults to 0 (unset is also off); only 1 enables
+complete pre-open IDB SHA256 reads. Normal open and missing-metadata disk context
+use stat fields (path, size, mtime, inode/device) without reading packed contents.
+Opt-in hashing consumes the existing open deadline and is for directed forensics.
+Explicit test/failure harness calls to idb_fingerprint or evidence context
+forensic_hash=True also request a complete fingerprint. E22 integrity
+verification still performs its required content checks independently of this
+diagnostic switch. Root Node protection never depends on an IDB file hash.
+
+tests/test_nexus_q1q2.py checks diagnostic failure results/warnings, installation
+and business errors, default stat-only opens and opt-in read/hash counts.

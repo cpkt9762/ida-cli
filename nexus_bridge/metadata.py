@@ -24,6 +24,24 @@ def idb_fingerprint(path, deadline=None):
         return {'path': str(target), 'error': type(exc).__name__}
 
 
+def idb_context(path, deadline=None, *, forensic_hash=None):
+    """Stat by default; complete reads require an explicit forensic opt-in."""
+    import os
+    from pathlib import Path
+    if forensic_hash is None:
+        forensic_hash = os.environ.get('IDA_CLI_NEXUS_FORENSIC_HASH', '0') == '1'
+    if forensic_hash:
+        return idb_fingerprint(path, deadline)
+    target = Path(path)
+    try:
+        value = target.stat()
+        return {'path': str(target), 'size': value.st_size,
+                'mtime_ns': value.st_mtime_ns, 'inode': value.st_ino,
+                'device': value.st_dev}
+    except OSError as exc:
+        return {'path': str(target), 'error': type(exc).__name__}
+
+
 def input_metadata_evidence(context=None, stage='checkpoint'):
     import os
     import sys
@@ -58,11 +76,13 @@ def input_metadata_evidence(context=None, stage='checkpoint'):
               'raw': raw, 'before_open': context.get('before_open'),
               'requested_path': context.get('requested_path'),
               'record_id': context.get('record_id'),
-              'disk_now': idb_fingerprint(path, context.get('deadline')) if isinstance(path, str) and path else None,
+              'disk_now': idb_context(path, context.get('deadline'),
+                  forensic_hash=context.get('forensic_hash')) if isinstance(path, str) and path else None,
               'previously_observed_idbs': previous,
               'observed_multiple_databases': any(p != path for p in previous),
               'history_scope': 'observations since adapter instrumentation; earlier history unknown',
-              'auto_is_ok': optional(ida_auto.auto_is_ok), 'auto_state': optional(ida_auto.get_auto_state)}
+              'auto_is_ok': optional(lambda: ida_auto.auto_is_ok()),
+              'auto_state': optional(lambda: ida_auto.get_auto_state())}
     try:
         from ida_nexus import discover_databases
         result['public_instances'] = [
@@ -78,18 +98,25 @@ def input_metadata_evidence(context=None, stage='checkpoint'):
 
 
 def warn_missing_input_metadata(value, context=None):
-    if (not value['input_file_path'] or not value['input_file_size']
-            or value['md5'] == '0' * 32 or value['sha256'] == '0' * 64):
+    # This boundary covers diagnostics only. Root Node protection is separate
+    # and must still fail closed before opening, executing or saving.
+    try:
+        if (value['input_file_path'] and value['input_file_size']
+                and value['md5'] != '0' * 32 and value['sha256'] != '0' * 64):
+            return
         import json
-        import logging
-        import sys
-        logger = logging.getLogger('ida_cli.metadata')
-        if not logger.handlers:
-            # Nexus captures per-operation sys.stderr; the owner's original
-            # stream still targets its process log and must retain evidence.
-            handler = logging.StreamHandler(sys.__stderr__)
-            handler.setFormatter(logging.Formatter('%(levelname)s %(name)s: %(message)s'))
-            logger.addHandler(handler)
-            logger.propagate = False
-        logger.warning(
-            'missing input metadata: %s', json.dumps(input_metadata_evidence(context), ensure_ascii=True))
+        detail = json.dumps(input_metadata_evidence(context), ensure_ascii=True)
+        message = 'missing input metadata: %s'
+    except Exception as exc:
+        detail = type(exc).__name__
+        message = 'input metadata diagnostic failed: %s'
+    import logging
+    import sys
+    logger = logging.getLogger('ida_cli.metadata')
+    if not logger.handlers:
+        # Nexus captures per-operation stderr; retain evidence in the owner log.
+        handler = logging.StreamHandler(sys.__stderr__)
+        handler.setFormatter(logging.Formatter('%(levelname)s %(name)s: %(message)s'))
+        logger.addHandler(handler)
+        logger.propagate = False
+    logger.warning(message, detail)

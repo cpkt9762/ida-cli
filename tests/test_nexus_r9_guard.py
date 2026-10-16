@@ -61,6 +61,16 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(self.flags, {1, 8})
         self.assertEqual(self.logs[0]['probe_error'], 'RuntimeError')
 
+    def test_unverifiable_root_refuses_open_and_explicit_save(self):
+        def unavailable(_):
+            raise RuntimeError('Root Node probe unavailable')
+        sys.modules['ida_netnode'].netnode.exist = unavailable
+        with self.assertRaisesRegex(RuntimeError, 'Root Node'):
+            self.guard.begin({'method': 'open'})
+        with self.assertRaisesRegex(RuntimeError, 'saving refused'):
+            self.guard.save_database()
+        self.assertEqual(self.flags, {1, 8})
+
     def test_diagnostic_getter_failure_does_not_break_healthy_operations(self):
         def unavailable():
             raise RuntimeError('diagnostic unavailable')

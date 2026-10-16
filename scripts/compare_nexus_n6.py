@@ -118,7 +118,7 @@ def metadata_checkpoint(env, old, new, label):
         row['failure_type'] = type(exc).__name__
         row['disk_at_failure'] = [idb_fingerprint(x) for x in (old.sample, new.sample)] if isinstance(old, Candidate) else [idb_fingerprint(new.sample)]
         try:
-            context = {'requested_path': str(new.sample)}
+            context = {'requested_path': str(new.sample), 'forensic_hash': True}
             for record in env.root.glob('*-prebuilt-idb.json'):
                 for item in json.loads(record.read_text()).get('before_open_fingerprints', []):
                     if item['path'] == str(new.sample):

@@ -65,7 +65,8 @@ assert set_value(ida_ida.INF_FSIZE, 0)
                     raise AssertionError('strict checkpoint accepted intentionally missing metadata')
                 metadata_checkpoint(env, old, new, label+' reopened prebuilt copies')
                 before = json.loads((env.root/(label+'-prebuilt-idb.json')).read_text())['before_open_fingerprints'][2]
-                context = {'requested_path': str(samples[1]), 'before_open': before}
+                context = {'requested_path': str(samples[1]), 'before_open': before,
+                           'forensic_hash': True}
                 code = METADATA_SOURCE.read_text() + f'\nimport json\nprint(json.dumps(input_metadata_evidence({context!r}, stage="successful checkpoint")))'
                 row['owner_evidence'] = script_result(new.call('run_script', {'code': code}))
                 row['status'] = 'PASS'

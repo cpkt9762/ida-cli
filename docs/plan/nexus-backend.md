@@ -788,5 +788,11 @@ netnode 名称存在性查询和时间/上下文更新，首次安装额外读�
 save_database（尤其同一脚本先破坏再保存）、其他客户端的显式保存及 guard 安装前的 Nexus
 启动/恢复内部行为不在 adapter 保护范围；不改 Nexus 服务端或客户端补丁。
 
+Q1/Q2：诊断专用 getter、采样或 JSON 序列化失败只告警，不改变已构造的业务返回或重放请求；
+安装依赖缺失仍失败，Root Node 保护判定缺失/不可确认仍拒绝 open/save，不降级。
+正常 open/缺元数据诊断仅保留 stat 上下文；完整预开库 SHA256 由
+IDA_CLI_NEXUS_FORENSIC_HASH=1 显式开启，默认 0（未设置同关闭），占用原 open 总期限。
+定向 harness 的 idb_fingerprint/forensic_hash=True 同样是显式取证；E22 必需的完整性核验不受此开关影响。
+
 R7：标准 lib 不依赖 F1_ROOT/F1_PYTHON；发布协议用例移入第十三项集成 target，显式启用
 `--features nexus-test-support`，保留全部协议与文件系统断言。该 feature 不用于产品构建。
