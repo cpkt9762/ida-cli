@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """N6 real IDA contracts against a fixed, independently hashed N0 binary."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -205,7 +206,7 @@ def baseline_prebuilt_open(env, baseline, sample, label, *, native=False):
     original = Path(metadata['input_file_path'])
     assert metadata['input_file_size'] == original.stat().st_size > 0
     assert metadata['sha256'] == digest(original) != '0' * 64
-    assert len(metadata['md5']) == 32 and metadata['md5'] != '0' * 32
+    assert metadata['md5'] == hashlib.md5(original.read_bytes()).hexdigest() != '0' * 32
     packed_hash = record['sha256'][0]
     assert digest(record['seed']) == digest(sample) == packed_hash
 
@@ -333,7 +334,7 @@ def assembly(env, baseline, binary):
     old = new = None
     records = []
     try:
-        old = Candidate(env, baseline, samples[0], "n6-x86-baseline", transport="stdio", inline="8000000")
+        old = baseline_prebuilt_open(env, baseline, samples[0], 'n6-x86-baseline')
         new = Candidate(env, binary, samples[1], "n6-x86-nexus", transport="stdio", inline="8000000")
         ea = next(f["address"] for f in old.call("list_functions",{})["result"]["functions"]
                   if f["name"] in ("main","_main"))

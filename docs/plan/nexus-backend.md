@@ -554,7 +554,7 @@ N7a-F10：原/辅助 lease 属于一次逻辑释放，分别 fresh guard 与一�
 `nexus_n7_fix1` 的三个专用用例，私有环境及每用例 150s 命令见 TESTING。
 
 编排者批准固定 N0 baseline 一侧的有限重开：r9 是 IDA 9.5 idalib 上游缺陷，
-也影响旧 native。N6/E04-N6 与 N6-tools 对照在编辑前若 N0 返回空路径、size 0、
+也影响旧 native。N6/E04-N6、N6-tools 与 x86 对照在编辑前若 N0 返回空路径、size 0、
 全零 MD5/SHA256，须先核验 analyzed seed 元数据完整及 seed/副本磁盘哈希未变，
 最多额外重开两次；关闭改变磁盘或持续失败立即失败，不恢复坏文件。
 每次时间、uptime、原始响应、前后磁盘哈希写入 `baseline-reopens.jsonl`。

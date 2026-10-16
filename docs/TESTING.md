@@ -643,7 +643,8 @@ F10 释放协调：每个自有 handle 新鲜检查保护后至多 release 一�
 每次记录时间、uptime、原始打开/元数据响应与关闭前后磁盘哈希到
 `baseline-reopens.jsonl`；磁盘改变或三次仍失败就失败，不恢复坏副本、不跳过比较。
 r9 是 IDA 9.5 idalib 上游缺陷，旧 native 也受影响；此规则只用于 N6/E04-N6、
-N6-tools 的固定 N0 预建副本，不重试刻意缺元数据的 compatibility fixture。
+N6-tools 与 x86 的固定 N0 预建副本，不重试刻意缺元数据的 compatibility fixture
+或 `n6_metadata_repro.py` 原始取证驱动。
 Nexus 测试侧不加重试，只使用产品自动重开；比较器和两条既有字段例外不变。
 全部 `test_nexus_*.py` 须每文件单独运行，并在 `env -i` 白名单下再各跑一次。
 

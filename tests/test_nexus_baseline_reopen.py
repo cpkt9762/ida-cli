@@ -26,6 +26,8 @@ class BaselineReopen(unittest.TestCase):
             partial = dict(missing, sha256=healthy['sha256'])
             record = {'seed': str(seed), 'copies': [str(sample)], 'sha256': [comparison.digest(seed)],
                       'analyzed_seed_metadata': dict(healthy, input_file_size=0) if bad_seed else healthy}
+            if bad_seed == 'md5':
+                record['analyzed_seed_metadata'] = dict(healthy, md5='1' * 32)
             (root / 'unit-prebuilt-idb.json').write_text(json.dumps(record))
             clients = []
 
@@ -100,9 +102,10 @@ class BaselineReopen(unittest.TestCase):
         self.assertEqual(rows[0]['metadata_response']['result']['input_file_size'], 0)
 
     def test_bad_seed_never_authorizes_retry(self):
-        clients, rows, failure = self.exercise(['missing'], bad_seed=True)
-        self.assertIsNotNone(failure)
-        self.assertFalse(clients)
+        for defect in (True, 'md5'):
+            clients, rows, failure = self.exercise(['missing'], bad_seed=defect)
+            self.assertIsNotNone(failure)
+            self.assertFalse(clients)
 
     def test_changed_disk_never_authorizes_retry(self):
         for stage in ('read', 'close'):
