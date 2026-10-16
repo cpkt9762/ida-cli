@@ -4,7 +4,7 @@ from pathlib import Path
 root=Path(os.environ['IDA_CLI_HOME'])
 fault=os.environ.get('N4_F2_OPEN_FAULT','')
 (root/'bridge-process.json').write_text(json.dumps({'pid':os.getpid()}))
-caps={'runtime':{'ida':[9,5,0],'python':[3,11,0],'nexus':[0,13,4],'domain':[0,5,1]},'methods':{}}
+caps={'runtime':{'ida':[9,5,0],'python':[3,11,0],'nexus':[0,13,4],'domain':[0,5,1]},'methods':{'get_database_info':'read_only'}}
 print(json.dumps({'ready':True,'capabilities':caps}),flush=True)
 lock=threading.Lock();first=[True]
 def send(stream,obj):
@@ -41,6 +41,8 @@ def serve(path):
                             send(stream,{'event':'release_unconfirmed','attempt':attempt})
                             continue
                     send(stream,{'event':'released','attempt':attempt})
+                elif kind=='execute':
+                    send(stream,{'event':'completed','attempt':attempt,'result':{'result':{'ok':True}}})
                 else:raise AssertionError(kind)
                 continue
             attempt=frame['attempt'];kind=frame['payload']['command']

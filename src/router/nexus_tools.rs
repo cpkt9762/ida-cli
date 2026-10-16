@@ -105,6 +105,7 @@ struct Database {
     token: String,
     pid: Option<u32>,
     opened_at: Instant,
+    last_active: Instant,
     cache_hit: bool,
     client: super::listing::ClientIdentity,
     opener: super::listing::ClientIdentity,
@@ -168,9 +169,10 @@ impl Tools {
                     open_path: Some(db.path.display().to_string()),
                     pending_requests: 0,
                     ref_count: 0,
-                    idle_secs: db.opened_at.elapsed().as_secs(),
+                    idle_secs: db.last_active.elapsed().as_secs(),
                     active: true,
                 });
+            worker.idle_secs = worker.idle_secs.min(db.last_active.elapsed().as_secs());
             worker.ref_count += 1;
             worker.pending_requests += operations.iter().filter(|identity| identity.lease == db.lease).filter(|identity| {
                 match endpoint.transition(|s,_|s.operation_progress(&identity.lease.client_id,identity)) {
@@ -239,7 +241,11 @@ impl Tools {
                     .elapsed()
                     .ok()
                     .map(|elapsed| elapsed.as_secs()),
-                idle_secs: db.opened_at.elapsed().as_secs(),
+                idle_secs: group
+                    .iter()
+                    .map(|(_, db)| db.last_active)
+                    .max()
+                    .map_or(0, |activity| activity.elapsed().as_secs()),
                 worker: ListedWorker {
                     pid: db.pid,
                     backend: "nexus".into(),
@@ -582,7 +588,11 @@ impl Tools {
                             let previous=records.values().find(|db|db.lease.instance_id==lease.instance_id);
                             let (opener,origin,opened_wall)=previous.map(|db|(db.opener.clone(),db.origin.clone(),db.opened_wall))
                                 .unwrap_or_else(||(super::listing::ClientIdentity::rpc_tenant(None),handle.clone(),std::time::SystemTime::now()));
-                            records.insert(handle.clone(), Database { path: canonical, lease, idb, token: token.clone(), pid, opened_at: Instant::now(), cache_hit:prepared.cache_hit, client:super::listing::ClientIdentity::rpc_tenant(None), opener, origin, opened_wall, _cache_guard:cache_guard.clone() });
+                            let now = Instant::now();
+                            for db in records.values_mut().filter(|db| db.lease.instance_id == lease.instance_id) {
+                                db.last_active = now;
+                            }
+                            records.insert(handle.clone(), Database { path: canonical, lease, idb, token: token.clone(), pid, opened_at: now, last_active: now, cache_hit:prepared.cache_hit, client:super::listing::ClientIdentity::rpc_tenant(None), opener, origin, opened_wall, _cache_guard:cache_guard.clone() });
                             ownership.transferred = true;
                             return Ok((handle,token));
                         }
@@ -785,6 +795,16 @@ impl Tools {
                 OperationId::new(id())?,
             )
         })?;
+        // Activity belongs to the owner, so closing the requesting lease must
+        // not restore an older idle value from a surviving sibling lease.
+        let now = Instant::now();
+        for db in self
+            .records()
+            .values_mut()
+            .filter(|db| db.lease.instance_id == database.lease.instance_id)
+        {
+            db.last_active = now;
+        }
         self.operations
             .lock()
             .unwrap_or_else(|e| e.into_inner())

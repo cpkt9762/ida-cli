@@ -66,6 +66,57 @@ async fn run_case(fault: &str) {
         10
     }));
     let cancellation = preparation.cancel.clone();
+    if fault == "listing-idle" {
+        let (first, first_token) = tools
+            .open(&router, &path.display().to_string(), preparation)
+            .await
+            .unwrap();
+        let (second, second_token) = tools
+            .open(
+                &router,
+                &path.display().to_string(),
+                Preparation::new(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        for db in tools.records().values_mut() {
+            db.opened_at = Instant::now() - Duration::from_secs(30);
+            db.last_active = Instant::now() - Duration::from_secs(30);
+            db.opened_wall = std::time::SystemTime::now() - Duration::from_secs(60);
+        }
+        assert!(tools.workers(&router)[0].idle_secs >= 30);
+        tools
+            .execute(
+                &router,
+                Some(&second),
+                "get_database_info",
+                json!({}),
+                Preparation::new(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        assert!(tools.workers(&router)[0].idle_secs < 2);
+        let listing = serde_json::to_value(tools.list_idbs(None)).unwrap();
+        assert_eq!(listing["idbs"].as_array().unwrap().len(), 1);
+        assert!(
+            listing["idbs"][0]["idle_secs"].as_u64().unwrap() < 2,
+            "{listing}"
+        );
+        assert!(
+            listing["idbs"][0]["open_secs"].as_u64().unwrap() >= 60,
+            "{listing}"
+        );
+        tools.close_token(&router, &second_token).await.unwrap();
+        let listing = serde_json::to_value(tools.list_idbs(None)).unwrap();
+        assert_eq!(listing["idbs"][0]["db_handle"], first);
+        assert!(
+            listing["idbs"][0]["idle_secs"].as_u64().unwrap() < 2,
+            "owner activity survives removal of its active lease: {listing}"
+        );
+        tools.close_token(&router, &first_token).await.unwrap();
+        bridge.shutdown().await.unwrap();
+        return;
+    }
     if fault.starts_with("release-") && fault != "release-busy" {
         let opened = tools
             .open(&router, &path.display().to_string(), preparation)
@@ -294,4 +345,9 @@ async fn open_release_proof() {
 #[tokio::test]
 async fn open_release_unconfirmed() {
     run_case("release-unconfirmed").await;
+}
+
+#[tokio::test]
+async fn open_listing_idle() {
+    run_case("listing-idle").await;
 }
