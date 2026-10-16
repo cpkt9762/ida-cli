@@ -47,6 +47,7 @@ def main():
     from ida_nexus import DatabaseHandle, DatabaseOpenOptions, wait_database_released
     from ida_nexus import _resolver
     from lifecycle import release_handle
+    from bridge import guarded_source
     original_spawn = _resolver.spawn_worker
     def spawn(*args, **kwargs):
         return owned_nexus_spawn(env, original_spawn, *args, **kwargs)
@@ -81,7 +82,9 @@ def delayed_close(self, save=None):
 db_module.Database.close = delayed_close
 result=True
 '''
-            assert handle.execute_python(code, timeout=3)['result'] is True
+            assert handle.execute_python(guarded_source(code, {
+                'method': 'close-proof-probe', 'requested_path': str(env.root / 'fixtures/mini'),
+                'record_id': instance.record_id}), timeout=3)['result'] is True
             original_request = http.client.HTTPConnection.request
             original_response = http.client.HTTPConnection.getresponse
             requests = []
