@@ -72,7 +72,11 @@ fn format_string_list(v: &Value) -> String {
     lines.push(format!("Strings ({} of {}):", strings.len(), total));
     for s in strings {
         let addr = s.get("address").and_then(|v| v.as_str()).unwrap_or("?");
-        let val = s.get("value").and_then(|v| v.as_str()).unwrap_or("?");
+        let val = s
+            .get("content")
+            .or_else(|| s.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         lines.push(format!("  {addr}  {:?}", val));
     }
     truncate_output(&lines.join("\n"))
@@ -94,10 +98,15 @@ fn format_segment_list(v: &Value) -> String {
     for s in segments {
         let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let start = s
-            .get("start_address")
+            .get("start")
+            .or_else(|| s.get("start_address"))
             .and_then(|v| v.as_str())
             .unwrap_or("?");
-        let end = s.get("end_address").and_then(|v| v.as_str()).unwrap_or("?");
+        let end = s
+            .get("end")
+            .or_else(|| s.get("end_address"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         let perms = s.get("permissions").and_then(|v| v.as_str()).unwrap_or("");
         lines.push(format!("  {name}  {start}-{end}  {perms}"));
     }
@@ -258,4 +267,37 @@ fn truncate_output(s: &str) -> String {
         lines.len() - MAX_HUMAN_LINES
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_response, OutputMode};
+    use serde_json::json;
+
+    #[test]
+    fn human_strings_show_backend_content() {
+        for field in ["content", "value"] {
+            let response = json!({"total": 1, "strings": [
+                {"address": "0x1838", field: "usage: printf 雪\n"}
+            ]});
+            assert_eq!(
+                format_response(&OutputMode::Human, "list_strings", &response),
+                "Strings (1 of 1):\n  0x1838  \"usage: printf 雪\\n\""
+            );
+        }
+    }
+
+    #[test]
+    fn human_segments_show_backend_address_ranges() {
+        for (start, end) in [("start", "end"), ("start_address", "end_address")] {
+            let segment =
+                json!({"name": "__text", start: "0x1000", end: "0x2000", "permissions": "r-x"});
+            for response in [json!([segment]), json!({"segments": [segment]})] {
+                assert_eq!(
+                    format_response(&OutputMode::Human, "list_segments", &response),
+                    "Segments (1):\n  __text  0x1000-0x2000  r-x"
+                );
+            }
+        }
+    }
 }
