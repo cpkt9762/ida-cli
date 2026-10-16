@@ -13,6 +13,9 @@ import sys
 sys.dont_write_bytecode = True
 from compare_nexus_baseline import (Environment, Process, Candidate, BASELINE_SHA,
                                     digest, json_equal, normalized, allocated_member_equal)
+import runpy
+METADATA_SOURCE = Path(__file__).resolve().parents[1] / 'nexus_bridge/metadata.py'
+idb_fingerprint = runpy.run_path(str(METADATA_SOURCE))['idb_fingerprint']
 
 
 def edit_cases(ea, funcs):
@@ -99,6 +102,37 @@ def script_result(response):
     return json.loads(value["stdout"])
 
 
+def metadata_checkpoint(env, old, new, label):
+    row = {'checkpoint': label}
+    try:
+        expected = old.call('get_database_info', {}) if isinstance(old, Candidate) else old.rpc('get_database_info')
+        row['baseline'] = expected
+        actual = new.call('get_database_info', {})
+        row['nexus'] = actual
+        assert json_equal(normalized({'result': expected['result']}, env.root/'fixtures/mini'),
+                          normalized({'result': actual['result']}, env.root/'fixtures/mini')), (expected, actual)
+        for answer in (expected, actual):
+            assert answer['result']['input_file_size'] == (env.root/'fixtures/mini').stat().st_size
+            assert answer['result']['sha256'] == digest(env.root/'fixtures/mini')
+    except Exception as exc:
+        row['failure_type'] = type(exc).__name__
+        row['disk_at_failure'] = [idb_fingerprint(x) for x in (old.sample, new.sample)] if isinstance(old, Candidate) else [idb_fingerprint(new.sample)]
+        try:
+            context = {'requested_path': str(new.sample)}
+            for record in env.root.glob('*-prebuilt-idb.json'):
+                for item in json.loads(record.read_text()).get('before_open_fingerprints', []):
+                    if item['path'] == str(new.sample):
+                        context['before_open'] = item
+            code = METADATA_SOURCE.read_text() + f'\nimport json\nprint(json.dumps(input_metadata_evidence({context!r}, stage="failed N6 checkpoint")))'
+            row['owner_evidence'] = script_result(new.call('run_script', {'code': code}))
+        except Exception as exc:
+            row['evidence_error'] = type(exc).__name__ + ': ' + str(exc)
+        raise
+    finally:
+        with (env.root/'n6-metadata-checkpoints.jsonl').open('a') as output:
+            output.write(json.dumps(row) + '\n')
+
+
 def member_witness(client, result, direct):
     tid = result["tid"]
     code = f"""import json, ida_typeinf as ti
@@ -151,7 +185,8 @@ print(json.dumps({{"input_file_path":ida_nalt.get_input_file_path(),
     assert len(set(hashes)) == 1
     (env.root/(label+"-prebuilt-idb.json")).write_text(json.dumps({"seed":str(seeds[0]),
         "copies":list(map(str,samples)), "sha256":hashes,
-        "analyzed_seed_metadata":metadata}, indent=2)+"\n")
+        "analyzed_seed_metadata":metadata,
+        "before_open_fingerprints":[idb_fingerprint(p) for p in [seeds[0], *samples]]}, indent=2)+"\n")
     return samples
 
 
@@ -168,6 +203,7 @@ def comparison(env, baseline, binary):
         funcs = old.rpc("list_functions", {})["result"]["functions"]
         ea = next(x["address"] for x in funcs if x["name"] in ("main", "_main"))
         new = Candidate(env, binary, samples[1], "n6-candidate", transport="stdio", inline="8000000")
+        metadata_checkpoint(env, old, new, 'E04-N6 reopened prebuilt copies')
         for method, params in edit_cases(ea, funcs):
             expected = old.rpc(method, params)
             expected.pop("jsonrpc", None)
@@ -353,16 +389,7 @@ def tool_contracts(env, baseline, binary):
     try:
         old = Candidate(env, baseline, samples[0], "n6-tool-baseline", transport="stdio", inline="8000000")
         new = Candidate(env, binary, samples[1], "n6-tool-nexus", transport="stdio", inline="8000000")
-        def metadata_checkpoint(label):
-            expected, actual = old.call("get_database_info", {}), new.call("get_database_info", {})
-            with (env.root/"n6-metadata-checkpoints.jsonl").open("a") as output:
-                output.write(json.dumps({"checkpoint":label,"baseline":expected,"nexus":actual})+"\n")
-            assert json_equal(normalized(expected, env.root/"fixtures/mini"),
-                              normalized(actual, env.root/"fixtures/mini")), (expected,actual)
-            for answer in (expected,actual):
-                assert answer["result"]["input_file_size"] == (env.root/"fixtures/mini").stat().st_size
-                assert answer["result"]["sha256"] == digest(env.root/"fixtures/mini")
-        metadata_checkpoint("reopened prebuilt copies")
+        metadata_checkpoint(env, old, new, "reopened prebuilt copies")
         funcs = old.call("list_functions", {})["result"]["functions"]
         ea = next(f["address"] for f in funcs if f["name"] in ("main", "_main"))
         other = next(f["address"] for f in funcs if f["address"] != ea)
@@ -371,7 +398,7 @@ def tool_contracts(env, baseline, binary):
         setup = "import ida_typeinf as ti, ida_ida, ida_auto\nida_ida.inf_set_auto_enabled(True)\nida_auto.enable_auto(True)\nassert ida_auto.auto_wait()\nassert ti.idc_parse_types('struct N6ToolPair { int left; int right; };', ti.PT_SIL) == 0"
         for c in (old,new):
             assert c.call("run_script", {"code":setup})["result"]["success"]
-        metadata_checkpoint("after equivalent analysis and type setup")
+        metadata_checkpoint(env, old, new, "after equivalent analysis and type setup")
         overrides = {
           "get_function_by_name":{"name":"main"}, "batch_lookup_functions":{"queries":[ea,"main","missing"]},
           "build_xref_matrix":{"addrs":[ea,other]}, "build_callgraph":{"address":ea,"max_depth":2},

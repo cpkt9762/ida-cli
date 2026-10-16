@@ -289,6 +289,7 @@ def invoke(method, params):
                  "base_address": hex(base) if base != ida_idaapi.BADADDR else None,
                  "min_address": hex(ida_ida.inf_get_min_ea()), "max_address": hex(ida_ida.inf_get_max_ea()),
                  "main_address": hex(main) if main != ida_idaapi.BADADDR else None}
+        warn_missing_input_metadata(value, globals().get('_metadata_context'))
     elif method == "list_functions":
         pattern = params.get("filter")
         items = [info for _, info in functions()

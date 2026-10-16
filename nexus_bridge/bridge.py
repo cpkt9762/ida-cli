@@ -22,6 +22,7 @@ from struct_tools import STRUCT_METHODS
 from query_tools import QUERY_METHODS
 from search_tools import SEARCH_METHODS
 from lifecycle import database_diagnostics, release_handle
+from metadata import idb_fingerprint
 
 TOOL_METHODS = (*TOOL_METHODS, *TYPE_METHODS, *EDIT_METHODS, *ANALYSIS_METHODS, *STRUCT_METHODS, *QUERY_METHODS, *SEARCH_METHODS, "batch_rename")
 
@@ -31,7 +32,7 @@ METHODS = {"execute_python": "may_write", "database_info": "read_only",
 METHODS.update({method: "may_write" if method in WRITE_METHODS else "read_only"
                 for method in TOOL_METHODS})
 TOOL_SOURCE = "\n".join(Path(__file__).with_name(name).read_text(encoding="utf-8")
-                        for name in ("type_tools.py", "edit_tools.py", "analysis_tools.py", "struct_tools.py", "query_tools.py", "search_tools.py", "tools.py"))
+                        for name in ("type_tools.py", "edit_tools.py", "analysis_tools.py", "struct_tools.py", "query_tools.py", "search_tools.py", "metadata.py", "tools.py"))
 SLICE_SOURCE = Path(__file__).with_name("slices.py").read_text(encoding="utf-8")
 SLICE_METHODS = {"batch_decompile", "search_pseudocode", "run_auto_analysis", "batch_rename", "_n5_cleanup"}
 
@@ -138,6 +139,7 @@ class Bridge:
         self.Options = DatabaseOpenOptions
         self.lock = threading.Lock()
         self.handles = {}
+        self.metadata_contexts = {}
         self.identity = uuid.uuid4().hex
         self.verification_probes = {}
         self.grants = {}
@@ -318,6 +320,9 @@ class Bridge:
         from ida_nexus import discover_databases
         kind = command["command"]
         if kind == "open":
+            metadata_context = {"requested_path": command["path"],
+                "before_open": idb_fingerprint(command["path"], deadline)
+                    if Path(command["path"]).suffix.lower() in ('.i64', '.idb') else None}
             options = dict(command["options"])
             wait_analysis = options.pop("wait_analysis", False)
             verification = options.pop("verification_idb", None)
@@ -372,6 +377,7 @@ class Bridge:
                          "instance_id": instance.record_id, "generation": generation,
                          "owner": "gui" if instance.backend == "gui" else "managed"}
                 self.handles[lease["lease_id"]] = (lease, handle)
+                self.metadata_contexts[lease["lease_id"]] = dict(metadata_context, record_id=instance.record_id)
             # Verify actual owner runtime without importing IDA in this process.
             try:
                 handle.set_disconnect_callback(lambda _handle, reason: self.disconnected(lease, reason, attempt))
@@ -388,6 +394,7 @@ class Bridge:
                         raise TimeoutError("open runtime check cleanup unconfirmed; lease retained") from exc
                 with self.lock:
                     self.handles.pop(lease["lease_id"], None)
+                    self.metadata_contexts.pop(lease["lease_id"], None)
                 # Close confirmed this unannounced lease is gone. If close
                 # itself fails, run() retains the uncertain open outcome.
                 channel.send({"event": "failed", "attempt": attempt,
@@ -421,7 +428,8 @@ class Bridge:
                 context = [self.identity, lease["lease_id"], lease["instance_id"], lease["generation"], self.lifetime_path]
                 code = TOOL_SOURCE + f"\nresult = invoke_slice({method!r}, {params!r}, {context!r}, {SLICE_SOURCE!r})\n"
             elif method in TOOL_METHODS:
-                code = TOOL_SOURCE + f"\nresult = invoke({method!r}, {params!r})\n"
+                context = dict(self.metadata_contexts.get(lease["lease_id"], {}), deadline=deadline)
+                code = TOOL_SOURCE + f"\n_metadata_context = {context!r}\nresult = invoke({method!r}, {params!r})\n"
             else:
                 raise ValueError("unsupported bridge method")
             operation_id = command["identity"]["operation_id"]
@@ -489,6 +497,7 @@ class Bridge:
             self.drop_lifetime(lease["lease_id"])
             with self.lock:
                 self.handles.pop(lease["lease_id"], None)
+                self.metadata_contexts.pop(lease["lease_id"], None)
             channel.send({"event": "released", "attempt": attempt, "outcome": outcome})
         elif kind == "shutdown":
             public_started[0] = True

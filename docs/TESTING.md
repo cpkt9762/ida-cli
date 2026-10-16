@@ -30,6 +30,8 @@ result=$?; uptime; test "$result" -eq 0
 `compare_nexus_n6.py` 先通过公开 auto_wait 完成分析、验证输入元数据、显式保存并关闭
 seed IDB，再复制三份 SHA256 相同的文件。工具对照在重开后、等价分析/类型 setup 后
 再次严格检查该完整 fixture 的元数据，原始响应先于比较落盘；意外缺失路径/大小/哈希必须失败。
+E04-N6 的预建副本也运行同一 checkpoint。失败时在关闭前通过公开 API 记录 owner 的实际 IDB/root filename、原始 ida_nalt 返回值、磁盘 SHA256/mtime、PID/record_id 和同 state 的公开实例列表；预建记录含打开前的磁盘指纹。产品缺失分支将同类只读取证写入 owner 的 warn 日志，不补造元数据或等待全库分析。进程历史仅表示 adapter 已观测的数据库，不能证明附加前的历史；独立创建的 worker 另由测试账本证明。取证不读取 token 或环境变量。
+`tests/support/n6_metadata_repro.py` 在全新 prepared 环境仅跑 tools/E04 的预建元数据步骤；`--inject-missing` 主动删自有 fixture 元数据以验证严格失败和取证落盘，不计自然 r9 复现。r9 根因不能由后续 PASS 关闭，结论以委托取证报告为准。
 独立的 n6-edges fixture 则通过公开 SDK delinf 删除存储字段，并用真实无栈帧函数
 对照合法缺失分支的空路径、零大小、零哈希与 -4/-5 错误结构；两类前提分别断言。
 产品按旧 native 契约序列化缺失值，不恢复原始输入信息；不通过重复运行挑选通过结果。
