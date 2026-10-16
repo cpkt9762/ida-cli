@@ -20,7 +20,7 @@ N9 packaging MUST carry both client patches until equivalent upstream validation
 @@ -969,12 +971,83 @@
          finally:
              connection.close()
- 
+
 -    def close(
 +    def _release_remote_lease_outcome(self, timeout: float) -> dict[str, Any]:
 +        """One public release request; an absent or malformed ACK is never proof."""
@@ -101,7 +101,7 @@ N9 packaging MUST carry both client patches until equivalent upstream validation
 -    ) -> None:
 +    ) -> dict[str, Any] | None:
          """Release this lease and optionally wait for a final managed IDB close."""
- 
+
          if not isinstance(wait_for_database, bool):
 @@ -987,8 +1060,12 @@
          ):
@@ -144,7 +144,7 @@ N9 packaging MUST carry both client patches until equivalent upstream validation
 @@ -1039,6 +1122,15 @@
          if connection is not None:
              connection.close()
- 
+
 +        if structured:
 +            if shutdown_pending:
 +                released = wait_for_database and wait_database_released(
