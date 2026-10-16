@@ -64,12 +64,19 @@ class Compatibility(unittest.TestCase):
                 retrieve_input_file_size=lambda: 0)}
         modules = {name: types.SimpleNamespace(**attributes.get(name, {})) for name in
             ('ida_auto', 'ida_funcs', 'ida_ida', 'ida_idaapi', 'ida_idp', 'ida_loader', 'ida_nalt', 'idautils', 'idc')}
+        modules['ida_loader'] = types.SimpleNamespace(PATH_TYPE_IDB=0, get_path=lambda _: '')
+        modules['ida_nalt'].get_root_filename = lambda: ''
+        modules['ida_auto'] = types.SimpleNamespace(auto_is_ok=lambda: True, get_auto_state=lambda: 0)
+        modules['ida_nexus'] = types.SimpleNamespace(discover_databases=lambda **_: [])
         with patch.dict(sys.modules, modules):
             tools = load('tools')
+            tools.warn_missing_input_metadata = load('metadata').warn_missing_input_metadata
             tools.processor_name = lambda: 'test processor'
-            info = tools.invoke('get_database_info', {})['value']
+            with self.assertLogs('ida_cli.metadata', level='WARNING') as logs:
+                info = tools.invoke('get_database_info', {})['value']
         self.assertEqual({k: info[k] for k in ('input_file_path', 'input_file_size', 'md5', 'sha256')},
             dict(input_file_path='', input_file_size=0, md5='0'*32, sha256='0'*64))
+        self.assertIn('missing input metadata', logs.output[0])
 
     def test_existing_function_without_frame_preserves_error_result(self):
         modules = dict(ida_funcs=types.SimpleNamespace(get_func=lambda ea: object()),
