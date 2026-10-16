@@ -690,6 +690,7 @@ GUI 验证可由独立人工辅助套件完成，但必须留下具体步骤、�
 timeout 30s cargo fmt --all -- --check
 timeout 30s cargo check --locked
 timeout 30s cargo clippy --locked --all-targets -- -D warnings
+timeout 30s cargo clippy --locked --all-targets --features nexus-test-support -- -D warnings
 timeout 30s cargo test --locked --lib
 ```
 
@@ -796,6 +797,7 @@ IDA_CLI_NEXUS_FORENSIC_HASH=1 显式开启，默认 0（未设置同关闭），
 
 R7：标准 lib 不依赖 F1_ROOT/F1_PYTHON；发布协议用例移入第十三项集成 target，显式启用
 `--features nexus-test-support`，保留全部协议与文件系统断言。该 feature 不用于产品构建。
+默认 Clippy 之外还须执行 `timeout 30s cargo clippy --locked --all-targets --features nexus-test-support -- -D warnings`。
 
 N7a-F5/r9root：r9 根因调查现为 N7b 前的关键路径。首次 Root 失败补充实际 ID0/IDB 路径、
 目录/锁完整 stat、保护设置前的公开标志、打包保存偏好与线程身份，并在期限内只读延迟复查；

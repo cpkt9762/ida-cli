@@ -19,6 +19,11 @@ class CacheTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
+        state = self.root/'state'
+        state.mkdir()
+        environment = patch.dict(os.environ, {'IDA_NEXUS_STATE_DIR': str(state)})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.group = self.root/'generations/g1'
         self.group.mkdir(parents=True)
         (self.group/'input.i64').write_bytes(b'user edits')

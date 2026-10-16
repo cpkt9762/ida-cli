@@ -232,6 +232,8 @@ gate-13 invocation fails with Cargo's required-feature message. Standard lib
 gates need neither F1_PYTHON nor F1_ROOT. Cache tests use private TMPDIR roots.
 
 ```bash
+timeout 30s cargo clippy --locked --all-targets -- -D warnings
+timeout 30s cargo clippy --locked --all-targets --features nexus-test-support -- -D warnings
 F1_PYTHON="$N0_ROOT/venv/bin/python" F1_ROOT="$N3_ROOT/r" timeout 30s cargo test --locked --features nexus-test-support --test nexus_bridge_regressions -- --test-threads=1
 ```
 
@@ -421,7 +423,8 @@ Build the unmodified input SHA with matching SDK/runtime and an external
 and `probe-runtime` output separately. Never use an unidentified installed CLI
 as the old-version baseline. Run each repository check with shell timeout:
 `cargo fmt --all -- --check`, `cargo check --locked`,
-`cargo clippy --locked --all-targets -- -D warnings`, and
+`cargo clippy --locked --all-targets -- -D warnings`,
+`timeout 30s cargo clippy --locked --all-targets --features nexus-test-support -- -D warnings`, and
 `cargo test --locked --lib`. Defaults are 30 seconds; announce the reason and
 180-second limit before a cold Rust/FFI build. Report existing failures and
 ignored tests explicitly. The old `just` recipes do not add these limits and
