@@ -43,10 +43,12 @@ impl PreparedOpen {
     pub async fn publish_verified_input(&self, preparation: &Preparation) -> Result<(), ToolError> {
         if let Some((root, key, idb)) = self.generation.clone() {
             let guard = self.cache_guard.clone();
+            let content_guard = self.content_guard.clone();
             let preparing = preparation.clone();
             preparation
                 .wait(blocking::run(blocking::WorkClass::Prepare, move || {
                     let _guard = guard;
+                    let _content_guard = content_guard;
                     super::generations::publish_index(&root, &key, &idb, &preparing)
                 }))
                 .await?
@@ -58,9 +60,11 @@ impl PreparedOpen {
         let destination = self.path.with_extension("");
         let preparing = preparation.clone();
         let guard = self.cache_guard.clone();
+        let content_guard = self.content_guard.clone();
         preparation
             .wait(blocking::run(blocking::WorkClass::Prepare, move || {
                 let _guard = guard;
+                let _content_guard = content_guard;
                 anyhow::ensure!(
                     directory.join("closed").is_file(),
                     "legacy verification close unconfirmed"

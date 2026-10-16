@@ -743,31 +743,53 @@ impl IdbStore {
                 Err(e) => return Err(e.into()),
             };
         let mut removed = Vec::new();
+        let mut nexus_dirty = false;
+        let mut legacy_dirty = false;
         for entry in entries {
             if let Some(relative) = nexus.get(&entry.hash) {
-                // A quarantined group still owns its metadata. clean is never
-                // GC and must not retire, restore or remove database files.
+                // Quarantined groups retain their own generation metadata.
                 let name = Path::new(relative)
                     .parent()
                     .and_then(Path::file_name)
                     .ok_or_else(|| anyhow::anyhow!("generation name missing"))?;
-                if self.try_lookup_generation(&entry.hash)?.is_some()
-                    || self.root.join("quarantine").join(name).exists()
+                if self.try_lookup_generation(&entry.hash)?.is_none()
+                    && !self.root.join("quarantine").join(name).exists()
                 {
-                    continue;
+                    nexus.remove(&entry.hash);
+                    nexus_dirty = true;
                 }
-            } else if self.lookup_by_hash(&entry.hash).is_some() {
-                continue;
             }
-            nexus.remove(&entry.hash);
-            legacy.remove(&entry.hash);
-            removed.push(entry);
+            if legacy.contains_key(&entry.hash) {
+                // Do not consult lookup_by_hash: its generation-first lookup
+                // says nothing about the independent flat legacy target.
+                let pattern = format!(".{}.", entry.hash);
+                let mut healthy = false;
+                for item in std::fs::read_dir(&self.root)? {
+                    let item = item?;
+                    let name = item.file_name();
+                    let name = name.to_string_lossy();
+                    if name.contains(&pattern) && name.ends_with(".i64") {
+                        healthy = true;
+                        break;
+                    }
+                }
+                if !healthy {
+                    legacy.remove(&entry.hash);
+                    legacy_dirty = true;
+                }
+            }
+            if !nexus.contains_key(&entry.hash) && !legacy.contains_key(&entry.hash) {
+                removed.push(entry);
+            }
         }
-        if !removed.is_empty() {
+        if nexus_dirty || legacy_dirty {
             for result in [
-                self.replace_metadata("nexus-index.json", &nexus),
-                self.replace_metadata("index.json", &legacy),
-            ] {
+                nexus_dirty.then(|| self.replace_metadata("nexus-index.json", &nexus)),
+                legacy_dirty.then(|| self.replace_metadata("index.json", &legacy)),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 if let Err(error) = result {
                     tracing::warn!(%error, "Nexus orphan metadata write failed; reconciling actual removals");
                 }

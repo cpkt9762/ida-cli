@@ -10,6 +10,13 @@ config = json.loads(pathlib.Path(__file__).with_suffix(".json").read_text())
 with open(pathlib.Path(config["methods"]).parent.parent / "n2-process-identities.jsonl", "a") as audit:
     audit.write(json.dumps({"pid": os.getpid(), "pgid": None,
                            "kind": "f2-worker-start", "owned_spawn": True}) + "\n")
+# Distinguish OS/Python startup from request dispatch in barrier failures.
+pathlib.Path(config["methods"]).with_name("worker-started").touch()
+if config.get("startup_socket"):
+    with socket.socket(socket.AF_UNIX) as startup:
+        startup.connect(config["startup_socket"])
+        startup.sendall(b"ready\n")
+        startup.recv(1)
 for line in sys.stdin:
     request = json.loads(line)
     method = request["method"]

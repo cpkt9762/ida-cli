@@ -765,3 +765,11 @@ timeout 180s env IDA_TEST=1 cargo test --locked --test nexus_release_e2e -- --te
 - [router](../../src/router/mod.rs)
 - [任务注册](../../src/server/task.rs)
 - 上游源码：`HexRaysSA/ida-nexus @ d60ff582fde90c59726336c0dbdf3e8286e9df7a`，重点阅读 `ida_nexus/handle.py`、`_server.py`、`_runtime.py`、`_resolver.py`、`database_state.py` 及 `tests/test_idalib_e2e.py`。
+
+N7a fix2 复审补充：注册完整性检查复用公开 `get_state_dir()`（含 tilde 展开）；
+不可取消的发布任务自行持有内容键 EX，直到文件系统调用返回；新/旧索引各自清理，
+仅整个 key 不再有健康目标时才计为孤立。合法 JSON 的越界数值按候选拒绝。
+tools 的 metadata 能力通过显式安装校验，首次请求、重连和 owner 换代采用同一入口。
+N2 fixture 的启动/调度握手和后续响应预算分离，并覆盖与真实 E2E 并发的 lib 三轮。
+r9 坏副本的只读取证显示文件未截断、B-tree 完整但 Root Node 全部 24 条记录缺失；
+尚不能由保存后的副本确定删除发生在哪一调用，也不能宣称用户 IDB 损坏风险已关闭。

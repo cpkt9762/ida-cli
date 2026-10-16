@@ -1476,3 +1476,7 @@ mod n4_fix_regressions {
 #[cfg(test)]
 #[path = "../../tests/support/n4_f2_open.rs"]
 mod n4_f2_regressions;
+
+#[cfg(test)]
+#[path = "../../tests/support/n7_fix2_publish.rs"]
+mod n7_fix2_publish;

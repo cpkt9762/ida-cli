@@ -1,5 +1,27 @@
 use super::*;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+// Startup includes process scheduling and Python initialization. Response budgets
+// below begin only after the worker reaches the requested fault barrier.
+const FIXTURE_STARTUP: Duration = Duration::from_secs(8);
+const FIXTURE_OPERATION: Duration = Duration::from_secs(10);
+
+async fn fixture_barrier<T: std::fmt::Debug>(
+    listener: &tokio::net::UnixListener,
+    call: &mut tokio::task::JoinHandle<T>,
+    directory: &std::path::Path,
+) -> tokio::net::UnixStream {
+    tokio::time::timeout(FIXTURE_STARTUP, async {
+        tokio::select! {
+            connection = listener.accept() => connection.expect("fixture barrier connection").0,
+            outcome = call => panic!("fixture operation ended before business barrier: {outcome:?}"),
+        }
+    }).await.unwrap_or_else(|error| {
+        panic!("fixture startup/dispatch barrier {error}; worker_started={}, methods={:?}",
+            directory.join("worker-started").exists(),
+            std::fs::read_to_string(directory.join("methods.log")))
+    })
+}
 
 pub(crate) async fn first_open_fixture(
     directory: &std::path::Path,
@@ -166,18 +188,15 @@ async fn sbpf_first_open_cancellation_propagates_and_cleans_worker() {
             let listener = tokio::net::UnixListener::bind(directory.join("ready.sock")).unwrap();
             let (router, path) =
                 first_open_fixture(&directory, "none", Some("get_function_by_name")).await;
-            let preparation = crate::preprocess::Preparation::new(Duration::from_secs(3));
+            let preparation = crate::preprocess::Preparation::new(FIXTURE_OPERATION);
             let cancel = preparation.cancel.clone();
             let owned = router.clone();
-            let call = tokio::spawn(async move {
+            let mut call = tokio::spawn(async move {
                 owned
                     .ensure_worker_prepared(&path, None, None, preparation)
                     .await
             });
-            let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let stream = fixture_barrier(&listener, &mut call, &directory).await;
             let mut stream = BufReader::new(stream);
             let mut line = String::new();
             stream.read_line(&mut line).await.unwrap();
@@ -389,20 +408,17 @@ async fn f3_post_open_busy(phase: &str, class: crate::blocking::WorkClass, count
     let (router, path) = first_open_fixture(&directory, "none", Some(phase)).await;
     let owned = router.clone();
     let output = directory.join("out.i64");
-    let call = tokio::spawn(async move {
+    let mut call = tokio::spawn(async move {
         owned
             .ensure_worker_prepared(
                 &path,
                 Some(output.to_str().unwrap()),
                 None,
-                crate::preprocess::Preparation::new(Duration::from_secs(4)),
+                crate::preprocess::Preparation::new(FIXTURE_OPERATION),
             )
             .await
     });
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
+    let stream = fixture_barrier(&listener, &mut call, &directory).await;
     let mut stream = BufReader::new(stream);
     let mut line = String::new();
     stream.read_line(&mut line).await.unwrap();
@@ -640,7 +656,7 @@ async fn f3_index_cancellation_retains_pending_input_evidence() {
             let cpath = std::ffi::CString::new(index.as_os_str().as_encoded_bytes()).unwrap();
             // SAFETY: a private fixture path in this child process's isolated home.
             assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
-            let preparation = crate::preprocess::Preparation::new(Duration::from_secs(4));
+            let preparation = crate::preprocess::Preparation::new(FIXTURE_OPERATION);
             let tracked = preparation.clone();
             let owned = router.clone();
             let output = directory.join("out.i64");
@@ -655,8 +671,13 @@ async fn f3_index_cancellation_retains_pending_input_evidence() {
                     .await
             });
             // O_NONBLOCK writer succeeds only when the real index reader is open.
-            let mut writer = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut writer = tokio::time::timeout(FIXTURE_STARTUP, async {
                 loop {
+                    assert!(
+                        !call.is_finished(),
+                        "fixture open ended before index reader: methods={:?}",
+                        std::fs::read_to_string(directory.join("methods.log"))
+                    );
                     match std::fs::OpenOptions::new()
                         .write(true)
                         .custom_flags(libc::O_NONBLOCK)
@@ -769,20 +790,17 @@ async fn f4_prewarm_fault(keep_warm: bool, already_open: bool, fault: &str) {
         None
     };
     let baseline = usize::from(already_open) + usize::from(fault == "new-client");
-    let preparation = crate::preprocess::Preparation::new(Duration::from_secs(4));
+    let preparation = crate::preprocess::Preparation::new(FIXTURE_OPERATION);
     let cancel = preparation.cancel.clone();
     let deadline = preparation.deadline;
     let worker = router.clone();
     let input = path.clone();
-    let call = tokio::spawn(async move {
+    let mut call = tokio::spawn(async move {
         preparation
             .scope(worker.prewarm_path_with_options(&input, keep_warm, "default"))
             .await
     });
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
+    let stream = fixture_barrier(&listener, &mut call, &directory).await;
     let mut stream = BufReader::new(stream);
     let mut line = String::new();
     stream.read_line(&mut line).await.unwrap();
@@ -1022,18 +1040,15 @@ async fn f4_first_open_cancel_preserves_other_client_reference() {
             let (router, path) =
                 first_open_fixture(&directory, "none", Some("get_function_by_name")).await;
             let (_socket_directory, listener) = short_fixture_listener(&directory);
-            let preparation = crate::preprocess::Preparation::new(Duration::from_secs(4));
+            let preparation = crate::preprocess::Preparation::new(FIXTURE_OPERATION);
             let cancel = preparation.cancel.clone();
             let owned = router.clone();
-            let call = tokio::spawn(async move {
+            let mut call = tokio::spawn(async move {
                 owned
                     .ensure_worker_prepared(&path, None, None, preparation)
                     .await
             });
-            let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let stream = fixture_barrier(&listener, &mut call, &directory).await;
             let mut stream = BufReader::new(stream);
             let mut line = String::new();
             stream.read_line(&mut line).await.unwrap();
@@ -1089,4 +1104,53 @@ pub(crate) fn fixture_reference_count(router: &RouterState) -> usize {
         .values()
         .map(HashSet::len)
         .sum()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r6_startup_gate_precedes_strict_response_budget() {
+    isolated_f3_case("r6_startup_gate_precedes_strict_response_budget", async {
+        let directory = std::env::temp_dir().join(format!("n2-r6-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let (router, path) =
+            first_open_fixture(&directory, "none", Some("get_function_by_name")).await;
+        let startup = tokio::net::UnixListener::bind(directory.join("startup.sock")).unwrap();
+        let listener = tokio::net::UnixListener::bind(directory.join("ready.sock")).unwrap();
+        let config_path = directory.join("worker.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["startup_socket"] = serde_json::json!(directory.join("startup.sock"));
+        std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let prep = crate::preprocess::Preparation::new(FIXTURE_OPERATION);
+        let cancel = prep.cancel.clone();
+        let owned = router.clone();
+        let mut call =
+            tokio::spawn(
+                async move { owned.ensure_worker_prepared(&path, None, None, prep).await },
+            );
+        let (mut startup_stream, _) = tokio::time::timeout(FIXTURE_STARTUP, startup.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ready = [0; 6];
+        startup_stream.read_exact(&mut ready).await.unwrap();
+        assert_eq!(&ready, b"ready\n");
+        assert!(!call.is_finished());
+        assert!(
+            !directory.join("methods.log").exists(),
+            "worker held before first request"
+        );
+        startup_stream.write_all(b"x").await.unwrap();
+        let stream = fixture_barrier(&listener, &mut call, &directory).await;
+        assert!(cancel.cancel());
+        let result = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(router.worker_count().await, 0);
+        drop(stream);
+        drop(startup_stream);
+        std::fs::remove_dir_all(directory).unwrap();
+    })
+    .await;
 }

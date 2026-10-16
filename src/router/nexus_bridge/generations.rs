@@ -91,6 +91,15 @@ pub fn publish_index(
         output.sync_all()?;
         // Only the index pointer is replaceable; generation contents never are.
         stage.commit(preparation, || {
+            #[cfg(test)]
+            {
+                // A real blocking syscall after the artifact commit point. Only
+                // the protocol regression creates this private FIFO.
+                let fifo = root.join(".n7-publish-fifo");
+                if fifo.exists() {
+                    std::fs::read(fifo)?;
+                }
+            }
             std::fs::rename(&stage.output, root.join("nexus-index.json"))
         })?;
         std::fs::File::open(root)?.sync_all()?;

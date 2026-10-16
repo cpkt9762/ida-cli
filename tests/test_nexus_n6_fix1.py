@@ -52,6 +52,23 @@ class Compatibility(unittest.TestCase):
         for raw in ('1_6', '-1', '18446744073709551616', '0x10000000000000000', '0o2000000000000000000000', '0b' + '1' * 65):
             self.assertIsNone(query.handler_address(raw, parse))
 
+    def test_tools_require_explicit_metadata_installation(self):
+        tools = load('tools')
+        # Unrelated globals cannot accidentally satisfy the capability contract.
+        tools.warn_missing_input_metadata = lambda *_: None
+        with self.assertRaisesRegex(RuntimeError, 'not installed'):
+            tools.invoke('get_database_info', {})
+        for capabilities in ({}, {'warn_missing_input_metadata': 1}):
+            with self.assertRaisesRegex(RuntimeError, 'requires callable'):
+                tools.install_tools(capabilities)
+        provider = load('metadata').warn_missing_input_metadata
+        tools.install_tools({'warn_missing_input_metadata': provider})
+        self.assertIs(tools._metadata_warning, provider)
+        with self.assertRaises(RuntimeError):
+            tools.install_tools({})
+        with self.assertRaisesRegex(RuntimeError, 'not installed'):
+            tools.invoke('get_database_info', {})
+
     def test_missing_metadata_has_native_zero_buffers(self):
         attributes = {
             'ida_idaapi': dict(BADADDR=2**64-1),
@@ -69,11 +86,18 @@ class Compatibility(unittest.TestCase):
         modules['ida_auto'] = types.SimpleNamespace(auto_is_ok=lambda: True, get_auto_state=lambda: 0)
         modules['ida_nexus'] = types.SimpleNamespace(discover_databases=lambda **_: [])
         with patch.dict(sys.modules, modules):
-            tools = load('tools')
-            tools.warn_missing_input_metadata = load('metadata').warn_missing_input_metadata
-            tools.processor_name = lambda: 'test processor'
-            with self.assertLogs('ida_cli.metadata', level='WARNING') as logs:
-                info = tools.invoke('get_database_info', {})['value']
+            with patch.object(sys, 'path', [str(REPO/'nexus_bridge'), *sys.path]):
+                source = load('bridge').TOOL_SOURCE
+            tools = types.ModuleType('installed_tools')
+            for generation in range(3):
+                # First installation, reconnect and owner replacement all execute
+                # the same checked source; stale capability state cannot satisfy it.
+                tools._metadata_warning = 'stale'
+                exec(source, tools.__dict__)
+                self.assertTrue(callable(tools._metadata_warning))
+                tools.processor_name = lambda: 'test processor'
+                with self.assertLogs('ida_cli.metadata', level='WARNING') as logs:
+                    info = tools.invoke('get_database_info', {})['value']
         self.assertEqual({k: info[k] for k in ('input_file_path', 'input_file_size', 'md5', 'sha256')},
             dict(input_file_path='', input_file_size=0, md5='0'*32, sha256='0'*64))
         self.assertIn('missing input metadata', logs.output[0])

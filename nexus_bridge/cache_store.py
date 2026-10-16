@@ -64,7 +64,7 @@ def rename_group(source, destination):
 
 
 def public_probe(path):
-    from ida_nexus import discover_databases, find_database_owner, probe_database_state
+    from ida_nexus import discover_databases, find_database_owner, get_state_dir, probe_database_state
     try:
         if find_database_owner(path, timeout=0.2) is not None:
             return 'public owner holds database'
@@ -75,7 +75,7 @@ def public_probe(path):
         configured = os.environ.get('IDA_NEXUS_STATE_DIR')
         if not configured:
             return 'registration completeness unknown: IDA_NEXUS_STATE_DIR missing'
-        directory = Path(configured)/'instances'
+        directory = get_state_dir()/'instances'
         if directory.is_symlink():
             return 'registration completeness unknown: symlink registry'
         records = [p for p in directory.iterdir() if p.name.endswith('.json')] if directory.exists() else []
@@ -168,8 +168,8 @@ class Store:
                 or data['version'] != 1 or data.get('name') != isolated.name
                 or not isinstance(data.get('epoch'), str) or not data['epoch']
                 or type(data.get('since')) not in (float, int)
-                or not math.isfinite(data['since'])
-                or type(data.get('checks')) is not int or data['checks'] < 0):
+                or not 0 <= data['since'] <= sys.float_info.max
+                or type(data.get('checks')) is not int or not 0 <= data['checks'] < 2**63):
             raise ValueError('invalid quarantine journal')
         return data
 

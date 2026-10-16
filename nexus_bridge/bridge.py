@@ -32,7 +32,13 @@ METHODS = {"execute_python": "may_write", "database_info": "read_only",
 METHODS.update({method: "may_write" if method in WRITE_METHODS else "read_only"
                 for method in TOOL_METHODS})
 TOOL_SOURCE = "\n".join(Path(__file__).with_name(name).read_text(encoding="utf-8")
-                        for name in ("type_tools.py", "edit_tools.py", "analysis_tools.py", "struct_tools.py", "query_tools.py", "search_tools.py", "metadata.py", "tools.py"))
+                        for name in ("type_tools.py", "edit_tools.py", "analysis_tools.py", "struct_tools.py", "query_tools.py", "search_tools.py", "tools.py"))
+# Both ordinary and sliced execution use this checked installation. The source
+# is evaluated anew by the current owner for each request, including reconnects.
+METADATA_SOURCE = Path(__file__).with_name("metadata.py").read_text(encoding="utf-8")
+TOOL_SOURCE += ("\n_tools_metadata = {}\n"
+                + f"exec({METADATA_SOURCE!r}, _tools_metadata)\n"
+                + "install_tools(_tools_metadata)\n")
 SLICE_SOURCE = Path(__file__).with_name("slices.py").read_text(encoding="utf-8")
 SLICE_METHODS = {"batch_decompile", "search_pseudocode", "run_auto_analysis", "batch_rename", "_n5_cleanup"}
 

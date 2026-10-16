@@ -11,6 +11,19 @@ METHODS = ("get_database_info", "get_analysis_status", "list_functions",
            "batch_decompile", "search_pseudocode", "run_auto_analysis", "_n5_cleanup")
 
 
+_metadata_warning = None
+
+
+def install_tools(capabilities):
+    """Explicit owner-side dependency injection, repeated on every source install."""
+    global _metadata_warning
+    _metadata_warning = None
+    provider = capabilities.get('warn_missing_input_metadata')
+    if not callable(provider):
+        raise RuntimeError('tools installation requires callable warn_missing_input_metadata')
+    _metadata_warning = provider
+
+
 def parse_address(raw, *, handler=False):
     """P2-2: rpc_dispatch::parse_address_value (Rust u64 + str::trim)."""
     import re
@@ -140,6 +153,8 @@ def processor_name():
 
 
 def invoke(method, params):
+    if method == 'get_database_info' and _metadata_warning is None:
+        raise RuntimeError('tools metadata capability not installed; call install_tools')
     import ida_auto
     import ida_funcs
     import ida_ida
@@ -289,7 +304,7 @@ def invoke(method, params):
                  "base_address": hex(base) if base != ida_idaapi.BADADDR else None,
                  "min_address": hex(ida_ida.inf_get_min_ea()), "max_address": hex(ida_ida.inf_get_max_ea()),
                  "main_address": hex(main) if main != ida_idaapi.BADADDR else None}
-        warn_missing_input_metadata(value, globals().get('_metadata_context'))
+        _metadata_warning(value, globals().get('_metadata_context'))
     elif method == "list_functions":
         pattern = params.get("filter")
         items = [info for _, info in functions()

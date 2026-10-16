@@ -194,9 +194,10 @@ proof acquired after expiry. This is **gate 13**, in addition to the twelve stan
 gates. Set `F1_PYTHON` to the absolute `venv/bin/python` of a freshly prepared N0
 environment with the current client patch. Missing or invalid `F1_PYTHON` is a
 hard failure with preparation instructions, never a skip. `F1_ROOT` optionally
-selects a short external evidence directory; otherwise it uses TMPDIR. No bridge
-regression variable is needed for the twelve standard gates; cache lib tests create
-and remove their own private directories under TMPDIR.
+selects a short external evidence directory; otherwise it uses TMPDIR. The N7
+publication protocol regression also uses `F1_PYTHON` in the lib gate. It launches
+an isolated libtest child, real bridge and N1 with the selected public client;
+only that child enables Nexus. Cache tests create private directories in TMPDIR.
 
 ```bash
 F1_PYTHON="$N0_ROOT/venv/bin/python" F1_ROOT="$N3_ROOT/r" timeout 30s cargo test --locked --test nexus_bridge_regressions -- --test-threads=1
@@ -643,3 +644,25 @@ N0 support, bridge pytest, n*_fix* tests and all three patch probes red/green.
 Run fresh lifecycle 9, contract 4, concurrency 14, N6 4 and special 8 suites.
 Record current HEAD, full commands, exits and uptime; assert cleanup CLEAN,
 all registered process identities exited and zero residual sockets.
+
+### N7a fix2 residual coverage
+
+`tests/test_nexus_n7_fix2.py` covers public state-directory resolution (absolute
+and tilde) and candidate-local numeric bounds. `nexus_n7_fix2_store` requires
+`IDA_CLI_NEXUS_DEV=1` and checks mixed healthy/stale indices independently.
+The lib publication protocol pauses a real FIFO read after commit arbitration,
+drops the waiter and waits for exact N1 Released plus retained-guard removal.
+A second same-key preparation must wait, then consume the published index.
+Both blocking publication jobs own the content EX guard themselves.
+
+N2 fixture barriers have separate startup/dispatch (8s) and operation (10s)
+bounds. Barrier waits also observe early operation completion and report whether
+the Python worker started and which requests arrived. Existing post-barrier
+response/cancellation assertions remain 1–2s. A startup socket regression holds
+the worker before its first request and releases it explicitly. Validate the lib
+gate three times concurrently with a fresh real E2E suite; do not serialize these
+runs to hide scheduling failures.
+
+Owner tool source explicitly installs a separately evaluated metadata capability
+namespace. Missing/noncallable dependencies fail installation; first request,
+reconnect and replacement owner all execute the same checked installation.
