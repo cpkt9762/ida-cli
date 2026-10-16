@@ -238,7 +238,23 @@ impl IdbStore {
         &self,
         binary_path: &Path,
     ) -> std::io::Result<(Option<PathBuf>, PathBuf)> {
+        if Self::nexus_selected()
+            && binary_path
+                .extension()
+                .is_some_and(|e| e == "i64" || e == "idb")
+        {
+            let direct = binary_path.canonicalize()?;
+            return Ok((Some(direct.clone()), direct));
+        }
         let hash = Self::try_compute_hash(binary_path)?;
+        if Self::nexus_selected() {
+            if let Some(path) = self.try_lookup_generation(&hash)? {
+                if Self::try_compute_hash(&path.with_extension(""))? != hash {
+                    return Err(std::io::Error::other("generation input hash mismatch"));
+                }
+                return Ok((Some(path.clone()), path));
+            }
+        }
         let basename = binary_path
             .file_name()
             .ok_or_else(|| {
@@ -294,6 +310,16 @@ impl IdbStore {
 
     /// Search for an existing `.i64` whose filename contains `hash`.
     pub fn lookup_by_hash(&self, hash: &str) -> Option<PathBuf> {
+        if Self::nexus_selected() {
+            match self.try_lookup_generation(hash) {
+                Ok(Some(path)) => return Some(path),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "Nexus cache lookup failed");
+                    return None;
+                }
+            }
+        }
         let pattern = format!(".{}.", hash);
         let entries = std::fs::read_dir(&self.root).ok()?;
         for entry in entries.flatten() {
@@ -391,12 +417,67 @@ impl IdbStore {
 
     /// List all entries from `index.json`.
     pub fn list(&self) -> Vec<IdbEntry> {
+        if Self::nexus_selected() {
+            return self.try_list().unwrap_or_else(|error| {
+                tracing::warn!(%error, "Nexus cache list unavailable");
+                Vec::new()
+            });
+        }
         let index_path = self.root.join("index.json");
         std::fs::read_to_string(&index_path)
             .ok()
             .and_then(|s| serde_json::from_str::<HashMap<String, IdbEntry>>(&s).ok())
             .map(|m| m.into_values().collect())
             .unwrap_or_default()
+    }
+
+    fn try_lookup_generation(&self, hash: &str) -> std::io::Result<Option<PathBuf>> {
+        crate::router::nexus_bridge::generations::current(&self.root, hash)
+            .map_err(std::io::Error::other)
+    }
+
+    /// Current generations and legacy metadata, deduplicated by the same key
+    /// used by open. Errors remain available to callers that require evidence.
+    pub fn try_list(&self) -> std::io::Result<Vec<IdbEntry>> {
+        let mut entries: BTreeMap<String, IdbEntry> =
+            match std::fs::read(self.root.join("index.json")) {
+                Ok(bytes) => serde_json::from_slice(&bytes)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+                Err(e) => return Err(e),
+            };
+        if Self::nexus_selected() {
+            let index = crate::router::nexus_bridge::generations::read_index(&self.root)
+                .map_err(std::io::Error::other)?;
+            for (key, relative) in index {
+                let current = self.try_lookup_generation(&key)?;
+                if entries.contains_key(&key) {
+                    continue;
+                }
+                let size = match current
+                    .as_ref()
+                    .map(|p| std::fs::metadata(p.with_extension("")))
+                {
+                    Some(Ok(meta)) => meta.len(),
+                    Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error)
+                    }
+                    _ => 0,
+                };
+                entries.insert(
+                    key.clone(),
+                    IdbEntry {
+                        hash: key,
+                        original_path: current
+                            .map_or(relative, |p| p.with_extension("").display().to_string()),
+                        binary_type: "native".into(),
+                        size,
+                        created_at: String::new(),
+                        last_accessed: String::new(),
+                    },
+                );
+            }
+        }
+        Ok(entries.into_values().collect())
     }
 
     pub fn try_stats(&self) -> std::io::Result<IdbStoreStats> {
@@ -433,13 +514,7 @@ impl IdbStore {
             Err(e) => return Err(e),
         };
         if Self::nexus_selected() {
-            match std::fs::read(self.root.join("nexus-index.json")) {
-                Ok(bytes) => {
-                    entry_count += serde_json::from_slice::<HashMap<String, String>>(&bytes)?.len()
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
+            entry_count = self.try_list()?.len();
         }
         Ok(IdbStoreStats {
             root: self.root.display().to_string(),
@@ -620,8 +695,10 @@ impl IdbStore {
     /// Returns the removed entries.
     pub fn clean(&self) -> Vec<IdbEntry> {
         if Self::nexus_selected() {
-            let _ = self.nexus_gc(0, None);
-            return Vec::new();
+            return self.clean_nexus_indices().unwrap_or_else(|error| {
+                tracing::warn!(%error, "Nexus orphan index cleanup refused");
+                Vec::new()
+            });
         }
         let index_path = self.root.join("index.json");
         let mut index: HashMap<String, IdbEntry> = std::fs::read_to_string(&index_path)
@@ -653,11 +730,155 @@ impl IdbStore {
 
         orphaned
     }
+
+    fn clean_nexus_indices(&self) -> anyhow::Result<Vec<IdbEntry>> {
+        use crate::router::nexus_bridge::{cache_lock, generations};
+        let _guard = cache_lock::try_exclusive(&self.root)?;
+        let entries = self.try_list()?;
+        let mut nexus = generations::read_index(&self.root)?;
+        let mut legacy: BTreeMap<String, IdbEntry> =
+            match std::fs::read(self.root.join("index.json")) {
+                Ok(bytes) => serde_json::from_slice(&bytes)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+                Err(e) => return Err(e.into()),
+            };
+        let mut removed = Vec::new();
+        for entry in entries {
+            if let Some(relative) = nexus.get(&entry.hash) {
+                // A quarantined group still owns its metadata. clean is never
+                // GC and must not retire, restore or remove database files.
+                let name = Path::new(relative)
+                    .parent()
+                    .and_then(Path::file_name)
+                    .ok_or_else(|| anyhow::anyhow!("generation name missing"))?;
+                if self.try_lookup_generation(&entry.hash)?.is_some()
+                    || self.root.join("quarantine").join(name).exists()
+                {
+                    continue;
+                }
+            } else if self.lookup_by_hash(&entry.hash).is_some() {
+                continue;
+            }
+            nexus.remove(&entry.hash);
+            legacy.remove(&entry.hash);
+            removed.push(entry);
+        }
+        if !removed.is_empty() {
+            for result in [
+                self.replace_metadata("nexus-index.json", &nexus),
+                self.replace_metadata("index.json", &legacy),
+            ] {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "Nexus orphan metadata write failed; reconciling actual removals");
+                }
+            }
+            let remaining = self.try_list()?;
+            removed.retain(|entry| !remaining.iter().any(|item| item.hash == entry.hash));
+        }
+        Ok(removed)
+    }
+    fn replace_metadata(&self, name: &str, value: &impl serde::Serialize) -> anyhow::Result<()> {
+        let destination = self.root.join(name);
+        let stage = crate::preprocess::StagedArtifact::create(&destination)?;
+        std::fs::write(&stage.output, serde_json::to_vec(value)?)?;
+        std::fs::File::open(&stage.output)?.sync_all()?;
+        stage.commit(
+            &crate::preprocess::Preparation::new(std::time::Duration::from_secs(5)),
+            || std::fs::rename(&stage.output, &destination),
+        )?;
+        std::fs::File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn n7_fix1_clean_preserves_healthy_and_returns_orphans() {
+        n7_fix1_store_case("clean");
+    }
+    #[test]
+    fn n7_fix1_observations_use_generation_identity() {
+        n7_fix1_store_case("observe");
+    }
+    fn n7_fix1_store_case(case: &str) {
+        if std::env::var("N7_STORE_CASE").as_deref() != Ok(case) {
+            let name = if case == "clean" {
+                "n7_fix1_clean_preserves_healthy_and_returns_orphans"
+            } else {
+                "n7_fix1_observations_use_generation_identity"
+            };
+            let status = std::process::Command::new("timeout")
+                .arg("10s")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("idb_store::tests::{name}"),
+                    "--nocapture",
+                ])
+                .env("N7_STORE_CASE", case)
+                .env("IDA_CLI_NEXUS_DEV", "1")
+                .env(
+                    "IDA_NEXUS_PYTHON",
+                    std::env::var_os("IDA_NEXUS_PYTHON")
+                        .unwrap_or_else(|| "/usr/bin/python3".into()),
+                )
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let root = temp_dir(&format!("n7-fix1-{case}"));
+        std::fs::create_dir_all(root.join("generations/good")).unwrap();
+        let source = root.join("source");
+        std::fs::write(&source, b"source").unwrap();
+        let key = IdbStore::try_compute_hash(&source).unwrap();
+        let idb = root.join("generations/good/input.i64");
+        std::fs::write(&idb, b"user edits").unwrap();
+        std::fs::write(idb.with_extension(""), b"source").unwrap();
+        std::fs::write(
+            root.join("generations/good/generation.json"),
+            serde_json::to_vec(&serde_json::json!({"version":1,"key":key})).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("nexus-index.json"),
+            serde_json::to_vec(&serde_json::json!({key.clone():"generations/good/input.i64"}))
+                .unwrap(),
+        )
+        .unwrap();
+        let orphan = IdbEntry {
+            hash: "orphan".into(),
+            original_path: "missing".into(),
+            binary_type: "native".into(),
+            size: 0,
+            created_at: "1Z".into(),
+            last_accessed: "1Z".into(),
+        };
+        std::fs::write(
+            root.join("index.json"),
+            serde_json::to_vec(&serde_json::json!({"orphan":orphan})).unwrap(),
+        )
+        .unwrap();
+        let store = IdbStore::with_root(root.clone());
+        if case == "clean" {
+            let removed = store.clean();
+            assert!(
+                idb.exists(),
+                "clean only removes orphaned indices, never healthy databases"
+            );
+            assert_eq!(removed.len(), 1);
+            assert_eq!(removed[0].hash, "orphan");
+            assert!(store.clean().is_empty());
+        } else {
+            assert_eq!(store.prepared_paths(&source).unwrap().0, Some(idb.clone()));
+            assert_eq!(store.lookup_by_hash(&key), Some(idb));
+            assert!(store.list().iter().any(|entry| entry.hash == key));
+            assert_eq!(store.try_stats().unwrap().entry_count, store.list().len());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// Return a unique temp directory for each test.
     fn temp_dir(suffix: &str) -> PathBuf {

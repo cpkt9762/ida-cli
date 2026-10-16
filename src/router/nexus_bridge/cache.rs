@@ -17,6 +17,8 @@ pub struct PreparedOpen {
     verification_handed_off: bool,
     generation: Option<(PathBuf, String, PathBuf)>,
     cache_guard: Option<std::sync::Arc<super::cache_lock::CacheGuard>>,
+    pub(crate) content_guard: Option<std::sync::Arc<super::cache_lock::CacheGuard>>,
+    pub(crate) cache_hit: bool,
 }
 impl Drop for PreparedOpen {
     fn drop(&mut self) {
@@ -91,6 +93,8 @@ impl PreparedOpen {
             verification_handed_off: false,
             generation: None,
             cache_guard: None,
+            content_guard: None,
+            cache_hit: false,
         }
     }
 }
@@ -107,17 +111,63 @@ pub async fn prepare_n7_open(
     preparation: &Preparation,
     refresh: bool,
 ) -> Result<PreparedOpen, ToolError> {
+    let canonical = path.clone();
+    let path = preparation
+        .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+            canonical.canonicalize()
+        }))
+        .await?
+        .map_err(|e| ToolError::InvalidPath(e.to_string()))?;
+    // Classify the caller's canonical database before a processor can erase its
+    // extension and identity. Direct databases never enter preprocessing.
+    if path.extension().is_some_and(|x| x == "i64" || x == "idb") {
+        if refresh {
+            return Err(ToolError::IdaError(
+                "refresh requires the source input, never an existing IDB".into(),
+            ));
+        }
+        let mut prepared = PreparedOpen::plain(path);
+        prepared.cache_hit = true;
+        prepared.options = serde_json::json!({"auto_analysis":false});
+        return Ok(prepared);
+    }
     let guard = super::cache_lock::acquire(&cache, preparation).await?;
     let processed =
         super::generations::preprocess(path.clone(), cache.clone(), preparation).await?;
     let source = processed
         .as_ref()
         .map_or(path, |stage| stage.output.clone());
+    let hash_source = source.clone();
+    let preparing = preparation.clone();
+    let hash = preparation
+        .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+            digest(&hash_source, &preparing)
+        }))
+        .await?
+        .map_err(|e| ToolError::IdaError(format!("cache content identity: {e}")))?;
+    let key = hash.to_hex()[..12].to_string();
+    let content_guard = super::cache_lock::acquire_content(&cache, &key, preparation).await?;
     let preparing = preparation.clone();
     let result = preparation
         .wait(blocking::run(blocking::WorkClass::Prepare, move || {
             let mut prepared = prepare_impl_inner(source, cache, &preparing, true, refresh)?;
+            // An independently mutable source must not publish under another
+            // content key than the one whose coordination right we hold.
+            let snapshot = if prepared.path.extension().is_some_and(|e| e == "i64") {
+                prepared.path.with_extension("")
+            } else {
+                prepared.path.clone()
+            };
+            let snapshot = prepared
+                .verification
+                .as_ref()
+                .map_or(snapshot, |p| p.join("input"));
+            anyhow::ensure!(
+                digest(&snapshot, &preparing)? == hash,
+                "source changed while waiting for cache content coordination"
+            );
             prepared.cache_guard = Some(guard);
+            prepared.content_guard = Some(content_guard);
             Ok::<_, anyhow::Error>(prepared)
         }))
         .await?
@@ -189,6 +239,7 @@ fn prepare_impl_inner(
             "refresh requires the source input, never an existing IDB"
         );
         let mut prepared = PreparedOpen::plain(path);
+        prepared.cache_hit = true;
         prepared.options = serde_json::json!({"auto_analysis":false});
         return Ok(prepared);
     }
@@ -239,6 +290,7 @@ fn prepare_impl_inner(
                 "generation input hash mismatch"
             );
             let mut prepared = PreparedOpen::plain(if idb.exists() { idb } else { input });
+            prepared.cache_hit = true;
             if prepared.path.extension().is_some_and(|e| e == "i64") {
                 prepared.options = serde_json::json!({"auto_analysis":false});
             }
@@ -275,6 +327,7 @@ fn prepare_impl_inner(
         }
         if allow_legacy && idb.exists() {
             let mut prepared = PreparedOpen::plain(idb);
+            prepared.cache_hit = true;
             prepared.options = serde_json::json!({"auto_analysis":false});
             return Ok(prepared);
         }
@@ -298,6 +351,8 @@ fn prepare_impl_inner(
                 verification_handed_off: false,
                 generation: None,
                 cache_guard: None,
+                content_guard: None,
+                cache_hit: true,
             };
             std::fs::copy(&idb, directory.join("probe.i64"))?;
             std::fs::rename(&staging, directory.join("input"))?;
@@ -340,6 +395,59 @@ fn hook(phase: &str) {
 mod f1_regressions {
     use super::*;
     use std::time::Duration;
+    #[tokio::test]
+    async fn n7_fix1_cold_waiter_rechecks_published_index() {
+        let root = root("n7-cold-key");
+        let source = root.join("source");
+        let cache = root.join("cache");
+        std::fs::write(&source, b"same cold input").unwrap();
+        let prep = Preparation::new(Duration::from_secs(5));
+        let first = prepare_n7_open(source.clone(), cache.clone(), &prep, false)
+            .await
+            .unwrap();
+        let second_prep = prep.clone();
+        let mut second =
+            tokio::spawn(async move { prepare_n7_open(source, cache, &second_prep, false).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "cold waiter must not select another generation before first index publication"
+        );
+        let idb = first.path.with_extension("i64");
+        std::fs::write(&idb, b"packed edits").unwrap();
+        first.publish_verified_input(&prep).await.unwrap();
+        drop(first);
+        assert_eq!(second.await.unwrap().unwrap().path, idb);
+    }
+    #[tokio::test]
+    async fn n7_fix1_direct_idb_bypasses_processor_and_rejects_force() {
+        if std::env::var("IDA_NEXUS_INPUT_PREPROCESSOR").as_deref() != Ok("/bin/cp") {
+            let status = std::process::Command::new("timeout")
+                .args(["10s"]).arg(std::env::current_exe().unwrap())
+                .args(["--exact", "router::nexus_bridge::cache::f1_regressions::n7_fix1_direct_idb_bypasses_processor_and_rejects_force", "--nocapture"])
+                .env("IDA_NEXUS_INPUT_PREPROCESSOR", "/bin/cp").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let root = root("n7-direct");
+        for extension in ["i64", "idb"] {
+            let idb = root.join(format!("direct.{extension}"));
+            std::fs::write(&idb, b"packed edits").unwrap();
+            let prep = Preparation::new(Duration::from_secs(5));
+            assert!(
+                prepare_n7_open(idb.clone(), root.join("cache"), &prep, true)
+                    .await
+                    .is_err(),
+                "direct IDB force must be rejected before preprocessing"
+            );
+            let opened = prepare_n7_open(idb.clone(), root.join("cache"), &prep, false)
+                .await
+                .unwrap();
+            assert_eq!(opened.path, idb.canonicalize().unwrap());
+            assert_eq!(opened.options, serde_json::json!({"auto_analysis":false}));
+        }
+    }
     #[test]
     fn legacy_verification_staging_requires_confirmed_close_after_handoff() {
         let root = root("verification-close");

@@ -2,7 +2,7 @@
 use super::{nexus_bridge::BridgeConfig, RouterState};
 use crate::{error::ToolError, nexus::*, preprocess::Preparation};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -105,6 +105,7 @@ struct Database {
     token: String,
     pid: Option<u32>,
     opened_at: Instant,
+    cache_hit: bool,
     _cache_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
 }
 pub struct Tools {
@@ -114,6 +115,7 @@ pub struct Tools {
     paths: Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     operations: Mutex<Vec<OperationIdentity>>,
     uncertain_cache: Arc<Mutex<Vec<Arc<RetainedOpen>>>>,
+    close_observers: Mutex<HashSet<SessionLease>>,
 }
 impl Tools {
     pub fn new(capacity: usize) -> anyhow::Result<Self> {
@@ -130,6 +132,7 @@ impl Tools {
             paths: Mutex::new(HashMap::new()),
             operations: Mutex::new(Vec::new()),
             uncertain_cache: Arc::default(),
+            close_observers: Mutex::default(),
         })
     }
     pub fn selected(&self) -> bool {
@@ -182,6 +185,28 @@ impl Tools {
             .iter()
             .find(|(_, db)| db.token == token)
             .map(|(h, _)| h.clone())
+    }
+    pub fn cache_hit(&self, handle: &str) -> Result<bool, ToolError> {
+        self.records()
+            .get(handle)
+            .map(|db| db.cache_hit)
+            .ok_or(ToolError::NoDatabaseOpen)
+    }
+    fn consume_released(&self, endpoint: &super::nexus_transport::NexusEndpoint) {
+        let mut released = Vec::new();
+        self.records().retain(|_, db| {
+            let confirmed = endpoint
+                .transition(|s, _| s.status(&db.lease.client_id, &db.lease))
+                .is_ok_and(|state| state.phase == SessionPhase::Released);
+            if confirmed {
+                released.push(db.lease.clone());
+            }
+            !confirmed
+        });
+        self.operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|op| !released.contains(&op.lease));
     }
     fn path_gate(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
         let mut paths = self.paths.lock().unwrap_or_else(|e| e.into_inner());
@@ -261,6 +286,7 @@ impl Tools {
         preparation: Preparation,
         refresh: bool,
     ) -> Result<(String, String), ToolError> {
+        self.consume_released(&router.nexus_endpoint());
         self.uncertain_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -417,6 +443,7 @@ impl Tools {
             cache_guard: cache_guard.clone(),
             uncertain_cache: self.uncertain_cache.clone(),
             open_guard,
+            content_guard: prepared.content_guard.clone(),
         };
         let mut cancelled = false;
         loop {
@@ -468,7 +495,7 @@ impl Tools {
                                 None => return Err(diagnostic("open missing IDB path; lease retained for bridge cleanup")),
                             };
                             let pid = event["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
-                            self.records().insert(handle.clone(), Database { path: canonical, lease, idb, token: token.clone(), pid, opened_at: Instant::now(), _cache_guard:cache_guard.clone() });
+                            self.records().insert(handle.clone(), Database { path: canonical, lease, idb, token: token.clone(), pid, opened_at: Instant::now(), cache_hit:prepared.cache_hit, _cache_guard:cache_guard.clone() });
                             ownership.transferred = true;
                             return Ok((handle,token));
                         }
@@ -741,7 +768,7 @@ impl Tools {
         }
     }
     pub async fn close_token(
-        &self,
+        self: &Arc<Self>,
         router: &RouterState,
         token: &str,
     ) -> Result<Option<(String, usize)>, ToolError> {
@@ -756,6 +783,13 @@ impl Tools {
         let gate = self.path_gate(&database.path);
         let _path = gate.lock().await;
         let bridge = Self::bridge(router).await?;
+        // Installed before release's first await. Dropping the caller cannot
+        // discard responsibility for a successfully published Database.
+        let _cleanup = ReleaseCleanup {
+            tools: Arc::downgrade(self),
+            endpoint: bridge.endpoint(),
+            lease: database.lease.clone(),
+        };
         release(&bridge, &database.lease).await?;
         let mut records = self.records();
         records.remove(&handle);
@@ -769,7 +803,11 @@ impl Tools {
             .count();
         Ok(Some((handle, remaining)))
     }
-    pub async fn close_path(&self, router: &RouterState, path: &Path) -> Result<(), ToolError> {
+    pub async fn close_path(
+        self: &Arc<Self>,
+        router: &RouterState,
+        path: &Path,
+    ) -> Result<(), ToolError> {
         let tokens: Vec<_> = self
             .records()
             .values()
@@ -788,7 +826,7 @@ impl Tools {
         router.warm_pool.lock().await.remove(path);
         Ok(())
     }
-    pub async fn shutdown(&self, router: &RouterState) -> Result<(), ToolError> {
+    pub async fn shutdown(self: &Arc<Self>, router: &RouterState) -> Result<(), ToolError> {
         let tokens: Vec<_> = self.records().values().map(|db| db.token.clone()).collect();
         for token in tokens {
             self.close_token(router, &token).await?;
@@ -851,6 +889,64 @@ impl Tools {
             json!({"path":path,"file_type":meta["file_type"],"processor":meta["processor"],"bits":meta["bits"],
             "function_count":meta["function_count"],"debug_info":null,"analysis_status":analysis}),
         )
+    }
+}
+
+struct ReleaseCleanup {
+    tools: std::sync::Weak<Tools>,
+    endpoint: super::nexus_transport::NexusEndpoint,
+    lease: SessionLease,
+}
+impl Drop for ReleaseCleanup {
+    fn drop(&mut self) {
+        let endpoint = self.endpoint.clone();
+        let lease = self.lease.clone();
+        let tools = self.tools.clone();
+        let confirmed = endpoint
+            .transition(|s, _| s.status(&lease.client_id, &lease))
+            .is_ok_and(|state| state.phase == SessionPhase::Released);
+        if confirmed {
+            if let Some(tools) = tools.upgrade() {
+                tools.consume_released(&endpoint);
+            }
+            return;
+        }
+        let Some(owner) = tools.upgrade() else {
+            return;
+        };
+        if !owner
+            .close_observers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(lease.clone())
+        {
+            return;
+        }
+        drop(owner);
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            while tokio::time::Instant::now() < deadline {
+                let Some(tools) = tools.upgrade() else {
+                    return;
+                };
+                tools.consume_released(&endpoint);
+                if !tools.records().values().any(|db| db.lease == lease) {
+                    break;
+                }
+                drop(tools);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if let Some(tools) = tools.upgrade() {
+                tools
+                    .close_observers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&lease);
+                if tools.records().values().any(|db| db.lease == lease) {
+                    tracing::warn!("cache guard retained after close proof observation deadline; next open will recheck exact N1 proof");
+                }
+            }
+        });
     }
 }
 
@@ -1196,12 +1292,14 @@ struct OpeningGuard {
     transferred: bool,
     cache_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
     uncertain_cache: Arc<Mutex<Vec<Arc<RetainedOpen>>>>,
+    content_guard: Option<Arc<super::nexus_bridge::cache_lock::CacheGuard>>,
 }
 struct RetainedOpen {
     bridge: Arc<super::nexus_bridge::NexusBridge>,
     identity: OpenIdentity,
     _cache_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
     _open_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
+    _content_guard: Option<Arc<super::nexus_bridge::cache_lock::CacheGuard>>,
 }
 impl RetainedOpen {
     fn cleanup_confirmed(&self) -> bool {
@@ -1239,6 +1337,7 @@ impl Drop for OpeningGuard {
                 identity: self.identity.clone(),
                 _cache_guard: self.cache_guard.clone(),
                 _open_guard: self.open_guard.clone(),
+                _content_guard: self.content_guard.clone(),
             });
             if retained.cleanup_confirmed() {
                 return;

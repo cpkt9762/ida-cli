@@ -2041,22 +2041,10 @@ impl RouterState {
             .workers(self)
             .iter()
             .any(|w| w.open_path.as_deref() == canonical.to_str());
-        let before = canonical.clone();
-        let cached_before = preparation
-            .wait(crate::blocking::run(
-                crate::blocking::WorkClass::Prepare,
-                move || {
-                    crate::idb_store::IdbStore::new()
-                        .prepared_paths(&before)
-                        .map_err(|e| ToolError::IdaError(e.to_string()))
-                },
-            ))
-            .await??
-            .0
-            .is_some();
         let (handle, token) = self
             .ensure_worker_prepared(path, None, Some(tenant), preparation.clone())
             .await?;
+        let cached_before = self.nexus_tools.cache_hit(&handle)?;
         let mut reference = nexus_tools::ReferenceGuard::new(self.clone(), token.clone());
         let details = self
             .nexus_open_details(&handle, preparation.clone())

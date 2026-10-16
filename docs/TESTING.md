@@ -567,12 +567,28 @@ the physical channel; encoding failure before any write does not.
 
 ## Nexus N7a cache and preprocessing acceptance
 
+N7a-F1 外部差异逐字段登记（旧行为、新行为、影响和验证范围）：
+
+| 字段/行为 | 旧行为 | 新行为 | 影响 | 验证范围 |
+|---|---|---|---|---|
+| `open_idb.result.path` | 平铺 basename/hash 缓存路径或直接 IDB 路径 | 新库位于 `generations/<unique>/input.i64`，有效 legacy 与直接 IDB 保留身份 | 调用方可见路径变化；force/GC 后缓存路径不永久；GUI 直接开 packed 文件不参与 flock | special 的 F3-cold 同库/owner、保存重开；直接 IDB 单测；GUI 真实行为留 N7c |
+| `get_database_info.input_file_path` | 通常为原输入元数据路径 | 可能是代际 `input` 快照 | 不保证等于用户原始路径；status.open_path 仍为 canonical 请求路径 | E04 仅在输入 SHA256 相等后规范化本字段；不比较 open 返回路径，不扩大例外 |
+| basename/hash 布局 | 外部脚本可按旧布局枚举/推导路径 | 新库由内容键索引选择最新代际 | 根级 glob/文件名推导须适配；编辑成果关闭后备份到缓存外，旧平铺库不搬家 | N6 夹具两种布局都显式枚举且仍要求恰好一个库 |
+| `IdbStore::clean()` | 移除孤立索引并返回移除项 | 同时处理两种索引，恢复不删健康库契约，不做全量 GC | 健康库和 quarantine 数据不变；不确定/错误有日志 | F4 健康库、真实返回项和重复调用 |
+| 预热 `cached_before`、list/统计 | 仅旧平铺观察 | 命中来自实际选库结果；当前代际与 legacy 元数据按键合并，错误可见 | 重复预热正确命中，新代际不再遗漏或重复计数；无法恢复原元数据时 list 使用 input 快照 | F5 单测观察身份一致；F3-cold 两次预热皆命中 |
+
+special_inputs 的实际数量为 8，新增 F3-cold：A 在真实 opened 事件交给 router 发布索引前暂停，B 并发冷开；验证内容键 EX 正被持有、同一个 IDB/owner、写入互读、保存重开与重复预热命中。F1/F2/F7 回归见 `tests/test_nexus_n7_fix1.py`；F3/F4/F5/F6 的 Rust 回归名含 `n7_fix1`。S1 单独的 `nexus_n7_fix1` target 使用真实 bridge 和确定性客户端协议 fixture；短回归不额外 close/shutdown 即消费迟到 Released，长回归让 120s observer 实际结束后才投递证明，验证下次 open 收敛旧 guard（该 target 需提前说明并使用 150s shell timeout）。这些协议 fixture 不等同真实 IDA E2E。
+
+GC 对配置 state 注册只做只读文件名/公开 record_id 集合对照，用于拒绝；不碰 Nexus 锁和状态内容。合法 dead 注册由公开发现 reap，之后仍须 packed、无组件等完整检查；预算选足即停、最终删除也受本轮容量约束。manifest/journal 的数组、null、标量和错误字段类型只拒绝本条目，其他候选继续。
+
+旧平铺缓存一律保留、继续计磁盘且可能长期超限，无自动迁移工具；force 不迁移用户修改、不回收旧空间。N8 全量验收前的 dry-run/可恢复迁移或离线清理途径已登记在计划，最终是否必须实现由用户裁定。本轮不操作真实旧缓存。
+
 Use a fresh prepared environment, `IDA_TEST=1`, short `--ipc-root`, private
 `IDA_CLI_HOME` / `IDA_NEXUS_STATE_DIR`, and the fixed N0 binary. Run
 `verify_nexus_e2e.py --suite special_inputs` with the existing root/target/sdk
 arguments under an announced outer 210s timeout (inner suite timeout 180s).
-Exactly 7 tests and seven PASS case files are required: E19, E21-held,
-E21-before-rename, E21-after-rename, E21-before-delete, E21-release, E21-lock.
+Exactly 8 tests and eight PASS case files are required: E19, E21-held,
+E21-before-rename, E21-after-rename, E21-before-delete, E21-release, E21-lock, F3-cold.
 Each Python driver uses 30s. The lock case exercises the actual Rust IdbStore
 maintenance subprocess while a real router owns a lease, then releases and
 reclaims after repeated checks. The suite alone configures GC grace to zero;
@@ -605,8 +621,8 @@ unknown outcomes retain protection. Same-IDB open locks cover bridge
 verification through final open. GC rechecks original and isolated paths, then
 waits `IDA_NEXUS_GC_GRACE_MS` (default 60000), with at least two observations and
 a final check. Restart epoch/time rollback resets grace; invalid journals are
-retained, restoration collisions retain both paths. Explicit IdbStore clean and
-remove follow these checks. `nexus_bridge/cache_store.py --root <cache> --epoch
+retained, restoration collisions retain both paths. Explicit IdbStore remove follows these checks; clean only removes orphaned
+metadata under the root exclusion lock and never deletes healthy databases. `nexus_bridge/cache_store.py --root <cache> --epoch
 <router-incarnation> --limit 0` is the same maintenance entrypoint; an epoch must
 be stable across one router's passes and new after restart. Low-level explicit
 cleanup reports refusals in JSON; router GC logs them. Legacy flat groups lack an
@@ -622,6 +638,6 @@ These are accepted limitations, not a claim of global external mutual exclusion.
 
 After final commit run the 12+13 standard gates, three consecutive lib rounds,
 N0 support, bridge pytest, n*_fix* tests and all three patch probes red/green.
-Run fresh lifecycle 9, contract 4, concurrency 14, N6 4 and special 7 suites.
+Run fresh lifecycle 9, contract 4, concurrency 14, N6 4 and special 8 suites.
 Record current HEAD, full commands, exits and uptime; assert cleanup CLEAN,
 all registered process identities exited and zero residual sockets.

@@ -18,6 +18,38 @@ impl Drop for CacheGuard {
 pub async fn acquire(root: &Path, preparation: &Preparation) -> Result<Arc<CacheGuard>, ToolError> {
     acquire_named(root, ".cache.lock".into(), libc::LOCK_SH, preparation).await
 }
+/// Hold from the first index lookup through final open/index publication.
+pub async fn acquire_content(
+    root: &Path,
+    key: &str,
+    preparation: &Preparation,
+) -> Result<Arc<CacheGuard>, ToolError> {
+    let name = blake3::hash(key.as_bytes()).to_hex();
+    acquire_named(
+        root,
+        format!(".content-{name}.lock"),
+        libc::LOCK_EX,
+        preparation,
+    )
+    .await
+}
+
+/// Synchronous metadata maintenance must never wait on an active publisher.
+pub fn try_exclusive(root: &Path) -> std::io::Result<CacheGuard> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root.join(".cache.lock"))?;
+    // SAFETY: this owned live descriptor is used only for a nonblocking flock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(CacheGuard(file))
+}
 /// Serialize final verification/open of the same IDB across cooperating routers.
 pub async fn acquire_open(
     root: &Path,

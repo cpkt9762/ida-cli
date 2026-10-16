@@ -105,7 +105,7 @@ def main():
             if child.returncode and re.search(r"license.*(?:invalid|failed|not found|unavailable|expired)|no valid license", text, re.IGNORECASE):
                 result["status"] = "BLOCKED"
             assert child.returncode == 0, f"{result['status']}: lifecycle command failed: {child.returncode}"
-            count = 1 if args.case else {"lifecycle": 9, "contract": 4, "concurrency": 14, "n6": 4, "special_inputs": 7}[args.suite]
+            count = 1 if args.case else {"lifecycle": 9, "contract": 4, "concurrency": 14, "n6": 4, "special_inputs": 8}[args.suite]
             assert summary == [(str(count), "0", "0")], f"wrong actual test count: {summary}"
             if args.suite == "lifecycle":
                 events = [json.loads(line) for line in (env.root / "rust-evidence.jsonl").read_text().splitlines()]
@@ -116,7 +116,7 @@ def main():
                 events = [json.loads((env.root/f"{case}-result.json").read_text()) for case in expected]
                 cases = [event["case"] for event in events if event["status"] == "PASS"]
             elif args.suite == "special_inputs":
-                expected = ["E19", "E21-held", "E21-before-rename", "E21-after-rename", "E21-before-delete", "E21-release", "E21-lock"]
+                expected = ["E19", "E21-held", "E21-before-rename", "E21-after-rename", "E21-before-delete", "E21-release", "E21-lock", "F3-cold"]
                 events = [json.loads((env.root/f"{case}-result.json").read_text()) for case in expected]
                 cases = [event["case"] for event in events if event["status"] == "PASS"]
             elif args.suite == "n6":

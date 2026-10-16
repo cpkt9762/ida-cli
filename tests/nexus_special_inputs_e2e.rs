@@ -55,6 +55,10 @@ fn e21_release_grace_reclaim_and_reopen() {
 fn e19_router_preprocessor_cancel() {
     special("E19");
 }
+#[test]
+fn f3_cold_routers_share_edits_and_prewarm_hits() {
+    special("F3-cold");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e21_router_lease_excludes_actual_store_gc() {

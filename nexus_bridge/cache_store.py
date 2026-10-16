@@ -68,8 +68,24 @@ def public_probe(path):
     try:
         if find_database_owner(path, timeout=0.2) is not None:
             return 'public owner holds database'
+        discovered = discover_databases(timeout=0.2)
+        # Veto only: public discovery may omit malformed lock-held records.
+        # Let the public API reap valid dead records first. Never open/lock any
+        # Nexus lock or read, rewrite, or remove registration contents here.
+        configured = os.environ.get('IDA_NEXUS_STATE_DIR')
+        if not configured:
+            return 'registration completeness unknown: IDA_NEXUS_STATE_DIR missing'
+        directory = Path(configured)/'instances'
+        if directory.is_symlink():
+            return 'registration completeness unknown: symlink registry'
+        records = [p for p in directory.iterdir() if p.name.endswith('.json')] if directory.exists() else []
+        if any(item.is_symlink() or not item.is_file() for item in records):
+            return 'registration completeness unknown: non-regular registration'
+        explained = [item.instance.record_id for item in discovered]
+        if len(explained) != len(records) or set(explained) != {p.stem for p in records}:
+            return 'registration completeness unknown: public discovery does not explain all registrations'
         if any(Path(item.instance.idb_path).resolve() == path.resolve()
-               for item in discover_databases(timeout=0.2)):
+               for item in discovered):
             return 'discovered owner holds database'
         state = probe_database_state(path)
         if state['unpacked_files']:
@@ -138,7 +154,8 @@ class Store:
         if path.is_symlink():
             raise ValueError('symlink generation manifest')
         data = json.loads(path.read_text())
-        if data.get('version') != 1 or not isinstance(data.get('key'), str) or not data['key']:
+        if (not isinstance(data, dict) or type(data.get('version')) is not int
+                or data['version'] != 1 or not isinstance(data.get('key'), str) or not data['key']):
             raise ValueError('invalid generation manifest')
         return data
 
@@ -147,15 +164,16 @@ class Store:
         if path.is_symlink():
             raise ValueError('symlink quarantine journal')
         data = json.loads(path.read_text())
-        if (data.get('version') != 1 or data.get('name') != isolated.name
-                or not isinstance(data.get('epoch'), str)
-                or not isinstance(data.get('since'), (float, int))
+        if (not isinstance(data, dict) or type(data.get('version')) is not int
+                or data['version'] != 1 or data.get('name') != isolated.name
+                or not isinstance(data.get('epoch'), str) or not data['epoch']
+                or type(data.get('since')) not in (float, int)
                 or not math.isfinite(data['since'])
-                or not isinstance(data.get('checks'), int) or data['checks'] < 0):
+                or type(data.get('checks')) is not int or data['checks'] < 0):
             raise ValueError('invalid quarantine journal')
         return data
 
-    def retire(self, isolated, rejected):
+    def retire(self, isolated, rejected, *, allow_delete=True):
         original = self.generations/isolated.name
         self.manifest(isolated)
         data = self.journal(isolated)
@@ -169,7 +187,7 @@ class Store:
             data.update(epoch=self.epoch, since=now, checks=0)
         data['checks'] += 1
         atomic_json(isolated/'quarantine.json', data)
-        if data['checks'] < 2 or now - data['since'] < self.grace:
+        if not allow_delete or data['checks'] < 2 or now - data['since'] < self.grace:
             return False
         self.hook('before_delete', original, isolated)
         reason = self.pair_check(original, isolated)
@@ -180,6 +198,8 @@ class Store:
         index_path = self.root/'nexus-index.json'
         if index_path.exists():
             index = json.loads(index_path.read_text())
+            if not isinstance(index, dict) or any(not isinstance(v, str) for v in index.values()):
+                raise ValueError('invalid generation index')
             relative = str(original.relative_to(self.root)/'input.i64')
             index = {key:value for key,value in index.items() if value != relative}
             atomic_json(index_path, index)
@@ -232,6 +252,9 @@ class Store:
                 raise ValueError('symlink cache container')
             directory.mkdir(exist_ok=True)
         rejected = result['rejected']
+        total = sum(p.stat().st_size for p in self.root.rglob('*') if p.is_file() and not p.is_symlink())
+        budget = max(0, total - limit)
+        planned = 0
         # Recovery always precedes new isolation, including explicit clean.
         for isolated in sorted(self.quarantine.iterdir()):
             try:
@@ -241,21 +264,26 @@ class Store:
                     continue
                 files = list(isolated.iterdir())
                 size = sum(p.stat().st_size for p in files if p.is_file())
-                if self.retire(isolated, rejected):
+                if self.retire(isolated, rejected, allow_delete=key is not None or budget > 0):
                     result['evicted_groups'] += 1
                     result['evicted_files'] += len(files)
                     result['evicted_bytes'] += size
+                    budget = max(0, budget - size)
+                elif isolated.exists() and self.pair_check(self.generations/isolated.name, isolated) is None:
+                    planned += size
             except (OSError, ValueError, TypeError, KeyError) as error:
                 rejected.append({'path':str(isolated), 'reason':'quarantine retained: ' + str(error)})
         groups = sorted(self.generations.iterdir(), key=lambda p: p.stat().st_mtime)
-        total = sum(p.stat().st_size for p in self.root.rglob('*') if p.is_file() and not p.is_symlink())
         for group in groups:
-            if key is None and total <= limit:
+            if key is None and planned >= budget:
                 break
             try:
                 if key is not None and self.manifest(group)['key'] != key:
                     continue
                 self.isolate(group, rejected)
+                isolated = self.quarantine/group.name
+                if isolated.exists() and not group.exists():
+                    planned += sum(p.stat().st_size for p in isolated.iterdir() if p.is_file())
             except (OSError, ValueError, TypeError, KeyError) as error:
                 rejected.append({'path':str(group), 'reason':'generation retained: ' + str(error)})
         for legacy in self.root.glob('*.i64'):

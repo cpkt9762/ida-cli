@@ -112,6 +112,16 @@ else:
     runtime["Bridge"].__init__ = registered_init
     send = runtime["Channel"].send
     def boundary_send(self, message):
+        publish = os.environ.get('N7_PUBLISH_BARRIER')
+        if publish and message.get('event') == 'opened':
+            barrier = Path(publish)
+            barrier.with_suffix('.arrived').write_text(json.dumps({'idb_path':message['idb_path']}))
+            import time
+            deadline = time.monotonic() + 15
+            while not barrier.with_suffix('.release').exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError('N7 before index publication barrier')
+                threading.Event().wait(.005)
         arm = env.root / "n5-boundary.arm"
         if message.get("event") == "yielded" and arm.exists():
             arm.unlink()

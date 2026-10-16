@@ -129,11 +129,13 @@ class Http:
 
 
 class Candidate:
-    def __init__(self, env, binary, sample, label, transport="http", inline="512", seed=None, allow_open_error=False, extra=None):
+    def __init__(self, env, binary, sample, label, transport="http", inline="512", seed=None, allow_open_error=False, extra=None, cache=None, defer_open=False):
         label = f"{label}-{os.getpid()}"
         self.env, self.binary, self.sample, self.transport = env, binary, sample, transport
         self.home = env.root / f"home-{label}"
         self.home.mkdir(mode=0o700)
+        if cache is not None:
+            (self.home/'idb').symlink_to(cache, target_is_directory=True)
         if seed:
             (self.home/"idb").mkdir()
             shutil.copyfile(seed,self.home/"idb"/seed.name)
@@ -170,7 +172,10 @@ class Candidate:
                 metadata=json.loads(data)["result"]["metadata"]
                 port=int(metadata["http_address"].rsplit(":",1)[1])
             self.client = Http(port)
-        self.open_result = self.mcp("open_idb", {"path":str(sample)})
+        self.open_result = {} if defer_open else self.mcp("open_idb", {"path":str(sample)})
+        if defer_open:
+            self.opened = None
+            return
         if not allow_open_error:
             assert "result" in self.open_result, self.open_result
         self.opened = self.open_result.get("result")

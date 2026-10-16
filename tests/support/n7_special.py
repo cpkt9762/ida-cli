@@ -1,5 +1,7 @@
 """Real N7a owners, public probes and product cache/preparation paths."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import hashlib
 import json
 import os
@@ -149,6 +151,7 @@ def cancellation(env, binary):
             return state['status'] in ('cancelled', 'failed', 'completed')
         wait_for(terminal)
         assert states[-1]['status'] == 'cancelled', states[-1]
+        assert states[-1]['meta']['execution_stopped'] is True, states[-1]
         def exited(pid):
             from process_identity import identity
             return identity(pid) is None
@@ -161,6 +164,69 @@ def cancellation(env, binary):
         client.stop()
 
 
+def cold_shared(env, binary):
+    cache = env.root/'f3-cache'; cache.mkdir()
+    barrier = env.root/'f3-publish'
+    marker = env.root/'f3-processed'
+    processor = env.root/'fixtures/f3-processor'
+    processor.write_text('#!' + str(env.root/'venv/bin/python') + '\n'
+        'import pathlib,shutil,sys\nshutil.copyfile(sys.argv[1],sys.argv[2])\n'
+        + 'pathlib.Path(' + repr(str(marker)) + ').touch()\n')
+    processor.chmod(0o700)
+    sample = env.root/'fixtures/mini'
+    a = Candidate(env, binary, sample, 'F3A', cache=cache, defer_open=True,
+                  extra={'N7_PUBLISH_BARRIER':str(barrier)})
+    b = Candidate(env, binary, sample, 'F3B', cache=cache, defer_open=True,
+                  extra={'IDA_NEXUS_INPUT_PREPROCESSOR':str(processor)})
+    def opened(client):
+        response = client.mcp('open_idb', {'path':str(sample)})
+        assert 'result' in response, response
+        client.opened = response['result']
+        return client.opened
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(opened, a)
+            wait_for(lambda: barrier.with_suffix('.arrived').exists())
+            assert not (cache/'nexus-index.json').exists(), 'pause must precede first index publication'
+            locks = list(cache.glob('.content-*.lock'))
+            assert len(locks) == 1, 'cold selection must have one cross-router content lock'
+            with locks[0].open('r+') as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    raise AssertionError('A must hold content coordination before publishing index')
+            second = pool.submit(opened, b)
+            wait_for(marker.exists)
+            barrier.with_suffix('.release').touch()
+            first.result(timeout=15); second.result(timeout=15)
+        one, two = idb_path(a).resolve(), idb_path(b).resolve()
+        assert one == two
+        from ida_nexus import find_database_owner
+        owner = find_database_owner(one, timeout=1)
+        assert owner is not None
+        owners = [w['pid'] for c in (a,b) for w in c.direct('status', {})['result']['workers']]
+        assert len(owners) == 2 and owners == [owner.pid, owner.pid], owners
+        value = a.call('run_script', {'code':"import ida_bytes,ida_funcs; ea=ida_funcs.getn_func(0).start_ea; assert ida_bytes.set_cmt(ea,'N7 F3 shared edits',True)"})['result']
+        assert value['success'], value
+        read = {'code':"import ida_bytes,ida_funcs; print(ida_bytes.get_cmt(ida_funcs.getn_func(0).start_ea,True))"}
+        assert b.call('run_script', read)['result']['stdout'].strip() == 'N7 F3 shared edits'
+        assert a.call('run_script', {'code':"import ida_loader; assert ida_loader.save_database(ida_loader.get_path(ida_loader.PATH_TYPE_IDB),0)"})['result']['success']
+        close(a); close(b)
+        opened(b)
+        assert idb_path(b).resolve() == one
+        assert b.call('run_script', read)['result']['stdout'].strip() == 'N7 F3 shared edits'
+        close(b)
+        warm = [b.direct('prewarm', {'keep_warm':False})['result'] for _ in range(2)]
+        assert all(w['cached_before'] is True and Path(w['cache_path']).resolve() == one for w in warm), warm
+        return {'same_idb':str(one), 'same_owner_pid':owner.pid, 'write_visible':True,
+                'save_reopen_retained':True, 'repeat_prewarm_hits':True}
+    finally:
+        barrier.with_suffix('.release').touch()
+        a.stop(); b.stop()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=Path, required=True)
@@ -170,7 +236,10 @@ def main():
     env = Environment(args.root)
     result = {'case':args.case, 'status':'FAIL'}
     try:
-        result['evidence'] = cancellation(env, args.binary) if args.case == 'E19' else cache_case(env, args.binary, args.case)
+        if args.case == 'F3-cold':
+            result['evidence'] = cold_shared(env, args.binary)
+        else:
+            result['evidence'] = cancellation(env, args.binary) if args.case == 'E19' else cache_case(env, args.binary, args.case)
         result['status'] = 'PASS'
     finally:
         (env.root/f'{args.case}-result.json').write_text(json.dumps(result, indent=2) + '\n')

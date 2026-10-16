@@ -516,10 +516,22 @@ N7 分为 N7a（缓存协调与 E19/E21）、N7b（sBPF/DSC 真实 E24/E25）和
 - 2026-10-16 用户裁定：不修改 Nexus 服务端或三个既有客户端补丁；接受“新代际 + 跨 router flock + 隔离区 + 宽限期”。新 native 产物位于 `idb/generations/<unique>/input.i64`；完整目录从 sibling staging 原子非覆盖发布，成功 open 后内容键的 `nexus-index.json` 指向当前代际。普通 open 复用有效代际，`open_idb(force=true)` 仅由源输入生成新代际，不覆盖旧库或用户修改；直接 IDB 不接受 force 重建。
 - 缓存根 `.cache.lock`：所有产品 open、发布与活动 lease 持共享锁；GC 非阻塞取得独占锁，拿不到即保留并报告。独立文件描述符的 flock 覆盖其他 router；共享锁允许不同库并发。原始准备/索引 blocking job 自持共享锁直至实际结束。相同目标的 `.open-<canonical-idb-hash>.lock` 从验证后交付 bridge 前持独占至最终 open 完成，串行化协作 router 的同库 opener；根锁同时排斥 GC。不确定 open 额外保留保护和 N1 cleanup 责任；只有 N1 确定未获取 lease 的失败或匹配 lease 的 Released 证明才释放锁。每个有界观察者最多等待 120s，超时后保护留在有界 registry，下次 open 再复查；仍未知则 GC 等待 router 恢复，达到既有容量阈值拒绝新 open，不宣称已释放。
 - GC 仅处理带有效 manifest 的新代际目录。公开 find/discover owner 和 probe 必须无占用，候选必须 packed，任何未知、in_use、崩溃、unpacked、组件/陌生文件或 symlink 均保留。整组目录非覆盖原子 rename 到同文件系统的 `quarantine/`，原路径和隔离路径复查；出现占用即还原，原处已被重新创建则两份均保留并报告，绝不覆盖。
-- 宽限期 `IDA_NEXUS_GC_GRACE_MS` 默认 60000；至少两轮检查及最终删除前再查全阴性，才锁内删除。journal 记录 epoch、起点与次数；router 重启/时间回拨重置宽限证明，损坏/缺失 journal 保留，不直接删除。GC 的单次公共探测/执行进程有 10s shell timeout，异常保留并告警；下一轮先恢复隔离状态。旧平铺 `.i64` 没有可原子搬移的整组目录，保留且解释原因，不擅自移动用户旧库。默认旧后端 GC 行为不变；显式 IdbStore clean/remove 使用同一机制。
+- 宽限期 `IDA_NEXUS_GC_GRACE_MS` 默认 60000；至少两轮检查及最终删除前再查全阴性，才锁内删除。journal 记录 epoch、起点与次数；router 重启/时间回拨重置宽限证明，损坏/缺失 journal 保留，不直接删除。GC 的单次公共探测/执行进程有 10s shell timeout，异常保留并告警；下一轮先恢复隔离状态。旧平铺 `.i64` 没有可原子搬移的整组目录，保留且解释原因，不擅自移动用户旧库。默认旧后端 GC 行为不变；显式 IdbStore remove 使用同一机制；clean 只在根排斥锁内清理孤立索引，不处理健康库。
 - 已接受的剩余窗口：不经过 ida-cli 的 opener 若直接打开隔离路径，或最后检查时已持 FD 但尚未登记/解包，不在保护范围内；发现仅覆盖配置的 `IDA_NEXUS_STATE_DIR`，组件/IDA 锁探测是兜底。E22 最后 hash 到 open 对协作 router 的 GC/open 有锁覆盖，对独立外部写入者仍非原子。活动用户代码/已有 owner 的任意写操作不构成事务快照。
 - `IDA_NEXUS_INPUT_PREPROCESSOR` 是可选受信任本地可执行文件，接收源输入和任务独占 staging 输出两参数；失败暴露错误，子进程由既有 Preparation supervisor 管理，取消等待自有进程树清理。默认不执行外部处理器；本阶段不接通真实 sBPF/DSC。
-- 验证组织：`tests/test_nexus_n7_cache.py` 确定性覆盖占用、三个 barrier 的恢复/拒绝、epoch/宽限、碰撞、坏 journal、状态错误与 symlink；`nexus_special_inputs_e2e` 预期 7 项（E19、E21-held/三个 barrier/release/lock），核对完整 PASS case 集和实际数量。最终运行命令、退出码、uptime、资源审计见委托报告，未运行的项目不得由这些实现说明计作通过。
+- 验证组织：`tests/test_nexus_n7_cache.py` 与 `tests/test_nexus_n7_fix1.py` 确定性覆盖占用、三个 barrier 的恢复/拒绝、epoch/宽限、碰撞、结构坏 JSON、状态错误、注册完整性及预算；`nexus_special_inputs_e2e` 预期 8 项（E19、E21-held/三个 barrier/release/lock、F3-cold），核对完整 PASS case 集和实际数量。F3-cold 在真实 owner 已打开但索引未发布处暂停 A，验证内容键锁阻止另一 router 另建代际，两边同库同 owner、修改互读、保存重开和重复预热命中。最终运行命令、退出码、uptime、资源审计见委托报告，未运行的项目不得由这些实现说明计作通过。
+- N7a-F1：内容键 EX 锁覆盖普通 open 的查索引、创建、最终 open 与索引发布，等待方取得锁后重新查索引；未知获取保留该锁直到 N1 精确清理证明。force 同样协调但始终新建。直接 canonical .i64/.idb 在预处理前识别，普通直接打开保持身份，force 拒绝。已发布 lease 的 close future 丢弃后有界观察精确 Released，120s 后仍未知继续保留，下次 open 再消费证明，断连不解锁。
+- GC 的公开发现只是放行前提；只读列出配置 state 下的注册文件名，与公开发现的 record_id 集合逐项、按数量对照，无法解释的注册将整个缓存根判为未知。只用于拒绝，不探测 Nexus 私有锁、不读取 token、不修改状态；合法 dead 注册由公开 API 自行 reap 后仍可按 packed/无组件等规则回收。容量按候选预计释放字节预算，选足停止，最终删除也服从本轮上限；结构坏 manifest/journal 只拒绝该条目。
+
+N7a 对外差异清单（不扩大 N6 的两条比较规则）：
+
+| 字段/行为 | 旧行为 | 新行为 | 影响 | 验证范围 |
+|---|---|---|---|---|
+| `open_idb.result.path` | 原始输入对应根级 basename/hash 缓存路径；直接 IDB 用原路径 | 新建库为 `generations/<unique>/input.i64`；有效 legacy 库复用、直接 IDB 保留身份 | 路径值对调用方可见；force 新建代际，不能把缓存路径当永久工作目录；GUI 直接打开该 packed 文件不参与 flock | F3-cold 比对实际 IDB、共享 owner、保存重开；F6 单测直接 IDB；真实 GUI 属 N7c，未验证 |
+| `get_database_info.input_file_path` | 旧库通常保留原输入元数据路径 | 新库可能指向该代际的 `input` 快照 | 不保证返回用户原始路径；`status.open_path` 仍为 canonical 请求路径 | E04 仅在输入 SHA256 完全相等后规范化此字段，不比较 open 返回路径；没有新增比较例外 |
+| basename/hash 缓存布局 | 脚本可能枚举根级 `*.i64` 或推导 basename/hash 文件名 | 内容键索引指向最新代际；路径不再可由 basename/hash 拼出 | 外部枚举/定位脚本须适配；用户保留编辑需在关闭后备份到缓存外；旧平铺文件不搬家 | N6 夹具显式枚举两种布局且仍要求恰好一库；F3-cold 验证内容键身份 |
+| `IdbStore::clean()` | 只移除孤立索引并返回真实移除项 | 恢复原契约，覆盖 legacy 与代际索引；健康库及 quarantine 的数据不删除 | 不再把 clean 当全量 GC；没有新增全量清空操作；拒绝/错误有日志 | F4 健康库不变、孤立项返回、重复 clean 无额外移除 |
+| 预热 `cached_before`、list、统计 | 旧平铺 index/枚举 | 命中字段取实际选库结果；list/统计合并最新代际与 legacy 元数据、按内容键去重；错误可见 | 不遗漏新代际、不重复计数；无原输入元数据时 list 使用 input 快照身份；旧代际仍计磁盘但不作为当前索引项 | F5 单测 prepared_paths/lookup/list/stats 一致；F3-cold 重复预热命中 |
 
 - 实现全局占用检查和缓存/重建协调，覆盖其他工具持有的 lease。
 - 接通 sBPF 现有 sbx 流程和 DSC 构建/加载，复用完成的 `.i64`，保持配置与错误可诊断。
@@ -529,6 +541,7 @@ N7 分为 N7a（缓存协调与 E19/E21）、N7b（sBPF/DSC 真实 E24/E25）和
 
 ### N8：全量功能验收与版本回退演练
 
+- 旧平铺缓存治理门禁：在 N8 全量验收前提供可预览（dry-run）、可恢复的旧平铺缓存迁移或离线清理途径，最终是否必须实现由用户裁定，验收前须有明确裁定。本轮不实现迁移工具。当前 flat 库一律保留、计磁盘且不自动回收，可能长期超出容量上限；force 不迁移用户修改也不释放旧空间。候选途径必须列组/字节、要求所有 opener 离线、备份并验证 packed 与用户修改、失败保留原文件和索引且可恢复；一次无人占用探测不构成离线独占证明。
 - 用同一个 Nexus 候选产物跑 E00–E28，记录源码 SHA、产物标识和各套件结果。GUI、sBPF/DSC 或其他必需条件缺失时不得进入 N9。
 - 完成与 N0 固定旧版本产物的功能对照；不得用同一数据库同时跑两个实现。
 - 在隔离目录演练第 8.2 节的旧发布版本、匹配运行时和数据库备份回退，确认备份完整性及版本兼容性。

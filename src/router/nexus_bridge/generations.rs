@@ -43,7 +43,7 @@ pub fn current(root: &Path, key: &str) -> anyhow::Result<Option<PathBuf>> {
     );
     Ok(Some(path))
 }
-fn read_index(root: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+pub(crate) fn read_index(root: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     match std::fs::read(root.join("nexus-index.json")) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
