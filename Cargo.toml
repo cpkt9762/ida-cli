@@ -16,6 +16,14 @@ name = "ida_mcp"
 name = "ida-cli"
 path = "src/main.rs"
 
+[features]
+nexus-test-support = []
+
+[[test]]
+name = "nexus_bridge_regressions"
+path = "tests/nexus_bridge_regressions.rs"
+required-features = ["nexus-test-support"]
+
 [dependencies]
 idalib = { path = "3rd-github/idalib/idalib" }
 rmcp = { path = "3rd-github/rust-sdk/crates/rmcp", features = ["server", "transport-io", "transport-streamable-http-server"] }

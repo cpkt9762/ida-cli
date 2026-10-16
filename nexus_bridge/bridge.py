@@ -22,7 +22,25 @@ from struct_tools import STRUCT_METHODS
 from query_tools import QUERY_METHODS
 from search_tools import SEARCH_METHODS
 from lifecycle import database_diagnostics, release_handle
-from metadata import idb_fingerprint
+
+GUARD_SOURCE = Path(__file__).with_name('save_guard.py').read_text(encoding='utf-8')
+
+
+def guarded_source(code, context, refuse=True):
+    """Install once per owner, then sample within the same native operation."""
+    setup = ("import sys as _r9_sys, types as _r9_types\n"
+             "if '_ida_cli_save_guard_v1' not in _r9_sys.modules:\n"
+             "    _r9_module = _r9_types.ModuleType('_ida_cli_save_guard_v1')\n"
+             f"    exec({GUARD_SOURCE!r}, _r9_module.__dict__)\n"
+             "    _r9_sys.modules['_ida_cli_save_guard_v1'] = _r9_module\n"
+             "_r9_guard = _r9_sys.modules['_ida_cli_save_guard_v1']\n"
+             f"_r9_guard.begin({context!r}, refuse={refuse!r})\n")
+    finish = f"_r9_guard.finish({context!r}, refuse={refuse!r})"
+    if refuse:
+        # A separate compilation preserves module-level future imports in raw
+        # execute_python code; a try-indented source would reject them.
+        return setup + f"try:\n    exec(compile({code!r}, '<ida-cli owner>', 'exec'), globals())\nfinally:\n    " + finish
+    return setup + code + '\nresult = {"save_guard_error": ' + finish + '}\n'
 
 TOOL_METHODS = (*TOOL_METHODS, *TYPE_METHODS, *EDIT_METHODS, *ANALYSIS_METHODS, *STRUCT_METHODS, *QUERY_METHODS, *SEARCH_METHODS, "batch_rename")
 
@@ -313,6 +331,9 @@ class Bridge:
 
     def close_verification(self, path, probe, deadline):
         from ida_nexus import wait_database_released
+        probe.execute_python(guarded_source('pass', {'method': 'verification-close',
+            'requested_path': path, 'record_id': probe.instance.record_id}, refuse=False),
+            timeout=max(0.001, deadline - time.monotonic()))
         probe.close(wait_for_database=True, timeout=max(0.001, deadline - time.monotonic()))
         # close() is idempotent after it starts, even if its first call raised.
         # Only the public lifetime-lock observation proves the copy is unused.
@@ -326,9 +347,9 @@ class Bridge:
         from ida_nexus import discover_databases
         kind = command["command"]
         if kind == "open":
-            metadata_context = {"requested_path": command["path"],
-                "before_open": idb_fingerprint(command["path"], deadline)
-                    if Path(command["path"]).suffix.lower() in ('.i64', '.idb') else None}
+            # Root sampling does not read or hash packed files on healthy opens.
+            metadata_context = {"requested_path": command["path"], "before_open": None,
+                                "open_started": time.monotonic()}
             options = dict(command["options"])
             wait_analysis = options.pop("wait_analysis", False)
             verification = options.pop("verification_idb", None)
@@ -352,8 +373,9 @@ class Bridge:
                 with self.lock:
                     self.verification_probes[verification] = probe
                 try:
-                    proof = probe.execute_python(
+                    proof = probe.execute_python(guarded_source(
                         "import ida_nalt\nsha = ida_nalt.retrieve_input_file_sha256()\nresult = sha.hex() if sha else None",
+                        dict(metadata_context, method='verification-open', record_id=probe.instance.record_id)),
                         timeout=max(0.001, deadline - time.monotonic()))["result"]
                 finally:
                     self.close_verification(verification, probe, deadline)
@@ -387,9 +409,16 @@ class Bridge:
             # Verify actual owner runtime without importing IDA in this process.
             try:
                 handle.set_disconnect_callback(lambda _handle, reason: self.disconnected(lease, reason, attempt))
-                actual = handle.execute_python("import ida_kernwin\nresult = ida_kernwin.get_kernel_version()", timeout=None)
+                actual = handle.execute_python(guarded_source(
+                    "import ida_kernwin\nresult = ida_kernwin.get_kernel_version()",
+                    dict(metadata_context, method='open', lease=lease,
+                         operation_id=command['identity'].get('operation_id'), record_id=instance.record_id)), timeout=None)
                 if wait_analysis:
                     handle.wait_autoanalysis(timeout=max(0.001, deadline - time.monotonic()))
+                    handle.execute_python(guarded_source('pass', dict(metadata_context,
+                        method='open-after-analysis', lease=lease,
+                        operation_id=command['identity'].get('operation_id'), record_id=instance.record_id)),
+                        timeout=max(0.001, deadline - time.monotonic()))
             except Exception as exc:
                 outcome = handle.close_outcome(wait_for_database=True,
                     timeout=max(0, deadline - time.monotonic()))
@@ -404,7 +433,7 @@ class Bridge:
                 # Close confirmed this unannounced lease is gone. If close
                 # itself fails, run() retains the uncertain open outcome.
                 channel.send({"event": "failed", "attempt": attempt,
-                              "error": error("disconnected", f"open runtime check failed: {type(exc).__name__}"),
+                              "error": error("disconnected", f"open runtime check failed: {exc}"),
                               "diagnostics": database_diagnostics(instance.idb_path)})
                 return
             caps = readiness()["capabilities"]
@@ -453,6 +482,8 @@ class Bridge:
             code = ("import time as _n5_time\n"
                     f"if _n5_time.monotonic() >= {deadline!r}:\n"
                     "    raise TimeoutError('total deadline expired before owner execution')\n# nexus owner deadline checked\n" + code)
+            code = guarded_source(code, dict(self.metadata_contexts.get(lease['lease_id'], {}),
+                method=method, operation_id=native_id, lease=lease))
             public_started[0] = True
             result = handle.execute_python(code, timeout=None, operation_id=native_id)
             if method in SLICE_METHODS and result["result"].get("more") is True:
@@ -480,8 +511,14 @@ class Bridge:
             context = [self.identity, lease["lease_id"], lease["instance_id"], lease["generation"], self.lifetime_path]
             cleanup_code = ("import sys\nmodule = sys.modules.get('_ida_cli_nexus_slices_v1')\n"
                             f"result = module.release_lease({context!r}) if module else None")
+            cleanup_code = guarded_source(cleanup_code,
+                dict(self.metadata_contexts.get(lease['lease_id'], {}), method='close',
+                     operation_id=command.get('identity', {}).get('operation_id',
+                         'release:' + str(attempt['sequence'])), lease=lease), refuse=False)
+            guard_error = None
             if handle.connected:
-                handle.execute_python(cleanup_code, timeout=max(0.001, deadline - time.monotonic()))
+                checked = handle.execute_python(cleanup_code, timeout=max(0.001, deadline - time.monotonic()))
+                guard_error = checked['result']['save_guard_error']
             else:
                 # This lease cannot execute again. A new public lease can only
                 # reclaim our references on the exact surviving instance.
@@ -490,8 +527,9 @@ class Bridge:
                 if instances:
                     cleanup_handle = self.Handle.attach(instances[0])
                     try:
-                        cleanup_handle.execute_python(cleanup_code,
+                        checked = cleanup_handle.execute_python(cleanup_code,
                             timeout=max(0.001, deadline - time.monotonic()))
+                        guard_error = checked['result']['save_guard_error']
                     finally:
                         cleanup_handle.close(wait_for_database=False)
             def publish(name, outcome):
@@ -504,9 +542,14 @@ class Bridge:
             with self.lock:
                 self.handles.pop(lease["lease_id"], None)
                 self.metadata_contexts.pop(lease["lease_id"], None)
-            channel.send({"event": "released", "attempt": attempt, "outcome": outcome})
+            channel.send({"event": "released", "attempt": attempt, "outcome": outcome,
+                          "save_guard_error": guard_error})
         elif kind == "shutdown":
             public_started[0] = True
+            handle.execute_python(guarded_source('pass',
+                dict(self.metadata_contexts.get(lease['lease_id'], {}),
+                     method='shutdown', lease=lease), refuse=command['save']),
+                timeout=max(0.001, deadline - time.monotonic()))
             handle.shutdown_database(save=command["save"])
             channel.send({"event": "shutdown_completed", "attempt": attempt})
 
@@ -604,6 +647,10 @@ class Bridge:
                 print(f"cancel during cleanup failed: {type(exc).__name__}", file=sys.stderr)
         for _lease, handle in handles:
             try:
+                if handle.connected:
+                    handle.execute_python(guarded_source('pass',
+                        dict(self.metadata_contexts.get(_lease['lease_id'], {}),
+                             method='bridge-close', lease=_lease), refuse=False), timeout=5)
                 handle.close(wait_for_database=True, timeout=5)
             except Exception as exc:
                 print(f"lease cleanup failed: {type(exc).__name__}: {exc}", file=sys.stderr)

@@ -70,6 +70,16 @@ if len(sys.argv) > 1 and sys.argv[1] == "external":
     finally:
         handle.close(wait_for_database=True, timeout=10)
 else:
+    if os.environ.get('N7_R9_LOSS_ON_OPEN') == '1':
+        from ida_nexus import DatabaseHandle
+        original_open = DatabaseHandle.open
+
+        def lose_root_on_open(_class, *args, **kwargs):
+            handle = original_open(*args, **kwargs)
+            handle.execute_python("import ida_netnode\nida_netnode.netnode('Root Node', 0, False).kill()", timeout=5)
+            return handle
+
+        DatabaseHandle.open = classmethod(lose_root_on_open)
     if os.environ.get("N3_LEASE_FAULT"):
         from ida_nexus import DatabaseHandle
         original_open_lease = DatabaseHandle._open_lease

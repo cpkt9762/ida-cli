@@ -773,3 +773,20 @@ tools 的 metadata 能力通过显式安装校验，首次请求、重连和 own
 N2 fixture 的启动/调度握手和后续响应预算分离，并覆盖与真实 E2E 并发的 lib 三轮。
 r9 坏副本的只读取证显示文件未截断、B-tree 完整但 Root Node 全部 24 条记录缺失；
 尚不能由保存后的副本确定删除发生在哪一调用，也不能宣称用户 IDB 损坏风险已关闭。
+
+N7a r9 保存保护：第三次现场的磁盘 Root Node 完整、owner 会话不可见，根因仍未定位。
+adapter 在 owner 的 open 检查、每次操作前后、save/close 前用公开 netnode API 采样。
+缺失或无法确认时永久标记当前 owner 异常，拒绝后续操作及 adapter 显式保存，并设置
+公开 `DBFL_TEMP | DBFL_KILL`：最终 lease 关闭丢弃异常解包状态，保留上一次成功保存的
+packed `.i64/.idb`。未保存的编辑会丢失，close 完成释放证明后仍返回明确错误。
+打开时缺失也拒绝；原已损坏库由 IDA 拒绝或由同一保护拒绝，不补造 Root Node。
+owner 中持有公开 IDB_Hooks，在自动 save/close 通知时再次采样并设置保护，覆盖 adapter
+连接断开后的自动关闭。正常 owner 不改变保存/关闭标志，E20 持久化仍须真实验证。
+首次异常记录操作身份、lease、前次采样、时间、公开路径及关键元数据；正常路径仅两次
+netnode 名称存在性查询和时间/上下文更新，首次安装额外读取关键元数据，不全量哈希 IDB。
+采样只能限定变化区间，不证明某个操作就是根因。用户 run_script 中自行直接调用
+save_database（尤其同一脚本先破坏再保存）、其他客户端的显式保存及 guard 安装前的 Nexus
+启动/恢复内部行为不在 adapter 保护范围；不改 Nexus 服务端或客户端补丁。
+
+R7：标准 lib 不依赖 F1_ROOT/F1_PYTHON；发布协议用例移入第十三项集成 target，显式启用
+`--features nexus-test-support`，保留全部协议与文件系统断言。该 feature 不用于产品构建。

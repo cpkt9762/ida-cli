@@ -36,6 +36,7 @@ struct State {
     callbacks: Mutex<()>,
     pending: Mutex<HashMap<u64, Pending>>,
     leases: Mutex<HashMap<LeaseId, SessionLease>>,
+    release_errors: Mutex<HashMap<LeaseId, (SessionLease, String)>>,
     events: broadcast::Sender<Value>,
     open_replies: Mutex<HashMap<OperationId, tokio::sync::oneshot::Sender<Value>>>,
     open_reply_capacity: usize,
@@ -189,6 +190,14 @@ fn cleanup_startup_sockets(directory: &std::path::Path) {
     }
 }
 impl NexusBridge {
+    pub(crate) fn take_release_error(&self, lease: &SessionLease) -> Option<String> {
+        self.state
+            .release_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&lease.lease_id)
+            .and_then(|(exact, message)| (exact == *lease).then_some(message))
+    }
     pub async fn start(router: &super::RouterState, config: BridgeConfig) -> anyhow::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir(&config.directory)?;
@@ -266,6 +275,7 @@ impl NexusBridge {
             callbacks: Mutex::new(()),
             pending: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
+            release_errors: Mutex::new(HashMap::new()),
             events,
             open_replies: Mutex::new(HashMap::new()),
             open_reply_capacity: capacity,
@@ -867,6 +877,13 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
             "released" => {
                 s.released(&attempt)?;
                 if let DeliveryTarget::Release { lease } = &attempt.target {
+                    if let Some(message) = event["save_guard_error"].as_str() {
+                        state
+                            .release_errors
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(lease.lease_id.clone(), (lease.clone(), message.into()));
+                    }
                     state
                         .leases
                         .lock()

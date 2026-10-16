@@ -11,20 +11,31 @@ async fn until(mut ready: impl FnMut() -> bool) {
     .await
     .expect("deterministic protocol/filesystem barrier");
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn released_waiter_retains_content_until_publication_syscall_returns() {
+pub async fn released_waiter_retains_content_until_publication_syscall_returns() {
     if std::env::var("N7_FIX2_PROTOCOL").as_deref() != Ok("1") {
         let root = std::env::temp_dir().join(format!("n7p-{}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
         let status = std::process::Command::new("timeout")
-            .arg("30s").arg(std::env::current_exe().unwrap())
-            .args(["--exact", "router::nexus_tools::n7_fix2_publish::released_waiter_retains_content_until_publication_syscall_returns", "--nocapture"])
-            .env("N7_FIX2_PROTOCOL", "1").env("IDA_CLI_NEXUS_DEV", "1")
+            .arg("30s")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "released_waiter_retains_content_until_publication_syscall_returns",
+                "--nocapture",
+            ])
+            .env("N7_FIX2_PROTOCOL", "1")
+            .env("IDA_CLI_NEXUS_DEV", "1")
             .env("IDA_CLI_HOME", root.join("home"))
             .env("IDA_NEXUS_STATE_DIR", root.join("state"))
-            .env("F1_ROOT", &root).env("IDA_NEXUS_IPC_ROOT", root.join("ipc-root"))
-            .env("IDA_NEXUS_PYTHON", std::env::var_os("F1_PYTHON").expect("prepared F1_PYTHON required for N7 protocol lib regression"))
-            .status().unwrap();
+            .env("F1_ROOT", &root)
+            .env("IDA_NEXUS_IPC_ROOT", root.join("ipc-root"))
+            .env(
+                "IDA_NEXUS_PYTHON",
+                std::env::var_os("F1_PYTHON")
+                    .expect("prepared F1_PYTHON required for gate 13 protocol regression"),
+            )
+            .status()
+            .unwrap();
         assert!(status.success(), "isolated real bridge protocol regression");
         std::fs::remove_dir_all(root).unwrap();
         return;

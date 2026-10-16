@@ -731,7 +731,7 @@ impl Tools {
                 if snapshot.status != OperationStatus::Succeeded {
                     return Err(snapshot
                         .error
-                        .map(ToolError::Nexus)
+                        .map(operation_error)
                         .unwrap_or_else(|| diagnostic("operation ended without a result")));
                 }
                 if let Some(pending) = &mut cleanup_pending {
@@ -1139,6 +1139,21 @@ fn normalize_addresses(value: &Value) -> Result<Value, ToolError> {
     }
 }
 
+fn operation_error(mut error: NexusError) -> ToolError {
+    let mut cause = error.cause.as_deref();
+    while let Some(detail) = cause {
+        if detail
+            .message
+            .starts_with("database state abnormal: Root Node")
+        {
+            error.message = format!("{}; {}", error.message, detail.message);
+            break;
+        }
+        cause = detail.cause.as_deref();
+    }
+    ToolError::Nexus(error)
+}
+
 fn business_error(message: &str) -> ToolError {
     if let Some(message) = message.strip_prefix("Invalid database path: ") {
         return ToolError::InvalidPath(message.into());
@@ -1260,7 +1275,9 @@ async fn release(
                 .endpoint()
                 .transition(|s, _| s.status(&lease.client_id, lease))?;
             if state.phase == SessionPhase::Released {
-                return Ok(());
+                return bridge
+                    .take_release_error(lease)
+                    .map_or(Ok(()), |message| Err(diagnostic(message)));
             }
             if let Some(delivery) = state.control_delivery {
                 if delivery.state != DeliveryState::Uncertain {
@@ -1477,6 +1494,6 @@ mod n4_fix_regressions {
 #[path = "../../tests/support/n4_f2_open.rs"]
 mod n4_f2_regressions;
 
-#[cfg(test)]
+#[cfg(feature = "nexus-test-support")]
 #[path = "../../tests/support/n7_fix2_publish.rs"]
-mod n7_fix2_publish;
+pub mod n7_fix2_publish;

@@ -15,6 +15,9 @@ ROOT = Path(os.environ["F1_ROOT"])
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, os.environ.get("F1_BRIDGE_DIR", str(REPO / "nexus_bridge")))
 import bridge
+# This harness emulates public HTTP execution, never an IDA owner. Root sampling
+# has real-owner coverage in n7_r9_guard.py; retain the exact transport payloads.
+bridge.guarded_source = lambda code, _context, refuse=True: code if refuse else 'r9-fixture-release'
 from ida_nexus import DatabaseHandle
 import ida_nexus
 import ida_nexus.handle as handle_module
@@ -103,6 +106,8 @@ class Connection:
                 cancelled = index == 0
             return json.dumps({"result": {"cancelled": cancelled}}).encode()
         code = self.payload.get("code", "")
+        if code == 'r9-fixture-release':
+            return json.dumps({'ok': True, 'result': {'result': {'save_guard_error': None}}}).encode()
         if code.startswith("import time as _n5_time\n"):
             guard, code = code.split("# nexus owner deadline checked\n", 1)
             exec(guard, {})

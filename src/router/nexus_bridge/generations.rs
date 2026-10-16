@@ -91,7 +91,7 @@ pub fn publish_index(
         output.sync_all()?;
         // Only the index pointer is replaceable; generation contents never are.
         stage.commit(preparation, || {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "nexus-test-support"))]
             {
                 // A real blocking syscall after the artifact commit point. Only
                 // the protocol regression creates this private FIFO.

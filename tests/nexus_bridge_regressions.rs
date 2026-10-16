@@ -1,4 +1,8 @@
 //! F1 regression barriers cross the persistent Python bridge, both Unix lanes and N1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn released_waiter_retains_content_until_publication_syscall_returns() {
+    ida_mcp::router::nexus_tools::n7_fix2_publish::released_waiter_retains_content_until_publication_syscall_returns().await;
+}
 use ida_mcp::{
     nexus::*,
     router::{

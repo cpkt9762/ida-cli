@@ -195,12 +195,15 @@ gates. Set `F1_PYTHON` to the absolute `venv/bin/python` of a freshly prepared N
 environment with the current client patch. Missing or invalid `F1_PYTHON` is a
 hard failure with preparation instructions, never a skip. `F1_ROOT` optionally
 selects a short external evidence directory; otherwise it uses TMPDIR. The N7
-publication protocol regression also uses `F1_PYTHON` in the lib gate. It launches
-an isolated libtest child, real bridge and N1 with the selected public client;
-only that child enables Nexus. Cache tests create private directories in TMPDIR.
+publication protocol regression belongs to this integration target, never the
+standard lib gate. Its isolated integration-test child uses the real bridge/N1.
+Enable `nexus-test-support` explicitly for gate 13 (15 cases); this feature only
+enables protocol test support and the syscall barrier. Without it, an explicit
+gate-13 invocation fails with Cargo's required-feature message. Standard lib
+gates need neither F1_PYTHON nor F1_ROOT. Cache tests use private TMPDIR roots.
 
 ```bash
-F1_PYTHON="$N0_ROOT/venv/bin/python" F1_ROOT="$N3_ROOT/r" timeout 30s cargo test --locked --test nexus_bridge_regressions -- --test-threads=1
+F1_PYTHON="$N0_ROOT/venv/bin/python" F1_ROOT="$N3_ROOT/r" timeout 30s cargo test --locked --features nexus-test-support --test nexus_bridge_regressions -- --test-threads=1
 ```
 
 Early disconnect callbacks carry the originating open attempt. Rust buffers at
@@ -650,7 +653,7 @@ all registered process identities exited and zero residual sockets.
 `tests/test_nexus_n7_fix2.py` covers public state-directory resolution (absolute
 and tilde) and candidate-local numeric bounds. `nexus_n7_fix2_store` requires
 `IDA_CLI_NEXUS_DEV=1` and checks mixed healthy/stale indices independently.
-The lib publication protocol pauses a real FIFO read after commit arbitration,
+The gate-13 publication protocol pauses a real FIFO read after commit arbitration,
 drops the waiter and waits for exact N1 Released plus retained-guard removal.
 A second same-key preparation must wait, then consume the published index.
 Both blocking publication jobs own the content EX guard themselves.
@@ -666,3 +669,30 @@ runs to hide scheduling failures.
 Owner tool source explicitly installs a separately evaluated metadata capability
 namespace. Missing/noncallable dependencies fail installation; first request,
 reconnect and replacement owner all execute the same checked installation.
+
+### r9 owner save protection
+
+Root Node loss remains unexplained. `save_guard.py` samples the public netnode
+name before/after each owner operation and before close. Missing or unverifiable
+Root Node permanently poisons that owner, refuses operations/adapter saves, and
+sets public `DBFL_TEMP | DBFL_KILL`. Final close discards abnormal unpacked state;
+the packed file remains at its last successful save and unsaved edits are lost.
+Close still establishes the exact N1 release proof and returns an explicit error.
+An owner hook checks automatic save/close as well; it does not rely on notification
+return values as a veto. Opening a missing-root owner also fails and discards it.
+
+`tests/support/n7_r9_guard.py` takes a fresh prepared root, current binary and
+private seed. It kills Root Node via public IDAPython in isolated owners, checks
+both shared releases and save errors, original hashes, reopening metadata, open
+rejection, and normal save/close persistence. `test_nexus_r9_guard.py` checks
+first-transition attribution, probe errors, diagnostic isolation and close hooks.
+Keep a baseline binary/bridge copy for red/green; injections are not natural r9.
+Validate first-failure owner logs contain method, operation id, lease and previous
+sample. Healthy operations add two name lookups and context/time updates; initial
+installation reads four metadata fields. No full IDB hashes or discovery scans
+are added to healthy requests.
+
+User scripts directly calling IDA save APIs and independent clients' explicit
+saves are outside coverage; TEMP/KILL only prevents automatic close writeback.
+The owner guard cannot intercept Nexus startup/recovery before its installation.
+Sampling bounds the first loss interval; it does not establish r9's root cause.

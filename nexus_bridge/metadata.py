@@ -36,7 +36,12 @@ def input_metadata_evidence(context=None, stage='checkpoint'):
     if name not in sys.modules:
         sys.modules[name] = types.SimpleNamespace(paths=[])
     history = sys.modules[name].paths
-    path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+    def optional(function):
+        try:
+            return function()
+        except Exception as exc:
+            return {'error': type(exc).__name__}
+    path = optional(lambda: ida_loader.get_path(ida_loader.PATH_TYPE_IDB))
     previous = list(history)
     if path not in history:
         history.append(path)
@@ -53,11 +58,11 @@ def input_metadata_evidence(context=None, stage='checkpoint'):
               'raw': raw, 'before_open': context.get('before_open'),
               'requested_path': context.get('requested_path'),
               'record_id': context.get('record_id'),
-              'disk_now': idb_fingerprint(path, context.get('deadline')) if path else None,
+              'disk_now': idb_fingerprint(path, context.get('deadline')) if isinstance(path, str) and path else None,
               'previously_observed_idbs': previous,
               'observed_multiple_databases': any(p != path for p in previous),
               'history_scope': 'observations since adapter instrumentation; earlier history unknown',
-              'auto_is_ok': ida_auto.auto_is_ok(), 'auto_state': ida_auto.get_auto_state()}
+              'auto_is_ok': optional(ida_auto.auto_is_ok), 'auto_state': optional(ida_auto.get_auto_state)}
     try:
         from ida_nexus import discover_databases
         result['public_instances'] = [

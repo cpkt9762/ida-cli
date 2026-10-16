@@ -29,6 +29,8 @@ class Handle:
         self.disconnect = False
 
     def execute_python(self, code, **options):
+        if code == 'r9-fixture-release':
+            return {'result': {'save_guard_error': None}}
         if code.startswith("import time as _n5_time\n"):
             guard, code = code.split("# nexus owner deadline checked\n", 1)
             exec(guard, {})  # Exercise the actual deadline check, then the fixture.
@@ -74,6 +76,10 @@ class Handle:
 class Harness:
     def __init__(self, directory, monkeypatch):
         import ida_nexus
+        # No IDA runtime exists in this transport harness. Root checks are
+        # independently exercised with public APIs in real-owner regressions.
+        monkeypatch.setattr(bridge_module, 'guarded_source',
+            lambda code, _context, refuse=True: code if refuse else 'r9-fixture-release')
         self.handle = Handle()
         self.opens = []
         def open_handle(path, **options):
