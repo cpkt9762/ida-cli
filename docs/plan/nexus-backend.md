@@ -868,10 +868,10 @@ R0最终验收（2026-10-17）：对象为`a1cbe3055d1b1179ac521daa2650e2b02b798
 最终聚焦复审为`/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/r0-rereview2/report.md`，结论无新增阻断并建议验收。
 本次只验收候选、原型和冻结契约为R5/R1输入；生产F1/F2/F4仍为已知红例，
 同boot公开managed类资格仍Unsupported，真实跨boot产品链、Linux/GUI/大库与完整维护仍待后续验证。
-下一阶段按协议§11.2先实施R5接收器隔离、F9竞态、统一home/state与版本握手；不提前宣称custody或owner收敛。
+当时下一阶段为协议§11.2的R5接收器隔离、F9竞态、统一home/state与版本握手；R5最终验收见下文，不提前宣称custody或owner收敛。
 
 
-R5提前基础（2026-10-17，本地实现，待独立复验）：生产接收器将完整坏JSON行、
+R5提前基础（2026-10-17，已验收为R1输入）：生产接收器将完整坏JSON行、
 错身份/旧attempt/重复终态与真实EOF/帧越界/物理写失败分开；迟到取得和停止仍核N1权威身份。
 原189条完整wire（含56历史致命）通过真实Rust接收器回放，范围仅为健壮性；
 实际生产F2另断言B保持Active、公共SDK查询42与控制可用，F1/F4仍expected-red。
@@ -881,3 +881,15 @@ F10以Rust既有home规则固定绝对输入，Python独立入口同表，state�
 未知携资源事件保留Python实际handle并阻止本桥新取得，不宣称custody或释放证明。
 测试入口和阶段边界见TESTING的R5小节。固定SDK/三补丁、owner v1、默认后端和dev开关未变；
 后续仍按R1→R3a→R2→R3b→R4→R6→R7推进，R5不验收N7a。
+
+R5最终验收对象为`cdde15ee9724b73973c2f85ee6d8a2708097e2f7`，包含初版08c6c9a/5d5d71c及一次局部返修。
+原审查R5-R1/R5-R2两项P2已关闭：listener绑定后的完整endpoint身份不被后续路径读取覆盖，
+建立/恢复/关闭均核类型和身份；生产取消在公共调用前发布精确intent/inflight并撤销握手token，
+取消与proof按原record串行，异常与后继替换不丢责任、不伪造停止。
+编排者新隔离复验89项Python测试/79项子测试（新增4/27）、安装3项、bridge/N5 16项、
+adapter20项含189/56回放、23项readiness反例、生产F2及真实IDA9.5小库链全部通过；
+13条命令全部exit0，52登记PID与37个runtime锁审计无残留。
+Rust输入未改，本轮运行复用核验过的固定测试二进制并加载最终Python字节；编译/静态检查与新运行来源分开记录。
+独立复验见`/tmp/n7r5f1v.fRRvfA/report/verification.md`；
+聚焦复审见`/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/r5-rereview1/report.md`，无新增P0/P1/P2。
+F1/F4仍留对应后续阶段；真实跨boot、GUI/Linux/大库、完整维护和N7a最终验收没有由本次结果替代。下一步委托R1 SDK边界。
