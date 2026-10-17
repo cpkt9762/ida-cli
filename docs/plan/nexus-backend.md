@@ -502,7 +502,7 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 ### N7：GUI、缓存和专用输入
 
 N7a-R第一阶段r4设计见 [释放与打开协议](nexus-release-protocol.md)：按U1–U6和r3双复审，保留两阶段释放/早custody/helper/同卷gate；补同boot资格执行前持久撤销/共享权威、transfer_id唯一事务执行者与close-only目标guard、常规记录自动压缩及GC双NB/维护安全导入。U6核验同宿主机/本地卷的整机boot-change可结旧lease/owner/执行当前存活占用，不等旧detach ACK，不伪历史ACK/Released/成功或重放操作；同boot PID/session消失不能替代。历史Linux VM实测只为设计输入，非Nexus/IDA产品验收。
-设计已完成聚焦双复审及编排者文字澄清核验，作为R0输入验收；本次编排者随后单独委托R0，设计验收不代表原型已运行。依赖顺序为R0→R5基础→R1→R3a→R2→R3b→R4→R6→R7，再N7b/N7c→N8→N9；实现逐步跑相关跨层用例，里程碑最终产物完整验收。R0/R4/R7各验证U6产品scope/身份/新占用/坏日志拒绝及历史unknown保持，不能拿VM报告记产品通过。
+设计已完成聚焦双复审及编排者文字澄清核验。R0及两轮返修现已通过编排者独立复验与聚焦审查，验收为R5/R1输入，具体范围见本节末的R0验收记录；不代表N7a产品验收。依赖顺序为R0→R5基础→R1→R3a→R2→R3b→R4→R6→R7，再N7b/N7c→N8→N9；实现逐步跑相关跨层用例，里程碑最终产物完整验收。R0/R4/R7各验证U6产品scope/身份/新占用/坏日志拒绝及历史unknown保持，不能拿VM报告记产品通过。
 以下N7a为历史实现/安全边界记录，若与r4获批设计的资源模型冲突，以新设计精确规则为后续实现目标，不把历史“必须Released才释放”或120s观察模型重复实现。U1仍是对历史“不改三个补丁”裁定的有条件修订；operation_id已有只接N1。最终目标不变：Nexus唯一管理与执行后端，N9删除旧执行路径、后端开关及fallback。
 
 N7 分为 N7a（缓存协调与 E19/E21）、N7b（sBPF/DSC 真实 E24/E25）和 N7c（GUI E23）。以下为 N7a 组合方案实现范围，是否验收由编排者决定，不表示 N7b/N7c 完成。
@@ -855,6 +855,17 @@ macOS 来源候选可读取；U6 仅判定/资源投影原型通过，真实产�
 R0 的脚本/模型绿不验收生产 N7a，不改 U1–U6，不取消后续任何门禁。
 后续顺序 R5→R1→R3a→R2→R3b→R4→R6→R7；合计约 32–51 工程人日另计多轮复审余量。
 
-R0-F1 独立审查返修：旧R0冻结输入暂不验收；六项原型缺陷现由scope消费者否定校验、
+R0-F1 独立审查返修（历史）：当时旧R0冻结输入暂不验收；六项原型缺陷由scope消费者否定校验、
 ACK提前锁存/逐次attach责任、完整稳定v1比较、durable内部真实退出恢复和完整manifest/源码字节导入覆盖。
-最终证据另存r0-fix1；不改生产协议、不将预期红例当产品修复，仍待编排者独立复验与聚焦复审。
+该轮证据另存r0-fix1；后续复审发现的通知异常重连与venv内首次导入缺口由R0-F2关闭。
+
+R0最终验收（2026-10-17）：对象为`a1cbe3055d1b1179ac521daa2650e2b02b798094`，
+工作区clean；R0初版、R0-F1与R0-F2的六项原问题及RR1-F1/RR1-F2均有关闭证据。
+编排者在新隔离环境执行SDK12、install3、v1_checks2、contract_checks2共19项测试及真实IDA9.5小库链，
+12条本轮命令全部exit0，候选三文件hash、完整v1兼容对象和作者产物相符；两个私有根共6条登记身份审计无残留。
+另17项OS/transfer/records/durable/Rust测试是固定依赖字节与日志hash核验后的历史结果，明确标记historical-fixed-bytes，未计为本轮新跑。
+独立执行报告为`/tmp/n7r0.f2v.LQElFW/report/verification.md`；
+最终聚焦复审为`/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/r0-rereview2/report.md`，结论无新增阻断并建议验收。
+本次只验收候选、原型和冻结契约为R5/R1输入；生产F1/F2/F4仍为已知红例，
+同boot公开managed类资格仍Unsupported，真实跨boot产品链、Linux/GUI/大库与完整维护仍待后续验证。
+下一阶段按协议§11.2先实施R5接收器隔离、F9竞态、统一home/state与版本握手；不提前宣称custody或owner收敛。
