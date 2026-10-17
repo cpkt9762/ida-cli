@@ -57,7 +57,7 @@ def close_check(handle, deadline):
 
 
 def release_handle(handle, deadline, publish=lambda *_: None, *, check=None,
-                   errors=(), owner_required=False, request_only=False):
+                   errors=(), owner_required=False, request_only=False, owner_proof=None):
     """One guarded release; groups request all own leases before waiting for proof.
 
     request_only returns the raw request outcome, never a logical release proof.
@@ -93,6 +93,11 @@ def release_handle(handle, deadline, publish=lambda *_: None, *, check=None,
                        release_acknowledged=state['outcome'].get('lease_released') is True)
         if request_only:
             return outcome
+        if owner_proof is not None and same_owner(handle, owner_proof):
+            # Consume only an already acquired public proof, never another
+            # lease's ACK. Keep this handle's raw request outcome untouched.
+            if release_state(owner_proof).get('owner_proved') is True:
+                state['owner_proved'] = True
         if state.get('owner_proved'):
             return dict(outcome, status='owner_released', owner_released=True,
                         lease_released=True, failure=None, proof='public_owner_lifetime')
@@ -109,3 +114,26 @@ def release_handle(handle, deadline, publish=lambda *_: None, *, check=None,
         return None
     finally:
         state['lock'].release()
+
+
+def same_owner(left, right):
+    """Public instance identity includes process/start time, not just IDB path."""
+    fields = ('record_id', 'pid', 'started_at', 'idb_path', 'backend')
+    left_key = tuple(getattr(left.instance, field, None) for field in fields)
+    right_key = tuple(getattr(right.instance, field, None) for field in fields)
+    return bool(left_key[0] and left_key[1]) and left_key == right_key
+
+
+def release_group(participants, deadline, publish=lambda *_: None, *, errors=()):
+    """Coordinate requested leases, sharing only same-owner lifetime proof."""
+    outcomes = [release_handle(member, deadline, publish, errors=errors)
+                for member in participants]
+    proved = [member for member, outcome in zip(participants, outcomes)
+              if outcome is not None and outcome.get('owner_released') is True]
+    for index, (member, outcome) in enumerate(zip(participants, outcomes)):
+        if outcome is None:
+            donor = next((peer for peer in proved if same_owner(member, peer)), None)
+            if donor is not None:
+                outcomes[index] = release_handle(member, deadline, publish,
+                    errors=errors, owner_proof=donor)
+    return outcomes

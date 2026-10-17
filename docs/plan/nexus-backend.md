@@ -553,6 +553,12 @@ N7a-F10：原/辅助 lease 属于一次逻辑释放，分别 fresh guard 与一�
 全部证明成立前保留精确责任，保存拒绝累积返回。S1 必须在最终 HEAD 单独运行
 `nexus_n7_fix1` 的三个专用用例，私有环境及每用例 150s 命令见 TESTING。
 
+N7a-F11：组内后取得的同一精确 owner lifetime 证明可解决先前成员的未知结果，
+即使原期限已耗尽；不重放 release、不伪造 ACK，保存拒绝仍累积返回。
+不同 record_id/pid/started_at/路径/backend 的证明不能传播。释放组矩阵逐组合验证
+保护、不重放、证明充分性、错误传递、收敛与责任保留六项不变量。
+I6 按编排裁定限定仍需 owner 证明的组；全部非最后 ACK 有效时不阻止第三方继续使用。
+
 编排者批准固定 N0 baseline 一侧的有限重开：r9 是 IDA 9.5 idalib 上游缺陷，
 也影响旧 native。N6/E04-N6、N6-tools 与 x86 对照在编辑前若 N0 返回空路径、size 0、
 全零 MD5/SHA256，须先核验 analyzed seed 元数据完整及 seed/副本磁盘哈希未变，

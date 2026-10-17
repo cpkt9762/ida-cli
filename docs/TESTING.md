@@ -637,6 +637,15 @@ F10 释放协调：每个自有 handle 新鲜检查保护后至多 release 一�
 全部推进后才等待所需公开 owner lifetime。未知 ACK 保留精确责任，第三方 sibling
 仍阻止 owner 证明，不重放或强关；辅助保护无法确认时不关闭。保存拒绝累积返回。
 
+F11 在组内传播已经取得的公开 owner lifetime 证明，包括首成员期限耗尽后、
+后续成员才证明释放的边界；核对 record_id、pid、started_at、IDB 路径和 backend，
+不改写各 lease 原始 ACK。有效非最后 ACK 全部成立时，本组可释放，第三方仍可使用。
+`timeout 30s "$S1_PYTHON" -B tests/test_nexus_release_matrix.py` 枚举 189 个可达状态，
+逐组合断言 I1–I6、原始 ACK，并检查五种不同 owner 身份不能混用。
+矩阵用协议 stub 和真实公开 lifetime API/隔离 flock；保护失败的具体 IDA 分支另由
+`test_nexus_r9_guard.py` 和保存保护回归覆盖。`F11_SOURCE` 可指向输入版 bridge 归档，
+`F11_MATRIX_RESULT` 可指定逐失败组合 JSON；3,280 个名义组合的排除统计也写入 JSON。
+
 固定 N0 的预建副本对照在编辑前通过 `baseline_prebuilt_open` 检查元数据。
 仅当空 `input_file_path`、size 0、MD5/SHA256 全零同时出现，且预建 seed 元数据
 完整、seed 与副本 packed SHA256 均未变时，允许 N0 额外重开至多两次。

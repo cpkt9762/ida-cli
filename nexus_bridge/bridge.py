@@ -21,7 +21,7 @@ from analysis_tools import ANALYSIS_METHODS
 from struct_tools import STRUCT_METHODS
 from query_tools import QUERY_METHODS
 from search_tools import SEARCH_METHODS
-from lifecycle import database_diagnostics, release_handle, release_errors
+from lifecycle import database_diagnostics, release_handle, release_errors, release_group
 from metadata import idb_context
 from open_recovery import open_checked
 
@@ -588,8 +588,7 @@ class Bridge:
                 release_handle(cleanup_handle, deadline,
                     errors=release_errors(handle), request_only=True)
             errors = tuple(message for member in participants for message in release_errors(member))
-            outcomes = [release_handle(member, deadline, publish, errors=errors)
-                        for member in participants]
+            outcomes = release_group(participants, deadline, publish, errors=errors)
             if any(outcome is None for outcome in outcomes):
                 return
             outcome = next((item for item in reversed(outcomes) if item.get('owner_released')),
