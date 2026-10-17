@@ -512,6 +512,8 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N7：GUI、缓存和专用输入
 
+N7a-R 第一阶段设计提案见 [释放与打开协议](nexus-release-protocol.md)：按独立终审 F1–F10 与 R8-F1/R8-F2 收敛跨 Rust/Python 状态、两阶段释放、open 清理和回滚恢复。该文档待设计评审，尚未实施或验收；评审通过前沿用下述已登记的实现状态与安全边界，不进入第二阶段。
+
 N7 分为 N7a（缓存协调与 E19/E21）、N7b（sBPF/DSC 真实 E24/E25）和 N7c（GUI E23）。以下为 N7a 组合方案实现范围，是否验收由编排者决定，不表示 N7b/N7c 完成。
 
 - 2026-10-16 用户裁定：不修改 Nexus 服务端或三个既有客户端补丁；接受“新代际 + 跨 router flock + 隔离区 + 宽限期”。新 native 产物位于 `idb/generations/<unique>/input.i64`；完整目录从 sibling staging 原子非覆盖发布，成功 open 后内容键的 `nexus-index.json` 指向当前代际。普通 open 复用有效代际，`open_idb(force=true)` 仅由源输入生成新代际，不覆盖旧库或用户修改；直接 IDB 不接受 force 重建。
