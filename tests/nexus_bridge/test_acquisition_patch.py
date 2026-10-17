@@ -354,3 +354,193 @@ def test_failed_second_resolve_keeps_retry_fact_and_first_unknown():
         assert result['unresolved_attempts'] == result['attempts']
         assert len(result['attempts']) == 1 and result['first_instance'] is b.instance
         assert events[-1] == ('BeforeResolve', {'path': str(b.path), 'reconnect': True})
+
+
+@pytest.mark.parametrize('observation', ['false', 'oserror', 'runtimeerror'])
+def test_legacy_observation_contract(observation):
+    """Also runs unchanged against the historical three-patch SDK."""
+    with Boundary(ROOT / ('legacy-observation-' + observation)) as b:
+        h = DatabaseHandle.attach(b.instance)
+        monitor = h._lease_thread
+        cause = {'false': None, 'oserror': OSError('public observation failed'),
+                 'runtimeerror': RuntimeError('public observation failed')}[observation]
+        with patch('ida_nexus.handle.wait_database_released', return_value=False,
+                   side_effect=cause) as observe:
+            try:
+                with pytest.raises(Exception) as caught:
+                    h.close(wait_for_database=True, timeout=0.1)
+                if cause is None:
+                    assert type(caught.value) is NexusConnectionError
+                    assert str(caught.value) == 'timed out after 0.1s waiting for the IDB to close'
+                else:
+                    assert caught.value is cause
+                observe.assert_called_once()
+            finally:
+                h.close(wait_for_database=False)
+        assert not monitor.is_alive()
+        assert h._lease_response is h._lease_connection is h._lease_socket is None
+        assert len([r for r in b.requests if r['endpoint'] == '/release_lease']) == 1
+
+
+@pytest.mark.parametrize('observation', ['false', 'oserror', 'runtimeerror'])
+@pytest.mark.parametrize('nonlast', [False, True])
+def test_structured_observation_preserves_ack(nonlast, observation):
+    with Boundary(ROOT / f'observation-{nonlast}-{observation}') as b:
+        h = DatabaseHandle.attach(b.instance)
+        sibling = DatabaseHandle.attach(b.instance) if nonlast else None
+        cause = {'false': None, 'oserror': OSError('public observation failed'),
+                 'runtimeerror': RuntimeError('public observation failed')}[observation]
+        try:
+            with patch('ida_nexus.handle.wait_database_released', return_value=False,
+                       side_effect=cause) as observe:
+                result = h.close_outcome(wait_for_database=True, timeout=0.1)
+            assert result['lease_released'] and not result['owner_released']
+            assert result['ack_kind'] == ('nonlast' if nonlast else 'last')
+            assert result['owner_pending'] is not nonlast
+            assert result['failure'] is None
+            if nonlast:
+                observe.assert_not_called()
+                assert 'observation_failure' not in result
+            else:
+                observe.assert_called_once()
+                assert result['observation_failure'] == ('timeout' if cause is None else 'exception')
+                if cause is not None:
+                    assert result['observation_failure_type'] == type(cause).__name__
+                    assert {'phase': 'owner_observation', 'type': type(cause).__name__} in result['cleanup_failures']
+            assert h.close_outcome(timeout=0) == result
+        finally:
+            h.close(wait_for_database=False)
+            if sibling is not None:
+                sibling.close(wait_for_database=False)
+        assert len([r for r in b.requests if r['endpoint'] == '/release_lease'
+                    and r['lease_id'] == h._lease_id]) == 1
+
+
+@pytest.mark.parametrize('observation', ['false', 'exception'])
+def test_release_primary_survives_cleanup_and_observation(observation):
+    with Boundary(ROOT / ('release-primary-' + observation)) as b:
+        h = DatabaseHandle.attach(b.instance)
+        monitor = h._lease_thread
+        primary = RuntimeError('release response cleanup failed')
+        secondary = OSError('public observation failed')
+        rpc_error = RuntimeError('RPC cleanup failed')
+        original = http.client.HTTPConnection
+        class ReleaseCleanupFailure(original):
+            def getresponse(self):
+                response = super().getresponse()
+                close = response.close
+                def fail():
+                    close()
+                    raise primary
+                response.close = fail
+                return response
+        class RpcCleanupFailure:
+            def close(self):
+                raise rpc_error
+        h._rpc_connection = RpcCleanupFailure()
+        try:
+            with patch.object(http.client, 'HTTPConnection', ReleaseCleanupFailure), \
+                    patch('ida_nexus.handle.wait_database_released', return_value=False,
+                          side_effect=secondary if observation == 'exception' else None):
+                with pytest.raises(RuntimeError) as caught:
+                    h.close(wait_for_database=True, timeout=0.1)
+            assert caught.value is primary
+            result = h.close_outcome(timeout=0)
+            assert result['lease_released'] and result['ack_kind'] == 'last'
+            assert result['owner_pending'] and not result['owner_released']
+            assert result['observation_failure'] == ('exception' if observation == 'exception' else 'timeout')
+            phases = [item['phase'] for item in result['cleanup_failures']]
+            assert 'response' in phases and 'rpc' in phases
+            if observation == 'exception':
+                assert 'owner_observation' in phases
+        finally:
+            h.close(wait_for_database=False)
+        assert not monitor.is_alive()
+        assert h._lease_response is h._lease_connection is h._lease_socket is None
+        assert len([r for r in b.requests if r['endpoint'] == '/release_lease']) == 1
+
+
+@pytest.mark.parametrize('phase', ['before-ack', 'last', 'nonlast', 'lost-ack', 'invalid-ack'])
+def test_concurrent_close_deadline_preserves_published_facts(phase):
+    """Real HTTP plus deterministic cleanup barrier; never sets SDK outcome."""
+    with Boundary(ROOT / ('short-close-' + phase), 'lost-ack' if phase == 'lost-ack' else 'healthy') as b:
+        if phase == 'invalid-ack':
+            handler = b.server.RequestHandlerClass
+            reply = handler.reply
+            def invalid(request, payload, status=200):
+                if request.path == '/release_lease':
+                    payload = {'ok': True, 'result': {'released': True, 'shutdown_pending': 'invalid'}}
+                return reply(request, payload, status)
+            handler.reply = invalid
+        h = DatabaseHandle.attach(b.instance)
+        sibling = DatabaseHandle.attach(b.instance) if phase == 'nonlast' else None
+        monitor = h._lease_thread
+        entered, resume = threading.Event(), threading.Event()
+        original = http.client.HTTPConnection
+        completed, errors, reentered = [], [], []
+        def barrier():
+            if not entered.is_set():
+                reentered.append(h.close_outcome(timeout=0))
+                h.close(timeout=0)
+                entered.set()
+                assert resume.wait(3), 'release the first close cleanup barrier'
+        class PausedRelease(original):
+            def getresponse(self):
+                if phase == 'before-ack':
+                    barrier()
+                response = super().getresponse()
+                close = response.close
+                def cleanup():
+                    if phase not in ('before-ack', 'lost-ack'):
+                        barrier()
+                    close()
+                response.close = cleanup
+                return response
+            def close(self):
+                if phase == 'lost-ack':
+                    barrier()
+                super().close()
+        def first_close():
+            try:
+                completed.append(h.close_outcome(wait_for_database=False, timeout=2))
+            except Exception as exc:
+                errors.append(exc)
+        thread = threading.Thread(target=first_close, name='r1-short-close')
+        try:
+            with patch.object(http.client, 'HTTPConnection', PausedRelease):
+                thread.start()
+                assert entered.wait(2), 'first close reached the HTTP/cleanup barrier'
+                for budget in (0.01, 0):
+                    result = h.close_outcome(wait_for_database=False, timeout=budget)
+                    assert result['lease_released'] is (phase in ('last', 'nonlast'))
+                    assert result['close_in_progress'] is True
+                    assert result['wait_failure'] == 'deadline'
+                    if phase in ('last', 'nonlast'):
+                        assert result['ack_kind'] == phase
+                        assert result['owner_pending'] is (phase == 'last')
+                        assert result['failure'] is None
+                    else:
+                        assert result['status'] == 'uncertain' and 'ack_kind' not in result
+                    assert not result['owner_released']
+                    assert h.claim_acquired() is h
+                    result.setdefault('cleanup_failures', []).append({'phase': 'caller', 'type': 'mutated'})
+                resume.set()
+                thread.join(4)
+            assert not thread.is_alive() and not errors, errors
+            final = completed[0]
+            assert h.close_outcome(timeout=0) == final
+            assert 'wait_failure' not in final and 'close_in_progress' not in final
+            assert not any(item['phase'] == 'caller' for item in final.get('cleanup_failures', []))
+            assert final['lease_released'] is (phase not in ('lost-ack', 'invalid-ack'))
+            assert reentered[0]['lease_released'] is (phase in ('last', 'nonlast'))
+            assert not monitor.is_alive()
+        finally:
+            resume.set()
+            if thread.ident is not None:
+                thread.join(4)
+            h.close(wait_for_database=False)
+            if sibling is not None:
+                sibling.close(wait_for_database=False)
+        assert not thread.is_alive()
+        assert len([r for r in b.requests if r['endpoint'] == '/release_lease'
+                    and r['lease_id'] == h._lease_id]) == 1

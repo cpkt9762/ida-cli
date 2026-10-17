@@ -1055,7 +1055,22 @@ Parsed last/nonlast release ACKs latch `ack_kind`/`lease_released` before any
 local cleanup. `cleanup_failure(s)` are independent. Close sends at most once,
 including concurrent/reentrant calls and unknown results; same-thread reentry
 returns a current snapshot, while a concurrent structured caller obeys its own
-timeout. `wait_for_database` keeps its existing public lifetime semantics.
+timeout. The close-lock owner publishes stable copies before transport cleanup
+and after subsequent diagnostics; readers never wait on another state lock.
+An exhausted concurrent wait returns the latest published ACK/owner facts with
+per-call `close_in_progress=true` and `wait_failure="deadline"`. Those markers
+never enter the cached outcome or the first caller's result. Before a valid ACK,
+or after a lost/invalid ACK, the snapshot remains unknown.
+
+`wait_for_database` keeps its existing public lifetime semantics: a normal False
+return still raises the legacy timeout; an observation exception preserves its
+original type, object and cause. A preceding release error takes priority over
+observation errors/timeouts, then the observation error takes priority over
+other local cleanup errors. All local cleanup attempts finish before raising.
+Structured results retain ACK/`owner_pending` and independently report
+`observation_failure="timeout"` or `"exception"` (plus
+`observation_failure_type` and an owner_observation cleanup diagnostic for an
+exception). Neither observation failure fabricates owner release.
 
 Run `tests/support/r1_sdk.py` with `R0_CANDIDATE` pointing at the new installed
 site-packages, plus `tests/nexus_bridge/test_acquisition_patch.py` and affected

@@ -3,11 +3,11 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const CLIENT_HASH: &str = "93eb5a03ab46f4f1d0aedc12ecdd5b9f22a966ad748bc3a1fd05adfd163d2432";
+pub const CLIENT_HASH: &str = "e9d57e725b4c0405faf959422720451215a9f7b2bd8f98bf0ad2377383b399ce";
 pub const CLIENT_MODULES: [(&str, &str); 3] = [
     (
         "handle.py",
-        "93eb5a03ab46f4f1d0aedc12ecdd5b9f22a966ad748bc3a1fd05adfd163d2432",
+        "e9d57e725b4c0405faf959422720451215a9f7b2bd8f98bf0ad2377383b399ce",
     ),
     (
         "_resolver.py",

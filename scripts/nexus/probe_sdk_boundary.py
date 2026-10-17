@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[2]
@@ -126,15 +127,25 @@ def main():
                 cleanup_errors.append(type(exc).__name__)
         # Always reach exact ledger cleanup, even if public acquisition failed
         # after Popen but before a handle existed. Preserve the primary error.
-        forced = env.cleanup()
+        # Public lifetime release precedes Python process teardown. Reap each
+        # exact held Popen before fallback cleanup can signal a healthy worker.
+        # A bounded wait failure is recorded and still reaches owned cleanup.
+        child_exits, child_wait_errors = [], []
         for child in children:
-            child.wait(timeout=5)
+            try:
+                child_exits.append({'pid': child.pid, 'returncode': child.wait(timeout=5)})
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                child_wait_errors.append({'pid': child.pid, 'type': type(exc).__name__})
+        forced = env.cleanup()
         env.assert_clean()
         result['audit'] = {'forced_cleanup': forced, 'sockets': env.residual_sockets(),
+                           'child_exits': child_exits, 'child_wait_errors': child_wait_errors,
                            'cleanup_errors': cleanup_errors, 'records': len(env.entries()), 'unfinished_intents': [p.name for p in env.intents.glob('*.json')]}
         (env.root / 'sdk-boundary.json').write_text(json.dumps(result, indent=2) + '\n')
         if result['status'] == 'PASS':
-            assert not forced and not cleanup_errors and not result['audit']['sockets'] and not result['audit']['unfinished_intents']
+            assert not forced and not cleanup_errors and not child_wait_errors
+            assert all(child['returncode'] == 0 for child in child_exits)
+            assert not result['audit']['sockets'] and not result['audit']['unfinished_intents']
     print(json.dumps({'status': result['status'], 'evidence': str(env.root / 'sdk-boundary.json')}))
     return 0
 

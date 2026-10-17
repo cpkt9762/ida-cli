@@ -2,7 +2,7 @@
 import json
 import os
 
-SDK_FILES = {'handle.py': '93eb5a03ab46f4f1d0aedc12ecdd5b9f22a966ad748bc3a1fd05adfd163d2432', '_resolver.py': 'd06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8', 'options.py': '1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe'}
+SDK_FILES = {'handle.py': 'e9d57e725b4c0405faf959422720451215a9f7b2bd8f98bf0ad2377383b399ce', '_resolver.py': 'd06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8', 'options.py': '1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe'}
 HANDLE_SHA = SDK_FILES['handle.py']
 
 

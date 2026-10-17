@@ -516,7 +516,7 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
  
      @staticmethod
      def _crashed_database_state(entry: DatabaseInstance) -> DatabaseFileState | None:
-@@ -934,214 +1228,187 @@
+@@ -934,214 +1228,214 @@
          return result
  
      def _release_remote_lease(self) -> bool:
@@ -560,16 +560,15 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 -    def _release_remote_lease_outcome(self, timeout: float) -> dict[str, Any]:
 -        """One public release request; an absent or malformed ACK is never proof."""
 -        outcome: dict[str, Any] = {
+-            "status": "uncertain", "lease_released": False,
+-            "owner_released": False, "failure": "transport",
+-        }
 +        """Legacy best-effort release, retaining parsed facts for diagnostics."""
 +        return self._release_remote_lease_outcome(2.0, legacy=True).get("shutdown_pending") is True
 +
 +    def _release_remote_lease_outcome(self, timeout: float, *, legacy: bool = False) -> dict[str, Any]:
 +        """Latch valid ACK before touching any response/connection cleanup."""
-+        outcome: dict[str, Any] = self._close_outcome if self._close_outcome is not None else {
-             "status": "uncertain", "lease_released": False,
--            "owner_released": False, "failure": "transport",
--        }
-+            "owner_released": False, "failure": "transport"}
++        outcome = self._close_snapshot()
 +        outcome["failure"] = "transport"
          if timeout <= 0:
              outcome["failure"] = "deadline"
@@ -615,7 +614,7 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 +                outcome.update(status="final_pending" if last else "lease_released",
 +                    lease_released=True, shutdown_pending=last, failure=None,
 +                    ack_kind="last" if last else "nonlast", owner_pending=last)
-+                self._close_outcome = outcome
++                self._publish_close_outcome(outcome)
 +        except Exception as exc:
 +            if legacy and not isinstance(exc, legacy_caught):
 +                legacy_error = exc
@@ -626,24 +625,38 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 -                connection.close()
 -            except Exception as exc:
 -                outcome.update(cleanup_failure="transport", cleanup_failure_type=type(exc).__name__)
++            self._publish_close_outcome(outcome)
 +            for phase, resource in (("response", response), ("transport", connection)):
 +                if resource is not None:
 +                    try:
 +                        resource.close()
 +                    except Exception as cleanup:
 +                        _cleanup_error(outcome, phase, cleanup)
++                        self._publish_close_outcome(outcome)
 +                        if legacy and legacy_error is None and (phase == "transport" or not isinstance(cleanup, legacy_caught)):
 +                            legacy_error = cleanup
 +        if legacy_error is not None:
 +            raise legacy_error
-+        return outcome
+         return outcome
 +
-+    def _close_snapshot(self) -> dict[str, Any]:
-+        outcome = dict(self._close_outcome or {"status": "uncertain", "owner_released": False,
-+            "lease_released": False, "failure": "close_in_progress"})
++    @staticmethod
++    def _copy_close_outcome(value: dict[str, Any]) -> dict[str, Any]:
++        outcome = dict(value)
 +        if "cleanup_failures" in outcome:
 +            outcome["cleanup_failures"] = [dict(item) for item in outcome["cleanup_failures"]]
-         return outcome
++        return outcome
++
++    def _publish_close_outcome(self, outcome: dict[str, Any]) -> None:
++        # The close-lock owner is the only writer. Published objects are never
++        # mutated or returned directly: readers load one stable reference and
++        # need neither the I/O lock nor a second lock with a new wait budget.
++        self._close_outcome = self._copy_close_outcome(outcome)
++
++    def _close_snapshot(self) -> dict[str, Any]:
++        published = self._close_outcome
++        return self._copy_close_outcome(published if published is not None else {
++            "status": "uncertain", "owner_released": False,
++            "lease_released": False, "failure": "close_in_progress"})
  
      def close_outcome(self, *, wait_for_database: bool = True,
                        timeout: float = DATABASE_CLOSE_TIMEOUT_SECONDS) -> dict[str, Any]:
@@ -653,7 +666,10 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 -        this method never retries a release. Repeated calls retain that outcome.
 +        """Issue at most one release; ACK and cleanup are independent facts.
 +
-+        Concurrent callers wait up to their own timeout. A same-thread reentry
++        Concurrent callers wait up to their own timeout, then return published
++        facts with per-call close_in_progress/wait_failure markers. These do
++        not alter the cached outcome or imply that an ACK is unknown.
++        A same-thread reentry
 +        returns a snapshot immediately (possibly close_incomplete), never
 +        waits on itself and never sends. Unknown outcomes are cached forever;
 +        this API does not perform the later owner-observation protocol.
@@ -665,8 +681,11 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 +            return self._close_snapshot()
          deadline = time.monotonic() + float(timeout)
          if not self._close_lock.acquire(timeout=float(timeout)):
-             return {"status": "uncertain", "owner_released": False,
-                     "lease_released": False, "failure": "close_in_progress"}
+-            return {"status": "uncertain", "owner_released": False,
+-                    "lease_released": False, "failure": "close_in_progress"}
++            outcome = self._close_snapshot()
++            outcome.update(close_in_progress=True, wait_failure="deadline")
++            return outcome
 +        self._close_owner = threading.get_ident()
          try:
 -            return self._close(wait_for_database=wait_for_database, timeout=max(0.0, deadline - time.monotonic()), structured=True)
@@ -730,17 +749,18 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
          self._close_outcome = {"status": "uncertain", "owner_released": False,
 -                               "lease_released": False, "failure": "close_incomplete"}
 +            "lease_released": False, "failure": "close_incomplete"}
++        self._publish_close_outcome(self._close_outcome)
 +        release_error = None
 +        try:
 +            if structured:
 +                outcome = self._release_remote_lease_outcome(max(0.0, min(2.0, deadline - time.monotonic())))
 +            else:
 +                self._release_remote_lease()
-+                outcome = self._close_outcome
++                outcome = self._close_snapshot()
 +        except Exception as exc:
 +            release_error = exc
-+            outcome = self._close_outcome
-+        self._close_outcome = outcome
++            outcome = self._close_snapshot()
++        self._publish_close_outcome(outcome)
          with self._lock:
              self._uncertain_operations.clear()
              self._active_cancel_state = None
@@ -757,6 +777,7 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 +            except Exception as exc:
 +                _cleanup_error(outcome, phase, exc)
 +                cleanup_errors.append((phase, exc))
++                self._publish_close_outcome(outcome)
          for subscription in subscriptions:
 -            subscription._close(detach=False)
 -        if structured:
@@ -795,6 +816,7 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 +        if connection is not None:
 +            cleanup("stream_connection", connection.close)
 +        shutdown_pending = outcome.get("shutdown_pending") is True
++        observation_error = None
 +        if shutdown_pending and wait_for_database:
              try:
 -                lease_socket.shutdown(socket.SHUT_RDWR)
@@ -849,15 +871,23 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 +                released = wait_database_released(self.instance,
 +                    timeout=max(0.0, deadline - time.monotonic()) if structured else float(timeout))
 +            except Exception as exc:
++                observation_error = exc
++                outcome.update(observation_failure="exception", observation_failure_type=type(exc).__name__)
 +                _cleanup_error(outcome, "owner_observation", exc)
-+                cleanup_errors.append(("owner_observation", exc))
-+                released = False
-+            if released:
-+                outcome.update(status="owner_released", owner_released=True, owner_pending=False)
-+            elif not structured:
-+                raise NexusConnectionError(f"timed out after {float(timeout):g}s waiting for the IDB to close")
++            else:
++                if released:
++                    outcome.update(status="owner_released", owner_released=True, owner_pending=False)
++                else:
++                    outcome["observation_failure"] = "timeout"
++                    observation_error = NexusConnectionError(
++                        f"timed out after {float(timeout):g}s waiting for the IDB to close")
++        self._publish_close_outcome(outcome)
 +        if not structured and release_error is not None:
 +            raise release_error
++        if not structured and observation_error is not None:
++            # Preserve the original public helper exception (including identity
++            # and cause); only a normal False return is a legacy timeout.
++            raise observation_error
 +        if not structured and cleanup_errors:
 +            # Original legacy RPC/thread/connection errors still raise, after
 +            # all cleanups have run. Structured callers inspect each failure.
