@@ -20,6 +20,8 @@ pub(super) struct Helper {
     environment: std::collections::BTreeMap<String, String>,
     restarts: std::sync::atomic::AtomicUsize,
     last_heartbeat: std::sync::Mutex<Value>,
+    calls: Mutex<()>,
+    finished: std::sync::atomic::AtomicBool,
 }
 impl Helper {
     pub async fn start(
@@ -125,6 +127,8 @@ impl Helper {
             environment: config.environment.clone(),
             restarts: std::sync::atomic::AtomicUsize::new(0),
             last_heartbeat: std::sync::Mutex::new(Value::Null),
+            calls: Mutex::new(()),
+            finished: std::sync::atomic::AtomicBool::new(false),
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -162,7 +166,16 @@ impl Helper {
         Ok(Arc::new(helper))
     }
 
-    pub async fn call(&self, mut value: Value) -> anyhow::Result<Value> {
+    pub async fn call(&self, value: Value) -> anyhow::Result<Value> {
+        let _call = tokio::time::timeout(Duration::from_secs(2), self.calls.lock()).await?;
+        anyhow::ensure!(
+            !self.finished.load(std::sync::atomic::Ordering::Acquire),
+            "ObservationClosed: helper has finished; reconnect is forbidden"
+        );
+        self.exchange(value).await
+    }
+
+    async fn exchange(&self, mut value: Value) -> anyhow::Result<Value> {
         self.reconnect().await?;
         use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         // SAFETY: geteuid has no arguments or memory safety preconditions.
@@ -339,7 +352,15 @@ impl Helper {
     }
 
     pub async fn finish(&self) -> anyhow::Result<()> {
-        self.call(json!({"kind":"finish"})).await?;
+        let _call = tokio::time::timeout(Duration::from_secs(2), self.calls.lock()).await?;
+        if self.finished.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        self.exchange(json!({"kind":"finish"})).await?;
+        // Serialize against every heartbeat/custody request. Once finish was
+        // accepted, a late caller must not turn the clean exit into recovery.
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Release);
         let status =
             tokio::time::timeout(Duration::from_secs(2), self.child.lock().await.wait()).await??;
         anyhow::ensure!(status.success(), "helper did not exit cleanly");
@@ -348,6 +369,9 @@ impl Helper {
 
     #[cfg(feature = "nexus-test-support")]
     pub async fn wait_injected_orphan(&self) -> anyhow::Result<Value> {
+        let _call = tokio::time::timeout(Duration::from_secs(2), self.calls.lock()).await?;
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Release);
         let mut child = self.child.lock().await;
         let pid = child.id();
         let status = tokio::time::timeout(Duration::from_secs(3), child.wait()).await??;

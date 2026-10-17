@@ -565,6 +565,15 @@ impl NexusBridge {
             .wait_injected_orphan()
             .await
     }
+    #[cfg(feature = "nexus-test-support")]
+    pub async fn test_finished_helper_heartbeat(&self) -> anyhow::Result<Value> {
+        self.state
+            .helper
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("test helper missing"))?
+            .call(json!({"kind":"heartbeat"}))
+            .await
+    }
     pub async fn status(&self, id: &str) -> anyhow::Result<()> {
         send(&self.control, &json!({"local_status":id})).await
     }

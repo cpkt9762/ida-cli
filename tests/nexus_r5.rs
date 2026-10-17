@@ -281,6 +281,15 @@ print(json.dumps({'owner_released':outcome['owner_released'],'lease_released':ou
                 }
             }).await??;
             bridge.shutdown().await?;
+            let helpers_before = std::fs::read(root.join("ipc/helper-state.json"))?;
+            // A late poll used to reconnect the successfully finished helper.
+            // Exercise that exact production path, rather than sleeping and
+            // hoping the background heartbeat happens to win the race.
+            anyhow::ensure!(bridge.test_finished_helper_heartbeat().await.is_err(),
+                "heartbeat revived a successfully finished helper");
+            anyhow::ensure!(!root.join("ipc/h").exists(), "finished helper endpoint remains live");
+            anyhow::ensure!(std::fs::read(root.join("ipc/helper-state.json"))? == helpers_before,
+                "late heartbeat rewrote finished helper registry");
         }
         Ok::<(),anyhow::Error>(())
     }.await;

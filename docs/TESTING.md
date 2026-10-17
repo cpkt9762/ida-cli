@@ -1122,6 +1122,11 @@ available until the matching custody/producer closure. Startup intent is signed
 before Popen; exact birth identity follows Popen before readiness. Missing source
 or unsupported recovery remains explicitly blocked. Neither EOF nor PID absence
 proves release. Orphan clock injection at 300 seconds records abandonment only.
+Accepted helper finish is serialized against all requests and permanently fences
+reconnect. The real startup regression directly issues a late heartbeat after
+finish and requires local refusal, unchanged registry and no endpoint. Final
+audits also inspect holders of every registered socket, including idle helpers
+whose durable watch table is empty.
 
 Admission is wire=2/schema=1/release=1/open=1/sdk_boundary=1,
 owner_observation=custody=helper=target_gate=1, same_boot_exit=boot_retirement=0.

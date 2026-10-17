@@ -705,7 +705,9 @@ async fn routine(managed: bool) {
                 gc(&root, round+1, u64::MAX, 1000+round).await?;
             }
             if round != 127 {
-                std::fs::write(root.join("next-owner"), (round+1).to_string())?;
+                let next_owner = root.join("next-owner.new");
+                std::fs::write(&next_owner, (round+1).to_string())?;
+                std::fs::rename(next_owner, root.join("next-owner"))?;
                 wait_for(|| Ok(std::fs::read_to_string(root.join("owner-generation")).ok().as_deref() == Some((round+1).to_string().as_str()))).await?;
             }
         }
