@@ -15,6 +15,7 @@ REPO = Path(__file__).resolve().parents[1]
 NEXUS_SHA = "d60ff582fde90c59726336c0dbdf3e8286e9df7a"
 CANCEL_HANDLE_SHA256 = "4cd1a9c27e969504eed4ae55d7cbd0e2b4b5a6ba67f0c2529ccb6006a8d67b76"
 PATCHED_HANDLE_SHA256 = "aa5d7ea42caaa922ef494d7d8a1406396537a4ea88d9e833825e08c8d279025e"
+SDK_CONTRACT = json.loads((REPO / "scripts/nexus/client-sdk-contract.json").read_text())
 
 
 def accepted_eula_entries(data: bytes) -> list[str]:
@@ -65,7 +66,9 @@ def prepare(args: argparse.Namespace) -> None:
     run(root, "venv", [sys.executable, "-m", "venv", str(root / "venv")])
     python = root / "venv/bin/python"
     pip = [str(python), "-m", "pip", "--isolated", "--disable-pip-version-check"]
-    run(root, "download", [*pip, "download", "--index-url", "https://pypi.org/simple",
+    wheel_source = (["--no-index", "--find-links", str(args.wheels.resolve(strict=True))]
+                    if args.wheels else ["--index-url", "https://pypi.org/simple"])
+    run(root, "download", [*pip, "download", *wheel_source,
                            "--no-cache-dir", "--no-deps", "--require-hashes", "--only-binary=:all:",
                            "-r", str(REPO / "scripts/nexus/requirements.lock"),
                            "-d", str(root / "wheels")])
@@ -74,8 +77,10 @@ def prepare(args: argparse.Namespace) -> None:
                                "--find-links", str(root / "wheels"), "-r", str(REPO / "scripts/nexus/requirements.lock")])
     run(root, "idapro", [*pip, "install", "--no-deps", "--no-index", str(root / "wheels" / wheel.name)])
     source = root / "nexus-source"
-    run(root, "clone", ["git", "clone", "--quiet", "--depth", "1", "--branch", "v0.13.4",
-                        "https://github.com/HexRaysSA/ida-nexus.git", str(source)])
+    clone = (["--no-hardlinks", "--local", str(args.source.resolve(strict=True))]
+             if args.source else ["--depth", "1", "--branch", "v0.13.4",
+                                  "https://github.com/HexRaysSA/ida-nexus.git"])
+    run(root, "clone", ["git", "clone", "--quiet", *clone, str(source)])
     sha = run(root, "source-sha", ["git", "rev-parse", "HEAD"], cwd=source)
     if sha != NEXUS_SHA:
         raise RuntimeError("Nexus tag no longer matches pinned SHA; refusing patch")
@@ -96,11 +101,29 @@ def prepare(args: argparse.Namespace) -> None:
         run(root, "close-patch", ["git", "apply", str(close_patch)], cwd=source)
         if digest(source / "ida_nexus/handle.py") != PATCHED_HANDLE_SHA256:
             raise RuntimeError("client close proof patch output hash mismatch; BLOCKED")
+    sdk_patch = REPO / "scripts/nexus/client-acquisition.patch"
+    sdk_applied = close_applied and args.sdk_baseline is None
+    if sdk_applied:
+        run(root, "sdk-patch-check", ["git", "apply", "--check", str(sdk_patch)], cwd=source)
+        run(root, "sdk-patch", ["git", "apply", str(sdk_patch)], cwd=source)
+        for name, expected in SDK_CONTRACT["files"].items():
+            if digest(source / "ida_nexus" / name) != expected:
+                raise RuntimeError(f"client SDK boundary patch output hash mismatch: {name}; BLOCKED")
     run(root, "nexus-wheel", [*pip, "wheel", "--no-deps", "--no-build-isolation",
                               "--no-cache-dir", "-w", str(root / "wheels"), str(source)])
     run(root, "nexus-install", [*pip, "install", "--no-deps", "--no-index", "--find-links", str(root / "wheels"),
                                 "ida-nexus==0.13.4"])
     run(root, "pip-check", [*pip, "check"])
+    installed = json.loads(run(root, "installed-sdk", [str(python), "-I", "-B", "-c",
+        "import hashlib,importlib,json,sys; from pathlib import Path; "
+        "names=('handle','_resolver','options'); "
+        "modules={n:Path(importlib.import_module('ida_nexus.'+n).__file__).resolve() for n in names}; "
+        "print(json.dumps({n+'.py':{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} "
+        "for n,p in modules.items()}))"]))
+    for name, module in installed.items():
+        if (not Path(module["path"]).is_relative_to(root / "venv")
+                or module["sha256"] != digest(source / "ida_nexus" / name)):
+            raise RuntimeError(f"installed SDK differs from prepared source: {name}; BLOCKED")
     profile_env = {name: os.environ[name] for name in ("HOME", "USER", "LOGNAME", "PATH") if name in os.environ}
     profile_env.update({"IDADIR": str(ida), "IDAUSR": str(root / "profile"),
                         "IDA_CLI_HOME": str(root / "cli-home"), "IDA_NEXUS_STATE_DIR": str(root / "state"),
@@ -125,6 +148,11 @@ def prepare(args: argparse.Namespace) -> None:
                 "client_close_patch_applied": close_applied,
                 "client_close_patch_sha256": digest(close_patch) if close_applied else None,
                 "client_handle_sha256": digest(source / "ida_nexus/handle.py"),
+                "client_sdk_patch_applied": sdk_applied,
+                "client_sdk_patch_sha256": digest(sdk_patch) if sdk_applied else None,
+                "client_sdk_contract": SDK_CONTRACT if sdk_applied else None,
+                "client_sdk_modules": installed,
+                "experimental_baseline": args.sdk_baseline,
                 "eula_entries_copied": len(eula), "checksums": checksums}
     (root / "environment.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps({"status": "PREPARED", "root": str(root), "nexus_sha": sha}))
@@ -135,6 +163,10 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True, help="new directory outside the repository")
     parser.add_argument("--ida-dir", type=Path, required=True)
     parser.add_argument("--eula-registry", type=Path, required=True, help="existing legally prepared ida.reg")
+    parser.add_argument("--source", type=Path, help="optional local fixed upstream clone (read only)")
+    parser.add_argument("--wheels", type=Path, help="optional offline hashed wheel directory (read only)")
+    parser.add_argument("--sdk-baseline", choices=("r0",),
+                        help="experimental three-patch baseline only; unsupported by production admission")
     parser.add_argument("--without-client-cancel-patch", action="store_true",
                         help="diagnostic red control only; not a supported bridge environment")
     parser.add_argument("--without-client-close-patch", action="store_true",

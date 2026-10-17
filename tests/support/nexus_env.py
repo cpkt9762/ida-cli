@@ -96,8 +96,16 @@ class Environment:
         actual = hashlib.sha256(source.read_bytes()).hexdigest()
         if actual != self.manifest.get("client_handle_sha256"):
             raise RuntimeError("installed Nexus client hash differs from environment manifest")
+        modules = self.manifest.get("client_sdk_modules", {})
+        for name, entry in modules.items():
+            module = source.parent / name
+            if (str(module.resolve()) != entry["path"]
+                    or hashlib.sha256(module.read_bytes()).hexdigest() != entry["sha256"]):
+                raise RuntimeError(f"installed Nexus SDK module hash differs: {name}")
         return {"applied": self.manifest.get("client_cancel_patch_applied", False),
                 "close_applied": self.manifest.get("client_close_patch_applied", False),
+                "sdk_applied": self.manifest.get("client_sdk_patch_applied", False),
+                "modules": modules,
                 "handle_sha256": actual}
 
     @contextmanager

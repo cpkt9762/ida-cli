@@ -15,6 +15,15 @@ protocol = contract()
 fault = os.environ['R5_FAULT']
 if fault.startswith('missing-') and fault.removeprefix('missing-') in protocol:
     protocol.pop(fault.removeprefix('missing-'))
+elif fault.startswith('module-'):
+    name = {'module-handle': 'handle.py', 'module-resolver': '_resolver.py',
+            'module-options': 'options.py'}.get(fault)
+    if name:
+        protocol['client_modules'][name] = '0' * 64
+    elif fault == 'module-missing':
+        protocol['client_modules'].pop('options.py')
+    elif fault == 'module-extra':
+        protocol['client_modules']['unknown.py'] = '0' * 64
 elif fault == 'wrong-hash':
     protocol['client_hash'] = '0' * 64
 elif fault == 'unknown-capability':

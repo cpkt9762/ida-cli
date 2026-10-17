@@ -1,0 +1,1041 @@
+Nexus 0.13.4 R1 additive client acquisition/ACK boundary.
+Apply after loopback-bind, client-cancel-unknown and client-close-proof.
+Upstream d60ff582fde90c59726336c0dbdf3e8286e9df7a; no server/wire changes.
+R0 candidate is historical; this static patch is the reproducible product input.
+Public types live in ida_nexus.handle/options and LaunchEvent in _resolver.
+No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
+
+--- a/ida_nexus/handle.py
++++ b/ida_nexus/handle.py
+@@ -1,3 +1,5 @@
++from __future__ import annotations
++
+ import http.client
+ import json
+ import math
+@@ -7,10 +9,10 @@
+ import uuid
+ from collections.abc import Callable
+ from types import TracebackType
+-from typing import Any, Self
++from typing import Any, Literal, Self, TypedDict
+ 
+ from ._registry import HOST, DatabaseInstance, _event_origin_id
+-from ._resolver import resolve_instance
++from ._resolver import LaunchEvent, resolve_instance
+ from .database_state import (
+     DatabaseFileState,
+     DatabaseRecovery,
+@@ -30,7 +32,8 @@
+     SaveResult,
+     ShutdownResult,
+ )
+-from .options import MAX_KEEPALIVE_SECONDS, DatabaseOpenOptions
++from .options import (MAX_KEEPALIVE_SECONDS, AcquisitionObserver, AcquisitionStage,
++                      DatabaseOpenOptions)
+ 
+ # Closing an IDB may include a final save. Allow the same five-minute budget as
+ # explicit saving plus a small margin for worker and registry teardown.
+@@ -239,6 +242,179 @@
+         self.close()
+ 
+ 
++FailureKind = Literal["not_sent", "lease_absent", "unknown_attach", "cleanup_required", "startup_unconfirmed"]
++
++
++class AttachEvent(TypedDict, total=False):
++    instance: DatabaseInstance
++    handle: DatabaseHandle | None
++    stage: AcquisitionStage
++    cause: Exception
++    http_status: int | None
++    failure_kind: FailureKind
++
++
++class ObserverError(TypedDict):
++    stage: AcquisitionStage
++    cause: Exception
++
++
++class AttachAttempt(TypedDict):
++    attempt: int
++    instance: DatabaseInstance
++    stage: AcquisitionStage
++    handle: DatabaseHandle | None
++    failure_kind: FailureKind | None
++    cause: Exception | None
++    http_status: int | None
++    obligation: Literal["unknown_attach", "exact_handle"] | None
++
++
++class AcquisitionOutcome(TypedDict):
++    """Raw facts, not custody/owner-exit proof. Old unknowns remain obligations.
++
++    Each attempt retains the exact public instance (including its in-memory
++    credentials); do not serialize this object. claim_acquired transfers only
++    the SDK's strong reference, never a lease or an earlier unknown attempt.
++    """
++    stage: AcquisitionStage
++    handle: DatabaseHandle | None
++    instance: DatabaseInstance | None
++    first_instance: DatabaseInstance | None
++    failure_kind: FailureKind | None
++    cause: Exception | None
++    http_status: int | None
++    observer_errors: list[ObserverError]
++    launches: list[tuple[AcquisitionStage, LaunchEvent]]
++    sdk_reconnect_used: bool
++    attempts: list[AttachAttempt]
++    unresolved_attempts: list[AttachAttempt]
++
++
++# Lock never spans a callback, a handle lock or any I/O. A callback may claim,
++# close or recursively acquire a different handle. Registration happens once,
++# before any user code or monitor construction; successful construction drops
++# it, failure retains it until explicit claim/close.
++_ACQUIRED_PENDING: dict[int, DatabaseHandle] = {}
++_ACQUIRED_PENDING_LOCK = threading.Lock()
++
++
++def _retain_acquired(handle: DatabaseHandle) -> None:
++    with _ACQUIRED_PENDING_LOCK:
++        if not handle._closed.is_set() and not handle._acquisition_claimed:
++            _ACQUIRED_PENDING[id(handle)] = handle
++
++
++class AcquiredFailure(Exception):
++    """SSE exists. The exact handle remains cleanable; cause is the original error."""
++    def __init__(self, handle: DatabaseHandle, cause: Exception):
++        super().__init__(str(cause))
++        self.handle, self.cause = handle, cause
++        self.observer_errors: list[ObserverError] = []
++
++
++class StageObserverFailure(Exception):
++    """Observer faults never qualify for transport reconnect."""
++    def __init__(self, stage: AcquisitionStage, cause: Exception):
++        super().__init__(str(cause))
++        self.stage, self.cause = stage, cause
++        self.attach_error: Exception | None = None
++        self.observer_errors: list[ObserverError] = []
++
++
++def _notify_stage(observer: AcquisitionObserver | None,
++                  stage: AcquisitionStage, value: Any) -> None:
++    if observer is not None:
++        try:
++            observer(stage, value)
++        except StageObserverFailure:
++            raise
++        except Exception as cause:
++            raise StageObserverFailure(stage, cause) from cause
++
++
++class LeaseOpenFailure(NexusConnectionError):
++    """An HTTP refusal, with status read before body/connection cleanup."""
++    def __init__(self, message: str, status: int):
++        super().__init__(message)
++        self.status = status
++
++
++def _cleanup_error(outcome: dict[str, Any], phase: str, error: Exception) -> None:
++    outcome.setdefault("cleanup_failure", phase)
++    outcome.setdefault("cleanup_failure_type", type(error).__name__)
++    outcome.setdefault("cleanup_failures", []).append({"phase": phase, "type": type(error).__name__})
++
++
++class _Acquisition:
++    """One synchronous call's ledger; independent of observer success."""
++    def __init__(self, observer: AcquisitionObserver | None):
++        self.observer = observer
++        self.stage: AcquisitionStage = "BeforeResolve"
++        self.instances: list[DatabaseInstance] = []
++        self.handles: list[DatabaseHandle] = []
++        self.attempts: list[AttachAttempt] = []
++        self.launches: list[tuple[AcquisitionStage, LaunchEvent]] = []
++        self.reconnect = False
++
++    def observe(self, stage: AcquisitionStage, value: Any) -> None:
++        self.stage = stage
++        if stage == "BeforeResolve":
++            self.reconnect |= value["reconnect"]
++        if stage in ("Resolved", "ReconnectResolved"):
++            self.instances.append(value)
++            self.reconnect |= stage == "ReconnectResolved"
++        elif stage == "BeforeAttach":
++            self.attempts.append({"attempt": len(self.attempts) + 1,
++                "instance": value, "stage": stage, "failure_kind": "not_sent",
++                "cause": None, "handle": None, "obligation": None, "http_status": None})
++        elif stage == "AttachMayBeSent":
++            # This callback executes BEFORE request. Commit may-sent only when
++            # it returns normally; observer refusal is definitely not a send.
++            _notify_stage(self.observer, stage, value)
++            self.attempts[-1].update(stage=stage, failure_kind="unknown_attach", obligation="unknown_attach")
++            return
++        elif stage == "Acquired":
++            self.handles.append(value)
++            self.attempts[-1].update(stage=stage, handle=value, failure_kind=None, obligation="exact_handle")
++        elif stage == "AttachFailed":
++            self.attempts[-1].update(value)
++            self.attempts[-1]["obligation"] = ("exact_handle" if value["handle"] is not None else
++                "unknown_attach" if value["failure_kind"] == "unknown_attach" else None)
++        elif stage == "AttachSucceeded":
++            self.attempts[-1].update(stage="Acquired", handle=value["handle"], failure_kind=None, obligation="exact_handle")
++        if stage in ("LaunchIntent", "Spawned", "LogReady", "Ready"):
++            self.launches.append((stage, dict(value)))
++        _notify_stage(self.observer, stage, value)
++
++    def outcome(self, handle: DatabaseHandle | None, error: Exception | None) -> AcquisitionOutcome:
++        if handle is None and self.handles:
++            handle = self.handles[-1]
++        cause = error
++        if isinstance(error, StageObserverFailure) and error.attach_error is not None:
++            cause = error.attach_error
++        if isinstance(cause, (AcquiredFailure, StageObserverFailure)):
++            cause = cause.cause
++        unknown = [attempt for attempt in self.attempts if attempt["obligation"] == "unknown_attach"]
++        failure = None if error is None else ("cleanup_required" if handle is not None else
++            self.attempts[-1]["failure_kind"] if self.attempts else
++            "startup_unconfirmed" if self.launches else "not_sent")
++        if handle is not None and error is not None and self.attempts:
++            self.attempts[-1].update(stage="Acquired", handle=handle, cause=cause,
++                failure_kind="cleanup_required", obligation="exact_handle")
++        if unknown:
++            failure = "unknown_attach"
++        return {"stage": "Acquired" if handle is not None else
++                self.attempts[-1]["stage"] if self.stage == "AttachFailed" and self.attempts else self.stage,
++            "handle": handle, "instance": self.instances[-1] if self.instances else None,
++            "first_instance": self.instances[0] if self.instances else None,
++            "failure_kind": failure, "cause": cause,
++            "http_status": self.attempts[-1]["http_status"] if self.attempts else None,
++            "observer_errors": getattr(error, "observer_errors", []),
++            "launches": self.launches, "attempts": self.attempts,
++            "unresolved_attempts": unknown, "sdk_reconnect_used": self.reconnect}
++
++
+ class DatabaseHandle:
+     """A shared Nexus instance plus one lifetime SSE client lease."""
+ 
+@@ -251,6 +427,8 @@
+         idle_timeout: float | None = None,
+         recovery: DatabaseRecovery = "none",
+         on_disconnect: Callable[["DatabaseHandle", str], None] | None = None,
++        on_acquired: Callable[["DatabaseHandle"], None] | None = None,
++        on_stage: AcquisitionObserver | None = None,
+     ) -> None:
+         if not math.isfinite(keepalive) or not 0 <= keepalive <= MAX_KEEPALIVE_SECONDS:
+             raise ValueError(
+@@ -280,9 +458,12 @@
+         self._lease_id = uuid.uuid4().hex
+         self._event_origin_id = _event_origin_id(self._lease_id)
+         self._on_disconnect = on_disconnect
++        self._on_stage = on_stage
++        self._acquisition_claimed = False
+         self._lock = threading.Lock()
+         self._request_lock = threading.Lock()
+         self._close_lock = threading.Lock()
++        self._close_owner: int | None = None
+         self._close_outcome: dict[str, Any] | None = None
+         self._closed = threading.Event()
+         self._disconnected = threading.Event()
+@@ -306,13 +487,27 @@
+             self._lease_response,
+             self._lease_socket,
+         ) = self._open_lease(instance)
+-        thread = threading.Thread(
+-            target=self._monitor_lease,
+-            name=f"ida-nexus-lease-{instance.pid}",
+-            daemon=True,
+-        )
+-        self._lease_thread = thread
+-        thread.start()
++        _retain_acquired(self)
++        try:
++            _notify_stage(on_stage, "Acquired", self)
++            if on_acquired is not None:
++                on_acquired(self)
++            # Reentrant close is legal; never start a monitor on a closed stream.
++            if not self._closed.is_set():
++                thread = threading.Thread(target=self._monitor_lease,
++                    name=f"ida-nexus-lease-{instance.pid}", daemon=True)
++                self._lease_thread = thread
++                thread.start()
++        except Exception as cause:
++            if on_acquired is None and on_stage is None:
++                # Legacy exception type remains intact, while the exact handle
++                # is discoverable for cleanup rather than lost after SSE.
++                cause.handle = self
++                raise
++            raise AcquiredFailure(self, cause.cause if isinstance(cause, StageObserverFailure) else cause) from cause
++        else:
++            with _ACQUIRED_PENDING_LOCK:
++                _ACQUIRED_PENDING.pop(id(self), None)
+ 
+     @classmethod
+     def attach(
+@@ -324,20 +519,52 @@
+         idle_timeout: float | None = None,
+         recovery: DatabaseRecovery = "none",
+         on_disconnect: Callable[["DatabaseHandle", str], None] | None = None,
++        on_acquired: Callable[["DatabaseHandle"], None] | None = None,
++        on_stage: AcquisitionObserver | None = None,
+     ) -> Self:
+         """Attach directly to one discovered instance without re-resolving it."""
+ 
+         requested_path = path or instance.exe_path or instance.idb_path
+         if not requested_path:
+             raise ValueError("instance has no attachable database path")
++        _notify_stage(on_stage, "BeforeAttach", instance)
+         constructor_options: dict[str, Any] = {
+             "keepalive": keepalive,
+             "on_disconnect": on_disconnect,
++            "on_acquired": on_acquired,
++            "on_stage": on_stage,
+             "recovery": recovery,
+         }
+         if idle_timeout is not None:
+             constructor_options["idle_timeout"] = idle_timeout
+-        return cls(requested_path, instance, **constructor_options)
++        stage = "BeforeAttach"
++        def observed(value: AcquisitionStage, entry: Any) -> None:
++            nonlocal stage
++            _notify_stage(on_stage, value, entry)
++            stage = value
++        constructor_options["on_stage"] = observed if on_stage is not None else None
++        try:
++            handle = cls(requested_path, instance, **constructor_options)
++        except Exception as error:
++            owned = getattr(error, "handle", None)
++            try:
++                _notify_stage(on_stage, "AttachFailed", {"instance":instance, "stage":stage,
++                    "handle":owned, "cause":error.cause if isinstance(error, (AcquiredFailure, StageObserverFailure)) else error,
++                    "http_status":getattr(error, "status", None),
++                    "failure_kind":"cleanup_required" if owned is not None else
++                        "lease_absent" if isinstance(error, LeaseOpenFailure) else
++                        "unknown_attach" if stage == "AttachMayBeSent" else "not_sent"})
++            except StageObserverFailure as notification:
++                if not hasattr(error, "observer_errors"):
++                    error.observer_errors = []
++                error.observer_errors.append({"stage": "AttachFailed", "cause": notification.cause})
++            raise
++        try:
++            _notify_stage(on_stage, "AttachSucceeded", {"instance":instance, "handle":handle})
++        except StageObserverFailure as notification:
++            _retain_acquired(handle)
++            raise AcquiredFailure(handle, notification.cause) from notification
++        return handle
+ 
+     @classmethod
+     def open(
+@@ -346,6 +573,7 @@
+         *,
+         options: DatabaseOpenOptions | None = None,
+         on_disconnect: Callable[["DatabaseHandle", str], None] | None = None,
++        on_acquired: Callable[["DatabaseHandle"], None] | None = None,
+     ) -> Self:
+         """Attach to a shared instance, spawning a configured worker if needed."""
+ 
+@@ -392,26 +620,100 @@
+                 windows_dir=options.windows_dir,
+                 no_segmentation=options.no_segmentation,
+                 debug_flags=options.debug_flags,
++                acquisition_observer=options.acquisition_observer,
+             )
+ 
++        _notify_stage(options.acquisition_observer, "BeforeResolve", {"path": path, "reconnect": False})
+         instance = resolve()
++        _notify_stage(options.acquisition_observer, "Resolved", instance)
+         attach_options: dict[str, Any] = {
+             "path": path,
+             "keepalive": options.keepalive,
+             "on_disconnect": on_disconnect,
++            "on_acquired": on_acquired,
++            "on_stage": options.acquisition_observer,
+             "recovery": recovery,
+         }
+         if options.idle_timeout is not None:
+             attach_options["idle_timeout"] = options.idle_timeout
+         try:
+             return cls.attach(instance, **attach_options)
+-        except NexusConnectionError:
++        except NexusConnectionError as error:
++            if getattr(error, "handle", None) is not None or getattr(error, "observer_errors", []):
++                raise
+             # The worker may cross its zero-lease shutdown boundary between
+             # resolve and the SSE handshake. Resolve once more as promised by
+             # the instance lifecycle contract.
+             time.sleep(0.05)
++            _notify_stage(options.acquisition_observer, "BeforeResolve", {"path": path, "reconnect": True})
+             replacement = resolve()
++            _notify_stage(options.acquisition_observer, "ReconnectResolved", replacement)
+             return cls.attach(replacement, **attach_options)
++
++    @classmethod
++    def attach_outcome(
++        cls, instance: DatabaseInstance, *, path: str | None = None,
++        keepalive: float = 0.0, idle_timeout: float | None = None,
++        recovery: DatabaseRecovery = "none",
++        on_disconnect: Callable[[DatabaseHandle, str], None] | None = None,
++        on_acquired: Callable[[DatabaseHandle], None] | None = None,
++        on_stage: AcquisitionObserver | None = None,
++    ) -> AcquisitionOutcome:
++        """One attach, never re-resolve/retry. Callbacks run inline without locks.
++
++        Exceptions become raw cause/secondary errors; a returned handle is the
++        exact resource, even when callbacks or monitor setup failed. Explicit
++        claim/close ends SDK retention, not any earlier unknown obligation.
++        """
++        ledger = _Acquisition(on_stage)
++        ledger.stage = "BeforeAttach"
++        ledger.instances.append(instance)
++        def acquired(handle: DatabaseHandle) -> None:
++            if on_acquired is not None:
++                on_acquired(handle)
++        try:
++            handle = cls.attach(instance, path=path, keepalive=keepalive,
++                idle_timeout=idle_timeout, recovery=recovery, on_disconnect=on_disconnect,
++                on_acquired=acquired, on_stage=ledger.observe)
++        except Exception as error:
++            return ledger.outcome(None, error)
++        return ledger.outcome(handle, None)
++
++    @classmethod
++    def open_outcome(
++        cls, path: str, *, options: DatabaseOpenOptions | None = None,
++        observer: AcquisitionObserver | None = None,
++        on_acquired: Callable[[DatabaseHandle], None] | None = None,
++        on_disconnect: Callable[[DatabaseHandle, str], None] | None = None,
++    ) -> AcquisitionOutcome:
++        """Legacy at-most-two resolve/attach attempts plus an obligation ledger.
++
++        Both options.acquisition_observer and observer run (options first).
++        Any observer failure aborts acquisition without a transport retry.
++        No post-exit re-resolve or durable custody is implemented by this API.
++        """
++        from dataclasses import replace
++        options = options or DatabaseOpenOptions()
++        def observe(stage: AcquisitionStage, value: Any) -> None:
++            _notify_stage(options.acquisition_observer, stage, value)
++            _notify_stage(observer, stage, value)
++        ledger = _Acquisition(observe)
++        def acquired(handle: DatabaseHandle) -> None:
++            if on_acquired is not None:
++                on_acquired(handle)
++        try:
++            handle = cls.open(path, options=replace(options, acquisition_observer=ledger.observe),
++                              on_acquired=acquired, on_disconnect=on_disconnect)
++        except Exception as error:
++            return ledger.outcome(None, error)
++        return ledger.outcome(handle, None)
++
++    def claim_acquired(self) -> Self:
++        """Idempotently transfer SDK retention to caller; concurrent close is legal."""
++        with _ACQUIRED_PENDING_LOCK:
++            self._acquisition_claimed = True
++            _ACQUIRED_PENDING.pop(id(self), None)
++        return self
+ 
+     @property
+     def instance(self) -> DatabaseInstance:
+@@ -465,48 +767,40 @@
+         self, entry: DatabaseInstance
+     ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse, socket.socket]:
+         connection = http.client.HTTPConnection(HOST, entry.port, timeout=10.0)
++        response = None
+         try:
+-            lease_path = (
+-                f"/health?sse=1&lease_id={self._lease_id}&keepalive={self.keepalive:g}"
+-            )
++            lease_path = f"/health?sse=1&lease_id={self._lease_id}&keepalive={self.keepalive:g}"
+             if self.idle_timeout is not None:
+                 lease_path += f"&idle_timeout={self.idle_timeout:g}"
+-            connection.request(
+-                "GET",
+-                lease_path,
+-                headers={
+-                    "Accept": "text/event-stream",
+-                    "Authorization": f"Bearer {entry._token}",
+-                },
+-            )
++            _notify_stage(self._on_stage, "AttachMayBeSent", entry)
++            connection.request("GET", lease_path, headers={
++                "Accept": "text/event-stream", "Authorization": f"Bearer {entry._token}"})
+             response = connection.getresponse()
+-        except (OSError, http.client.HTTPException) as exc:
+-            connection.close()
+-            raise NexusConnectionError(
+-                f"failed to establish instance lease: {exc}"
+-            ) from exc
+-        if response.status != 200:
+-            body = response.read(4096).decode("utf-8", errors="replace")
+-            connection.close()
+-            raise NexusConnectionError(
+-                f"failed to establish instance lease: HTTP {response.status}: {body}"
+-            )
+-        # The 10-second timeout bounds only the handshake. A lease is an
+-        # indefinite SSE stream; leaving that timeout on the socket can falsely
+-        # disconnect healthy instances if a heartbeat is delayed by scheduling
+-        # or system sleep.
+-        lease_socket = connection.sock
+-        if lease_socket is None and response.fp is not None:
+-            raw = getattr(response.fp, "raw", None)
+-            lease_socket = getattr(raw, "_sock", None)
+-        if lease_socket is None:
+-            response.close()
+-            connection.close()
+-            raise NexusConnectionError(
+-                "failed to establish instance lease: socket unavailable"
+-            )
+-        lease_socket.settimeout(None)
+-        return connection, response, lease_socket
++            if response.status != 200:
++                # Read status before diagnostic body I/O, which may itself fail.
++                raise LeaseOpenFailure(f"failed to establish instance lease: HTTP {response.status}", response.status)
++            lease_socket = connection.sock
++            if lease_socket is None and response.fp is not None:
++                lease_socket = getattr(getattr(response.fp, "raw", None), "_sock", None)
++            if lease_socket is None:
++                raise NexusConnectionError("failed to establish instance lease: socket unavailable")
++            lease_socket.settimeout(None)
++            return connection, response, lease_socket
++        except Exception as error:
++            cleanup_errors = []
++            for resource in (response, connection):
++                if resource is not None:
++                    try:
++                        resource.close()
++                    except Exception as cleanup:
++                        cleanup_errors.append(cleanup)
++            if cleanup_errors:
++                error.cleanup_errors = cleanup_errors
++            if isinstance(error, (OSError, http.client.HTTPException)):
++                failure = NexusConnectionError(f"failed to establish instance lease: {error}")
++                failure.cleanup_errors = cleanup_errors
++                raise failure from error
++            raise
+ 
+     @staticmethod
+     def _crashed_database_state(entry: DatabaseInstance) -> DatabaseFileState | None:
+@@ -934,214 +1228,187 @@
+         return result
+ 
+     def _release_remote_lease(self) -> bool:
+-        """Best-effort release; return whether it committed final IDB shutdown."""
+-
+-        entry = self.instance
+-        connection = http.client.HTTPConnection(HOST, entry.port, timeout=2.0)
+-        try:
+-            body = json.dumps({"lease_id": self._lease_id}).encode("utf-8")
+-            connection.request(
+-                "POST",
+-                "/release_lease",
+-                body=body,
+-                headers={
+-                    "Accept": "application/json",
+-                    "Content-Type": "application/json",
+-                    "Authorization": f"Bearer {entry._token}",
+-                },
+-            )
+-            response = connection.getresponse()
+-            try:
+-                payload = json.loads(response.read())
+-                result = payload.get("result") if isinstance(payload, dict) else None
+-                return bool(
+-                    isinstance(result, dict) and result.get("shutdown_pending") is True
+-                )
+-            finally:
+-                response.close()
+-        except (
+-            TimeoutError,
+-            OSError,
+-            http.client.HTTPException,
+-            UnicodeDecodeError,
+-            json.JSONDecodeError,
+-        ):
+-            # Closing the SSE socket below remains the authoritative fallback.
+-            return False
+-        finally:
+-            connection.close()
+-
+-    def _release_remote_lease_outcome(self, timeout: float) -> dict[str, Any]:
+-        """One public release request; an absent or malformed ACK is never proof."""
+-        outcome: dict[str, Any] = {
++        """Legacy best-effort release, retaining parsed facts for diagnostics."""
++        return self._release_remote_lease_outcome(2.0, legacy=True).get("shutdown_pending") is True
++
++    def _release_remote_lease_outcome(self, timeout: float, *, legacy: bool = False) -> dict[str, Any]:
++        """Latch valid ACK before touching any response/connection cleanup."""
++        outcome: dict[str, Any] = self._close_outcome if self._close_outcome is not None else {
+             "status": "uncertain", "lease_released": False,
+-            "owner_released": False, "failure": "transport",
+-        }
++            "owner_released": False, "failure": "transport"}
++        outcome["failure"] = "transport"
+         if timeout <= 0:
+             outcome["failure"] = "deadline"
+             return outcome
+-        connection = http.client.HTTPConnection(HOST, self.instance.port, timeout=timeout)
++        connection = response = None
++        legacy_error = None
++        legacy_caught = (OSError, http.client.HTTPException, UnicodeDecodeError, json.JSONDecodeError)
+         try:
++            entry = self.instance
++            connection = http.client.HTTPConnection(HOST, entry.port, timeout=timeout)
+             connection.request("POST", "/release_lease",
+                 body=json.dumps({"lease_id": self._lease_id}).encode("utf-8"),
+                 headers={"Accept": "application/json", "Content-Type": "application/json",
+-                         "Authorization": f"Bearer {self.instance._token}"})
++                         "Authorization": f"Bearer {entry._token}"})
+             response = connection.getresponse()
+-            try:
+-                payload = json.loads(response.read())
+-                result = payload.get("result") if isinstance(payload, dict) else None
+-                if (response.status != 200 or payload.get("ok") is not True
+-                    or not isinstance(result, dict) or result.get("released") is not True
+-                    or type(result.get("shutdown_pending")) is not bool):
+-                    outcome["failure"] = "invalid_response"
+-                else:
+-                    outcome.update(status="final_pending" if result["shutdown_pending"] else "lease_released",
+-                                   lease_released=True, shutdown_pending=result["shutdown_pending"], failure=None)
+-            finally:
+-                response.close()
+-        except (TimeoutError, OSError, http.client.HTTPException, UnicodeDecodeError,
+-                json.JSONDecodeError, AttributeError, TypeError) as exc:
+-            outcome.update(status="uncertain", lease_released=False,
+-                           failure="transport" if isinstance(exc, (OSError, http.client.HTTPException)) else "invalid_response")
++            payload = json.loads(response.read())
++            result = payload.get("result") if isinstance(payload, dict) else None
++            if (response.status != 200 or not isinstance(payload, dict)
++                or payload.get("ok") is not True or not isinstance(result, dict)
++                or result.get("released") is not True
++                or type(result.get("shutdown_pending")) is not bool):
++                outcome["failure"] = "invalid_response"
++            else:
++                last = result["shutdown_pending"]
++                outcome.update(status="final_pending" if last else "lease_released",
++                    lease_released=True, shutdown_pending=last, failure=None,
++                    ack_kind="last" if last else "nonlast", owner_pending=last)
++                self._close_outcome = outcome
++        except Exception as exc:
++            if legacy and not isinstance(exc, legacy_caught):
++                legacy_error = exc
++            outcome.update(failure="transport" if isinstance(exc, (OSError, http.client.HTTPException))
++                           else "invalid_response", failure_type=type(exc).__name__)
+         finally:
+-            try:
+-                connection.close()
+-            except Exception as exc:
+-                outcome.update(cleanup_failure="transport", cleanup_failure_type=type(exc).__name__)
++            for phase, resource in (("response", response), ("transport", connection)):
++                if resource is not None:
++                    try:
++                        resource.close()
++                    except Exception as cleanup:
++                        _cleanup_error(outcome, phase, cleanup)
++                        if legacy and legacy_error is None and (phase == "transport" or not isinstance(cleanup, legacy_caught)):
++                            legacy_error = cleanup
++        if legacy_error is not None:
++            raise legacy_error
++        return outcome
++
++    def _close_snapshot(self) -> dict[str, Any]:
++        outcome = dict(self._close_outcome or {"status": "uncertain", "owner_released": False,
++            "lease_released": False, "failure": "close_in_progress"})
++        if "cleanup_failures" in outcome:
++            outcome["cleanup_failures"] = [dict(item) for item in outcome["cleanup_failures"]]
+         return outcome
+ 
+     def close_outcome(self, *, wait_for_database: bool = True,
+                       timeout: float = DATABASE_CLOSE_TIMEOUT_SECONDS) -> dict[str, Any]:
+-        """Release once and return lease_released, owner_released, or uncertain.
+-
+-        An uncertain result must be reconciled with public owner lifetime proof;
+-        this method never retries a release. Repeated calls retain that outcome.
++        """Issue at most one release; ACK and cleanup are independent facts.
++
++        Concurrent callers wait up to their own timeout. A same-thread reentry
++        returns a snapshot immediately (possibly close_incomplete), never
++        waits on itself and never sends. Unknown outcomes are cached forever;
++        this API does not perform the later owner-observation protocol.
+         """
+         if (not isinstance(wait_for_database, bool) or isinstance(timeout, bool)
+             or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout < 0):
+             raise ValueError("close options require boolean wait and finite non-negative timeout")
++        if self._close_owner == threading.get_ident():
++            return self._close_snapshot()
+         deadline = time.monotonic() + float(timeout)
+         if not self._close_lock.acquire(timeout=float(timeout)):
+             return {"status": "uncertain", "owner_released": False,
+                     "lease_released": False, "failure": "close_in_progress"}
++        self._close_owner = threading.get_ident()
+         try:
+-            return self._close(wait_for_database=wait_for_database, timeout=max(0.0, deadline - time.monotonic()), structured=True)
+-        except Exception as exc:
+-            outcome = {"status": "uncertain", "owner_released": False,
+-                       "lease_released": False, "failure": "cleanup",
+-                       "failure_type": type(exc).__name__}
+-            self._close_outcome = outcome
+-            return dict(outcome)
++            return self._close(wait_for_database=wait_for_database,
++                timeout=max(0.0, deadline - time.monotonic()), structured=True)
+         finally:
++            self._close_owner = None
+             self._close_lock.release()
+ 
+     def close(self, *, wait_for_database: bool = False,
+               timeout: float = DATABASE_CLOSE_TIMEOUT_SECONDS) -> None:
+-        """Retain the original None/exception contract for existing callers."""
++        """Keep the legacy None return and final-owner timeout exception."""
++        if self._close_owner == threading.get_ident():
++            return
+         with self._close_lock:
+-            self._close(wait_for_database=wait_for_database, timeout=timeout)
+-
+-    def _close(
+-        self,
+-        *,
+-        structured: bool = False,
+-        wait_for_database: bool = False,
+-        timeout: float = DATABASE_CLOSE_TIMEOUT_SECONDS,
+-    ) -> dict[str, Any] | None:
+-        """Release this lease and optionally wait for a final managed IDB close."""
+-
++            self._close_owner = threading.get_ident()
++            try:
++                self._close(wait_for_database=wait_for_database, timeout=timeout)
++            finally:
++                self._close_owner = None
++
++    def _close(self, *, structured: bool = False, wait_for_database: bool = False,
++               timeout: float = DATABASE_CLOSE_TIMEOUT_SECONDS) -> dict[str, Any] | None:
+         if not isinstance(wait_for_database, bool):
+             raise TypeError("wait_for_database must be a boolean")
+-        if (
+-            isinstance(timeout, bool)
+-            or not isinstance(timeout, (int, float))
+-            or not math.isfinite(timeout)
+-            or timeout < 0
+-        ):
++        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
++            or not math.isfinite(timeout) or timeout < 0):
+             raise ValueError("timeout must be a finite non-negative number")
+         if self._closed.is_set():
+-            return dict(self._close_outcome or {"status": "uncertain", "owner_released": False,
+-                                               "lease_released": False, "failure": "legacy_close"})
++            return self._close_snapshot() if structured else None
+         deadline = time.monotonic() + float(timeout)
+-        self._closed.set()
++        self._closed.set()  # Before any user/transport code, including reentry.
++        self.claim_acquired()
+         self._close_outcome = {"status": "uncertain", "owner_released": False,
+-                               "lease_released": False, "failure": "close_incomplete"}
++            "lease_released": False, "failure": "close_incomplete"}
++        release_error = None
++        try:
++            if structured:
++                outcome = self._release_remote_lease_outcome(max(0.0, min(2.0, deadline - time.monotonic())))
++            else:
++                self._release_remote_lease()
++                outcome = self._close_outcome
++        except Exception as exc:
++            release_error = exc
++            outcome = self._close_outcome
++        self._close_outcome = outcome
+         with self._lock:
+             self._uncertain_operations.clear()
+             self._active_cancel_state = None
+             subscriptions = tuple(self._idb_subscriptions)
+             self._idb_subscriptions.clear()
++            response, connection, stream_socket = self._lease_response, self._lease_connection, self._lease_socket
++            rpc_connection, thread = self._rpc_connection, self._lease_thread
++            self._lease_response = self._lease_connection = self._lease_socket = None
++            self._rpc_connection = self._rpc_last_used = None
++        cleanup_errors = []
++        def cleanup(phase: str, action: Callable[[], Any]) -> None:
++            try:
++                action()
++            except Exception as exc:
++                _cleanup_error(outcome, phase, exc)
++                cleanup_errors.append((phase, exc))
+         for subscription in subscriptions:
+-            subscription._close(detach=False)
+-        if structured:
+-            outcome = self._release_remote_lease_outcome(max(0.0, min(2.0, deadline - time.monotonic())))
+-            shutdown_pending = outcome.get("shutdown_pending") is True
+-        else:
+-            shutdown_pending = self._release_remote_lease()
+-            outcome = dict(self._close_outcome)
+-        self._close_outcome = outcome
+-        with self._lock:
+-            response = self._lease_response
+-            connection = self._lease_connection
+-            lease_socket = self._lease_socket
+-            rpc_connection = self._rpc_connection
+-            thread = self._lease_thread
+-            self._lease_response = None
+-            self._lease_connection = None
+-            self._lease_socket = None
+-            self._rpc_connection = None
+-            self._rpc_last_used = None
+-        if lease_socket is not None:
++            cleanup("subscription", lambda: subscription._close(detach=False))
++        if stream_socket is not None:
++            cleanup("stream_shutdown", lambda: stream_socket.shutdown(socket.SHUT_RDWR))
++        # Closing raw SocketIO wakes the monitor without BufferedReader's lock.
++        raw = getattr(getattr(response, "fp", None), "raw", None)
++        if raw is not None:
++            cleanup("stream_raw", raw.close)
++        if rpc_connection is not None:
++            cleanup("rpc", rpc_connection.close)
++        if thread is not None and thread is not threading.current_thread():
++            cleanup("monitor", lambda: thread.join(
++                timeout=max(0.0, min(2.0, deadline - time.monotonic())) if structured else 2.0))
++        if response is not None:
++            cleanup("stream_response", response.close)
++        if connection is not None:
++            cleanup("stream_connection", connection.close)
++        shutdown_pending = outcome.get("shutdown_pending") is True
++        if shutdown_pending and wait_for_database:
+             try:
+-                lease_socket.shutdown(socket.SHUT_RDWR)
+-            except OSError:
+-                pass
+-        # On Windows, shutdown() does not wake a BufferedReader blocked in
+-        # readline() when HTTPResponse owns the socket through SocketIO. Close
+-        # that raw stream directly; HTTPResponse.close() would instead wait for
+-        # the BufferedReader lock until the next SSE heartbeat.
+-        raw_stream = None
+-        if response is not None and response.fp is not None:
+-            raw_stream = getattr(response.fp, "raw", None)
+-        if raw_stream is not None:
+-            try:
+-                raw_stream.close()
+-            except OSError:
+-                pass
+-        if rpc_connection is not None:
+-            rpc_connection.close()
+-        if thread is not None and thread is not threading.current_thread():
+-            thread.join(timeout=max(0.0, min(2.0, deadline - time.monotonic())) if structured else 2.0)
+-        if response is not None:
+-            try:
+-                response.close()
+-            except (OSError, ValueError):
+-                # The raw stream was intentionally closed above to wake the
+-                # monitor; HTTPResponse.flush() may observe that closed stream.
+-                pass
+-        if connection is not None:
+-            connection.close()
+-
+-        if structured:
+-            if shutdown_pending:
+-                released = wait_for_database and wait_database_released(
+-                    self.instance, timeout=max(0.0, deadline - time.monotonic()))
+-                outcome.update(status="owner_released" if released else "uncertain",
+-                               owner_released=bool(released),
+-                               failure=None if released else "lifetime_unconfirmed")
+-            self._close_outcome = outcome
+-            return dict(outcome)
+-        if (
+-            wait_for_database
+-            and shutdown_pending
+-            and not wait_database_released(
+-                self.instance,
+-                timeout=float(timeout),
+-            )
+-        ):
+-            raise NexusConnectionError(
+-                f"timed out after {float(timeout):g}s waiting for the IDB to close"
+-            )
++                released = wait_database_released(self.instance,
++                    timeout=max(0.0, deadline - time.monotonic()) if structured else float(timeout))
++            except Exception as exc:
++                _cleanup_error(outcome, "owner_observation", exc)
++                cleanup_errors.append(("owner_observation", exc))
++                released = False
++            if released:
++                outcome.update(status="owner_released", owner_released=True, owner_pending=False)
++            elif not structured:
++                raise NexusConnectionError(f"timed out after {float(timeout):g}s waiting for the IDB to close")
++        if not structured and release_error is not None:
++            raise release_error
++        if not structured and cleanup_errors:
++            # Original legacy RPC/thread/connection errors still raise, after
++            # all cleanups have run. Structured callers inspect each failure.
++            unexpected = [error for phase, error in cleanup_errors
++                if not (phase in ("stream_shutdown", "stream_raw") and isinstance(error, OSError))
++                and not (phase == "stream_response" and isinstance(error, (OSError, ValueError)))]
++            if unexpected:
++                raise unexpected[0]
++        return self._close_snapshot() if structured else None
+ 
+     def __enter__(self) -> Self:
+         return self
+--- a/ida_nexus/_resolver.py
++++ b/ida_nexus/_resolver.py
+@@ -1,11 +1,15 @@
++from __future__ import annotations
++
+ import math
+ import os
+ import subprocess
+ import time
+ from collections.abc import Callable, Mapping, Sequence
+-from dataclasses import dataclass, replace
++from dataclasses import dataclass, field, replace
+ from pathlib import Path
+ from typing import TypedDict
++
++from .options import AcquisitionObserver
+ 
+ from ._registry import (
+     DEFAULT_TIMEOUT,
+@@ -36,6 +40,24 @@
+ from .paths import _find_console_script
+ 
+ 
++class LaunchEvent(TypedDict, total=False):
++    """In-memory launch facts. No owner-exit proof or durable custody is implied.
++
++    suffix/source/target/backend precede Popen. Spawned adds the real process,
++    pid and monotonic creation time. Callers
++    capture platform birth identity inline, before permitting log/ready work.
++    """
++    suffix: str
++    source: str
++    target: str
++    backend: str
++    process: subprocess.Popen[bytes]
++    pid: int
++    spawned_at: float
++    log_path: str
++    instance: DatabaseInstance
++
++
+ @dataclass(frozen=True)
+ class WorkerLaunchOptions:
+     """Options used only when a new idalib worker is spawned.
+@@ -45,6 +67,7 @@
+     process itself and are handed to the spawn instead.
+     """
+ 
++    acquisition_observer: AcquisitionObserver | None = field(default=None, kw_only=True)
+     worker_env: Mapping[str, str] | None = None
+     worker_cwd: str | None = None
+     auto_analysis: bool = True
+@@ -315,6 +338,10 @@
+     if options.worker_cwd is not None:
+         spawn_environment["cwd"] = options.worker_cwd
+ 
++    launch: LaunchEvent = {"suffix":suffix, "source":source, "target":expected_idb, "backend":"idalib"}
++    observer = options.acquisition_observer
++    if observer is not None:
++        observer("LaunchIntent", dict(launch))
+     process: subprocess.Popen[bytes]
+     if os.name == "nt":
+         process = subprocess.Popen(
+@@ -338,7 +365,15 @@
+             start_new_session=True,
+             **spawn_environment,
+         )
++    # Publish Popen immediately. Native identity query failure cannot hide
++    # creation; the callback receives process and may capture birth itself.
++    spawned_at = time.monotonic()
++    if observer is not None:
++        observer("Spawned", dict(launch, process=process, pid=process.pid,
++            spawned_at=spawned_at))
+     log_path = ensure_private_directory(LOG_DIR) / f"{process.pid}-{suffix}.log"
++    if observer is not None:
++        observer("LogReady", dict(launch, pid=process.pid, log_path=str(log_path)))
+     return process, log_path
+ 
+ 
+@@ -478,6 +513,7 @@
+     no_segmentation: bool = False,
+     debug_flags: int | Sequence[str] = 0,
+     spawner: WorkerSpawner = spawn_worker,
++    acquisition_observer: AcquisitionObserver | None = None,
+ ) -> DatabaseInstance:
+     """Resolve one database owner, applying IDA options only when spawning.
+ 
+@@ -496,6 +532,7 @@
+         else expected_idb_path(source)
+     )
+     launch_options = WorkerLaunchOptions(
++        acquisition_observer=acquisition_observer,
+         worker_env=worker_env,
+         worker_cwd=os.fspath(worker_cwd) if worker_cwd is not None else None,
+         auto_analysis=auto_analysis,
+@@ -619,6 +656,10 @@
+             lease_grace,
+             launch_options,
+         )
+-        return _await_ready(process, expected_idb, log_path, deadline)
++        entry = _await_ready(process, expected_idb, log_path, deadline)
++        if acquisition_observer is not None:
++            acquisition_observer("Ready", {"process": process, "pid": process.pid,
++                "log_path": str(log_path), "instance": entry})
++        return entry
+     finally:
+         spawn_lock.close()
+--- a/ida_nexus/options.py
++++ b/ida_nexus/options.py
+@@ -1,10 +1,50 @@
++from __future__ import annotations
++
+ """Public options for opening or spawning an IDA Nexus database."""
+ 
+ import math
+ from collections.abc import Mapping, Sequence
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from pathlib import Path
+ from types import MappingProxyType
++from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, overload
++
++if TYPE_CHECKING:
++    from ._registry import DatabaseInstance
++    from ._resolver import LaunchEvent
++    from .handle import AttachEvent, DatabaseHandle
++
++AcquisitionStage: TypeAlias = Literal["BeforeResolve", "LaunchIntent", "Spawned",
++    "LogReady", "Ready", "Resolved", "ReconnectResolved", "BeforeAttach",
++    "AttachMayBeSent", "Acquired", "AttachSucceeded", "AttachFailed"]
++
++class ResolveEvent(TypedDict):
++    path: str
++    reconnect: bool
++
++# Resolved/BeforeAttach/AttachMayBeSent pass the original DatabaseInstance;
++# Acquired passes DatabaseHandle; AttachSucceeded/Failed pass an attach event;
++# launch stages pass LaunchEvent (declared in _resolver). Never serialize them.
++class AcquisitionObserver(Protocol):
++    """Synchronous, lock-free callback. Raising aborts; never triggers retry.
++
++    LaunchIntent may be refused before creation; Spawned always contains the
++    real Popen, including when the child already exited. Observers capture OS
++    birth identity here and must not infer owner exit from launcher exit.
++    Acquired receives the retained, cleanable handle before monitor creation.
++    """
++    @overload
++    def __call__(self, stage: Literal["Resolved", "ReconnectResolved", "BeforeAttach", "AttachMayBeSent"],
++                 value: DatabaseInstance, /) -> None: ...
++    @overload
++    def __call__(self, stage: Literal["Acquired"], value: DatabaseHandle, /) -> None: ...
++    @overload
++    def __call__(self, stage: Literal["AttachSucceeded", "AttachFailed"], value: AttachEvent, /) -> None: ...
++    @overload
++    def __call__(self, stage: Literal["LaunchIntent", "Spawned", "LogReady", "Ready"], value: LaunchEvent, /) -> None: ...
++    @overload
++    def __call__(self, stage: Literal["BeforeResolve"], value: ResolveEvent, /) -> None: ...
++    def __call__(self, stage: AcquisitionStage, value: object, /) -> None: ...
+ 
+ MAX_KEEPALIVE_SECONDS = 3600.0
+ 
+@@ -36,6 +76,7 @@
+     and gives the worker nothing.
+     """
+ 
++    acquisition_observer: AcquisitionObserver | None = field(default=None, kw_only=True)
+     spawn: bool = True
+     startup_timeout: float = 120.0
+     output_database: str | Path | None = None

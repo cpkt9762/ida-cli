@@ -28,7 +28,9 @@ def main():
         return original(root, label, command, **kwargs)
 
     module.run = local_run
-    sys.argv = [str(REPO / "scripts/prepare_nexus_env.py"), *remaining]
+    # Keep the historical generator's exact aa5 baseline. Never silently apply
+    # the formal R1 patch and then try to patch that product a second time.
+    sys.argv = [str(REPO / "scripts/prepare_nexus_env.py"), "--sdk-baseline", "r0", *remaining]
     module.main()
 
 

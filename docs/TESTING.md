@@ -154,10 +154,11 @@ IDA auto-analyses it and writes an `.i64` alongside.
 
 ## Nexus N3 bridge, patch and lifecycle
 
-N3 uses the fixed public Nexus client with the user-approved local
+N3 introduced the fixed public Nexus client with the user-approved local
 `client-cancel-unknown.patch`, then `client-close-proof.patch`. Preparation verifies the patched `handle.py`
 SHA-256 and records patch status. Only a validated upstream fix passing the
-probe and N0/N3 gates permits removal; N9 packages must carry all three local patches, including `loopback-bind.patch`.
+probe and N0/N3 gates permits removal. R1 adds a fourth patch; N9 packages must
+carry the complete declared chain, including `loopback-bind.patch`.
 
 Close proof uses `close_outcome`: nonfinal lease ACK, final owner lifetime proof,
 or uncertainty. On uncertainty the bridge reports it before one bounded public
@@ -911,8 +912,8 @@ and checks ordinary/-I/-P/PYTHONSAFEPATH, exact schema/closure, every member
 permission/hash, omitted payload/dependency and mismatched preexisting pyc. The
 loader executes only the verified in-memory source bytes; -B alone is insufficient.
 
-`r0_sdk` generates and exercises a temporary three-file U1 candidate; production
-patches stay unchanged. `r0_real_ida` uses one disposable tiny IDB and a second
+`r0_sdk` generates and exercises a temporary three-file U1 candidate. This is the
+historical R0 experiment, not the formal R1 SDK. `r0_real_ida` uses one disposable tiny IDB and a second
 independent public client; it verifies loaded v1 code/ABI/dependencies against
 fixed source by whole-object equality, then deliberately removes Root only in that IDB to test TEMP|KILL
 and packed-byte retention. Its owned workers are registered, waited and audited.
@@ -995,8 +996,9 @@ after return, the existing public stop-proof path remains usable.
 `--features nexus-test-support --test nexus_r5` contains readiness-only rejection
 cases (no grants/acquisitions; exact child/socket cleanup) and the separately
 selected real tiny IDA chain. Admission requires wire2/schema1/release1/open1,
-owner_observation0, the fixed handle hash and exactly the four implemented
-capabilities; capability order is immaterial and duplicates fail. No helper,
+owner_observation0 and the complete current `protocol.contract()` (R1 extends
+the R5 handle check to three module hashes and seven capabilities); capability
+order is immaterial and duplicates fail. No helper,
 custody or owner-observation capability is advertised. Member release progress
 uses nonterminal release_observation schema1/release_protocol1; N1 remains the
 only business-result authority. Owner v1 guard/lifecycle/slices code is unchanged.
@@ -1012,3 +1014,77 @@ while F1/F4 remain `current-product-expected-red`. `r0_freeze.py` records those
 separately and the current installation closure is 19 members. Historical R0
 freezes and logs remain immutable; neither replay nor the real tiny chain accepts
 N7a or supplies R1/R3 custody, R2 release, R4 transactions, R6 or R7 evidence.
+
+### N7a-R R1 installed SDK boundary
+
+The formal client chain is `loopback-bind.patch` → `client-cancel-unknown.patch`
+→ `client-close-proof.patch` → `client-acquisition.patch`, against Nexus
+0.13.4/d60ff582fde90c59726336c0dbdf3e8286e9df7a and Domain 0.5.1. The fourth
+static patch changes only `handle.py`, `_resolver.py`, and `options.py`.
+`client-sdk-contract.json` declares all three expected hashes and capabilities;
+prepare checks source and actual imported installed files, and bridge/Rust
+readiness reject any missing/extra/mismatched module or capability before grants.
+The preparer accepts read-only offline `--source`/`--wheels` inputs while retaining
+fixed source/wheel hash checks. Always use a fresh external root.
+
+`DatabaseHandle.open_outcome`/`attach_outcome` return the typed in-memory
+`AcquisitionOutcome`/`AttachAttempt` contracts from `ida_nexus.handle`.
+`AcquisitionObserver`, `AcquisitionStage`, and `ResolveEvent` live in
+`ida_nexus.options`; launch payloads use `_resolver.LaunchEvent`. Callbacks are
+synchronous and run without SDK ledger locks. `BeforeResolve` records retry
+intent before resolution, and `BeforeAttach` is distinct from `AttachMayBeSent`.
+Every attempt retains its original instance and unknown obligation even after
+a later rejection/success/close. Outcomes carry the original cause plus separate
+`observer_errors`; observer failures never trigger transport reconnect.
+Do not serialize these objects: instances contain in-memory authentication data.
+
+After SSE acquisition, the SDK retains the exact handle before callbacks or
+monitor construction/start. `on_acquired`, `Acquired`, and error outcomes expose
+that same handle. On failure it remains retained until explicit idempotent
+`claim_acquired()` or close; no automatic close disguises responsibility.
+Successful construction hands ownership to the caller. Claim/close/reentrant
+callbacks are safe; pending locks never span callbacks or I/O. Legacy methods
+preserve existing positional/keyword parameters, returns and exception types.
+Legacy monitor failure exposes the original exception with `.handle`; additive
+callback failures use `AcquiredFailure`/`StageObserverFailure` with `.cause`.
+
+`LaunchIntent` precedes Popen; `Spawned` immediately delivers the real Popen,
+PID and monotonic creation time before log/ready work. Native birth identity
+must be captured by the observer; launcher exit is not owner-exit proof.
+Parsed last/nonlast release ACKs latch `ack_kind`/`lease_released` before any
+local cleanup. `cleanup_failure(s)` are independent. Close sends at most once,
+including concurrent/reentrant calls and unknown results; same-thread reentry
+returns a current snapshot, while a concurrent structured caller obeys its own
+timeout. `wait_for_database` keeps its existing public lifetime semantics.
+
+Run `tests/support/r1_sdk.py` with `R0_CANDIDATE` pointing at the new installed
+site-packages, plus `tests/nexus_bridge/test_acquisition_patch.py` and affected
+Python/R5/N1/transport/bridge targets. The matrix preserves all twelve R0 SDK
+behaviors and adds type/signature, original-instance, callback, thread, reentry,
+claim/close concurrency and failed-second-resolve assertions. Real HTTP/SSE
+faults are test boundaries, not production private-protocol replacement.
+The new probe requires a fresh prepared root and its own interpreter:
+
+```sh
+timeout 180s "$R1_ENV/venv/bin/python" scripts/nexus/probe_sdk_boundary.py --root "$R1_ENV"
+```
+
+It verifies actual module hashes, real IDA9.5 legacy and outcome tiny-database
+chains, early callback failure/claim, last/nonlast ACKs and existing execute/wait
+operation IDs. Unsupported old SDK with `--expect-unpatched` exits 2; formal
+SDK exits 0. The three older probes keep their original red=2/green=0 meanings.
+For ambiguity red, use the historical 3c05a51 cancel patch, not no-cancel SDK.
+Never run two real probes against one prepared state/sample.
+
+`r0_prepare.py` explicitly requests `--sdk-baseline r0`, preserving the exact
+aa5 handle and frozen candidate generator output. This is experiment-only:
+production readiness rejects it. Historical generator, three old patches and
+evidence remain unchanged; do not regenerate history with formal R1 bytes.
+
+Existing N1 execute/wait calls already pass their exact `operation_id`; no new
+SDK parameter or temporary custody is introduced. Preparing guard/analysis/
+verification RPC admission, durable launch/handle custody and proof helper are
+R3a dependencies. Production acquisition remains on its existing path pending
+that atomic admission. R2 owns two-phase Tools/N1 release; R4 owns transactions.
+F1/F4 remain explicit production expected-red cases. SDK raw facts, the F2
+isolation green and these probes do not establish no-orphan or N7a acceptance.

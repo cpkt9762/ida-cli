@@ -25,7 +25,7 @@ from lifecycle import database_diagnostics, release_handle, release_errors, rele
 from metadata import idb_context
 from open_recovery import open_checked
 from config import ida_cli_home, startup_paths
-from protocol import HANDLE_SHA, admission
+from protocol import SDK_FILES, admission
 from lifetime import LifetimeListener
 
 GUARD_SOURCE = Path(__file__).with_name('save_guard.py').read_text(encoding='utf-8')
@@ -83,9 +83,15 @@ def readiness():
         versions = [importlib.metadata.version(name) for name in ("ida-nexus", "ida-domain")]
         if versions != ["0.13.4", "0.5.1"]:
             raise ValueError(f"requires pinned Nexus 0.13.4/Domain 0.5.1; got {versions}")
-        source = Path(ida_nexus.__file__).parent / "handle.py"
-        if hashlib.sha256(source.read_bytes()).hexdigest() != HANDLE_SHA:
-            raise ValueError("Nexus client cancellation/close proof patch missing or incompatible handle.py")
+        package = Path(ida_nexus.__file__).resolve().parent
+        sdk_modules = {}
+        for name, expected in SDK_FILES.items():
+            module = importlib.import_module("ida_nexus." + name.removesuffix(".py"))
+            source = Path(module.__file__).resolve()
+            actual = hashlib.sha256(source.read_bytes()).hexdigest()
+            if source != package / name or actual != expected:
+                raise ValueError(f"ProtocolMismatch: incompatible SDK module {name}")
+            sdk_modules[name] = {"path": str(source), "sha256": actual}
     except (ImportError, importlib.metadata.PackageNotFoundError, ValueError, OSError) as exc:
         return {"ready": False, "error": error("dependency_unavailable", exc)}
     try:
@@ -100,7 +106,7 @@ def readiness():
         return {"ready": False, "error": error("runtime_unavailable", exc)}
     return {"ready": True, "capabilities": {"runtime": {
         "ida": ida, "python": list(sys.version_info[:3]), "nexus": [0, 13, 4], "domain": [0, 5, 1]},
-        "methods": METHODS}, "client_cancel_patch": True, "protocol": protocol, "paths": paths}
+        "methods": METHODS}, "client_cancel_patch": True, "client_sdk_modules": sdk_modules, "protocol": protocol, "paths": paths}
 
 
 def validate_response_depth(message):

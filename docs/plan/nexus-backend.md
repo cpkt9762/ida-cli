@@ -893,3 +893,14 @@ Rust输入未改，本轮运行复用核验过的固定测试二进制并加载�
 独立复验见`/tmp/n7r5f1v.fRRvfA/report/verification.md`；
 聚焦复审见`/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/r5-rereview1/report.md`，无新增P0/P1/P2。
 F1/F4仍留对应后续阶段；真实跨boot、GUI/Linux/大库、完整维护和N7a最终验收没有由本次结果替代。下一步委托R1 SDK边界。
+
+R1 SDK边界实现（待44ad独立复验/审查，未验收）：新增静态第四补丁
+`client-acquisition.patch`，只改固定SDK的handle/_resolver/options，旧三补丁与R0生成器不改。
+公开typed outcome、阶段observer、早期精确handle交付/claim、Popen前intent及立即Spawned、
+逐次unknown责任和ACK先于清理锁存；回调错误不触发transport重试，原cause与次因分别保留。
+prepare与Rust/Python握手核三模块实际hash及sdk_boundary1，未实现owner/custody/helper能力仍不advertise。
+R0实验prepare显式保留aa5基线；正式SDK和实验模式不自动兼容或fallback。
+验证入口及完整责任边界见TESTING的R1小节，机器证据见
+`/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/r1/`。
+已有N1业务execute/wait身份继续透传；Preparing原子准入、启动/handle durable custody及helper保留给R3a，
+本轮不将生产open切到半套协议。F1/F4仍为后续阶段的生产expected-red，R2两阶段、R4事务、R6/R7门禁未由SDK事实替代。

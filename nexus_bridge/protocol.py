@@ -2,13 +2,16 @@
 import json
 import os
 
-HANDLE_SHA = 'aa5d7ea42caaa922ef494d7d8a1406396537a4ea88d9e833825e08c8d279025e'
+SDK_FILES = {'handle.py': '93eb5a03ab46f4f1d0aedc12ecdd5b9f22a966ad748bc3a1fd05adfd163d2432', '_resolver.py': 'd06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8', 'options.py': '1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe'}
+HANDLE_SHA = SDK_FILES['handle.py']
 
 
 def contract():
     return {'wire': 2, 'schema': 1, 'release': 1, 'open': 1,
             'owner_observation': 0, 'client_hash': HANDLE_SHA,
-            'capabilities': ['absolute_home_v1', 'lifetime_handshake_v1',
+            'sdk_boundary': 1, 'client_modules': dict(SDK_FILES),
+            'capabilities': ['absolute_home_v1', 'ack_cleanup_v1', 'acquisition_outcome_v1',
+                             'launch_observer_v1', 'lifetime_handshake_v1',
                              'receiver_isolation_v1', 'release_observation_v1']}
 
 

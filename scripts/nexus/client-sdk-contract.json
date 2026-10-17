@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "sdk_boundary": 1,
+  "nexus_version": "0.13.4",
+  "nexus_sha": "d60ff582fde90c59726336c0dbdf3e8286e9df7a",
+  "domain_version": "0.5.1",
+  "files": {
+    "handle.py": "93eb5a03ab46f4f1d0aedc12ecdd5b9f22a966ad748bc3a1fd05adfd163d2432",
+    "_resolver.py": "d06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8",
+    "options.py": "1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe"
+  },
+  "capabilities": [
+    "acquisition_outcome_v1",
+    "ack_cleanup_v1",
+    "launch_observer_v1"
+  ],
+  "unavailable": [
+    "durable_custody",
+    "proof_helper",
+    "preparing_operations",
+    "post_exit_resolve",
+    "two_phase_release"
+  ]
+}

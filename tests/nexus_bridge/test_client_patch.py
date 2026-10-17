@@ -44,7 +44,7 @@ def client(monkeypatch):
 
 
 @pytest.mark.parametrize("pending,proof,status", [(False, False, "lease_released"),
-    (True, True, "owner_released"), (True, False, "uncertain")])
+    (True, True, "owner_released"), (True, False, "final_pending")])
 def test_close_requires_final_lifetime_proof(client, monkeypatch, pending, proof, status):
     connection = Connection({"ok": True, "result": {"released": True, "shutdown_pending": pending}})
     monkeypatch.setattr("ida_nexus.handle.http.client.HTTPConnection", lambda *_a, **_kw: connection)
