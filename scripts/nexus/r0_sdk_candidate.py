@@ -38,6 +38,11 @@ class LeaseOpenFailure(NexusConnectionError):
         self.status = status
 
 
+def _cleanup_error(outcome, phase, error):
+    outcome.update(cleanup_failure=phase, cleanup_failure_type=type(error).__name__)
+    outcome.setdefault("cleanup_failures", []).append({"phase":phase, "type":type(error).__name__})
+
+
 class DatabaseHandle:
 ''')
     # Constructor and attach receive a new optional callback; legacy callers retain signatures/results.
@@ -75,6 +80,28 @@ class DatabaseHandle:
                      '            "keepalive": keepalive,\n            "on_disconnect": on_disconnect,\n            "on_acquired": on_acquired,\n            "on_stage": on_stage,\n')
     handle = replace(handle, '        constructor_options: dict[str, Any] = {\n',
                      '        if on_stage is not None:\n            on_stage("BeforeAttach", instance)\n        constructor_options: dict[str, Any] = {\n')
+    handle = replace(handle, '        return cls(requested_path, instance, **constructor_options)\n', '''        stage = "BeforeAttach"
+        def observed(value, entry):
+            nonlocal stage
+            stage = value
+            if on_stage is not None:
+                on_stage(value, entry)
+        constructor_options["on_stage"] = observed
+        try:
+            handle = cls(requested_path, instance, **constructor_options)
+        except Exception as error:
+            owned = error.handle if isinstance(error, AcquiredFailure) else None
+            if on_stage is not None:
+                on_stage("AttachFailed", {"instance":instance, "stage":stage,
+                    "handle":owned, "cause":error, "http_status":getattr(error, "status", None),
+                    "failure_kind":"cleanup_required" if owned is not None else
+                        "lease_absent" if isinstance(error, LeaseOpenFailure) else
+                        "unknown_attach" if stage == "AttachMayBeSent" else "not_sent"})
+            raise
+        if on_stage is not None:
+            on_stage("AttachSucceeded", {"instance":instance, "handle":handle})
+        return handle
+''')
     # The second mapping is the open -> attach call.
     handle = replace(handle, '''            "keepalive": options.keepalive,
             "on_disconnect": on_disconnect,
@@ -118,7 +145,8 @@ class DatabaseHandle:
                 on_acquired(handle)
         def observed(value, _instance):
             nonlocal stage
-            stage = value
+            if value in ("BeforeAttach", "AttachMayBeSent"):
+                stage = value
         try:
             handle = cls.attach(instance, on_acquired=acquired, on_stage=observed, **kwargs)
             return {"stage":"Acquired", "handle":handle, "instance":instance,
@@ -135,9 +163,23 @@ class DatabaseHandle:
     def open_outcome(cls, path, *, options=None, observer=None):
         from dataclasses import replace
         options = options or DatabaseOpenOptions()
-        events, handles, launches = [], [], []
+        events, handles, launches, attempts = [], [], [], []
         def observe(stage, value):
             events.append((stage, value))
+            if stage == "BeforeAttach":
+                attempts.append({"attempt":len(attempts)+1, "instance":value,
+                    "stage":stage, "failure_kind":"not_sent", "cause":None,
+                    "handle":None, "obligation":None, "http_status":None})
+            elif stage == "AttachMayBeSent":
+                attempts[-1].update(stage=stage, failure_kind="unknown_attach",
+                                     obligation="unknown_attach")
+            elif stage == "AttachFailed":
+                attempts[-1].update(value)
+                attempts[-1]["obligation"] = ("exact_handle" if value["handle"] is not None else
+                    "unknown_attach" if value["failure_kind"] == "unknown_attach" else None)
+            elif stage == "AttachSucceeded":
+                attempts[-1].update(stage="Acquired", failure_kind=None,
+                                     handle=value["handle"], obligation="exact_handle")
             if stage in ("LaunchIntent", "Spawned", "LogReady"):
                 launches.append((stage, value))
             if observer is not None:
@@ -155,10 +197,14 @@ class DatabaseHandle:
             failure = ("cleanup_required" if handle is not None else "lease_absent"
                        if isinstance(error, LeaseOpenFailure) else "resolve_or_attach_unknown")
         resolved = [value for stage, value in events if stage in ("Resolved", "ReconnectResolved")]
+        unresolved = [attempt for attempt in attempts if attempt["obligation"] == "unknown_attach"]
+        if unresolved:
+            failure = "unknown_attach"
         return {"stage":"Acquired" if handle is not None else events[-1][0] if events else "BeforeResolve",
                 "handle":handle, "instance":resolved[-1] if resolved else None,
                 "first_instance":resolved[0] if resolved else None, "failure_kind":failure,
-                "cause":cause, "launches":launches,
+                "cause":cause, "launches":launches, "attempts":attempts,
+                "unresolved_attempts":unresolved,
                 "sdk_reconnect_used":any(stage == "ReconnectResolved" for stage, _ in events)}
 
     def claim_acquired(self):
@@ -176,10 +222,24 @@ class DatabaseHandle:
                        "lease_released":False, "failure":"close_incomplete"})
             outcome.update(cleanup_failure="transport", cleanup_failure_type=type(exc).__name__)''')
     handle = replace(handle, '''                                   lease_released=True, shutdown_pending=result["shutdown_pending"], failure=None)''', '''                                   lease_released=True, shutdown_pending=result["shutdown_pending"], failure=None,
-                                   ack_kind="last" if result["shutdown_pending"] else "nonlast")''')
+                                   ack_kind="last" if result["shutdown_pending"] else "nonlast")
+                    # Latch the parsed fact before any response/connection cleanup.
+                    self._close_outcome = outcome''')
+    handle = replace(handle, '''            finally:
+                response.close()
+        except (TimeoutError, OSError, http.client.HTTPException, UnicodeDecodeError,
+                json.JSONDecodeError, AttributeError, TypeError) as exc:
+''', '''            finally:
+                try:
+                    response.close()
+                except Exception as cleanup:
+                    _cleanup_error(outcome, "response", cleanup)
+        except (TimeoutError, OSError, http.client.HTTPException, UnicodeDecodeError,
+                json.JSONDecodeError, AttributeError, TypeError) as exc:
+''')
     handle = replace(handle, '''            outcome.update(status="uncertain", lease_released=False,
                            failure="transport" if isinstance(exc, (OSError, http.client.HTTPException)) else "invalid_response")''', '''            if outcome.get("lease_released"):
-                outcome.update(cleanup_failure="response", cleanup_failure_type=type(exc).__name__)
+                _cleanup_error(outcome, "response", exc)
             else:
                 outcome.update(status="uncertain", lease_released=False,
                     failure="transport" if isinstance(exc, (OSError, http.client.HTTPException)) else "invalid_response")''')
@@ -188,6 +248,8 @@ class DatabaseHandle:
                                failure=None if released else "lifetime_unconfirmed")''', '''                outcome.update(status="owner_released" if released else
                                       "final_pending" if outcome.get("lease_released") else "uncertain",
                                owner_released=bool(released), owner_pending=not bool(released))''')
+    handle = replace(handle, '                outcome.update(cleanup_failure="transport", cleanup_failure_type=type(exc).__name__)\n',
+                     '                _cleanup_error(outcome, "transport", exc)\n')
     handle = replace(handle, '''        if rpc_connection is not None:
             rpc_connection.close()
         if thread is not None and thread is not threading.current_thread():
@@ -198,14 +260,14 @@ class DatabaseHandle:
         except Exception as exc:
             if not structured:
                 raise
-            outcome.update(cleanup_failure="rpc", cleanup_failure_type=type(exc).__name__)
+            _cleanup_error(outcome, "rpc", exc)
         try:
             if thread is not None and thread is not threading.current_thread():
                 thread.join(timeout=max(0.0, min(2.0, deadline - time.monotonic())) if structured else 2.0)
         except Exception as exc:
             if not structured:
                 raise
-            outcome.update(cleanup_failure="monitor", cleanup_failure_type=type(exc).__name__)
+            _cleanup_error(outcome, "monitor", exc)
 ''')
     handle_path.write_text(handle)
     options_path = target / "ida_nexus/options.py"

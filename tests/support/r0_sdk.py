@@ -22,6 +22,145 @@ ROOT.mkdir(parents=True, exist_ok=True)
 
 
 class SDKPrototypes(unittest.TestCase):
+    def test_cleanup_without_valid_ack_never_supplies_release(self):
+        rows = []
+        for error_type in (OSError, ValueError, RuntimeError):
+            with self.subTest(error=error_type.__name__), Boundary(ROOT / ('no-ack-' + error_type.__name__)) as boundary:
+                handle = DatabaseHandle.attach(boundary.instance)
+                original = http.client.HTTPConnection
+                def factory(*args, **kwargs):
+                    connection = original(*args, **kwargs)
+                    getresponse = connection.getresponse
+                    def response():
+                        value = getresponse()
+                        read, close = value.read, value.close
+                        def invalid(*args, **kwargs):
+                            read(*args, **kwargs)
+                            return b'{}'
+                        def fail():
+                            close()
+                            raise error_type('controlled cleanup without valid ACK')
+                        value.read, value.close = invalid, fail
+                        return value
+                    connection.getresponse = response
+                    return connection
+                with patch.object(http.client, 'HTTPConnection', factory):
+                    first = handle.close_outcome(wait_for_database=False, timeout=1)
+                self.assertFalse(first['lease_released'])
+                self.assertNotIn('ack_kind', first)
+                self.assertEqual(first['failure'], 'invalid_response')
+                self.assertEqual(first['cleanup_failure_type'], error_type.__name__)
+                self.assertEqual(handle.close_outcome(wait_for_database=False, timeout=1), first)
+                self.assertEqual(sum(x['endpoint'] == '/release_lease' for x in boundary.requests), 1)
+                rows.append({'error':error_type.__name__, 'outcome':first})
+        durable(ROOT / 'no-ack.json', rows)
+
+    def test_each_attach_attempt_preserves_unknown_across_reconnect(self):
+        records = []
+        for sequence in (("unknown", "reject"), ("unknown", "success"),
+                         ("unknown", "unknown"), ("reject", "reject")):
+            with self.subTest(sequence=sequence), Boundary(ROOT / ("attempts-" + "-".join(sequence)),
+                    "reject" if sequence[0] == "reject" else "healthy") as boundary:
+                original = http.client.HTTPConnection
+                seen = []
+                class FaultConnection(original):
+                    def request(self, method, path, *args, **kwargs):
+                        self.is_attach = "sse=1" in path
+                        return super().request(method, path, *args, **kwargs)
+
+                    def getresponse(self):
+                        response = super().getresponse()
+                        if getattr(self, "is_attach", False):
+                            index = len(seen)
+                            seen.append(response.status)
+                            if index == 0 and sequence[1] == "reject":
+                                boundary.scenario = "reject"
+                            if sequence[index] == "unknown":
+                                response.close()
+                                raise OSError("controlled response lost after accepted attach")
+                        return response
+                with patch.object(http.client, "HTTPConnection", FaultConnection):
+                    result = DatabaseHandle.open_outcome(str(boundary.path),
+                        options=DatabaseOpenOptions(spawn=False))
+                try:
+                    self.assertTrue(result["sdk_reconnect_used"])
+                    self.assertEqual(len(result["attempts"]), 2)
+                    self.assertEqual(len(seen), 2, "preserve original two-attempt compatibility")
+                    for index, attempt in enumerate(result["attempts"]):
+                        self.assertEqual(attempt["attempt"], index+1)
+                        self.assertEqual(attempt["instance"], boundary.instance)
+                        expected = {"unknown":"unknown_attach", "reject":"lease_absent", "success":None}[sequence[index]]
+                        self.assertEqual(attempt["failure_kind"], expected)
+                        self.assertEqual(attempt["obligation"], "unknown_attach" if expected == "unknown_attach"
+                            else "exact_handle" if expected is None else None)
+                    unknown = sequence.count("unknown")
+                    self.assertEqual(len(result["unresolved_attempts"]), unknown)
+                    self.assertEqual(result["failure_kind"], "unknown_attach" if unknown else "lease_absent")
+                    self.assertEqual(result["handle"] is not None, sequence[1] == "success")
+                    self.assertEqual(sum(x["endpoint"] == "/release_lease" for x in boundary.requests), 0)
+                    records.append({"sequence":sequence, "failure_kind":result["failure_kind"],
+                        "unresolved":unknown, "success_handle":result["handle"] is not None,
+                        "attempts":[{k:(type(v).__name__ if k == "cause" else
+                            v.record_id if k == "instance" else bool(v) if k == "handle" else v)
+                            for k,v in a.items()} for a in result["attempts"]]})
+                finally:
+                    if result["handle"] is not None:
+                        self.assertTrue(result["handle"].close_outcome(wait_for_database=False, timeout=1)["lease_released"])
+                        self.assertEqual(len(result["unresolved_attempts"]), unknown,
+                                         "new successful handle close does not prove old attempt absent")
+        durable(ROOT / "attempts.json", records)
+
+    def test_ack_latched_before_all_cleanup_exception_classes(self):
+        records = []
+        for last in (False, True):
+            for phase in ("response", "connection"):
+                for error_type in (OSError, ValueError, RuntimeError):
+                    label = f"latch-{last}-{phase}-{error_type.__name__}"
+                    with self.subTest(label=label), Boundary(ROOT / label) as boundary:
+                        handle = DatabaseHandle.attach(boundary.instance)
+                        other = None if last else DatabaseHandle.attach(boundary.instance)
+                        original = http.client.HTTPConnection
+                        def factory(*args, **kwargs):
+                            connection = original(*args, **kwargs)
+                            getresponse = connection.getresponse
+                            def response():
+                                value = getresponse()
+                                close = value.close if phase == "response" else connection.close
+                                def fail():
+                                    # Observe object latch while still inside cleanup.
+                                    self.assertTrue(handle._close_outcome["lease_released"])
+                                    self.assertEqual(handle._close_outcome["ack_kind"], "last" if last else "nonlast")
+                                    close()
+                                    raise error_type("controlled cleanup after parsed ACK")
+                                if phase == "response":
+                                    value.close = fail
+                                else:
+                                    connection.close = fail
+                                return value
+                            connection.getresponse = response
+                            return connection
+                        try:
+                            with patch.object(http.client, "HTTPConnection", factory):
+                                first = handle.close_outcome(wait_for_database=False, timeout=1)
+                            again = handle.close_outcome(wait_for_database=False, timeout=1)
+                            self.assertEqual(first, again)
+                            self.assertTrue(first["lease_released"])
+                            self.assertEqual(first["ack_kind"], "last" if last else "nonlast")
+                            self.assertEqual(first["shutdown_pending"], last)
+                            self.assertIsNone(first["failure"])
+                            self.assertIn({"phase":"response" if phase == "response" else "transport",
+                                "type":error_type.__name__}, first["cleanup_failures"])
+                            calls = sum(x.get("lease_id") == handle._lease_id and x["endpoint"] == "/release_lease"
+                                        for x in boundary.requests)
+                            self.assertEqual(calls, 1)
+                            records.append({"last":last,"phase":phase,"error":error_type.__name__,
+                                            "outcome":first,"release_calls":calls})
+                        finally:
+                            handle.close_outcome(wait_for_database=False, timeout=1)
+                            if other is not None:
+                                other.close_outcome(wait_for_database=False, timeout=1)
+        durable(ROOT / "ack-matrix.json", records)
+
     def test_observer_is_keyword_only_and_old_positional_options_stay_compatible(self):
         self.assertFalse(DatabaseOpenOptions(False).spawn)
         self.assertEqual(resolver.WorkerLaunchOptions(None, "/private/tmp").worker_cwd, "/private/tmp")
