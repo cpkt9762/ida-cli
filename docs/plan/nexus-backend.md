@@ -4,7 +4,7 @@
 
 日期：2026-10-15。
 
-执行约束：开发步骤必须委托给 Codex GPT-6.1 Sol，推理档位 `xhigh`；开发开始前必须新建 Git worktree 和分支。用户输入的 `xhign` 在本文统一为工具实际支持的 `xhigh`。
+执行约束（2026-10-17用户后续指定覆盖历史配置）：实现用 `dev / codex-worker / gpt-6.1-sol / full-access / high`；常规只读审查用 `review / gpt-6-astra / xhigh`，provider/modeId以每次实际profile核验为准。本阶段保留已批准的Claude/xhigh独立交叉复审。继续使用既有独立worktree与分支；不为每一阶段重建工作区，不修改全局配置。
 
 ## 1. 目标与验收范围
 
@@ -101,25 +101,17 @@
 
 ## 3. 委托模型、角色和权限
 
-### 3.1 固定执行配置
+### 3.1 当前执行配置与profile核验
 
-2026-10-15 已通过 Paseo `list_profiles`、`list_models` 和 `inspect_provider` 核对：
+历史“开发与审查均GPT-6.1 Sol/xhigh”由用户后续指定覆盖；本轮委托已重新核对dev配置。后续每次由编排者list_profiles核对对应profile，照抄实际provider/model/modeId/thinkingOptionId，不静默换模型，也不修改实际全局profile。
 
-| 字段 | 本任务配置 |
-|---|---|
-| 展示名称 | Codex GPT-6.1 Sol |
-| 委托 worker provider | `codex-worker` |
-| model | `gpt-6.1-sol` |
-| `create_agent.provider` | `codex-worker/gpt-6.1-sol` |
-| `settings.modeId` | `full-access` |
-| `settings.thinkingOptionId` | `xhigh` |
-| `notifyOnFinish` | `true` |
-| `workspaceId` | 同仓库默认省略；真实工作目录写入委托单 |
-| 额外 features | 默认不设置，不从其他任务复制 |
+| 职责 | profile / model / 推理 | provider与权限边界 |
+|---|---|---|
+| 实现/测试/修复 | dev / gpt-6.1-sol / high | 本轮codex-worker、full-access；后续按实际dev核验，非sol-dev |
+| 常规只读审查 | review / gpt-6-astra / xhigh | provider/modeId按实际review核验；只读审查指定SHA与证据 |
+| 本阶段已批准独立交叉复审 | Claude / xhigh | 保留既有批准；编排者核对当前配置，worker不得自行派人 |
 
-开发、测试、修复以及本文规定的独立审查均使用这组模型配置，职责通过委托单区分。执行前再次发现 provider/model，缺失时报告阻塞，不静默换模型或推理档位。
-
-创建本计划时，`sol-dev` profile 的配置与本任务不匹配，且其角色卡面向 Solana 套利仓库；后续 profile 可能变化，每次委托均重新发现并核对。本任务按用户已确认的上述固定配置执行，不修改全局 profile、schedule 或 daemon 配置，不把其他仓库的生产流程强加到 ida-cli。`full-access` 不是部署、推送或操作真实数据库的授权。
+notifyOnFinish=true；同仓库workspaceId默认省略，真实工作目录写入委托单。额外features默认不设置；缺失profile/model时报阻塞，不沿用旧sol-dev或历史固定配置。full-access不授权部署、push或真实数据库操作；不得改profile、schedule或daemon。
 
 ### 3.2 编排者和 worker 分工
 
@@ -135,13 +127,8 @@
 
 ### 3.3 每次委托的角色前言
 
-编排者应将以下前言原样放在 `initialPrompt` 开头，再接七字段委托单。该前言适用于本文的 ida-cli 实现任务。
-
-> 你是 ida-cli Nexus 接入项目的被委托实现 worker。使用 Codex GPT-6.1 Sol，推理档位 xhigh。先进入委托单指定的独立 worktree，核对实际路径、分支和基线 SHA。只处理本阶段范围，不修改原始工作区、其他 worktree、用户已有 daemon、全局安装和真实研究数据库。不创建或指挥其他 agent，不修改调度和 daemon 配置。涉及 Rust 时读取 rust-skills，涉及 IDA/Nexus 时读取适用 IDA 技能和官方接口资料。所有编译、检查、测试必须有 shell timeout；超出 30 秒须先写明理由和上限。使用独立测试目录、IDA_CLI_HOME、IDA_NEXUS_STATE_DIR 和测试样本副本。测试中保留有意义的断言，不得用跳过、吞错或删功能换取通过。完成后输出本地提交 SHA、变更摘要、验证命令及退出码、证据位置、限制和剩余问题。不得 push、部署、替换已安装程序或关闭其他客户端的数据库。遇到阻塞如实产出，不自行扩大授权。
-
-审查任务使用独立前言：
-
-> 你是 ida-cli Nexus 接入项目的只读审查 worker。使用 Codex GPT-6.1 Sol，推理档位 xhigh。核对委托单指定的 worktree 和提交 SHA，只读审查 diff、源码和验证证据，不改文件、不提交、不启动或停止其他人的进程，不创建其他 agent。优先检查数据库所有权、取消/期限、IPC 背压、共享缓存和结果兼容性。按严重程度报告问题，给出位置、触发条件和依据；没有发现问题时说明审查范围与未验证部分。
+编排者按当前profile notes，从 `~/.paseo-solarb/roles/` 读取对应完整角色卡，原样放在initialPrompt开头，再接七字段委托单；实现用dev角色卡，只读审查用review角色卡，本阶段Claude交叉复审保留已批准配置。不得修改实际角色卡/全局配置，也不得再复制旧计划里Sol/xhigh的自造实现或审查前言。
+角色卡全文与委托中的具体范围、超时、证据、worker不派agent/不改schedule及不push等约束一起生效；本次r4委托自身角色卡前言保持原样，修改的仅为本计划中过时的引用。
 
 七字段委托单必须填写具体值，不能只贴“执行 N3”：
 
@@ -512,7 +499,9 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 
 ### N7：GUI、缓存和专用输入
 
-N7a-R 第一阶段 r3 设计见 [释放与打开协议](nexus-release-protocol.md)：按独立终审、两份设计评审及用户 U1–U5，补齐必需 proof helper、Preparing/停止责任、两类目标稳定协调区与缓存 GC 共存、同卷事务及跨 home 门禁；U5 的 OS 退出证据/平台与 fork-session 门禁列为核心，分必需核心和可选增强。U1 已有条件批准客户端补丁扩展，作为对下述历史“不改三个补丁”裁定的显式修订；操作 operation_id 已有，只接线 N1。该设计待增量复审，尚未实施或验收；保留下述历史实现记录与安全边界，不进入第二阶段。
+N7a-R第一阶段r4设计见 [释放与打开协议](nexus-release-protocol.md)：按U1–U6和r3双复审，保留两阶段释放/早custody/helper/同卷gate；补同boot资格执行前持久撤销/共享权威、transfer_id唯一事务执行者与close-only目标guard、常规记录自动压缩及GC双NB/维护安全导入。U6核验同宿主机/本地卷的整机boot-change可结旧lease/owner/执行当前存活占用，不等旧detach ACK，不伪历史ACK/Released/成功或重放操作；同boot PID/session消失不能替代。历史Linux VM实测只为设计输入，非Nexus/IDA产品验收。
+设计仍待聚焦双复审；通过后由本次编排者另派R0，不在文档阶段启动实现。依赖顺序为R0→R5基础→R1→R3a→R2→R3b→R4→R6→R7，再N7b/N7c→N8→N9；实现逐步跑相关跨层用例，里程碑最终产物完整验收。R0/R4/R7各验证U6产品scope/身份/新占用/坏日志拒绝及历史unknown保持，不能拿VM报告记产品通过。
+以下N7a为历史实现/安全边界记录，若与r4获批设计的资源模型冲突，以新设计精确规则为后续实现目标，不把历史“必须Released才释放”或120s观察模型重复实现。U1仍是对历史“不改三个补丁”裁定的有条件修订；operation_id已有只接N1。最终目标不变：Nexus唯一管理与执行后端，N9删除旧执行路径、后端开关及fallback。
 
 N7 分为 N7a（缓存协调与 E19/E21）、N7b（sBPF/DSC 真实 E24/E25）和 N7c（GUI E23）。以下为 N7a 组合方案实现范围，是否验收由编排者决定，不表示 N7b/N7c 完成。
 
@@ -768,7 +757,7 @@ timeout 180s env IDA_TEST=1 cargo test --locked --test nexus_release_e2e -- --te
 ### 8.3 最终交付清单
 
 - 独立 worktree/分支及本地提交序列。
-- 实际使用 `codex-worker/gpt-6.1-sol`、`xhigh` 的阶段派单记录。
+- 分阶段保存实际profile/provider/model/mode/推理记录；当前实现dev/gpt-6.1-sol/high、review/gpt-6-astra/xhigh，本阶段Claude/xhigh交叉复审；历史派单不冒称新配置。
 - Nexus 唯一数据库管理与执行后端、专用 Python 环境和版本检查。
 - 旧 native-linked/idat-compat 执行路径、后端选择逻辑及专属依赖的删除清单和产物验证。
 - 长任务调度、总期限、取消状态和控制通道实现。
