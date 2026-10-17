@@ -4,6 +4,8 @@
 
 日期：2026-10-15。
 
+2026-10-17 增量验收：N7a-R 的 r4 设计 `8eb0d88` 已获 Astra/Claude 双复审认可，编排者直接核验补齐测试证据 scope、持久 boot 绑定粒度与既有 owner 不追认资格三处文字澄清，允许按依赖进入 R0 原型。此项仅为设计输入验收，N7a 产品及 N7b/N7c、N8、N9 均未完成。
+
 执行约束（2026-10-17用户后续指定覆盖历史配置）：实现用 `dev / codex-worker / gpt-6.1-sol / full-access / high`；常规只读审查用 `review / gpt-6-astra / xhigh`，provider/modeId以每次实际profile核验为准。本阶段保留已批准的Claude/xhigh独立交叉复审。继续使用既有独立worktree与分支；不为每一阶段重建工作区，不修改全局配置。
 
 ## 1. 目标与验收范围
@@ -500,7 +502,7 @@ N1 测试只用确定性单调时钟、记录执行器和 barrier；E02、E14、
 ### N7：GUI、缓存和专用输入
 
 N7a-R第一阶段r4设计见 [释放与打开协议](nexus-release-protocol.md)：按U1–U6和r3双复审，保留两阶段释放/早custody/helper/同卷gate；补同boot资格执行前持久撤销/共享权威、transfer_id唯一事务执行者与close-only目标guard、常规记录自动压缩及GC双NB/维护安全导入。U6核验同宿主机/本地卷的整机boot-change可结旧lease/owner/执行当前存活占用，不等旧detach ACK，不伪历史ACK/Released/成功或重放操作；同boot PID/session消失不能替代。历史Linux VM实测只为设计输入，非Nexus/IDA产品验收。
-设计仍待聚焦双复审；通过后由本次编排者另派R0，不在文档阶段启动实现。依赖顺序为R0→R5基础→R1→R3a→R2→R3b→R4→R6→R7，再N7b/N7c→N8→N9；实现逐步跑相关跨层用例，里程碑最终产物完整验收。R0/R4/R7各验证U6产品scope/身份/新占用/坏日志拒绝及历史unknown保持，不能拿VM报告记产品通过。
+设计已完成聚焦双复审及编排者文字澄清核验，作为R0输入验收；本次编排者随后单独委托R0，设计验收不代表原型已运行。依赖顺序为R0→R5基础→R1→R3a→R2→R3b→R4→R6→R7，再N7b/N7c→N8→N9；实现逐步跑相关跨层用例，里程碑最终产物完整验收。R0/R4/R7各验证U6产品scope/身份/新占用/坏日志拒绝及历史unknown保持，不能拿VM报告记产品通过。
 以下N7a为历史实现/安全边界记录，若与r4获批设计的资源模型冲突，以新设计精确规则为后续实现目标，不把历史“必须Released才释放”或120s观察模型重复实现。U1仍是对历史“不改三个补丁”裁定的有条件修订；operation_id已有只接N1。最终目标不变：Nexus唯一管理与执行后端，N9删除旧执行路径、后端开关及fallback。
 
 N7 分为 N7a（缓存协调与 E19/E21）、N7b（sBPF/DSC 真实 E24/E25）和 N7c（GUI E23）。以下为 N7a 组合方案实现范围，是否验收由编排者决定，不表示 N7b/N7c 完成。

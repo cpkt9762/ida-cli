@@ -1,9 +1,10 @@
 # Nexus 释放与打开协议：N7a-R 设计
 
-状态：第一阶段 r4 设计修订，落实 U1–U6 与 r3 聚焦复审，待本轮增量复审；不代表实现、测试或 N7 验收通过。
+状态：第一阶段 r4 已经 Astra 与 Claude 聚焦双复审，编排者核验并补齐 R4-F1/T1/T2 文字澄清后，验收为第二阶段 R0 的设计输入；不代表实现、测试或 N7 产品验收通过。
 日期：2026-10-17。设计基线：`feat/nexus-backend`，`f47dd2301b096f1c4b6643906f6e8976e8663469`。
 设计输入提交：`460f0966cc6db174d49342a5536a1a54e046ebd8`（r3；前序设计为 ff81992、36ed13c）；产品与测试仍为上述 f47dd23。
 第二阶段须另行派单；本阶段只提交本文件及主计划 N7 中的引用。
+设计验收对象为 `8eb0d88e21dffed38fc5208b0cf473ec2adba11c`；双评审见 `/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/rereview4-{astra,claude}/report.md`。两位均确认无新增 P0/P1，并允许编排者直接核验下述三处文字同步；完整运行能力按 §11.2 从 R0 实证，不重复将文档回应计为产品测试。
 
 ## 1. 依据、目标与保留边界
 
@@ -237,7 +238,7 @@ Popen 直接子进程从创建捕获 exec-stable 身份；suffix 只作关联，
 默认 `eligibility=false`。`managed=true`、固定启动器、受信任代码或有限反例通过，都不能证明所有执行入口可控；接受独立 Nexus 客户端、GUI、未知插件/native 扩展而无法纳入下述撤销协议的 owner，**同 boot 分支默认不支持**。不改服务端、不偷偷限制原有外部客户端功能；R0 若无法证实入口闭合，就保留 false，U6 boot-change 分支不受此资格限制。
 
 权威为由物理 owner canonical target 推导的固定协调区 `owners/<OwnerKeyHash>.eligibility.json`，跨 home/router/helper 共享一份；含完整 OwnerKey、boot/观察域、authority generation、单调 eligibility_epoch、allow/revoked、原因和已核验入口能力。多个目标引用同 owner 时只引用该权威，不复制可各自变真的 bool；映射不完整拒绝 OS 证明。
-仅首次绑定的新物理 OwnerKey 可在 R0 入口/平台门禁全满足时 durable 建立 allow；同一 OwnerKey/boot 由 allow→revoked 后永不恢复。重新订阅、新 helper、重启 router、失败/取消均不能重置；新 owner 必须用新物理身份和新权威。
+只有遵守本协议的 router 在 spawn 时登记、从启动起就有完整可核验入口覆盖的新物理 OwnerKey，才可在 R0 入口/平台门禁全满足时 durable 建立 allow；首次发现此前已存在的 owner 不能被追认为 allow。跨 router 只能核验既有权威及从启动起的连续记录，不能因首次发现而新建或重置资格。同一 OwnerKey/boot 由 allow→revoked 后永不恢复；重新订阅、新 helper、重启 router、失败/取消均不能重置，新 owner 必须用新物理身份和新权威。
 任何可能 fork/setsid/转移 FD 的操作（包括用户 run_script、未覆盖的内部/插件执行）在**授予执行权前**，先在根 SH→目标 EX 下写 revoked、递增 epoch，文件与目录 fsync，取得 durable revoke_ack，再释放锁并按 N1 epoch 复核后 grant。撤销写入失败或状态不明就不 grant；尚未执行时崩溃也保留 revoked。不得等 RPC 返回后撤销，也不因取消而恢复。
 
 helper 只写带读到的 epoch/hash 的不可变 `OSObservationCandidate`，不是最终合格 proof，不持目标锁等待别的写者。最终发证由根 SH→目标 EX 的唯一 journal 写入者重新读取权威并验证当前仍 allow、候选 epoch/hash/boot 与当前一致，再 durable 生成 os_process_exit；消费时再次同锁复核并原子记录实际解除的义务。撤销与发证/消费在同一锁下串行，跨 helper 缓存 true 或已生成的旧 epoch proof 都不能绕过后来的 revoked。
@@ -256,7 +257,7 @@ R0 必测真实 fork-without-exec/setsid/SCM_RIGHTS/可继承exec反例、执行
 `BootChangeCapability` 必含平台方法/版本、machine scope 与来源、稳定 volume identity、host namespace/虚拟化范围、旧/新boot及核验摘要。macOS R0 核验硬件 IOPlatformUUID、目标卷原生 UUID 与 bootsessionuuid 的绑定；Linux R0 核验非空硬件/firmware机器身份、挂载卷原生 UUID、host boot_id与观察域的来源。它们是候选来源，不自动获得能力；缺失/不唯一/可被当前范围克隆或回滚时标 UnsupportedBootScope 并 blocked。
 虚拟化/克隆/快照恢复默认无此 capability，除非存在不随guest快照复制/回滚、能认证同一实例连续性的外部管理域证明；不能把guest DMI/machine-id或本地随机文件单独当防克隆证据。本地卷身份用原生稳定卷ID与对象fileid/manifest绑定，重启后原始 st_dev 编号变化只能在该绑定核验后重映射，不可按路径放宽。跨机器复制journal、VM克隆/恢复快照、远程文件系统/远程锁、身份或host观察域无法验证时拒绝本分支。
 
-所有本地lease/startup/operation资源在取得或grant前须durable绑定捕获的machine/volume/host boot及创建incarnation；历史缺绑定项不能事后按路径猜归旧boot。
+会写入journal/协调区、形成跨进程或重启后清理义务的本地lease/startup/operation资源，必须引用已durable绑定machine/volume/host boot的创建incarnation；绑定按router/bridge/owner运行实例建立一次，后续记录显式引用。普通内存operation复用已绑定实例，不要求每次grant重复fsync；一旦形成持久义务，仍须在准入对应副作用前完成绑定引用的持久化，不能事后追认。历史缺绑定项不能按路径猜归旧boot。
 同机整机 boot 变化可证明旧boot owner、其内存 lease、全部本机继承FD和旧本机执行不再存活，不受旧session逃逸或同boot revoked影响。它证明“当前资源已不存在”，不证明历史close/save/执行成功。
 按精确旧boot/OwnerKey/LeaseKey/LaunchIdentity及operation归属，durable记录 `ResourceDisposition=RetiredByBootChange`、`ExecutionLiveness=ImpossibleInCurrentBoot` 与原历史结果引用；N1原phase/UnknownOutcome、原ACK位、原execution_stopped/因果证明字段不改成Released/成功/已收到停止回执。诊断墓碑保留原错误与NeverReplay，旧token/operation不复活、不自动重放。
 N1/Tools用上述正交资源状态从活admission/cleanup等待集、watcher/lease/owner/startup保留表及对应root SH中移除**仅属于旧boot的**资源；若原stop责任只是在等待该旧boot本机执行结束，也以ImpossibleInCurrentBoot结当前存活义务，不再永久占槽/阻gate。历史停止结果仍unknown，不能用于新boot执行。未绑定旧boot、远程执行或新boot资源不受影响。
@@ -683,7 +684,7 @@ owner 由私有 flock 和真实公共 wait_database_released 模拟，绝不读�
 
 同时记录 commands、原始 ACK、Python events、Rust accepted/dropped events、server lease 集、Python handle 集、N1 phase/delivery/stop、Tools 记录/锁与用户响应。
 不能只断言 Python events 列表，也不能 stub N1 的转移、直接塞 release_state、手工把 released 投递给 Rust 来当产品会产生的证明。
-旧事件回放只证明接收器健壮性；收敛必须由生产 watcher 的真实公开 proof 导致。
+旧事件回放只证明接收器健壮性；收敛必须由对应scope的生产证据生成与消费路径推进：公共lifetime路径使用生产watcher的真实公共proof，同boot OS与U6分别使用经权威核验的生产证据；不能手工投递released或改写私有状态冒充收敛，不伪造ACK，也不放宽各scope的资格条件。
 
 矩阵调度一律使用文件/管道 barrier 或注入单调时钟，不用真实 sleep 模拟 3s/15s/120s；owner 真正放 flock 后才产生公共 proof。
 同一个 Rust+bridge+helper 可复用多条互相隔离的 lease 轨迹，每条有独立 parent/state/事务与 finally 审计；崩溃/重启族使用单独进程组。
