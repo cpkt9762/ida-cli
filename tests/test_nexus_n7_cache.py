@@ -118,5 +118,28 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(self.store.collect(0, key='abc')['evicted_groups'], 1)
 
 
+    def test_gc_root_and_target_locks_are_nonblocking_and_skip_only_busy_target(self):
+        from target_coordination import Target
+        second = self.root/'generations/g2'
+        second.mkdir()
+        (second/'input.i64').write_bytes(b'separate private payload')
+        (second/'generation.json').write_text(json.dumps({'version':1,'key':'other'}))
+        with cache.lock(self.root,exclusive=False):
+            result = self.store.collect(0)
+            self.assertTrue(result['rejected'])
+            self.assertTrue(self.group.exists())
+            self.assertTrue(second.exists())
+        # This descriptor models a target writer while GC owns the root EX.
+        # The test explicitly supplies that root-lock ownership boundary.
+        with Target(self.group/'input.i64',root_locked=True) as target:
+            with target.locked():
+                result = self.store.collect(0)
+                self.assertTrue(result['rejected'])
+                self.assertTrue(self.group.exists())
+                self.assertFalse(second.exists())
+                self.assertTrue((self.root/'quarantine/g2/input.i64').exists())
+        self.assertTrue((target.directory.path/'lock').exists())
+
+
 if __name__ == '__main__':
     unittest.main()

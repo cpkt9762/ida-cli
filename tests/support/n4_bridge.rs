@@ -29,6 +29,16 @@ impl BaselineOpenReply for State {
 async fn n4_fix_open_delivery_survives_broadcast_lag() {
     let (events, _) = broadcast::channel(8);
     let state = State {
+        helper: None,
+        bridge_observer: None,
+        bridge_exit: Mutex::new(None),
+        observer_stop: tokio_util::sync::CancellationToken::new(),
+        observation_faults: Mutex::new(HashMap::new()),
+        custody_resources: Mutex::new(HashMap::new()),
+        custody_replies: Mutex::new(HashMap::new()),
+        startups: Mutex::new(HashMap::new()),
+        custody_retirements: Mutex::new(HashMap::new()),
+        retired_open_resources: Mutex::new(HashSet::new()),
         endpoint: NexusEndpoint::new(8),
         callbacks: Mutex::new(()),
         pending: Mutex::new(HashMap::new()),
@@ -143,6 +153,16 @@ async fn n5_old_delivery_callbacks_preserve_second_attempt_and_terminal_state() 
     let mut lanes = endpoint.take_lanes().unwrap();
     let (events, _) = broadcast::channel(8);
     let state = Arc::new(State {
+        helper: None,
+        bridge_observer: None,
+        bridge_exit: Mutex::new(None),
+        observer_stop: tokio_util::sync::CancellationToken::new(),
+        observation_faults: Mutex::new(HashMap::new()),
+        custody_resources: Mutex::new(HashMap::new()),
+        custody_replies: Mutex::new(HashMap::new()),
+        startups: Mutex::new(HashMap::new()),
+        custody_retirements: Mutex::new(HashMap::new()),
+        retired_open_resources: Mutex::new(HashSet::new()),
         endpoint: endpoint.clone(),
         callbacks: Mutex::new(()),
         pending: Mutex::new(HashMap::new()),

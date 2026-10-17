@@ -1,4 +1,4 @@
-"""R5 admission contract. Future custody/helper families remain unavailable."""
+"""Exact R3a admission. OS retirement and full transactions remain unavailable."""
 import json
 import os
 
@@ -8,11 +8,13 @@ HANDLE_SHA = SDK_FILES['handle.py']
 
 def contract():
     return {'wire': 2, 'schema': 1, 'release': 1, 'open': 1,
-            'owner_observation': 0, 'client_hash': HANDLE_SHA,
+            'owner_observation': 1, 'custody':1, 'helper':1, 'target_gate':1,
+            'same_boot_exit':0, 'boot_retirement':0, 'client_hash': HANDLE_SHA,
             'sdk_boundary': 1, 'client_modules': dict(SDK_FILES),
             'capabilities': ['absolute_home_v1', 'ack_cleanup_v1', 'acquisition_outcome_v1',
+                             'durable_public_proof_v1', 'final_preparing_v1', 'internal_grant_v1',
                              'launch_observer_v1', 'lifetime_handshake_v1',
-                             'receiver_isolation_v1', 'release_observation_v1']}
+                             'receiver_isolation_v1', 'release_observation_v1', 'target_gate_base_v1']}
 
 
 def validate(value):

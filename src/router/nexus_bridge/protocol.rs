@@ -1,4 +1,4 @@
-//! R5 adapter admission. Observation version zero explicitly means unavailable.
+//! Exact adapter admission, including the implemented R3a custody boundary.
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -26,6 +26,11 @@ pub struct Protocol {
     release: u8,
     open: u8,
     owner_observation: u8,
+    custody: u8,
+    helper: u8,
+    target_gate: u8,
+    same_boot_exit: u8,
+    boot_retirement: u8,
     client_hash: String,
     sdk_boundary: u8,
     client_modules: BTreeMap<String, String>,
@@ -38,7 +43,12 @@ impl Protocol {
             schema: 1,
             release: 1,
             open: 1,
-            owner_observation: 0,
+            owner_observation: 1,
+            custody: 1,
+            helper: 1,
+            target_gate: 1,
+            same_boot_exit: 0,
+            boot_retirement: 0,
             client_hash: CLIENT_HASH.into(),
             sdk_boundary: 1,
             client_modules: CLIENT_MODULES
@@ -49,10 +59,14 @@ impl Protocol {
                 "absolute_home_v1",
                 "ack_cleanup_v1",
                 "acquisition_outcome_v1",
+                "durable_public_proof_v1",
+                "final_preparing_v1",
+                "internal_grant_v1",
                 "launch_observer_v1",
                 "lifetime_handshake_v1",
                 "receiver_isolation_v1",
                 "release_observation_v1",
+                "target_gate_base_v1",
             ]
             .into_iter()
             .map(String::from)

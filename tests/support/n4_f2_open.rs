@@ -18,7 +18,10 @@ async fn run_case(fault: &str) {
             .env("IDA_CLI_HOME", &root)
             .env("IDA_NEXUS_STATE_DIR", root.join("state"))
             .env("IDA_CLI_NEXUS_DEV", "1")
-            .env("IDA_NEXUS_PYTHON", "/usr/bin/python3")
+            .env(
+                "IDA_NEXUS_PYTHON",
+                std::env::var_os("F1_PYTHON").unwrap_or_else(|| "/usr/bin/python3".into()),
+            )
             .env("IDA_NEXUS_IPC_ROOT", root.join("ipc"))
             .env(
                 "IDA_NEXUS_BRIDGE_SCRIPT",

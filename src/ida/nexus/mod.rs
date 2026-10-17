@@ -5,6 +5,7 @@
 //! execution while holding that lock. `NexusBackend::send` only enqueues commands.
 //! The legacy worker selection remains a development comparison until N9.
 
+mod custody;
 mod deadline;
 mod delivery;
 mod error;
@@ -12,6 +13,9 @@ mod model;
 mod operation;
 mod session;
 
+pub use custody::{
+    AcquisitionId, AcquisitionPurpose, CustodyDecision, CustodyDisposition, InternalPurpose,
+};
 pub use deadline::{AcceptedRequest, Clock, Deadline, RemainingBudget, SystemClock};
 pub use error::{NexusError, NexusErrorCode, RetryAdvice};
 pub use model::*;

@@ -10,6 +10,7 @@ import time
 from types import SimpleNamespace
 
 ROOT = Path(os.environ["F1_ROOT"])
+Path(os.environ['IDA_NEXUS_STATE_DIR']).mkdir(mode=0o700, parents=True, exist_ok=True)
 (ROOT / "process.json").write_text(json.dumps({"pid": os.getpid(), "birth": subprocess.check_output(["timeout", "3s", "/bin/ps", "-p", str(os.getpid()), "-o", "lstart="], text=True).strip(), "command": [sys.executable, __file__]}))
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, os.environ.get("F1_BRIDGE_DIR", str(REPO / "nexus_bridge")))
@@ -158,7 +159,143 @@ def outcome_event(**values):
     instance_bridge[0].control.send({"event": "local_status", "id": "fixture-verdict", **values})
 
 instance_bridge = [None]
-original_invoke = bridge.Bridge.invoke
+# These pre-custody transport regressions intentionally mock DatabaseHandle.open
+# and owner identity. Freeze their previous acquisition adapter explicitly;
+# execute/cancel/release still use the current production bridge and real N1.
+# This fixture cannot establish R3a custody/helper/proof correctness. The separate
+# nexus_r3a target uses the formal SDK and verified installation for that claim.
+production_invoke = bridge.Bridge.invoke
+def legacy_transport_open(self, channel, attempt, command, deadline, public_started):
+    from ida_nexus import discover_databases
+    from bridge import idb_context, ida_cli_home, open_checked, guarded_source, release_handle, error, database_diagnostics
+    import hashlib
+    import uuid
+    readiness = bridge.readiness
+    kind = command["command"]
+    if kind == "open":
+        # The default diagnostic context uses stat, independently of the
+        # owner Root Node protection. Full reads require forensic opt-in.
+        metadata_context = {"requested_path": command["path"],
+                            "before_open": idb_context(command["path"], deadline),
+                            "open_started": time.monotonic()}
+        options = dict(command["options"])
+        wait_analysis = options.pop("wait_analysis", False)
+        verification = options.pop("verification_idb", None)
+        snapshot = options.pop("verify_input_snapshot", None)
+        attach = options.pop("attach_instance", None)
+        options["startup_timeout"] = max(0.001, deadline - time.monotonic())
+        options["worker_env"] = dict(os.environ)
+        options["worker_cwd"] = str(ida_cli_home())
+        if verification is not None:
+            original = Path(command["path"])
+            copy_hash = hashlib.sha256(Path(verification).read_bytes()).digest()
+            if hashlib.sha256(original.read_bytes()).digest() != copy_hash:
+                raise ValueError("legacy cache changed during verification copy; refusing reuse")
+            expected = hashlib.sha256(Path(snapshot).read_bytes()).hexdigest()
+            with self.lock:
+                self.verification_probes[verification] = None
+            public_started[0] = True
+            def track_probe(probe, _context):
+                with self.lock:
+                    self.verification_probes[verification] = probe
+
+            def release_probe(_probe):
+                public_started[0] = False
+                with self.lock:
+                    self.verification_probes.pop(verification, None)
+
+            probe, _, _ = open_checked(self.Handle, self.Options, str(verification),
+                {'auto_analysis': False, 'worker_env': dict(os.environ),
+                 'worker_cwd': str(ida_cli_home())}, deadline, guarded_source,
+                dict(metadata_context, method='verification-open'), track_probe, release_probe,
+                lambda: public_started.__setitem__(0, True))
+            try:
+                proof = probe.execute_python(guarded_source(
+                    "import ida_nalt\nsha = ida_nalt.retrieve_input_file_sha256()\nresult = sha.hex() if sha else None",
+                    dict(metadata_context, method='verification-open', record_id=probe.instance.record_id)),
+                    timeout=max(0.001, deadline - time.monotonic()))["result"]
+            finally:
+                self.close_verification(verification, probe, deadline)
+            # A confirmed closed probe has no lease or operation left.
+            # The following verification rejections are certain failures.
+            public_started[0] = False
+            if not isinstance(proof, str) or len(proof) != 64 or proof == "0" * 64:
+                raise ValueError("legacy cache input SHA256 is unavailable; refusing reuse without changing original")
+            if proof != expected:
+                raise ValueError("legacy cache input SHA256 mismatch; refusing reuse without changing original")
+            if hashlib.sha256(original.read_bytes()).digest() != copy_hash:
+                raise ValueError("legacy cache changed during Nexus verification; refusing reuse")
+            options["startup_timeout"] = max(0.001, deadline - time.monotonic())
+        lease_box = []
+
+        def track_open(handle, context):
+            instance = handle.instance
+            with self.lock:
+                generation = self.generations.setdefault(instance.record_id, 1)
+                lease = {"client_id": command["identity"]["client_id"], "lease_id": uuid.uuid4().hex,
+                         "instance_id": instance.record_id, "generation": generation,
+                         "owner": "gui" if instance.backend == "gui" else "managed"}
+                self.handles[lease["lease_id"]] = (lease, handle)
+                self.metadata_contexts[lease["lease_id"]] = dict(context, record_id=instance.record_id)
+                lease_box[:] = [lease]
+            context.update(lease=lease, operation_id=command['identity'].get('operation_id'))
+            handle.set_disconnect_callback(lambda _handle, reason: self.disconnected(lease, reason, attempt))
+
+        def release_open(_handle):
+            public_started[0] = False
+            with self.lock:
+                lease = lease_box[0]
+                self.handles.pop(lease['lease_id'], None)
+                self.metadata_contexts.pop(lease['lease_id'], None)
+
+        if attach:
+            instances = [x.instance for x in discover_databases() if x.instance.record_id == attach]
+            if len(instances) != 1:
+                raise ValueError("attach instance is not available")
+            public_started[0] = True
+            handle = self.Handle.attach(instances[0], idle_timeout=options.get("idle_timeout"))
+            track_open(handle, metadata_context)
+        else:
+            handle, actual, _ = open_checked(self.Handle, self.Options, command['path'], options,
+                deadline, guarded_source, dict(metadata_context, method='open'),
+                track_open, release_open, lambda: public_started.__setitem__(0, True))
+        instance, lease = handle.instance, lease_box[0]
+        # Verify actual owner runtime without importing IDA in this process.
+        try:
+            if attach:
+                actual = handle.execute_python(guarded_source(
+                    "import ida_kernwin\nresult = ida_kernwin.get_kernel_version()",
+                    dict(metadata_context, method='open', lease=lease_box[0])),
+                    timeout=max(0.001, deadline-time.monotonic()))
+            if wait_analysis:
+                handle.wait_autoanalysis(timeout=max(0.001, deadline - time.monotonic()))
+                handle.execute_python(guarded_source('pass', dict(metadata_context,
+                    method='open-after-analysis', lease=lease,
+                    operation_id=command['identity'].get('operation_id'), record_id=instance.record_id)),
+                    timeout=max(0.001, deadline - time.monotonic()))
+        except Exception as exc:
+            outcome = release_handle(handle, deadline)
+            if outcome is None:
+                raise TimeoutError("open runtime check cleanup unconfirmed; lease retained") from exc
+            with self.lock:
+                self.handles.pop(lease["lease_id"], None)
+                self.metadata_contexts.pop(lease["lease_id"], None)
+            # Close confirmed this unannounced lease is gone. If close
+            # itself fails, run() retains the uncertain open outcome.
+            channel.send({"event": "failed", "attempt": attempt,
+                          "error": error("disconnected", f"open runtime check failed: {exc}; {outcome['save_guard_error'] or ''}"),
+                          "save_guard_error": outcome['save_guard_error'],
+                          "diagnostics": database_diagnostics(instance.idb_path)})
+            return
+        caps = readiness()["capabilities"]
+        ida = [int(x) for x in actual["result"].split(".")[:3]]
+        caps["runtime"]["ida"] = ida + [0] * (3 - len(ida))
+        channel.send({"event": "opened", "attempt": attempt, "lease": lease,
+                      "capabilities": caps, "pid": instance.pid, "idb_path": instance.idb_path,
+                      "recovery": handle.recovery})
+        return
+    return production_invoke(self, channel, attempt, command, deadline, public_started)
+original_invoke = legacy_transport_open
 
 def invoke(self, channel, attempt, command, deadline, public_started):
     instance_bridge[0] = self

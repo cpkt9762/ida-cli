@@ -12,6 +12,9 @@ import sys
 import time
 import uuid
 
+if '__verified_source__' not in globals():
+    sys.path.insert(0, str(Path(__file__).resolve().parent / 'custody'))
+
 
 @contextmanager
 def lock(root, exclusive=True):
@@ -120,6 +123,21 @@ class Store:
         self.probe, self.clock, self.hook = probe, clock, hook
         self.generations = self.root/'generations'
         self.quarantine = self.root/'quarantine'
+
+    @contextmanager
+    def target_gate(self, group):
+        # collect already holds this actual cache root EX. Opening another SH
+        # description here would deadlock against our own GC lock.
+        from target_coordination import Target
+        from target_journal import Journal
+        with Target(group/'input.i64', root_locked=True) as target:
+            with target.locked(nb=True):
+                journal = Journal(target)
+                journal.gate()
+                journal.settle()
+                if journal.value['entries']:
+                    raise RuntimeError('ObservationPending: target still has durable references')
+                yield
 
     def check(self, group, *, missing=False):
         reason = self.probe(group/'input.i64')
@@ -279,14 +297,15 @@ class Store:
                     continue
                 files = list(isolated.iterdir())
                 size = sum(p.stat().st_size for p in files if p.is_file())
-                if self.retire(isolated, rejected, allow_delete=key is not None or budget > 0):
-                    result['evicted_groups'] += 1
-                    result['evicted_files'] += len(files)
-                    result['evicted_bytes'] += size
-                    budget = max(0, budget - size)
-                elif isolated.exists() and self.pair_check(self.generations/isolated.name, isolated) is None:
-                    planned += size
-            except (OSError, ValueError, TypeError, KeyError) as error:
+                with self.target_gate(isolated):
+                    if self.retire(isolated, rejected, allow_delete=key is not None or budget > 0):
+                        result['evicted_groups'] += 1
+                        result['evicted_files'] += len(files)
+                        result['evicted_bytes'] += size
+                        budget = max(0, budget - size)
+                    elif isolated.exists() and self.pair_check(self.generations/isolated.name, isolated) is None:
+                        planned += size
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
                 rejected.append({'path':str(isolated), 'reason':'quarantine retained: ' + str(error)})
         groups = sorted(self.generations.iterdir(), key=lambda p: p.stat().st_mtime)
         for group in groups:
@@ -295,11 +314,12 @@ class Store:
             try:
                 if key is not None and self.manifest(group)['key'] != key:
                     continue
-                self.isolate(group, rejected)
-                isolated = self.quarantine/group.name
-                if isolated.exists() and not group.exists():
-                    planned += sum(p.stat().st_size for p in isolated.iterdir() if p.is_file())
-            except (OSError, ValueError, TypeError, KeyError) as error:
+                with self.target_gate(group):
+                    self.isolate(group, rejected)
+                    isolated = self.quarantine/group.name
+                    if isolated.exists() and not group.exists():
+                        planned += sum(p.stat().st_size for p in isolated.iterdir() if p.is_file())
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
                 rejected.append({'path':str(group), 'reason':'generation retained: ' + str(error)})
         for legacy in self.root.glob('*.i64'):
             rejected.append({'path':str(legacy), 'reason':'legacy flat group has no atomic directory container; retained'})

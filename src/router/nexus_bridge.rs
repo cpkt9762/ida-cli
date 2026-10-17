@@ -1,7 +1,10 @@
 //! Persistent public Python client adapter. Neither lane shares a physical stream.
 pub mod cache;
 pub mod cache_lock;
+mod custody_wire;
 pub mod generations;
+mod helper;
+pub(crate) mod installation;
 pub mod protocol;
 mod receiver;
 use super::nexus_transport::{Delivery, NexusEndpoint, NexusWireFrame};
@@ -35,6 +38,16 @@ struct Pending {
 }
 struct State {
     endpoint: NexusEndpoint,
+    helper: Option<Arc<helper::Helper>>,
+    bridge_observer: Option<String>,
+    bridge_exit: Mutex<Option<Value>>,
+    observer_stop: tokio_util::sync::CancellationToken,
+    observation_faults: Mutex<HashMap<String, String>>,
+    custody_resources: Mutex<HashMap<LeaseId, custody_wire::Resource>>,
+    custody_replies: Mutex<HashMap<String, (Value, Value)>>,
+    startups: Mutex<HashMap<String, Value>>,
+    custody_retirements: Mutex<HashMap<String, Value>>,
+    retired_open_resources: Mutex<HashSet<OperationId>>,
     callbacks: Mutex<()>,
     pending: Mutex<HashMap<u64, Pending>>,
     leases: Mutex<HashMap<LeaseId, SessionLease>>,
@@ -145,7 +158,7 @@ impl State {
 /// Owned by one RouterState. Dropping it kills only its own bridge, never an owner.
 pub struct NexusBridge {
     state: Arc<State>,
-    child: AsyncMutex<Child>,
+    child: Arc<AsyncMutex<Child>>,
     lifetime: AsyncMutex<Option<ChildStdin>>,
     control: Writer,
     directory: PathBuf,
@@ -229,6 +242,21 @@ impl NexusBridge {
         );
         std::fs::create_dir(&config.directory)?;
         std::fs::set_permissions(&config.directory, std::fs::Permissions::from_mode(0o700))?;
+        let installation_path = config.directory.join("installation");
+        installation::create(&installation_path)?;
+        config.environment.insert(
+            "IDA_CLI_BRIDGE_INSTALLATION".into(),
+            installation_path.to_string_lossy().into_owned(),
+        );
+        let mut helper = if config
+            .script
+            .file_name()
+            .is_some_and(|name| name == "bridge.py")
+        {
+            Some(helper::Helper::start(&mut config, &installation_path).await?)
+        } else {
+            None // Explicit fixture adapters keep their pre-custody wire contract.
+        };
         let mut owner = StartupGuard {
             child: None,
             directory: Some(config.directory.clone()),
@@ -239,10 +267,23 @@ impl NexusBridge {
         let control = UnixListener::bind(&control_path)?;
         let capacity = router.config.max_pending_per_tenant;
         let log = std::fs::File::create(config.directory.join("stderr.log"))?;
+        let production = config
+            .script
+            .file_name()
+            .is_some_and(|name| name == "bridge.py");
+        let mut process = Command::new(&config.python);
+        if production {
+            process
+                .arg("-I")
+                .arg("-B")
+                .arg(installation_path.join("bootstrap.py"))
+                .arg("bridge");
+        } else {
+            process.arg(&config.script);
+        }
         owner.child = Some(
-            Command::new(&config.python)
+            process
                 .current_dir(&startup_cwd)
-                .arg(&config.script)
                 .arg(&business_path)
                 .arg(&control_path)
                 .arg(capacity.to_string())
@@ -276,6 +317,15 @@ impl NexusBridge {
             if ready["ready"] != true {
                 anyhow::bail!("Nexus readiness: {}", ready["error"]);
             }
+            if ready["custody_protocol"] == 1 && helper.is_none() {
+                let root = ready["paths"]["state_dir"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("helper state path missing"))?;
+                config
+                    .environment
+                    .insert("IDA_NEXUS_STATE_DIR".into(), root.into());
+                helper = Some(helper::Helper::start(&mut config, &installation_path).await?);
+            }
             protocol::Protocol::validate(ready["protocol"].clone())?;
             anyhow::ensure!(
                 ready["paths"]["ida_cli_home"].as_str() == ida_home.to_str(),
@@ -297,10 +347,15 @@ impl NexusBridge {
             caps.runtime.validate()?;
             let (b, _) = business.accept().await?;
             let (c, _) = control.accept().await?;
-            Ok::<_, anyhow::Error>((caps, b, c))
+            Ok::<_, anyhow::Error>((
+                caps,
+                b,
+                c,
+                ready["observer_incarnation"].as_str().map(str::to_owned),
+            ))
         };
         let connected = tokio::time::timeout(Duration::from_secs(15), startup).await;
-        let (caps, b, c) = match connected {
+        let (caps, b, c, bridge_observer) = match connected {
             Ok(Ok(value)) => value,
             other => {
                 return Err(match other {
@@ -317,6 +372,16 @@ impl NexusBridge {
         let (events, _) = broadcast::channel(capacity.max(8));
         let state = Arc::new(State {
             endpoint,
+            helper,
+            bridge_observer,
+            bridge_exit: Mutex::new(None),
+            observer_stop: tokio_util::sync::CancellationToken::new(),
+            observation_faults: Mutex::new(HashMap::new()),
+            custody_resources: Mutex::new(HashMap::new()),
+            custody_replies: Mutex::new(HashMap::new()),
+            startups: Mutex::new(HashMap::new()),
+            custody_retirements: Mutex::new(HashMap::new()),
+            retired_open_resources: Mutex::new(HashSet::new()),
             callbacks: Mutex::new(()),
             pending: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
@@ -330,8 +395,42 @@ impl NexusBridge {
         });
         let bw = start_channel(b, state.clone(), false);
         let cw = start_channel(c, state.clone(), true);
+        if let Some(helper) = &state.helper {
+            send(&cw, &json!({"helper_configuration":{"endpoint":helper.endpoint,"incarnation":helper.incarnation,"state_root":helper.state_root}})).await?;
+        }
         tokio::spawn(pump(lanes.business, bw, state.clone()));
         tokio::spawn(pump(lanes.control, cw.clone(), state.clone()));
+        let child = owner
+            .child
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("startup child missing"))?;
+        let child = Arc::new(AsyncMutex::new(child));
+        let observed_child = child.clone();
+        let observing = Arc::downgrade(&state);
+        let proof_writer = cw.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                let Some(state) = observing.upgrade() else {
+                    break;
+                };
+                if state.observer_stop.is_cancelled() {
+                    break;
+                }
+                match observed_child.lock().await.try_wait() {
+                    Ok(Some(status)) => {
+                        *state.bridge_exit.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(json!({"pid":pid,"status":status.to_string()}));
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(%error, "bridge producer waitpid unavailable"),
+                }
+                if let Err(error) = custody_wire::proofs(&state, &proof_writer).await {
+                    tracing::warn!(%error, "owner observation retained; proof custody not complete");
+                }
+            }
+        });
         let ticking = state.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(10));
@@ -356,6 +455,9 @@ impl NexusBridge {
                     .collect();
                 ticking.endpoint.transition(|s, t| {
                     for lease in leases {
+                        if let Err(error) = s.poll_preparation(&lease, t) {
+                            tracing::debug!(%error, "Nexus preparing cancellation pending");
+                        }
                         if s.status(&lease.client_id, &lease).is_ok_and(|status| status.phase == SessionPhase::ReleaseRequired) {
                             if let Err(error) = s.release(&lease.client_id, &lease, t) {
                                 tracing::debug!(%error, lease_id=lease.lease_id.as_str(), "Nexus retained open lease cleanup pending");
@@ -374,14 +476,10 @@ impl NexusBridge {
                 });
             }
         });
-        let child = owner
-            .child
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("startup child missing"))?;
         owner.directory = None; // ownership transfers to the live bridge only now.
         Ok(Self {
             state,
-            child: AsyncMutex::new(child),
+            child,
             lifetime: AsyncMutex::new(lifetime),
             control: cw,
             directory: config.directory,
@@ -411,6 +509,62 @@ impl NexusBridge {
     pub fn endpoint(&self) -> NexusEndpoint {
         self.state.endpoint.clone()
     }
+    #[cfg(feature = "nexus-test-support")]
+    pub async fn test_helper_pause(&self) -> anyhow::Result<Value> {
+        self.state
+            .helper
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("test helper missing"))?
+            .inject_pause()
+            .await
+    }
+
+    #[cfg(feature = "nexus-test-support")]
+    pub async fn test_helper_fault(&self, cleanup: bool) -> anyhow::Result<Value> {
+        if cleanup {
+            self.state.observer_stop.cancel();
+        }
+        let helper = self
+            .state
+            .helper
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("test helper missing"))?;
+        helper.inject_crash().await
+    }
+    pub(crate) fn open_resource_obligations(&self, identity: &OpenIdentity) -> (bool, bool) {
+        // OpenIdentity contains only typed strings/options. Fail closed if its
+        // representation ever acquires a fallible serializer.
+        let Ok(encoded) = serde_json::to_value(identity) else {
+            return (true, false);
+        };
+        let live = self
+            .state
+            .startups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|item| item["acquisition"]["parent"] == encoded);
+        let retired = self
+            .state
+            .retired_open_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&identity.operation_id);
+        (live, retired)
+    }
+    #[cfg(feature = "nexus-test-support")]
+    pub fn test_detach_observer(&self) {
+        self.state.observer_stop.cancel();
+    }
+    #[cfg(feature = "nexus-test-support")]
+    pub async fn test_wait_injected_orphan(&self) -> anyhow::Result<Value> {
+        self.state
+            .helper
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("helper unavailable"))?
+            .wait_injected_orphan()
+            .await
+    }
     pub async fn status(&self, id: &str) -> anyhow::Result<()> {
         send(&self.control, &json!({"local_status":id})).await
     }
@@ -432,6 +586,10 @@ impl NexusBridge {
         }
         remove_lifetime_socket(&self.directory)?;
         self.state.fail("bridge stopped");
+        if let Some(helper) = &self.state.helper {
+            // Never force-stop an observer with outstanding responsibility.
+            helper.finish().await?;
+        }
         Ok(())
     }
     /// Test supervisor may terminate this exact child; no process-name scans.
@@ -659,6 +817,193 @@ async fn event_received(
     state: &Arc<State>,
     control: bool,
 ) -> anyhow::Result<()> {
+    if event["event"] == "owner_backup_proof" {
+        anyhow::ensure!(control, "backup proof on wrong lane");
+        let watch = event["watch"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("backup watch missing"))?;
+        let proof = &event["proof"];
+        anyhow::ensure!(
+            state.bridge_observer.as_deref() == proof["record"]["helper"].as_str()
+                && proof["record"]["watch"] == watch
+                && proof["record"]["evidence_type"] == "public_owner_lifetime",
+            "backup proof producer mismatch"
+        );
+        let mut resources = state
+            .custody_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(resource) = resources.values_mut().find(|r| r.watch == watch) {
+            anyhow::ensure!(
+                proof["record"]["owner"] == resource.owner
+                    && proof["record"]["acquisition"]
+                        == serde_json::to_value(&resource.acquisition)?,
+                "backup proof resource mismatch"
+            );
+            resource.backup = Some(proof.clone());
+        } else {
+            drop(resources);
+            let mut observations = state.startups.lock().unwrap_or_else(|e| e.into_inner());
+            let item = observations
+                .get_mut(watch)
+                .ok_or_else(|| anyhow::anyhow!("backup proof unknown watch"))?;
+            anyhow::ensure!(
+                item["owner"] == proof["record"]["owner"]
+                    && item["acquisition"] == proof["record"]["acquisition"],
+                "backup proof observation mismatch"
+            );
+            item["backup_proof"] = proof.clone();
+        }
+        return Ok(());
+    }
+    if event["event"] == "owner_proof_ack" {
+        anyhow::ensure!(control, "owner proof acknowledgement on wrong lane");
+        let watch = event["watch"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("owner proof watch missing"))?;
+        let resource = state
+            .custody_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .find(|r| r.watch == watch)
+            .cloned();
+        let (owner, proof, target, coord) = if let Some(resource) = &resource {
+            (
+                resource.owner.clone(),
+                resource
+                    .proof
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("proof ACK before custody"))?,
+                resource.target.clone(),
+                resource.coord_key.clone(),
+            )
+        } else {
+            let observations = state.startups.lock().unwrap_or_else(|e| e.into_inner());
+            let item = observations
+                .get(watch)
+                .ok_or_else(|| anyhow::anyhow!("proof ACK has no retained observation"))?;
+            (
+                item["owner"].clone(),
+                item["proof"].clone(),
+                item["target"].clone(),
+                item["coord_key"].clone(),
+            )
+        };
+        anyhow::ensure!(
+            owner == event["owner"]
+                && proof["sha256"] == event["sha256"]
+                && state.bridge_observer.as_deref()
+                    == event["consumer"]["record"]["helper"].as_str(),
+            "owner proof ACK binding mismatch"
+        );
+        state.helper.as_ref().ok_or_else(|| anyhow::anyhow!("proof ACK helper missing"))?.journal(json!({
+            "action":"bridge_closed","target":target,"coord_key":coord,"watch":watch,"consumer":event["consumer"]})).await?;
+        if let Some(resource) = resource {
+            if let Some(current) = state
+                .custody_resources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&resource.lease.lease_id)
+            {
+                current.bridge_proof_ack = true;
+            }
+        } else if let Some(item) = state
+            .startups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(watch)
+        {
+            item["bridge_proof_ack"] = json!(true);
+        }
+        return Ok(());
+    }
+    if event["event"] == "custody_retired_ack" {
+        anyhow::ensure!(control, "retirement acknowledgement on wrong lane");
+        let watch = event["receipt"]["watch"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("retirement watch missing"))?;
+        let mut pending = state
+            .custody_retirements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(receipt) = pending.get(watch) {
+            anyhow::ensure!(
+                *receipt == event["receipt"],
+                "retirement acknowledgement mismatch"
+            );
+            let receipt = pending
+                .remove(watch)
+                .ok_or_else(|| anyhow::anyhow!("retirement disappeared"))?;
+            state.emit(json!({"event":"custody_settled", "lease":receipt["lease"], "acquisition":receipt["acquisition"], "watch":watch}));
+        }
+        return Ok(());
+    }
+    if event["event"] == "custody_receipt" {
+        anyhow::ensure!(control, "custody receipt on wrong lane");
+        let nonce = event["nonce"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("custody receipt nonce missing"))?;
+        state
+            .custody_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(nonce);
+        return Ok(());
+    }
+    if event["event"] == "custody_request" {
+        anyhow::ensure!(control, "custody request must use independent control lane");
+        let nonce = event["nonce"]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.len() <= 128)
+            .ok_or_else(|| anyhow::anyhow!("invalid custody nonce"))?;
+        let retained = state
+            .custody_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(nonce)
+            .cloned();
+        if let Some((original, response)) = retained {
+            anyhow::ensure!(original == event, "conflicting custody retransmission");
+            send(writer, &response).await.map_err(|error| {
+                error
+                    .downcast::<std::io::Error>()
+                    .map(receiver::EventIoError::from)
+                    .map(anyhow::Error::from)
+                    .unwrap_or_else(|error| error)
+            })?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            state
+                .custody_replies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+                < state.open_reply_capacity + 8,
+            "Busy: unacknowledged custody replies full; existing obligations retained"
+        );
+        let result = custody_wire::receive(&event, state).await;
+        let reply = match result {
+            Ok(value) => value,
+            Err(error) => {
+                json!({"custody_reply":event["nonce"],"ok":false,"error":error.to_string()})
+            }
+        };
+        state
+            .custody_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(nonce.into(), (event.clone(), reply.clone()));
+        send(writer, &reply).await.map_err(|error| {
+            error
+                .downcast::<std::io::Error>()
+                .map(receiver::EventIoError::from)
+                .map(anyhow::Error::from)
+                .unwrap_or_else(|error| error)
+        })?;
+        return Ok(());
+    }
     if event["event"] == "dispatch_ready" {
         let encoded = event["frame"].take();
         let frame: NexusWireFrame = if control {
@@ -768,7 +1113,7 @@ async fn event_received(
         crate::blocking::response(move || apply_event(event, &owned)).await?
     }
 }
-fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
+fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
     if event["event"] == "disconnected" {
         let lease: SessionLease = serde_json::from_value(event["lease"].clone())?;
         let _ordered = state.callbacks.lock().unwrap_or_else(|e| e.into_inner());
@@ -810,6 +1155,40 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
         return Ok(());
     }
     if event["event"] == "local_status" {
+        let helper_status = state.helper.as_ref().map(|h| h.status_snapshot());
+        let resources: Vec<_> = state
+            .custody_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|r| {
+                json!({"watch":r.watch,"target":r.target,"coord_key":r.coord_key,
+                "acquisition":r.acquisition,"lease":r.lease,"owner":r.owner,
+                "public_proof_adopted":r.proof.is_some(),"producer_closed":r.consumer.is_some(),
+                "bridge_closed":r.bridge_proof_ack})
+            })
+            .collect();
+        let startups: Vec<_> = state
+            .startups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|r| {
+                json!({"watch":r["watch"],"target":r["target"],"coord_key":r["coord_key"],
+                "acquisition":r["acquisition"],"launch":r["launch"],"owner":r["owner"],
+                "public_proof_adopted":r.get("proof").is_some()})
+            })
+            .collect();
+        event["custody"] = json!({
+            "helper":helper_status,"resource_details":resources,"startup_details":startups,
+            "state_root":state.helper.as_ref().map(|h| &h.state_root),
+            "helper_endpoint":state.helper.as_ref().map(|h| &h.endpoint),
+            "resources":state.custody_resources.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            "startup_and_pre_attach":state.startups.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            "retirement_acks":state.custody_retirements.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            "limit":state.open_reply_capacity,
+            "blocked":*state.observation_faults.lock().unwrap_or_else(|e| e.into_inner()),
+            "same_boot_eligibility":false,"boot_retirement":"NotEnabled"});
         state.emit(event);
         return Ok(());
     }
@@ -833,7 +1212,7 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
                 | "release_unconfirmed"
                 | "release_observation"
         ),
-        "unknown or unsupported message family (custody/helper/owner observation not implemented)"
+        "unknown or unsupported message family"
     );
     // Clone/decode potentially large results and errors before taking N1's lock.
     // Business callbacks already run on the bounded response worker.

@@ -161,11 +161,14 @@ impl IdbStore {
                 EPOCH.get_or_init(|| format!("{}-{:?}", std::process::id(), SystemTime::now()));
             let python = std::env::var_os("IDA_NEXUS_PYTHON")
                 .ok_or_else(|| anyhow::anyhow!("IDA_NEXUS_PYTHON missing"))?;
+            let installation = crate::router::nexus_bridge::installation::Temporary::create()?;
             let mut command = std::process::Command::new("timeout");
             command
                 .args(["10s"])
                 .arg(python)
-                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("nexus_bridge/cache_store.py"))
+                .args(["-I", "-B"])
+                .arg(installation.path.join("installation/bootstrap.py"))
+                .arg("cache_store")
                 .arg("--root")
                 .arg(&self.root)
                 .arg("--limit")

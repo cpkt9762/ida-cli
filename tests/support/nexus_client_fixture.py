@@ -14,6 +14,7 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tests/support"))
 from nexus_env import Environment
+from r0_transport import barrier as startup_barrier
 
 env = Environment(Path(os.environ["N3_ENV_ROOT"]))
 # No signal handler changes in the bridge's business threads. Persist creation
@@ -31,6 +32,8 @@ def owned_popen(command, **options):
         child.wait(timeout=3)
         raise
     env.children.append(child)
+    if os.environ.get('R3A_STARTUP_PHASE') == 'PopenReturn':
+        startup_barrier(Path(os.environ['R5_ROOT']),'startup')
     return child
 proxy.Popen = owned_popen
 # Record even a dependency-failure bridge before importing Nexus.
@@ -107,7 +110,21 @@ else:
     if os.environ.get("N3_WRONG_VERSION"):
         original_version = importlib.metadata.version
         importlib.metadata.version = lambda name: "0.13.3" if name == "ida-nexus" else original_version(name)
-    runtime = runpy.run_path(os.environ.get("N6_TEST_BRIDGE_SOURCE", str(REPO / "nexus_bridge/bridge.py")), run_name="n4_fixture")
+    if os.environ.get("N6_TEST_BRIDGE_SOURCE"):
+        runtime = runpy.run_path(os.environ["N6_TEST_BRIDGE_SOURCE"], run_name="n4_fixture")
+    else:
+        installation = Path(os.environ["IDA_CLI_BRIDGE_INSTALLATION"])
+        sys.argv = [str(installation / "bootstrap.py"), "bridge", *sys.argv[1:]]
+        bootstrap = runpy.run_path(sys.argv[0], run_name="verified_fixture")
+        runtime = vars(bootstrap["load_entry"]())
+    if os.environ.get('R3A_STARTUP_PHASE') in ('LaunchIntent','Spawned','LogReady','Ready'):
+        from acquisition import Custodian
+        original_stage = Custodian.stage
+        def startup_stage(self, stage, value):
+            original_stage(self,stage,value)
+            if stage == os.environ['R3A_STARTUP_PHASE']:
+                startup_barrier(Path(os.environ['R5_ROOT']),'startup')
+        Custodian.stage = startup_stage
     bridge_init = runtime["Bridge"].__init__
     def registered_init(self, business, control, capacity):
         # F2/P2-b: parent endpoints predate initialization. Record before any

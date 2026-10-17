@@ -7,6 +7,8 @@ from pathlib import Path
 import socket
 import sys
 import threading
+import uuid
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -76,6 +78,39 @@ class Handle:
                 "shutdown_pending": False}
 
 
+class TransportCustodian:
+    """Typed custody boundary double; never used by a production-chain test."""
+    def __init__(self, bridge, attempt, command, deadline, track):
+        self.bridge, self.attempt, self.track = bridge, attempt, track
+        self.acquisition = {'parent':command['identity']}
+        self.handle = None
+        self.originals, self.launches = {}, {}
+        self.running = True
+
+    def gate(self, _target):
+        return nullcontext()
+
+    def obtain(self, Handle, Options, path, options, context):
+        self.handle = Handle.open(path, options=Options(**options))
+        self.track(self.handle, context)
+        self.lease = next(lease for lease,handle in self.bridge.handles.values() if handle is self.handle)
+        return self.handle
+
+    def execute(self, _purpose, code, **_options):
+        return self.handle.execute_python(code, timeout=1, operation_id='fixture-internal-' + uuid.uuid4().hex)
+
+    def ready(self, capabilities, _wait_analysis, recovery):
+        self.bridge.business.send({'event':'opened', 'attempt':self.attempt, 'lease':self.lease,
+            'capabilities':capabilities, 'pid':self.handle.instance.pid,
+            'idb_path':self.handle.instance.idb_path, 'recovery':recovery})
+
+    def known_no_acquisition(self):
+        return self.handle is None
+
+    def fail(self, _error):
+        raise AssertionError('transport handle double unexpectedly failed preparation')
+
+
 class Harness:
     def __init__(self, directory, monkeypatch):
         import ida_nexus
@@ -83,6 +118,10 @@ class Harness:
         # independently exercised with public APIs in real-owner regressions.
         monkeypatch.setattr(bridge_module, 'guarded_source',
             lambda code, _context, refuse=True: code if refuse else 'r9-fixture-release')
+        # These tests isolate transport/executor behavior with a public-handle
+        # double. Real custody/N1/helper/SDK behavior is exercised without this
+        # double in nexus_r3a.rs, including all early delivery boundaries.
+        monkeypatch.setattr(bridge_module, 'Custodian', TransportCustodian)
         self.handle = Handle()
         self.opens = []
         def open_handle(path, **options):
@@ -124,7 +163,8 @@ class Harness:
         return frame
 
     def open(self):
-        self.dispatch(0, {"command": "open", "identity": {"client_id": "client-1"}, "path": "sample", "options": {}})
+        self.dispatch(0, {"command": "open", "identity": {"client_id": "client-1", "task_id":None,
+            "request_id":f'open-{self.sequence}', "operation_id":f'open-{self.sequence}'}, "path": "sample", "options": {}})
         opened = self.receive()
         assert opened["event"] == "opened", opened
         self.lease = opened["lease"]
@@ -187,10 +227,11 @@ def test_status_and_cancel_have_independent_connection_and_executor(harness):
     assert harness.handle.cancelled == "op-0"
     # Initial-open checks use the remaining total open budget; business
     # execution keeps its independent causal cancellation/unknown contract.
-    initial = [(code, options) for code, options in harness.handle.calls if "get_kernel_version" in code]
+    initial = [(code, options) for code, options in harness.handle.calls
+               if options.get('operation_id', '').startswith('fixture-internal-')]
     assert initial and all(options["timeout"] > 0 for _, options in initial)
     assert all(options["timeout"] is None for code, options in harness.handle.calls
-               if "get_kernel_version" not in code)
+               if not options.get('operation_id', '').startswith('fixture-internal-'))
     harness.handle.resume.set()
     assert [harness.receive()["event"] for _ in range(4)] == ["completed"] * 4
 

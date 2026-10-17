@@ -1,5 +1,5 @@
 """Bounded initial-open retries and conservative, post-recovery rollback."""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import fcntl
 import hashlib
 import json
@@ -75,13 +75,23 @@ def identity(path, deadline):
     return value
 
 
-def inventory(directory, deadline):
-    return {p.name: identity(p, deadline) for p in sorted(directory.iterdir())}
+def inventory(directory, deadline, coordination=None):
+    result = {}
+    for path in sorted(directory.iterdir()):
+        value = identity(path, deadline)
+        if coordination is not None and path == coordination.path:
+            coordination.verify()
+            # Only this exact no-follow coordination directory may change its
+            # routine entries. Its inode/dev/mode remain part of the snapshot.
+            value = {k:value[k] for k in ('inode', 'device', 'mode')}
+        result[path.name] = value
+    return result
 
 
 class Snapshot:
-    def __init__(self, root, target, deadline, *, owner_probe=None):
+    def __init__(self, root, target, deadline, *, owner_probe=None, coordination=None):
         self.target, self.deadline = target, deadline
+        self.coordination = coordination
         self.owner_probe = owner_probe or public_owner_probe
         self.names = {target.name, *(target.with_suffix(ext).name
             for ext in ('.id0', '.id1', '.id2', '.nam', '.til'))}
@@ -95,7 +105,7 @@ class Snapshot:
         self.path.mkdir(mode=0o700)
         (self.path/'snapshot').mkdir(mode=0o700)
         self.parent_identity = stable_stat(target.parent.lstat())[:3]
-        self.before = inventory(target.parent, deadline)
+        self.before = self.inventory()
         self.data = {'version': 1, 'target': str(target), 'status': 'snapshotting',
                      'before': self.before, 'parent_identity': self.parent_identity,
                      'files': {}, 'snapshot_files': {}, 'attempts': []}
@@ -115,6 +125,13 @@ class Snapshot:
 
     def journal(self):
         atomic_json(self.path/'recovery.json', self.data)
+        if self.coordination is not None:
+            from target_journal import Journal
+            Journal(self.coordination).file_intent(self.path/'recovery.json', self.data['status'], self.data['attempts'])
+
+    def inventory(self):
+        return inventory(self.target.parent, self.deadline,
+                         self.coordination.directory if self.coordination is not None else None)
 
     def check_owner(self):
         remaining(self.deadline)
@@ -131,7 +148,7 @@ class Snapshot:
     def expect(self, expected):
         if stable_stat(self.target.parent.lstat())[:3] != self.parent_identity:
             raise RuntimeError('recovery parent directory identity changed; scene retained')
-        if inventory(self.target.parent, self.deadline) != expected:
+        if self.inventory() != expected:
             raise RuntimeError('recovery file identity/directory changed; snapshot/scene retained')
 
     def copy(self, source, destination, expected, mode):
@@ -158,7 +175,7 @@ class Snapshot:
 
     def failed(self, attempt):
         """Record owner-produced identities before allowing the owner to close."""
-        observed = inventory(self.target.parent, self.deadline)
+        observed = self.inventory()
         for name, value in observed.items():
             if name not in self.names and self.before.get(name) != value:
                 raise RuntimeError('unexpected new/changed recovery directory entry: ' + name)
@@ -179,7 +196,7 @@ class Snapshot:
     def rollback(self, observed):
         """Only after lease AND public owner lifetime release were proved."""
         self.check_owner()
-        current = inventory(self.target.parent, self.deadline)
+        current = self.inventory()
         for name, value in current.items():
             if observed.get(name) != value:
                 raise RuntimeError('recovery file identity changed after close: ' + name)
@@ -226,30 +243,48 @@ def failure_state(handle, deadline):
 
 
 def open_checked(Handle, Options, path, options, deadline, guarded_source, context,
-                 acquired=lambda *_: None, released=lambda *_: None, starting=lambda: None):
+                 acquired=lambda *_: None, released=lambda *_: None, starting=lambda: None,
+                 *, custodian=None):
     """Retry only a guard-confirmed *first* sample failure, never a business call."""
     from ida_nexus import probe_database_state
     root = ida_cli_home()/'idb'
-    state = probe_database_state(path, output_database=options.get('output_database'))
-    target = Path(state['idb_path']).resolve()
-    with open_locks(root, target, deadline):
+    # Target identity is derived without calling Nexus probe: the new gate must
+    # reject damaged coordination before any resolver/owner side effect.
+    output = options.get('output_database') or path
+    target = Path(output).resolve()
+    if target.suffix not in ('.i64', '.idb'):
+        target = Path(str(target) + '.i64')
+    locking = custodian.gate(target) if custodian else open_locks(root, target, deadline)
+    with locking:
         state = probe_database_state(path, output_database=options.get('output_database'))
-        snapshot = Snapshot(root, target, deadline) if state['state'] in ('crashed', 'unpacked') else None
+        snapshot = Snapshot(root, target, deadline, coordination=custodian.target if custodian else None) if state['state'] in ('crashed', 'unpacked') else None
         for number in range(1, 4):
             logging.getLogger('ida_cli.open').debug('open attempt %d/3: %s', number, target)
             attempt_context = dict(context, open_attempt=number, deadline=deadline)
             starting()
-            handle = Handle.open(path, options=Options(**dict(options,
-                startup_timeout=remaining(deadline))))
-            acquired(handle, attempt_context)
+            current_options = dict(options, startup_timeout=remaining(deadline))
+            if custodian:
+                handle = custodian.obtain(Handle, Options, path, current_options, attempt_context)
+            else:
+                handle = Handle.open(path, options=Options(**current_options))
+                acquired(handle, attempt_context)
             attempt_context['record_id'] = handle.instance.record_id
             try:
-                actual = handle.execute_python(guarded_source(
-                    'import ida_kernwin\nresult = ida_kernwin.get_kernel_version()',
-                    attempt_context), timeout=remaining(deadline))
+                code = guarded_source('import ida_kernwin\nresult = ida_kernwin.get_kernel_version()', attempt_context)
+                if custodian:
+                    custodian.execute('guard', guarded_source('pass', attempt_context))
+                    custodian.execute('root', guarded_source('pass', attempt_context))
+                    actual = custodian.execute('runtime', code)
+                else:
+                    actual = handle.execute_python(code, timeout=remaining(deadline))
             except Exception as exc:
                 try:
-                    proof = failure_state(handle, deadline)
+                    if custodian:
+                        proof = custodian.execute('root',
+                            "import sys\n_g=sys.modules.get('_ida_cli_save_guard_v1')\n"
+                            "result = _g.close_status() if _g else {'close_safe': False, 'initial': False}")['result']
+                    else:
+                        proof = failure_state(handle, deadline)
                 except Exception as diagnostic:
                     # An already disconnected client cannot run the fresh
                     # guard query. It is never permission to reopen the owner.
@@ -264,12 +299,14 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                 observed, observation_error = None, None
                 if snapshot and proof['initial']:
                     try:
-                        observed = snapshot.failed(number)
+                        with custodian.file_gate() if custodian else nullcontext():
+                            observed = snapshot.failed(number)
                     except Exception as error:
                         observation_error = error
                 # Snapshot collection can take time or fail. Its earlier proof
                 # classifies the failure; only a new owner sample permits close.
-                outcome = release_handle(handle, deadline, owner_required=proof['initial'])
+                outcome = (custodian.release_for_retry() if custodian else
+                           release_handle(handle, deadline, owner_required=proof['initial']))
                 if outcome is None or (proof['initial'] and not outcome['release_acknowledged']):
                     raise RuntimeError('open cleanup release unconfirmed; snapshot/scene retained') from exc
                 released(handle)
@@ -279,13 +316,17 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                     raise RuntimeError('open runtime check failed; no initial Root retry: ' + str(exc)
                                        + '; ' + (outcome['save_guard_error'] or '')) from exc
                 if snapshot:
-                    snapshot.rollback(observed)
+                    with custodian.file_gate() if custodian else nullcontext():
+                        snapshot.rollback(observed)
                 if number == 3:
                     raise RuntimeError('Root Node initial open failed after 3 attempts; '
                                        'original file retained; recovery snapshot/scene retained') from exc
+                if custodian:
+                    custodian.next_retry()
                 continue
             if snapshot:
-                snapshot.complete()
+                with custodian.file_gate() if custodian else nullcontext():
+                    snapshot.complete()
             if number > 1:
                 logging.getLogger('ida_cli.open').warning(
                     'Root Node automatic reopen succeeded after %d attempts: %s', number, handle.instance.record_id)

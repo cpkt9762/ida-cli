@@ -459,7 +459,7 @@ impl Tools {
             ));
         }
         let gate = self.path_gate(&canonical);
-        let _path = preparation.wait(async { Ok(gate.lock().await) }).await?;
+        let mut path_guard = Some(preparation.wait(async { Ok(gate.lock().await) }).await?);
         let cache_guard =
             super::nexus_bridge::cache_lock::acquire(&crate::idb_store::idb_root(), &preparation)
                 .await?;
@@ -531,14 +531,35 @@ impl Tools {
             transferred: false,
             cache_guard: cache_guard.clone(),
             uncertain_cache: self.uncertain_cache.clone(),
-            open_guard,
+            open_guard: Some(open_guard),
             content_guard: prepared.content_guard.clone(),
         };
         let mut cancelled = false;
+        let mut registered = false;
         loop {
-            let (_, failure) = bridge
+            let (acquired, failure) = bridge
                 .endpoint()
                 .transition(|s, _| s.open_progress(&client, &identity))?;
+            if !registered {
+                if let Some(lease) = acquired {
+                    let phase = endpoint
+                        .transition(|s, _| s.status(&lease.client_id, &lease))?
+                        .phase;
+                    // Reliable custody already protects this physical IDB. The
+                    // index must be committed while content EX is held; analysis
+                    // must not keep unrelated callers behind these open locks.
+                    if matches!(phase, SessionPhase::Preparing | SessionPhase::Active)
+                        && failure.is_none()
+                    {
+                        prepared.publish_verified_input(&preparation).await?;
+                    }
+                    ownership.open_guard.take();
+                    ownership.content_guard.take();
+                    prepared.content_guard.take();
+                    path_guard.take();
+                    registered = true;
+                }
+            }
             if let Some(error) = failure {
                 return Err(error.into());
             }
@@ -575,7 +596,9 @@ impl Tools {
                             if cancelled || preparation.check().is_err() {
                                 return Err(diagnostic("open cancelled/expired; acquired lease transferred to bridge cleanup"));
                             }
-                            prepared.publish_verified_input(&preparation).await?;
+                            if !registered {
+                                prepared.publish_verified_input(&preparation).await?;
+                            }
                             preparation.check()?;
                             let handle = id();
                             let token = id();
@@ -1410,7 +1433,7 @@ async fn release(
 // Installed before awaiting an opening outcome. Every error/deadline/drop
 // transfers cleanup to the bounded N1/bridge lease registry, including late opens.
 struct OpeningGuard {
-    open_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
+    open_guard: Option<Arc<super::nexus_bridge::cache_lock::CacheGuard>>,
     bridge: Arc<super::nexus_bridge::NexusBridge>,
     identity: OpenIdentity,
     transferred: bool,
@@ -1422,11 +1445,16 @@ struct RetainedOpen {
     bridge: Arc<super::nexus_bridge::NexusBridge>,
     identity: OpenIdentity,
     _cache_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
-    _open_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
+    _open_guard: Option<Arc<super::nexus_bridge::cache_lock::CacheGuard>>,
     _content_guard: Option<Arc<super::nexus_bridge::cache_lock::CacheGuard>>,
 }
 impl RetainedOpen {
     fn cleanup_confirmed(&self) -> bool {
+        let (pending_resources, retired_resources) =
+            self.bridge.open_resource_obligations(&self.identity);
+        if pending_resources {
+            return false;
+        }
         self.bridge.endpoint().transition(|sessions, _| {
             let Ok((lease, failure)) =
                 sessions.open_progress(&self.identity.client_id, &self.identity)
@@ -1441,7 +1469,8 @@ impl RetainedOpen {
             // N1 wraps every uncertain delivery in UnknownOutcome. A failure
             // without a lease is releasable only when N1 confirms it was not sent
             // or the bridge confirmed acquisition failed.
-            failure.is_some_and(|error| error.code != NexusErrorCode::UnknownOutcome)
+            retired_resources
+                || failure.is_some_and(|error| error.code != NexusErrorCode::UnknownOutcome)
         })
     }
 }

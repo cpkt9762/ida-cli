@@ -13,7 +13,15 @@ import threading
 import time
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+if '__verified_source__' not in globals():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "custody"))
+
+
+def module_source(name):
+    if '__verified_source__' in globals():
+        return sys._ida_cli_verified_sources[name]
+    return Path(__file__).with_name(name).read_text(encoding='utf-8')
 from tools import METHODS as TOOL_METHODS
 from type_tools import TYPE_METHODS
 from edit_tools import EDIT_METHODS, WRITE_METHODS
@@ -27,8 +35,10 @@ from open_recovery import open_checked
 from config import ida_cli_home, startup_paths
 from protocol import SDK_FILES, admission
 from lifetime import LifetimeListener
+from acquisition import Custodian
+from bridge_observer import BackupSources, INCARNATION as OBSERVER_INCARNATION
 
-GUARD_SOURCE = Path(__file__).with_name('save_guard.py').read_text(encoding='utf-8')
+GUARD_SOURCE = module_source('save_guard.py')
 
 
 def guarded_source(code, context, refuse=True):
@@ -53,21 +63,21 @@ METHODS = {"execute_python": "may_write", "database_info": "read_only",
            "rename_address": "may_write", "read_name": "read_only"}
 METHODS.update({method: "may_write" if method in WRITE_METHODS else "read_only"
                 for method in TOOL_METHODS})
-TOOL_SOURCE = "\n".join(Path(__file__).with_name(name).read_text(encoding="utf-8")
+TOOL_SOURCE = "\n".join(module_source(name)
                         for name in ("type_tools.py", "edit_tools.py", "analysis_tools.py", "struct_tools.py", "query_tools.py", "search_tools.py", "tools.py"))
 # Both ordinary and sliced execution use this checked installation. The source
 # is evaluated anew by the current owner for each request, including reconnects.
-METADATA_SOURCE = Path(__file__).with_name("metadata.py").read_text(encoding="utf-8")
+METADATA_SOURCE = module_source("metadata.py")
 TOOL_SOURCE += ("\n_tools_metadata = {}\n"
                 + f"exec({METADATA_SOURCE!r}, _tools_metadata)\n"
                 + "install_tools(_tools_metadata)\n")
-RELEASE_SOURCE = Path(__file__).with_name('lifecycle.py').read_text(encoding='utf-8')
+RELEASE_SOURCE = module_source('lifecycle.py')
 SLICE_SOURCE = ("import sys, types\n"
     "if '_ida_cli_release_protocol_v1' not in sys.modules:\n"
     "    _release_module = types.ModuleType('_ida_cli_release_protocol_v1')\n"
     f"    exec({RELEASE_SOURCE!r}, _release_module.__dict__)\n"
     "    sys.modules['_ida_cli_release_protocol_v1'] = _release_module\n"
-    + Path(__file__).with_name("slices.py").read_text(encoding="utf-8"))
+    + module_source("slices.py"))
 SLICE_METHODS = {"batch_decompile", "search_pseudocode", "run_auto_analysis", "batch_rename", "_n5_cleanup"}
 
 
@@ -106,7 +116,8 @@ def readiness():
         return {"ready": False, "error": error("runtime_unavailable", exc)}
     return {"ready": True, "capabilities": {"runtime": {
         "ida": ida, "python": list(sys.version_info[:3]), "nexus": [0, 13, 4], "domain": [0, 5, 1]},
-        "methods": METHODS}, "client_cancel_patch": True, "client_sdk_modules": sdk_modules, "protocol": protocol, "paths": paths}
+        "methods": METHODS}, "client_cancel_patch": True, "client_sdk_modules": sdk_modules, "protocol": protocol, "paths": paths, "custody_protocol": 1,
+        "observer_incarnation":OBSERVER_INCARNATION}
 
 
 def validate_response_depth(message):
@@ -187,6 +198,12 @@ class Bridge(LifetimeListener):
         self.verification_probes = {}
         self.cleanup_handles = {}
         self.grants = {}
+        self.custody_requests = {}
+        self.custodians = {}
+        self.acquisitions = {}
+        self.backup_sources = BackupSources(self, capacity)
+        self.helper_configuration = None
+        self.helper_ready = threading.Event()
         self.generations = {}
         self.unknown = {}
         self.executing = {}
@@ -227,6 +244,57 @@ class Bridge(LifetimeListener):
 
     def receive(self, channel, message):
         self.initialized.wait()
+        if 'owner_backup_query' in message:
+            self.backup_sources.query(message['owner_backup_query'])
+            return
+        if 'owner_proof_custody' in message:
+            receipt = message['owner_proof_custody']
+            owner = receipt['owner']
+            proof = receipt['proof']['record']
+            if proof['owner'] != owner or proof['evidence_type'] != 'public_owner_lifetime':
+                raise ValueError('ProtocolMismatch: owner proof custody')
+            closed = self.backup_sources.close(receipt)
+            self.control.send({'event':'owner_proof_ack', 'owner':owner, 'watch':receipt['watch'],
+                               'sha256':receipt['proof']['sha256'], 'consumer':closed})
+            return
+        if 'custody_retired' in message:
+            receipt = message['custody_retired']
+            with self.lock:
+                lease = receipt.get('lease')
+                custody = self.custodians.get(lease['lease_id']) if lease else None
+                if custody is not None:
+                    if custody.lease != receipt['lease'] or custody.watch != receipt['watch']:
+                        raise ValueError('ProtocolMismatch: retired custody identity')
+                    self.custodians.pop(receipt['lease']['lease_id'])
+                    held = self.handles.get(receipt['lease']['lease_id'])
+                    if held is not None and held[0] == receipt['lease']:
+                        self.handles.pop(receipt['lease']['lease_id'])
+                        self.metadata_contexts.pop(receipt['lease']['lease_id'], None)
+                    parent = custody.acquisition['parent']['operation_id']
+                    if (self.acquisitions.get(parent) is custody and custody.acquisition == receipt['acquisition']
+                            and not custody.originals):
+                        self.acquisitions.pop(parent)
+                elif lease is None:
+                    parent = receipt['acquisition']['parent']['operation_id']
+                    custody = self.acquisitions.get(parent)
+                    if custody is not None and not custody.originals and custody.handle is None and not custody.running:
+                        self.acquisitions.pop(parent)
+            self.control.send({'event':'custody_retired_ack', 'receipt':receipt})
+            self.backup_sources.retire(receipt['watch'])
+            return
+        if 'helper_configuration' in message:
+            if self.helper_configuration is not None and self.helper_configuration != message['helper_configuration']:
+                raise ValueError('ProtocolMismatch: helper configuration changed')
+            self.helper_configuration = message['helper_configuration']
+            self.helper_ready.set()
+            return
+        if 'custody_reply' in message:
+            with self.lock:
+                pending = self.custody_requests.get(message['custody_reply'])
+                if pending is not None:
+                    pending[1].append(message)
+                    pending[0].set()
+            return
         if "grant" in message:
             with self.lock:
                 holder = self.grants.get(message["sequence"])
@@ -244,6 +312,9 @@ class Bridge(LifetimeListener):
                 verifications = list(self.verification_probes)
             channel.send({"event": "local_status", "id": message["local_status"],
                           "held": held, "owners": owners, "verification_probes": verifications,
+                          "acquisitions":len(self.acquisitions), "custodians":len(self.custodians),
+                          "original_instances":len(self.backup_sources.items),
+                          "backup_closures":len(getattr(self.backup_sources, 'closed', {})),
                           "lifetime_listener_healthy": self.lifetime_healthy})
             return
         frame = message
@@ -283,6 +354,27 @@ class Bridge(LifetimeListener):
         except Exception as exc:
             from ida_nexus import NexusConnectionError, RemoteError
             details = {}
+            no_acquisition = False
+            if frame['payload']['command'] == 'open':
+                with self.lock:
+                    custody = self.acquisitions.get(frame['payload']['identity']['operation_id'])
+                if custody is not None and custody.handle is not None:
+                    try:
+                        custody.fail(exc)
+                    except Exception as failure:
+                        # A missing IPC ACK cannot authorize local detach or
+                        # erase the same handle. Expose both independent errors.
+                        channel.send({'event':'uncertain', 'attempt':attempt,
+                            'error':error('unknown_outcome', f'{type(exc).__name__}: {exc}; custody failure: {failure}')})
+                    return
+                if custody is not None:
+                    no_acquisition = custody.known_no_acquisition()
+                    try:
+                        custody.fail(exc)
+                    except Exception as failure:
+                        channel.send({'event':'uncertain', 'attempt':attempt,
+                            'error':error('unknown_outcome', f'{type(exc).__name__}: {exc}; observation cleanup: {failure}')})
+                        return
             if frame["payload"]["command"] == "open":
                 command = frame["payload"]
                 details['diagnostics'] = database_diagnostics(
@@ -301,10 +393,10 @@ class Bridge(LifetimeListener):
             elif isinstance(exc, NexusConnectionError):
                 if frame["payload"]["command"] == "execute":
                     self.mark_unknown(frame["payload"]["identity"]["operation_id"], attempt)
-                channel.send({"event": "uncertain", "attempt": attempt,
+                channel.send({"event": "failed" if no_acquisition else "uncertain", "attempt": attempt,
                               "error": error("disconnected", str(exc)), **details})
             else:
-                uncertain = public_started[0]
+                uncertain = public_started[0] and not no_acquisition
                 if uncertain and frame["payload"]["command"] == "execute":
                     self.mark_unknown(frame["payload"]["identity"]["operation_id"], attempt)
                 channel.send({"event": "uncertain" if uncertain else "failed", "attempt": attempt,
@@ -312,6 +404,13 @@ class Bridge(LifetimeListener):
         finally:
             with self.lock:
                 self.grants.pop(key, None)
+                if frame['payload']['command'] == 'open' and frame['payload']['identity'].get('operation_id') is not None:
+                    parent = frame['payload']['identity']['operation_id']
+                    custody = self.acquisitions.get(parent)
+                    if custody is not None:
+                        custody.running = False
+                        if custody.handle is None and not custody.originals and not custody.launches:
+                            self.acquisitions.pop(parent)
                 if frame["payload"]["command"] == "execute":
                     operation_id = frame["payload"]["identity"]["operation_id"]
                     if (operation_id not in self.unknown
@@ -415,51 +514,37 @@ class Bridge(LifetimeListener):
                     self.handles.pop(lease['lease_id'], None)
                     self.metadata_contexts.pop(lease['lease_id'], None)
 
+            custodian = Custodian(self, attempt, command, deadline, track_open)
+            with self.lock:
+                self.acquisitions[command['identity']['operation_id']] = custodian
             if attach:
                 instances = [x.instance for x in discover_databases() if x.instance.record_id == attach]
                 if len(instances) != 1:
                     raise ValueError("attach instance is not available")
-                public_started[0] = True
-                handle = self.Handle.attach(instances[0], idle_timeout=options.get("idle_timeout"))
-                track_open(handle, metadata_context)
+                with custodian.gate(instances[0].idb_path):
+                    public_started[0] = True
+                    handle = custodian.obtain_attach(self.Handle, instances[0], options, metadata_context)
+                check_context = dict(metadata_context, method='open', lease=lease_box[0])
+                custodian.execute('guard', guarded_source('pass', check_context))
+                custodian.execute('root', guarded_source('pass', check_context))
+                actual = custodian.execute('runtime', guarded_source(
+                    "import ida_kernwin\nresult = ida_kernwin.get_kernel_version()", check_context))
             else:
                 handle, actual, _ = open_checked(self.Handle, self.Options, command['path'], options,
                     deadline, guarded_source, dict(metadata_context, method='open'),
-                    track_open, release_open, lambda: public_started.__setitem__(0, True))
+                    track_open, release_open, lambda: public_started.__setitem__(0, True),
+                    custodian=custodian)
             instance, lease = handle.instance, lease_box[0]
-            # Verify actual owner runtime without importing IDA in this process.
-            try:
-                if attach:
-                    actual = handle.execute_python(guarded_source(
-                        "import ida_kernwin\nresult = ida_kernwin.get_kernel_version()",
-                        dict(metadata_context, method='open', lease=lease_box[0])),
-                        timeout=max(0.001, deadline-time.monotonic()))
-                if wait_analysis:
-                    handle.wait_autoanalysis(timeout=max(0.001, deadline - time.monotonic()))
-                    handle.execute_python(guarded_source('pass', dict(metadata_context,
-                        method='open-after-analysis', lease=lease,
-                        operation_id=command['identity'].get('operation_id'), record_id=instance.record_id)),
-                        timeout=max(0.001, deadline - time.monotonic()))
-            except Exception as exc:
-                outcome = release_handle(handle, deadline)
-                if outcome is None:
-                    raise TimeoutError("open runtime check cleanup unconfirmed; lease retained") from exc
-                with self.lock:
-                    self.handles.pop(lease["lease_id"], None)
-                    self.metadata_contexts.pop(lease["lease_id"], None)
-                # Close confirmed this unannounced lease is gone. If close
-                # itself fails, run() retains the uncertain open outcome.
-                channel.send({"event": "failed", "attempt": attempt,
-                              "error": error("disconnected", f"open runtime check failed: {exc}; {outcome['save_guard_error'] or ''}"),
-                              "save_guard_error": outcome['save_guard_error'],
-                              "diagnostics": database_diagnostics(instance.idb_path)})
-                return
+            if wait_analysis:
+                custodian.rpc('analysis', lambda operation_id, timeout:
+                    handle.wait_autoanalysis(timeout=timeout, operation_id=operation_id))
+                custodian.execute('root', guarded_source('pass', dict(metadata_context,
+                    method='open-after-analysis', lease=lease,
+                    operation_id=command['identity'].get('operation_id'), record_id=instance.record_id)))
             caps = readiness()["capabilities"]
             ida = [int(x) for x in actual["result"].split(".")[:3]]
             caps["runtime"]["ida"] = ida + [0] * (3 - len(ida))
-            channel.send({"event": "opened", "attempt": attempt, "lease": lease,
-                          "capabilities": caps, "pid": instance.pid, "idb_path": instance.idb_path,
-                          "recovery": handle.recovery})
+            custodian.ready(caps, wait_analysis, handle.recovery)
             return
         lease = command.get("lease") or command["identity"]["lease"]
         with self.lock:
@@ -561,8 +646,13 @@ class Bridge(LifetimeListener):
             def check_primary():
                 nonlocal cleanup_handle
                 if handle.connected:
-                    checked = handle.execute_python(cleanup_code,
-                        timeout=max(.001, deadline-time.monotonic()))
+                    custodian = self.custodians.get(lease['lease_id'])
+                    if custodian is not None:
+                        custodian.cleanup()
+                        checked = custodian.execute('cleanup', cleanup_code, cleanup=True)
+                    else:
+                        checked = handle.execute_python(cleanup_code,
+                            timeout=max(.001, deadline-time.monotonic()))
                 else:
                     if cleanup_handle is None:
                         instances = [item.instance for item in discover_databases()
@@ -614,6 +704,10 @@ class Bridge(LifetimeListener):
                 self.metadata_contexts.pop(lease["lease_id"], None)
             channel.send({"event": "released", "attempt": attempt, "outcome": outcome,
                           "save_guard_error": outcome["save_guard_error"]})
+            custodian = self.custodians.get(lease['lease_id'])
+            if custodian is not None:
+                custodian.release_outcome = outcome
+                custodian.release_event.set()
         elif kind == "shutdown":
             public_started[0] = True
             handle.execute_python(guarded_source('pass',
@@ -736,6 +830,11 @@ class Bridge(LifetimeListener):
                 print(f'auxiliary lease retained; no default close: {type(exc).__name__}: {exc}', file=sys.stderr)
         for _lease, handle in handles:
             try:
+                if _lease['lease_id'] in self.custodians:
+                    # Once control IPC is gone there is no N1 authority for a
+                    # new guard/cleanup RPC. Preserve the durable helper watch;
+                    # process/transport exit is not a resource-stop proof.
+                    raise RuntimeError('custody cleanup pending without N1 grant; independent helper and target responsibility retained')
                 outcome = release_handle(handle, time.monotonic()+5)
                 if outcome is None:
                     raise RuntimeError('lease release unconfirmed; exact handle retained')

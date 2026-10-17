@@ -1135,3 +1135,289 @@ fn n5_f2_superseded_attempt_is_exact_and_available_at_dispatch() {
         .unwrap();
     assert!(rig.sessions.delivery_superseded(&old));
 }
+
+#[test]
+fn r3a_public_lifetime_before_detach_terminal_preserves_exact_ack() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("r3a-proof-first", "r3a-proof-first-owner", 1);
+    rig.sessions
+        .release(&lease.client_id, &lease, &mut rig.backend)
+        .expect("issue one release");
+    let delivery = rig
+        .sessions
+        .status(&lease.client_id, &lease)
+        .expect("release status")
+        .control_delivery
+        .expect("retained release delivery");
+    rig.sessions
+        .public_owner_lifetime(&lease)
+        .expect("exact public lifetime proof");
+    let after_proof = rig
+        .sessions
+        .status(&lease.client_id, &lease)
+        .expect("proof status");
+    assert_eq!(after_proof.phase, SessionPhase::Released);
+    assert_eq!(
+        after_proof
+            .control_delivery
+            .expect("proof does not synthesize ACK")
+            .state,
+        delivery.state
+    );
+    assert!(rig
+        .sessions
+        .released(&delivery.attempt)
+        .expect("late exact ACK retained"));
+    assert_eq!(
+        rig.sessions
+            .status(&lease.client_id, &lease)
+            .expect("final status")
+            .control_delivery
+            .expect("original delivery retained")
+            .state,
+        DeliveryState::Confirmed
+    );
+    assert!(!rig
+        .sessions
+        .released(&delivery.attempt)
+        .expect("duplicate terminal is idempotent"));
+}
+
+#[test]
+fn r3a_cancel_before_custody_never_grants_preparation() {
+    let mut rig = Rig::new();
+    let (parent, lease) = rig.begin_open("r3a-cancel", "owner-r3a", 1, 120);
+    rig.sessions
+        .cancel_open(&lease.client_id, &parent)
+        .expect("cancel pending parent");
+    let acquisition = AcquisitionId {
+        parent,
+        purpose: AcquisitionPurpose::Final,
+        ordinal: 1,
+    };
+    let decision = rig
+        .sessions
+        .acquired(&acquisition, lease.clone(), true)
+        .expect("retain late handle");
+    assert_eq!(decision.disposition, CustodyDisposition::CleanupOnly);
+    assert_eq!(
+        rig.sessions.status(&lease.client_id, &lease).unwrap().phase,
+        SessionPhase::ReleaseRequired
+    );
+    assert_eq!(
+        rig.sessions
+            .acquired(&acquisition, lease.clone(), true)
+            .unwrap(),
+        decision
+    );
+    let identity = OperationIdentity {
+        task_id: None,
+        request_id: RequestId::new("r3a-rpc").unwrap(),
+        operation_id: OperationId::new("r3a-rpc").unwrap(),
+        lease: lease.clone(),
+    };
+    assert!(rig
+        .sessions
+        .internal_grant(
+            &acquisition,
+            identity,
+            InternalPurpose::Runtime,
+            decision.grant_epoch
+        )
+        .is_err());
+    assert_eq!(
+        rig.backend.business.len(),
+        1,
+        "only outer open was enqueued"
+    );
+}
+
+#[test]
+fn r3a_preparing_denies_user_execute_and_cancel_revokes_epoch() {
+    let mut rig = Rig::new();
+    let (parent, lease) = rig.begin_open("r3a-epoch", "owner-r3a", 1, 120);
+    let acquisition = AcquisitionId {
+        parent: parent.clone(),
+        purpose: AcquisitionPurpose::Final,
+        ordinal: 1,
+    };
+    let decision = rig
+        .sessions
+        .acquired(&acquisition, lease.clone(), true)
+        .unwrap();
+    assert_eq!(
+        rig.sessions.status(&lease.client_id, &lease).unwrap().phase,
+        SessionPhase::Preparing
+    );
+    let request = accepted(&rig.clock, "r3a-user", "list_functions", json!({}));
+    assert!(rig
+        .sessions
+        .queue(
+            &lease.client_id,
+            &lease,
+            request,
+            OperationId::new("r3a-user").unwrap()
+        )
+        .is_err());
+    let identity = OperationIdentity {
+        task_id: None,
+        request_id: RequestId::new("r3a-running").unwrap(),
+        operation_id: OperationId::new("r3a-running").unwrap(),
+        lease: lease.clone(),
+    };
+    let (attempt, _) = rig
+        .sessions
+        .internal_grant(
+            &acquisition,
+            identity.clone(),
+            InternalPurpose::Runtime,
+            decision.grant_epoch,
+        )
+        .unwrap();
+    rig.sessions.cancel_open(&lease.client_id, &parent).unwrap();
+    let revoked = rig.sessions.custody_decision(&lease).unwrap();
+    assert_eq!(revoked.disposition, CustodyDisposition::CleanupOnly);
+    assert!(revoked.grant_epoch > decision.grant_epoch);
+    rig.sessions
+        .delivery_failed(
+            &attempt,
+            DispatchFailure::Uncertain(NexusError::new(NexusErrorCode::Disconnected, "RPC EOF")),
+        )
+        .unwrap();
+    let stopped = rig
+        .sessions
+        .operation_status(&lease.client_id, &identity)
+        .unwrap();
+    assert_eq!(stopped.status, OperationStatus::UnknownOutcome);
+    assert!(!stopped.execution_stopped);
+    assert!(
+        rig.sessions
+            .release(&lease.client_id, &lease, &mut rig.backend)
+            .is_err(),
+        "EOF does not stop RPC"
+    );
+    rig.sessions
+        .complete(&identity, Completion::Success(json!("9.5")))
+        .unwrap();
+    let late = rig
+        .sessions
+        .operation_status(&lease.client_id, &identity)
+        .unwrap();
+    assert_eq!(late.status, OperationStatus::UnknownOutcome);
+    assert!(late.execution_stopped);
+    assert!(
+        rig.sessions
+            .prepared(&acquisition, &lease, capabilities(), false)
+            .is_err(),
+        "late result cannot revive parent"
+    );
+}
+
+#[test]
+fn r3a_custody_does_not_complete_open_and_ready_requires_exact_rpc_facts() {
+    let mut rig = Rig::new();
+    let (parent, lease) = rig.begin_open("r3a-ready", "r3a-owner", 1, 120);
+    let outer = rig
+        .backend
+        .attempts
+        .last()
+        .expect("outer open attempt")
+        .clone();
+    let acquisition = AcquisitionId {
+        parent: parent.clone(),
+        purpose: AcquisitionPurpose::Final,
+        ordinal: 1,
+    };
+    let decision = rig
+        .sessions
+        .acquired(&acquisition, lease.clone(), true)
+        .expect("early custody");
+    assert_ne!(
+        rig.sessions
+            .delivery_status(&lease.client_id, &outer)
+            .unwrap()
+            .state,
+        DeliveryState::Confirmed,
+        "physical custody cannot finish the caller's open"
+    );
+    assert!(
+        rig.sessions
+            .prepared(&acquisition, &lease, capabilities(), false)
+            .is_err(),
+        "no prepared RPC facts"
+    );
+    for (ordinal, purpose) in [
+        InternalPurpose::Guard,
+        InternalPurpose::Runtime,
+        InternalPurpose::Root,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("r3a-prep-{ordinal}");
+        let identity = OperationIdentity {
+            task_id: None,
+            request_id: RequestId::new(&name).unwrap(),
+            operation_id: OperationId::new(&name).unwrap(),
+            lease: lease.clone(),
+        };
+        rig.sessions
+            .internal_grant(
+                &acquisition,
+                identity.clone(),
+                purpose,
+                decision.grant_epoch,
+            )
+            .expect("exact internal grant");
+        assert!(
+            rig.sessions
+                .internal_grant(
+                    &acquisition,
+                    identity.clone(),
+                    purpose,
+                    decision.grant_epoch
+                )
+                .is_err(),
+            "replayed request cannot start the public RPC twice"
+        );
+        assert!(
+            rig.sessions
+                .prepared(&acquisition, &lease, capabilities(), false)
+                .is_err(),
+            "running RPC has no stopped evidence"
+        );
+        rig.sessions
+            .complete(&identity, Completion::Success(json!({"ok":true})))
+            .expect("real RPC return");
+    }
+    let mut forged = acquisition.clone();
+    forged.parent.request_id = RequestId::new("forged-prepared").unwrap();
+    assert!(rig
+        .sessions
+        .prepared(&forged, &lease, capabilities(), false)
+        .is_err());
+    assert!(
+        rig.sessions
+            .prepared(&acquisition, &lease, capabilities(), true)
+            .is_err(),
+        "bridge cannot replace parent requirements"
+    );
+    rig.sessions
+        .prepared(&acquisition, &lease, capabilities(), false)
+        .expect("all required operations succeeded and stopped");
+    assert_eq!(
+        rig.sessions.status(&lease.client_id, &lease).unwrap().phase,
+        SessionPhase::Active
+    );
+    assert_eq!(
+        rig.sessions
+            .delivery_status(&lease.client_id, &outer)
+            .unwrap()
+            .state,
+        DeliveryState::Confirmed
+    );
+    assert!(
+        rig.sessions.cancel_open(&lease.client_id, &parent).is_err(),
+        "Active uses session lifecycle"
+    );
+}

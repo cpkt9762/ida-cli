@@ -35,7 +35,7 @@ rmcp = { path = "3rd-github/rust-sdk/crates/rmcp", features = ["server", "transp
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal", "process", "io-util", "time"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 schemars = "1.2"
 anyhow = "1"
 thiserror = "2"
@@ -50,6 +50,7 @@ bytes = "1"
 http-body = "1"
 http-body-util = "0.1"
 tower-service = "0.3"
+sha2 = "=0.10.9"
 
 [build-dependencies]
 idalib-build = { path = "3rd-github/idalib/idalib-build" }
@@ -60,4 +61,9 @@ rstest = "0.25"
 [[test]]
 name = "nexus_r5"
 path = "tests/nexus_r5.rs"
+required-features = ["nexus-test-support"]
+
+[[test]]
+name = "nexus_r3a"
+path = "tests/nexus_r3a.rs"
 required-features = ["nexus-test-support"]

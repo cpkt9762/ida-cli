@@ -11,11 +11,13 @@ pub(super) struct Operation {
 
 pub(super) struct Opening {
     identity: OpenIdentity,
-    request: AcceptedRequest,
+    pub(super) request: AcceptedRequest,
     pub(super) uncertain: bool,
-    cancel_requested: bool,
+    pub(super) cancel_requested: bool,
     pub(super) failure: Option<NexusError>,
-    acquired: Option<SessionLease>,
+    pub(super) acquired: Option<SessionLease>,
+    pub(super) acquisition_ordinal: u64,
+    pub(super) wait_analysis: bool,
 }
 
 /// Pure local coordinator. All mutations are serialized by `&mut self`.
@@ -23,6 +25,8 @@ pub(super) struct Opening {
 /// Terminal IDs are retained for this coordinator's lifetime; reaching capacity
 /// returns Busy rather than forgetting tombstones or replaying an old request.
 pub struct NexusSessions<C> {
+    pub(super) custodies: HashMap<LeaseId, super::custody::Custody>,
+    pub(super) internal_operations: HashMap<OperationId, (AcquisitionId, InternalPurpose, u64)>,
     pub(super) clock: C,
     capabilities: Result<NexusCapabilities, NexusError>,
     capacity: usize,
@@ -35,6 +39,7 @@ pub struct NexusSessions<C> {
     pub(super) openings: HashMap<OperationId, Opening>,
     requests: HashSet<RequestId>,
     used_operations: HashSet<OperationId>,
+    internal_ids: HashSet<OperationId>,
 }
 
 impl<C: Clock> NexusSessions<C> {
@@ -46,6 +51,8 @@ impl<C: Clock> NexusSessions<C> {
         capacity: usize,
     ) -> Self {
         Self {
+            custodies: HashMap::new(),
+            internal_operations: HashMap::new(),
             clock,
             capabilities,
             capacity,
@@ -58,6 +65,7 @@ impl<C: Clock> NexusSessions<C> {
             openings: HashMap::new(),
             requests: HashSet::new(),
             used_operations: HashSet::new(),
+            internal_ids: HashSet::new(),
         }
     }
 
@@ -78,7 +86,12 @@ impl<C: Clock> NexusSessions<C> {
                 "request/operation identity cannot be reused",
             ));
         }
-        if self.used_operations.len() >= self.capacity {
+        if self
+            .used_operations
+            .len()
+            .saturating_sub(self.internal_ids.len())
+            >= self.capacity
+        {
             return Err(NexusError::new(
                 NexusErrorCode::Busy,
                 "Nexus contract retention capacity reached",
@@ -86,6 +99,32 @@ impl<C: Clock> NexusSessions<C> {
         }
         self.requests.insert(request.clone());
         self.used_operations.insert(operation.clone());
+        Ok(())
+    }
+
+    pub(super) fn reserve_internal(
+        &mut self,
+        request: &RequestId,
+        operation: &OperationId,
+    ) -> Result<(), NexusError> {
+        if self.requests.contains(request) || self.used_operations.contains(operation) {
+            return Err(NexusError::new(
+                NexusErrorCode::DuplicateIdentity,
+                "internal identity cannot be reused",
+            ));
+        }
+        // Each admitted parent can retain at most three serial acquisitions,
+        // each with sixteen exact RPC IDs. This is diagnostic retention, not
+        // another public admission slot and not preallocated physical leases.
+        if self.internal_ids.len() >= self.capacity.saturating_mul(48) {
+            return Err(NexusError::new(
+                NexusErrorCode::Busy,
+                "internal diagnostic retention capacity reached",
+            ));
+        }
+        self.requests.insert(request.clone());
+        self.used_operations.insert(operation.clone());
+        self.internal_ids.insert(operation.clone());
         Ok(())
     }
 
@@ -111,6 +150,11 @@ impl<C: Clock> NexusSessions<C> {
             request_id: request.request_id.clone(),
             operation_id: spec.operation_id,
         };
+        let command_wait_analysis = spec
+            .options
+            .get("wait_analysis")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let command = SessionCommand::Open {
             identity: identity.clone(),
             path: spec.path,
@@ -127,6 +171,8 @@ impl<C: Clock> NexusSessions<C> {
                 cancel_requested: false,
                 failure: None,
                 acquired: None,
+                acquisition_ordinal: 1,
+                wait_analysis: command_wait_analysis,
             },
         );
         self.send_delivery(command, attempt, backend)?;
@@ -165,7 +211,10 @@ impl<C: Clock> NexusSessions<C> {
         }
         if let Some(lease) = lease {
             if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
-                if session.phase == SessionPhase::Active {
+                if matches!(
+                    session.phase,
+                    SessionPhase::Active | SessionPhase::Preparing
+                ) {
                     session.phase = SessionPhase::ReleaseRequired;
                 }
             }
@@ -181,6 +230,16 @@ impl<C: Clock> NexusSessions<C> {
         identity: &OpenIdentity,
         lease: SessionLease,
         capabilities: NexusCapabilities,
+    ) -> Result<OpenDisposition, NexusError> {
+        self.register_acquisition(identity, lease, capabilities, true)
+    }
+
+    pub(super) fn register_acquisition(
+        &mut self,
+        identity: &OpenIdentity,
+        lease: SessionLease,
+        capabilities: NexusCapabilities,
+        complete: bool,
     ) -> Result<OpenDisposition, NexusError> {
         let opening = self.openings.get(&identity.operation_id).ok_or_else(|| {
             NexusError::new(NexusErrorCode::InvalidIdentity, "unknown open operation")
@@ -231,9 +290,11 @@ impl<C: Clock> NexusSessions<C> {
         if let Some(opening) = self.openings.get_mut(&identity.operation_id) {
             opening.acquired = Some(lease.clone());
         }
-        self.confirm_delivery(DeliveryTarget::Open {
-            identity: identity.clone(),
-        });
+        if complete {
+            self.confirm_delivery(DeliveryTarget::Open {
+                identity: identity.clone(),
+            });
+        }
         if error.is_some() {
             if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
                 session.phase = SessionPhase::ReleaseRequired;
@@ -325,7 +386,15 @@ impl<C: Clock> NexusSessions<C> {
                 "open cancellation identity/owner mismatch",
             ));
         }
-        if opening.acquired.is_some() {
+        if opening.acquired.is_some()
+            && !opening.acquired.as_ref().is_some_and(|lease| {
+                self.custodies.contains_key(&lease.lease_id)
+                    && self
+                        .sessions
+                        .get(&lease.lease_id)
+                        .is_some_and(|s| s.phase == SessionPhase::Preparing)
+            })
+        {
             return Err(NexusError::new(
                 NexusErrorCode::InvalidTransition,
                 "open already reconciled; use the acquired session lifecycle",
@@ -615,7 +684,9 @@ impl<C: Clock> NexusSessions<C> {
         if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
             if !matches!(
                 session.phase,
-                SessionPhase::ReleaseRequested | SessionPhase::Disconnected
+                SessionPhase::ReleaseRequested
+                    | SessionPhase::Disconnected
+                    | SessionPhase::Released
             ) {
                 return Err(NexusError::new(
                     NexusErrorCode::InvalidTransition,
