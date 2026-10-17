@@ -2,6 +2,7 @@
 import logging
 from pathlib import Path
 import socket
+import stat
 
 LOG = logging.getLogger(__name__)
 
@@ -12,28 +13,66 @@ class LifetimeListener:
         self.lifetimes = {}
         self.lifetime_pending = {}
         self.lifetime_healthy = False
+        self.lifetime_endpoint = None
+        self.lifetime_inode = None
         self.lifetime_socket = self.new_lifetime_listener()
 
+    def lifetime_endpoint_identity(self):
+        entry = Path(self.lifetime_path).lstat()
+        if not stat.S_ISSOCK(entry.st_mode):
+            raise OSError('lifetime endpoint is not a socket')
+        return (entry.st_dev, entry.st_ino)
+
+    def unlink_lifetime_endpoint(self, endpoint):
+        # A pathname is only a lookup: never acquire ownership during cleanup.
+        if endpoint is None or self.lifetime_endpoint_identity() != endpoint:
+            raise OSError('lifetime endpoint replaced; unlink refused')
+        Path(self.lifetime_path).unlink()
+        self.lifetime_endpoint = None
+        self.lifetime_inode = None
+
     def new_lifetime_listener(self):
+        self.lifetime_healthy = False
         listener = socket.socket(socket.AF_UNIX)
-        bound_inode = None
+        bound_endpoint = None
         try:
             listener.bind(self.lifetime_path)
-            bound_inode = Path(self.lifetime_path).lstat().st_ino
+            # Once bind succeeded, absence is no longer an authorized rebind.
+            # If identity acquisition fails, keep a non-owned refusal sentinel.
+            self.lifetime_endpoint = ()
+            self.lifetime_inode = None
+            bound_endpoint = self.lifetime_endpoint_identity()
+            self.lifetime_endpoint = bound_endpoint
+            self.lifetime_inode = bound_endpoint[1]
             listener.listen(self.lifetime_capacity)
             listener.settimeout(.2)
-            self.lifetime_inode = Path(self.lifetime_path).lstat().st_ino
+            if self.lifetime_endpoint_identity() != bound_endpoint:
+                raise OSError('lifetime endpoint changed before publication')
             self.lifetime_healthy = True
             return listener
         except BaseException:
+            self.lifetime_healthy = False
             listener.close()
-            if bound_inode is not None:
+            if bound_endpoint is not None:
                 try:
-                    if Path(self.lifetime_path).lstat().st_ino == bound_inode:
-                        Path(self.lifetime_path).unlink()
-                except FileNotFoundError:
-                    pass
+                    self.unlink_lifetime_endpoint(bound_endpoint)
+                except OSError:
+                    # A changed/missing/unreadable path is not authority to
+                    # rebind later. Retain the original identity and refuse.
+                    LOG.exception('lifetime creation cleanup refused; endpoint retained')
             raise
+
+    def close_lifetime_listener(self):
+        self.lifetime_healthy = False
+        self.lifetime_socket.close()
+        if self.lifetime_endpoint is None:
+            return
+        try:
+            self.unlink_lifetime_endpoint(self.lifetime_endpoint)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            LOG.exception('lifetime close cleanup refused; endpoint retained')
 
     def recover_lifetime_listener(self, failed):
         with self.lock:
@@ -42,13 +81,15 @@ class LifetimeListener:
                 return False
             try:
                 if self.lifetime_socket is not failed:
-                    return True
-                if self.lifetime_inode is not None:
-                    if Path(self.lifetime_path).lstat().st_ino != self.lifetime_inode:
+                    if self.lifetime_endpoint_identity() != self.lifetime_endpoint:
+                        raise OSError('current lifetime endpoint replaced; recovery refused')
+                    self.lifetime_healthy = self.lifetime_socket.fileno() >= 0
+                    return self.lifetime_healthy
+                if self.lifetime_endpoint is not None:
+                    if self.lifetime_endpoint_identity() != self.lifetime_endpoint:
                         raise OSError('lifetime endpoint replaced; recovery refused')
                     failed.close()
-                    Path(self.lifetime_path).unlink()
-                    self.lifetime_inode = None
+                    self.unlink_lifetime_endpoint(self.lifetime_endpoint)
                 # Only our successful unlink authorizes retry on an absent path.
                 # bind still refuses a replacement created in the meantime.
                 self.lifetime_socket = self.new_lifetime_listener()
@@ -81,7 +122,8 @@ class LifetimeListener:
     def lifetime_eligible(self, lease_id, stored):
         return (stored is not None and self.handles.get(lease_id) is stored
                 and stored[1].connected and not self.stopped.is_set()
-                and not any(record.get('handle') is stored[1] and record.get('cancel_requested')
+                and not any(record.get('handle') is stored[1]
+                            and (record.get('cancel_intent') or record.get('cancel_requested'))
                             for record in self.executing.values()))
 
     def accept_lifetime(self, connection):

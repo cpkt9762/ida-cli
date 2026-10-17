@@ -504,20 +504,44 @@ class Bridge(LifetimeListener):
             else:
                 channel.send({"event": "completed", "attempt": attempt, "result": result})
         elif kind == "cancel":
-            public_started[0] = True
             operation_id = command["identity"]["operation_id"]
             with self.lock:
-                native_id = self.executing.get(operation_id, {}).get("native_id", operation_id)
-            outcome = handle.cancel_operation_outcome(native_id)
-            with self.lock:
+                if self.handles.get(lease['lease_id']) is not stored:
+                    raise ValueError('cancel lease changed before public call')
                 record = self.executing.get(operation_id)
+                if record is not None and record['handle'] is not handle:
+                    raise ValueError('cancel execution handle does not match lease')
+                native_id = record.get('native_id', operation_id) if record is not None else operation_id
                 if record is not None:
-                    record["cancel_requested"] = True
-                    if outcome["execution_stopped"]:
-                        record["stop_proof"] = outcome
+                    # Admission observes intent before the public call can
+                    # block. Proof retries remain separate until it returns.
+                    record['cancel_intent'] = True
+                    record['cancel_inflight'] = record.get('cancel_inflight', 0) + 1
+                    cancel_gate = record.setdefault('cancel_gate', threading.Lock())
+                    # Revoke already acknowledged handshakes even if this
+                    # execution record is replaced before their final check.
+                    self.lifetime_pending.pop(lease['lease_id'], None)
+            public_started[0] = True
+            try:
+                if record is None:
+                    outcome = handle.cancel_operation_outcome(native_id)
+                else:
+                    with cancel_gate:
+                        outcome = handle.cancel_operation_outcome(native_id)
+                    with self.lock:
+                        if (self.executing.get(operation_id) is record
+                                and self.handles.get(lease['lease_id']) is stored
+                                and record.get('native_id', operation_id) == native_id
+                                and outcome['execution_stopped']):
+                            record['stop_proof'] = outcome
+            finally:
+                with self.lock:
+                    if record is not None:
+                        record['cancel_inflight'] -= 1
+                        record['cancel_requested'] = True
+                self.proof_wakeup.set()
             channel.send({"event": "cancel_ack", "attempt": attempt,
                           "accepted": outcome["status"] == "cancelled", "outcome": outcome})
-            self.proof_wakeup.set()
         elif kind == "release":
             public_started[0] = True
             context = [self.identity, lease["lease_id"], lease["instance_id"], lease["generation"], self.lifetime_path]
@@ -612,7 +636,8 @@ class Bridge(LifetimeListener):
             proven = []
             with self.lock:
                 for operation_id, record in self.executing.items():
-                    if not record["unknown"] or not record["cancel_requested"] or record["proving"]:
+                    if (not record["unknown"] or not record["cancel_requested"]
+                            or record["proving"] or record.get('cancel_inflight')):
                         continue
                     # A deadline limits new public probes, never consumption of
                     # authoritative evidence already acquired on another path.
@@ -634,17 +659,29 @@ class Bridge(LifetimeListener):
                                    "error": error("cancel_pending", "stop proof deadline expired; outcome remains unknown")})
 
     def publish_stop(self, operation_id, record, outcome):
+        with self.lock:
+            if self.executing.get(operation_id) is not record:
+                return
         self.control.send({"event": "stopped", "attempt": record["attempt"],
                            "proof": "causal_cancel_not_pending", "outcome": outcome})
         with self.lock:
+            if self.executing.get(operation_id) is not record:
+                return
             if self.unknown.get(operation_id) == record["attempt"]:
                 self.unknown.pop(operation_id, None)
-            if self.executing.get(operation_id) is record:
-                self.executing.pop(operation_id, None)
+            self.executing.pop(operation_id, None)
 
     def confirm_stop(self, operation_id, record):
         try:
-            outcome = record.get("stop_proof") or record["handle"].cancel_operation_outcome(record.get("native_id", operation_id))
+            with self.lock:
+                if self.executing.get(operation_id) is not record or record.get('cancel_inflight'):
+                    return
+                cancel_gate = record.setdefault('cancel_gate', threading.Lock())
+            with cancel_gate:
+                with self.lock:
+                    if self.executing.get(operation_id) is not record or record.get('cancel_inflight'):
+                        return
+                outcome = record.get("stop_proof") or record["handle"].cancel_operation_outcome(record.get("native_id", operation_id))
             if outcome["execution_stopped"]:
                 self.publish_stop(operation_id, record, outcome)
             elif outcome["status"] == "failed":
@@ -672,13 +709,7 @@ class Bridge(LifetimeListener):
             verifications = list(self.verification_probes.items())
             auxiliary = list(self.cleanup_handles.items())
             operations = list(self.executing.items())
-        self.lifetime_socket.close()
-        # R-sock: unlink only our own socket, never a replacement at that path.
-        try:
-            if Path(self.lifetime_path).lstat().st_ino == self.lifetime_inode:
-                Path(self.lifetime_path).unlink()
-        except FileNotFoundError:
-            pass  # Parent may already have removed this exact owned endpoint.
+        self.close_lifetime_listener()
         for lease, _handle in handles:
             self.drop_lifetime(lease["lease_id"])
         for operation_id, record in operations:

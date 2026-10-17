@@ -980,6 +980,18 @@ failed rebinds and refuses a foreign endpoint. Home preserves literal `~` and
 symlink/`..` semantics. Missing HOME fallback is calculation-only; real runs use
 a private HOME. State continues to use public `get_state_dir`.
 
+R5-R1/R5-R2 regressions additionally replace real AF_UNIX paths during listen
+and timeout setup (socket, regular file, symlink and disappearance), check failed
+setup/close cleanup, and drive both handshake windows through real
+`Bridge.invoke(cancel)` with public API barriers. Bound device/inode ownership
+is immutable; healthy publication and every unlink recheck socket type and identity.
+Cancellation intent precedes the blocking API call, while proof retries wait for
+all public calls on that exact execution record. Pending, failed, exceptional and
+replaced record/handle outcomes retain old A/B sockets without installing the new
+connection, inventing stop evidence or contaminating a successor. A real proof
+scheduler scan during a second in-flight public cancel must queue no extra call;
+after return, the existing public stop-proof path remains usable.
+
 `--features nexus-test-support --test nexus_r5` contains readiness-only rejection
 cases (no grants/acquisitions; exact child/socket cleanup) and the separately
 selected real tiny IDA chain. Admission requires wire2/schema1/release1/open1,
