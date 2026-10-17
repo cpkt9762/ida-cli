@@ -931,3 +931,11 @@ R3a实现交付（2026-10-18，待编排者独立复验/review，不作阶段验
 F4的analysis主错、服务端lease与失败cleanup事实保持，N1不再丢lease，之后由真实公共proof结算；历史R0 expected-red未改写。
 R2完整两阶段/立即重开F1、R3b恢复/verification/auxiliary编排、R4全事务/维护/完整durable故障矩阵、R7及跨boot产品实验未由本轮验收。
 本轮仅交付R3a，后续仍按既定顺序由编排者派单；默认后端和native功能保留。
+
+R3a fix1定向返修（待44ad及原reviewer复审，不作验收）：独立review的五P1/六反例
+分别补公共True后的固定proof身份重试、新writer先恢复startup签收及已授权bridge备用proof、
+失败准入provisional source精确撤回、quarantine/retired业务拒绝、旧verification及辅助attach的实际target gate。
+反向producer/身份/hash仍拒绝，不伪闭合旧producer或删除未结责任。Q1真实r9跨ordinal时序及Q2真实IPC丢finish回复
+均证实为当前缺陷；最小修复保旧ordinal对象/事件与durable proof归并、持久finish接受后永久fence。
+回归入口见TESTING，红绿来源/最终字节/全部失败和精确资源审计见外部`r3a-fix1/`。
+固定SDK四patch、U1–U6及sameboot Unsupported不变；R2/R3b/R4及跨boot责任保持后续。

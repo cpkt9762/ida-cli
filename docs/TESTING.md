@@ -1178,3 +1178,35 @@ owns full two-phase release projection/immediate reopen (F1), R3b recovery and
 auxiliary orchestration, R4 full file transactions/maintenance/fault matrices,
 and R7 product acceptance. GUI/Linux/large database and cross-boot product tests
 are outside this run. Historical R0 expected-red evidence stays frozen.
+
+R3a fix1 review regressions live in `tests/nexus_bridge/test_custody_fix1.py`.
+They cover retrying one reserved proof after partial writes or lost registry
+updates, authorized helper/bridge producers, startup-owner binding, refused
+admission stability, real GC quarantine/retirement across homes and target gates
+for legacy verification and owner-side auxiliary attach. The latter evaluates
+the same verified gate sources in private modules inside the owner; it does not
+depend on the owner's installed bridge modules. Runtime RPCs release target EX.
+These are gate foundations, not full R3b verification/auxiliary custody.
+
+The production N1/bridge/helper/SDK r9 test
+`r9_late_ordinal_retirement_and_public_proof_before_release_return` uses barriers
+before/after the next ordinal and before the original release reply. It requires
+the old receipt to leave the new watch active and both ordinals to settle.
+The library test `accepted_finish_lost_ipc_reply_is_durably_fenced` uses a real
+Unix relay to discard the accepted finish response before Rust receives a byte;
+it also rejects finish with a pending parent, then tests late heartbeat and
+same-incarnation restart against the durable finish tombstone.
+
+Run both with the private environment variables above and shell timeout:
+
+```sh
+timeout 30s "$R3A_PYTHON" -B -m pytest tests/nexus_bridge/test_custody_fix1.py
+timeout 120s cargo test --locked --features nexus-test-support --test nexus_r3a r9_late_ordinal -- --test-threads=1
+timeout 30s cargo test --locked --features nexus-test-support --lib accepted_finish_lost_ipc_reply
+```
+
+The fixed `3acfefd` baseline's six safety-red cases and Q1/Q2 evidence, candidate
+installation manifests, final-byte runs and failures are recorded separately in
+`/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/r3a-fix1/`. Original review/root
+evidence remains read-only. Fix1 awaits independent review; it does not accept
+R3a or start R2. SDK hashes/patches and Unsupported same-boot status are unchanged.

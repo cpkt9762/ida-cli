@@ -1064,3 +1064,18 @@ F1 自然关闭耗时、准备 RPC 停止身份、startup 后台写入、hook �
 本轮实测入口与隔离环境见TESTING的R3a小节，原始输出/uptime/最终hash/实际case/PID锁审计在外部`r3a/`报告目录。
 最终direct与managed各128轮、五startup断桥barrier和新真实IDA9.5 Rust Tools链已实跑；F4保持原analysis失败/残留lease/cleanup失败事实后公共proof结算。
 这不是N7a验收；R2两阶段和F1、R3b完整恢复编排、R4事务/维护、R7及跨boot产品实证仍保留后续责任。
+
+### 12.2 R3a fix1返修边界（待独立复审）
+
+五P1/六安全反例的修补仍限R3a基础：真实公共True后的proof发布保原instance、固定pending身份及有界退避；
+精确已提交事实可重用，未知内容/身份冲突继续保场阻断。新writer先按原launch/watch/epoch/acquisition/CoordKey
+消费授权StartupOwnerSubscribed，再按持久helper或BridgeSubscribed授权消费公共proof，不代替旧producer闭合。
+目标/字节准入先于备用观察；确无attach且未签收的provisional source可精确撤回，未知helper交付仍保责任。
+同CoordKey/稳定锁上的quarantine/retired仅保GC/证据访问，业务在probe/open前拒绝。
+旧verification及owner内辅助attach同样过基础target gate；不提前宣称完整R3b custody编排。
+
+Q1以实际N1/SDK/生产bridge barrier确认旧ordinal迟到retirement及公共proof先于原release回复的缺陷，
+以旧ordinal对象/事件隔离和期限内归并原durable proof修补。Q2以真实IPC在helper接受finish后丢完整回复确认重连缺陷，
+以精确durable finish tombstone恢复接受事实并阻重启；仍有parent/watch时拒finish不fence。
+复现/回归命令及精确来源见TESTING和外部`r3a-fix1/`。U1–U6、固定SDK及sameboot Unsupported不变，
+R2完整两阶段、R3b/R4和跨boot仍按原顺序另行委托，返修本身不宣告R3a验收。
