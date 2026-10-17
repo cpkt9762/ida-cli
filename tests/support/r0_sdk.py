@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.environ["R0_CANDIDATE"])
-from ida_nexus import DatabaseHandle, DatabaseOpenOptions
+from ida_nexus import DatabaseHandle, DatabaseOpenOptions, NexusConnectionError
 from ida_nexus.handle import _ACQUIRED_PENDING
 import ida_nexus._resolver as resolver
 from process_identity import identity
@@ -22,6 +22,77 @@ ROOT.mkdir(parents=True, exist_ok=True)
 
 
 class SDKPrototypes(unittest.TestCase):
+    def test_observer_errors_before_acquisition_are_not_transport_retries(self):
+        rows = []
+        for stage in ("Resolved", "BeforeAttach", "AttachMayBeSent", "AttachFailed", "ReconnectResolved"):
+            for error_type in (ValueError, OSError, NexusConnectionError):
+                label = "observer-" + stage + "-" + error_type.__name__
+                with self.subTest(label=label), Boundary(ROOT / label, "reject") as boundary:
+                    events = []
+                    cause = error_type("controlled " + label)
+                    def observe(value, _entry):
+                        events.append(value)
+                        if value == stage:
+                            raise cause
+                    result = DatabaseHandle.open_outcome(str(boundary.path),
+                        options=DatabaseOpenOptions(spawn=False), observer=observe)
+                    self.assertIs(result["cause"], cause)
+                    self.assertIsNone(result["handle"])
+                    self.assertNotIn("Acquired", events)
+                    self.assertEqual(sum(x["endpoint"] == "lease_rejected" for x in boundary.requests),
+                                     1 if stage in ("AttachFailed", "ReconnectResolved") else 0)
+                    self.assertEqual(result["sdk_reconnect_used"], stage == "ReconnectResolved")
+                    rows.append({"stage":stage,"error":error_type.__name__,"events":events,
+                                 "failure_kind":result["failure_kind"]})
+        durable(ROOT / "observer-errors.json", rows)
+
+    def test_post_acquired_stage_errors_preserve_custody_without_reconnect(self):
+        rows = []
+        for stage in ("AttachSucceeded", "AttachFailed"):
+            for error_type in (ValueError, NexusConnectionError):
+                label = stage + "-" + error_type.__name__
+                with self.subTest(label=label), Boundary(ROOT / label) as boundary:
+                    events, handles = [], []
+                    notification = error_type("controlled " + label)
+                    acquisition = ValueError("controlled acquired callback failure")
+                    def observe(value, entry):
+                        events.append(value)
+                        if value == "Acquired":
+                            handles.append(entry)
+                            if stage == "AttachFailed":
+                                raise acquisition
+                        if value == stage:
+                            raise notification
+                    result = DatabaseHandle.open_outcome(str(boundary.path),
+                        options=DatabaseOpenOptions(spawn=False), observer=observe)
+                    try:
+                        self.assertEqual(len(handles), 1)
+                        self.assertEqual(sum(x["endpoint"] == "lease" for x in boundary.requests), 1)
+                        self.assertIs(result["handle"], handles[0])
+                        self.assertEqual(result["failure_kind"], "cleanup_required")
+                        self.assertIs(result["cause"], acquisition if stage == "AttachFailed" else notification)
+                        if stage == "AttachFailed":
+                            self.assertIs(result["observer_errors"][0]["cause"], notification)
+                        self.assertFalse(result["sdk_reconnect_used"])
+                        self.assertNotIn("ReconnectResolved", events)
+                        self.assertIs(_ACQUIRED_PENDING[id(handles[0])], handles[0])
+                        attempt = result["attempts"][0]
+                        self.assertEqual(attempt["failure_kind"], "cleanup_required")
+                        self.assertEqual(attempt["obligation"], "exact_handle")
+                        self.assertIs(attempt["handle"], handles[0])
+                        self.assertEqual(sum(x["endpoint"] == "/release_lease" for x in boundary.requests), 0)
+                    finally:
+                        for handle in handles:
+                            handle.close_outcome(wait_for_database=False, timeout=1)
+                    self.assertEqual(sum(x["endpoint"] == "/release_lease" for x in boundary.requests), 1)
+                    self.assertNotIn(id(handles[0]), _ACQUIRED_PENDING)
+                    rows.append({"stage":stage, "error":error_type.__name__, "accepted":1,
+                        "acquired":1, "failure_kind":result["failure_kind"],
+                        "cause":type(result["cause"]).__name__, "events":events,
+                        "observer_errors":[type(x["cause"]).__name__ for x in result["observer_errors"]],
+                        "release_calls":1})
+        durable(ROOT / "stage-errors.json", rows)
+
     def test_cleanup_without_valid_ack_never_supplies_release(self):
         rows = []
         for error_type in (OSError, ValueError, RuntimeError):

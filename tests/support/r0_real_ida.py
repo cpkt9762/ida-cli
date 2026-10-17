@@ -35,8 +35,16 @@ def main():
     sys.path.insert(0, str(args.candidate))
     sys.path.insert(0, str(REPO / "nexus_bridge"))
     from ida_nexus import DatabaseHandle, DatabaseOpenOptions, wait_database_released
+    import ida_nexus.handle as handle_module
+    import ida_nexus.options as options_module
+    import ida_nexus._resolver as resolver_module
     import bridge
     calls, spawned, result = [], [], {"scope": "real-IDA-9.5-tiny-public-chain"}
+    result["client_candidate"] = {}
+    for module in (handle_module, options_module, resolver_module):
+        path = Path(module.__file__).resolve()
+        assert path.is_relative_to(args.candidate.resolve()), "real client must load the new candidate"
+        result["client_candidate"][path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
     handle = None
     listener, accepted = None, []
     intent = None

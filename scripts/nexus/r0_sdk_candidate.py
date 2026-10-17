@@ -30,6 +30,22 @@ class AcquiredFailure(Exception):
     def __init__(self, handle, cause):
         super().__init__(str(cause))
         self.handle, self.cause = handle, cause
+        self.observer_errors = []
+
+
+class StageObserverFailure(Exception):
+    """Observer errors are never transport failures eligible for reconnect."""
+    def __init__(self, stage, cause, attach_error=None):
+        super().__init__(str(cause))
+        self.stage, self.cause, self.attach_error = stage, cause, attach_error
+
+
+def _notify_stage(observer, stage, value):
+    if observer is not None:
+        try:
+            observer(stage, value)
+        except Exception as cause:
+            raise StageObserverFailure(stage, cause) from cause
 
 
 class LeaseOpenFailure(NexusConnectionError):
@@ -79,27 +95,34 @@ class DatabaseHandle:
     handle = replace(handle, '            "keepalive": keepalive,\n            "on_disconnect": on_disconnect,\n',
                      '            "keepalive": keepalive,\n            "on_disconnect": on_disconnect,\n            "on_acquired": on_acquired,\n            "on_stage": on_stage,\n')
     handle = replace(handle, '        constructor_options: dict[str, Any] = {\n',
-                     '        if on_stage is not None:\n            on_stage("BeforeAttach", instance)\n        constructor_options: dict[str, Any] = {\n')
+                     '        _notify_stage(on_stage, "BeforeAttach", instance)\n        constructor_options: dict[str, Any] = {\n')
     handle = replace(handle, '        return cls(requested_path, instance, **constructor_options)\n', '''        stage = "BeforeAttach"
         def observed(value, entry):
             nonlocal stage
             stage = value
-            if on_stage is not None:
-                on_stage(value, entry)
+            _notify_stage(on_stage, value, entry)
         constructor_options["on_stage"] = observed
         try:
             handle = cls(requested_path, instance, **constructor_options)
         except Exception as error:
             owned = error.handle if isinstance(error, AcquiredFailure) else None
-            if on_stage is not None:
-                on_stage("AttachFailed", {"instance":instance, "stage":stage,
+            try:
+                _notify_stage(on_stage, "AttachFailed", {"instance":instance, "stage":stage,
                     "handle":owned, "cause":error, "http_status":getattr(error, "status", None),
                     "failure_kind":"cleanup_required" if owned is not None else
                         "lease_absent" if isinstance(error, LeaseOpenFailure) else
                         "unknown_attach" if stage == "AttachMayBeSent" else "not_sent"})
+            except StageObserverFailure as notification:
+                if owned is None:
+                    notification.attach_error = error
+                    raise
+                error.observer_errors.append({"stage":"AttachFailed", "cause":notification.cause})
             raise
-        if on_stage is not None:
-            on_stage("AttachSucceeded", {"instance":instance, "handle":handle})
+        try:
+            _notify_stage(on_stage, "AttachSucceeded", {"instance":instance, "handle":handle})
+        except StageObserverFailure as notification:
+            _ACQUIRED_PENDING[id(handle)] = handle
+            raise AcquiredFailure(handle, notification.cause) from notification
         return handle
 ''')
     # The second mapping is the open -> attach call.
@@ -122,12 +145,10 @@ class DatabaseHandle:
     handle = replace(handle, '                debug_flags=options.debug_flags,\n',
                      '                debug_flags=options.debug_flags,\n                acquisition_observer=options.acquisition_observer,\n')
     handle = replace(handle, '        instance = resolve()\n', '''        instance = resolve()
-        if options.acquisition_observer is not None:
-            options.acquisition_observer("Resolved", instance)
+        _notify_stage(options.acquisition_observer, "Resolved", instance)
 ''')
     handle = replace(handle, '            replacement = resolve()\n', '''            replacement = resolve()
-            if options.acquisition_observer is not None:
-                options.acquisition_observer("ReconnectResolved", replacement)
+            _notify_stage(options.acquisition_observer, "ReconnectResolved", replacement)
 ''')
     # Structurally typed rejection, no parsing of message text.
     handle = replace(handle, '''            raise NexusConnectionError(
@@ -187,13 +208,18 @@ class DatabaseHandle:
         def acquired(handle):
             handles.append(handle)
             observe("Acquired", handle)
+        observer_errors = []
         try:
             handle = cls.open(path, options=replace(options, acquisition_observer=observe),
                               on_acquired=acquired)
             cause, failure = None, None
         except Exception as error:
             handle = handles[-1] if handles else None
-            cause = error.cause if isinstance(error, AcquiredFailure) else error
+            cause = error.cause if isinstance(error, (AcquiredFailure, StageObserverFailure)) else error
+            observer_errors = getattr(error, "observer_errors", [])
+            if handle is not None and attempts:
+                attempts[-1].update(stage="Acquired", handle=handle, cause=cause,
+                    failure_kind="cleanup_required", obligation="exact_handle")
             failure = ("cleanup_required" if handle is not None else "lease_absent"
                        if isinstance(error, LeaseOpenFailure) else "resolve_or_attach_unknown")
         resolved = [value for stage, value in events if stage in ("Resolved", "ReconnectResolved")]
@@ -203,7 +229,7 @@ class DatabaseHandle:
         return {"stage":"Acquired" if handle is not None else events[-1][0] if events else "BeforeResolve",
                 "handle":handle, "instance":resolved[-1] if resolved else None,
                 "first_instance":resolved[0] if resolved else None, "failure_kind":failure,
-                "cause":cause, "launches":launches, "attempts":attempts,
+                "cause":cause, "observer_errors":observer_errors, "launches":launches, "attempts":attempts,
                 "unresolved_attempts":unresolved,
                 "sdk_reconnect_used":any(stage == "ReconnectResolved" for stage, _ in events)}
 
