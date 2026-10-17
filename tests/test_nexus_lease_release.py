@@ -1,5 +1,4 @@
 """Real pinned client + production bridge, fake public transport and IDA APIs."""
-import hashlib
 import importlib.util
 import json
 import os
@@ -8,12 +7,13 @@ import unittest
 import inspect
 import sys
 import threading
+import tempfile
 import time
 import types
 from unittest.mock import Mock, patch
 
 REPO = Path(__file__).resolve().parents[1]
-ROOT = REPO
+ROOT = Path(os.environ['R3A_CASE_ROOT'])
 sys.path.insert(0, str(REPO / "nexus_bridge"))
 import ida_nexus
 from ida_nexus import DatabaseHandle
@@ -36,9 +36,10 @@ def case(version='current', lost_ack=False, root_loss=False, slice_cleanup=False
     spec.loader.exec_module(guard)
     guard._delayed_probes = lambda context: []
     guard._log = lambda value: None
-    path = str(ROOT / "mock.i64")
+    directory = Path(tempfile.mkdtemp(prefix='release-', dir=ROOT))
+    path = str(directory / "mock.i64")
     instance = types.SimpleNamespace(record_id="review-owner", backend="idalib",
-        managed=True, pid=os.getpid(), port=1, idb_path=path, exe_path="",
+        managed=True, pid=os.getpid(), started_at=time.time(), port=1, idb_path=path, exe_path="",
         _token=os.urandom(16).hex())
 
     class Hook:
@@ -118,6 +119,7 @@ def case(version='current', lost_ack=False, root_loss=False, slice_cleanup=False
         owner.lock = threading.Lock()
         owner.identity, owner.lifetime_path = "review-bridge", str(ROOT / "lifetime")
         owner.handles = {"logical": (lease, primary)}
+        owner.custodians = {}
         owner.cleanup_handles, owner.metadata_contexts = {}, {}
         owner.Handle = types.SimpleNamespace(attach=lambda entry: auxiliary)
         owner.drop_lifetime = lambda key: None

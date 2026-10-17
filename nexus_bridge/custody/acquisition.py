@@ -1,5 +1,6 @@
 """Physical final acquisition custody; N1 grants every preparation RPC."""
 from contextlib import contextmanager
+import copy
 import threading
 import time
 import uuid
@@ -70,6 +71,7 @@ class Custodian:
             guard = self.target.locked(deadline=self.deadline)
             guard.__enter__()
             self.target_guard = guard
+            self.target.business_admission()
             Journal(self.target).gate(self.helper['state_root'])
             yield self.target
         finally:
@@ -97,23 +99,45 @@ class Custodian:
             if stage == 'BeforeAttach':
                 self.attach_ordinal += 1
             owner = owner_key(value)
-            # The original authentication-bearing instance stays in this state
-            # root process. No record_id-to-instance reconstruction is used.
-            key = digest(owner)
-            self.originals.setdefault(key, value)
-            self.bridge.backup_sources.subscribe(value, owner)
             if self.owner == owner and self.subscription is not None:
                 return
-            self.owner = owner
-            self.watch = uuid.uuid4().hex
-            epoch = Journal(self.target).begin(self.acquisition, self.watch, owner=owner)
-            self.bridge.backup_sources.register(owner, self.watch)
-            reply = self.helper_request({'kind':'subscribe', 'watch':self.watch, 'subscription_epoch':epoch,
-                'target':str(self.target.target), 'coord_key':self.target.key,
-                'owner':owner, 'acquisition':self.acquisition})
-            self.subscription = reply['receipt']
-            self.observations[self.watch] = {'owner':owner, 'receipt':self.subscription, 'attempts':{}}
-            Journal(self.target).owner_signed(self.subscription)
+            watch = uuid.uuid4().hex
+            # No backup object is allocated until target/byte admission succeeds.
+            epoch = Journal(self.target).begin(self.acquisition, watch, owner=owner)
+            key = digest(owner)
+            subscription = dict(kind='subscribe', watch=watch, subscription_epoch=epoch,
+                target=str(self.target.target), coord_key=self.target.key,
+                owner=owner, acquisition=self.acquisition)
+            helper_started = False
+            try:
+                self.bridge.backup_sources.subscribe(value, owner, watch)
+                self.originals.setdefault(key, value)
+                binding = self.bridge.backup_sources.bind(subscription)
+                Journal(self.target).bridge_signed(binding)
+                self.owner, self.watch = owner, watch
+                self.observations[watch] = {'owner':owner, 'receipt':None, 'attempts':{}}
+                helper_started = True
+                try:
+                    reply = self.helper_request(subscription)
+                except Exception:
+                    # ACK loss after a signed subscribe is not an absent watch.
+                    item = self.helper_request({'kind':'lookup', 'watch':watch})['item']
+                    if item is None:
+                        helper_started = False
+                        raise
+                    reply = self.helper_request(subscription)
+                self.subscription = reply['receipt']
+                self.observations[watch]['receipt'] = self.subscription
+                Journal(self.target).owner_signed(self.subscription)
+            except BaseException:
+                if not helper_started:
+                    self.bridge.backup_sources.abort_unstarted(owner, watch)
+                    if not any(o['owner'] == owner for w,o in self.observations.items() if w != watch):
+                        self.originals.pop(key, None)
+                    self.observations.pop(watch, None)
+                    Journal(self.target).abort_unstarted(watch)
+                # Unknown helper delivery retains its exact watch and source.
+                raise
             # Transfer observation responsibility before any HTTP attach can
             # be sent. Later attempts add obligations; they never erase this
             # watch because another attempt acquired or was rejected.
@@ -339,13 +363,41 @@ class Custodian:
         # The release event records actual public evidence. N1 must also consume
         # the ordered terminal before another ordinal can be reserved.
         self.transact('cleanup_status', acquisition=self.acquisition, lease=self.lease)
+        # N1 can learn the original release thread's real public lifetime before
+        # the independent producer has published it to the target journal.
+        # Consume that durable fact before a new owner reaches check_owner.
+        delay = .01
+        while True:
+            with self.file_gate():
+                journal = Journal(self.target)
+                journal.recover_public_proofs()
+                previous = next((i for i in journal.value['entries'].values() if i['watch'] == self.watch), None)
+                if previous is None or previous.get('proof'):
+                    break
+            self.bridge.backup_sources.query({'watch':self.watch, 'target':self.target_path,
+                'coord_key':self.coord_key, 'owner':self.owner, 'acquisition':self.acquisition,
+                'subscription_epoch':self.subscription['record']['subscription_epoch']})
+            remaining = self.deadline-time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('r9 target proof custody pending; prior ordinal retained')
+            threading.Event().wait(min(delay, remaining))
+            delay = min(.2, delay*2)
         return self.release_outcome
 
     def next_retry(self):
+        # A late retirement must still address the old physical ordinal.
+        with self.bridge.lock:
+            if self.lease and self.bridge.custodians.get(self.lease['lease_id']) is self:
+                previous = copy.copy(self)
+                previous.running = False
+                self.bridge.custodians[self.lease['lease_id']] = previous
         self.acquisition = self.transact('root_retry', parent=self.command['identity'])['acquisition']
         self.helper_request({'kind':'reserve_parent', 'parent':self.acquisition['parent']})
         self.handle = self.lease = self.decision = self.subscription = self.owner = None
-        self.release_event.clear()
+        self.release_event = threading.Event()
+        self.originals, self.observations, self.launches = {}, {}, {}
+        self.outcome = None
+        self.attach_ordinal = 0
         self.release_outcome = None
         self.target_guard = self.target.locked(deadline=self.deadline)
         self.target_guard.__enter__()

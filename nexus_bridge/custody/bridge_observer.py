@@ -14,15 +14,17 @@ class BackupSources:
         self.items = {}
         self.publisher = Observer(INCARNATION, capacity)
 
-    def subscribe(self, instance, owner):
+    def subscribe(self, instance, owner, watch=None):
         key = digest(owner)
         with self.bridge.lock:
             if key in self.items:
+                if watch is not None:
+                    self.items[key]['watches'].add(watch)
                 return
             if (len(self.items) >= self.capacity
                     or sum(len(encoded(i['owner'])) + 8192 for i in self.items.values()) >= 512*1024):
                 raise RuntimeError('Busy: bridge original instance live_refs capacity')
-            entry = {'instance':instance, 'owner':owner, 'released':False, 'proofs':{}, 'watches':set(), 'closed':set(),
+            entry = {'instance':instance, 'owner':owner, 'released':False, 'proofs':{}, 'watches':({watch} if watch is not None else set()), 'closed':set(),
                      'stop':threading.Event()}
             self.items[key] = entry
             thread = threading.Thread(target=self.observe, args=(entry,), daemon=True)
@@ -31,11 +33,28 @@ class BackupSources:
                 thread.start()
             except Exception as exc:
                 entry['error'] = 'ObservationFailed: bridge public source Thread.start: ' + str(exc)
+                self.items.pop(key)  # Thread.start failed before any observation/attach.
                 raise
 
     def register(self, owner, watch):
         with self.bridge.lock:
             self.items[digest(owner)]['watches'].add(watch)
+
+    def bind(self, value):
+        with self.bridge.lock:
+            entry = self.items[digest(value['owner'])]
+            watch = value['watch']
+            if watch not in entry['watches']:
+                raise ValueError('unknown provisional bridge watch')
+            bindings = entry.setdefault('bindings', {})
+            if watch not in bindings:
+                item = entry.setdefault('binding_items', {}).setdefault(watch, dict(value))
+                bindings[watch] = self.publisher.publish(item, 'BridgeSubscribed')
+            return bindings[watch]
+
+    def abort_unstarted(self, owner, watch):
+        """Only the pre-attach caller may revoke this precise provisional source."""
+        self.retire(watch)
 
     def observe(self, entry):
         from ida_nexus import wait_database_released
@@ -64,7 +83,8 @@ class BackupSources:
                 return
             proof = entry['proofs'].get(watch)
             if proof is None:
-                proof = self.publisher.publish(value, 'PublicOwnerLifetime',
+                item = entry.setdefault('proof_items', {}).setdefault(watch, dict(value))
+                proof = self.publisher.publish(item, 'PublicOwnerLifetime',
                     evidence_type='public_owner_lifetime', source='bridge_original')
                 entry['proofs'][watch] = proof
         self.bridge.control.send({'event':'owner_backup_proof', 'watch':watch, 'proof':proof})
@@ -124,6 +144,9 @@ class BackupSources:
                 if watch in entry['watches']:
                     entry['watches'].remove(watch)
                     entry['proofs'].pop(watch, None)
+                    entry.get('bindings', {}).pop(watch, None)
+                    entry.get('binding_items', {}).pop(watch, None)
+                    entry.get('proof_items', {}).pop(watch, None)
                     entry['closed'].discard(watch)
                     if not entry['watches']:
                         entry['stop'].set()

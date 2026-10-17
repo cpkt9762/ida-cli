@@ -139,7 +139,7 @@ impl Rig {
                     .unwrap(),
                     OpenSpec {
                         operation_id: OperationId::new(id()).unwrap(),
-                        path: "fixture".into(),
+                        path: self.root.join("input.i64").display().to_string(),
                         options: json!({}),
                     },
                     t,

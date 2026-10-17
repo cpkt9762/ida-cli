@@ -267,8 +267,72 @@ impl Helper {
             .clone()
     }
 
+    fn finish_accepted(&self) -> anyhow::Result<bool> {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let path = self.endpoint.with_file_name("helper-state.json");
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let before = file.metadata()?;
+        // SAFETY: geteuid has no arguments or memory preconditions.
+        let uid = unsafe { libc::geteuid() };
+        anyhow::ensure!(
+            before.is_file()
+                && before.uid() == uid
+                && before.nlink() == 1
+                && before.permissions().mode() & 0o777 == 0o600
+                && before.len() <= 1024 * 1024,
+            "ObservationRecoveryBlocked: untrusted helper registry"
+        );
+        let mut data = Vec::new();
+        (&mut file).take(1024 * 1024 + 1).read_to_end(&mut data)?;
+        let after = file.metadata()?;
+        let current = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            before.dev() == after.dev()
+                && before.ino() == after.ino()
+                && before.len() == after.len()
+                && before.len() == data.len() as u64
+                && before.mtime() == after.mtime()
+                && before.mtime_nsec() == after.mtime_nsec()
+                && before.ctime() == after.ctime()
+                && before.ctime_nsec() == after.ctime_nsec()
+                && before.ino() == current.ino()
+                && before.dev() == current.dev(),
+            "ObservationRecoveryBlocked: helper registry changed"
+        );
+        let saved: Value = serde_json::from_slice(&data)?;
+        anyhow::ensure!(
+            saved["schema"] == 1
+                && saved["helper"] == self.incarnation
+                && (self.state_root.is_null() || saved["state_root"] == self.state_root),
+            "ObservationRecoveryBlocked: helper finish identity mismatch"
+        );
+        if saved["finishing"] != true {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            saved["items"].as_object().is_some_and(|m| m.is_empty())
+                && saved["parents"].as_object().is_some_and(|m| m.is_empty()),
+            "ObservationRecoveryBlocked: finish still has responsibility"
+        );
+        Ok(true)
+    }
+
     async fn reconnect(&self) -> anyhow::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
+        if self.finish_accepted()? {
+            self.finished
+                .store(true, std::sync::atomic::Ordering::Release);
+            anyhow::bail!("ObservationClosed: durable helper finish forbids reconnect");
+        }
         let mut child = self.child.lock().await;
         let Some(status) = child.try_wait()? else {
             return Ok(());
@@ -356,7 +420,12 @@ impl Helper {
         if self.finished.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
-        self.exchange(json!({"kind":"finish"})).await?;
+        if let Err(error) = self.exchange(json!({"kind":"finish"})).await {
+            if !self.finish_accepted()? {
+                return Err(error);
+            }
+            tracing::warn!(%error, "helper finish reply lost; exact durable acceptance recovered");
+        }
         // Serialize against every heartbeat/custody request. Once finish was
         // accepted, a late caller must not turn the clean exit into recovery.
         self.finished
@@ -406,5 +475,186 @@ impl Helper {
         child.kill().await?;
         let status = child.wait().await?;
         Ok(json!({"pid":pid,"injected_signal":"SIGKILL","status":status.to_string()}))
+    }
+}
+
+#[cfg(all(test, feature = "nexus-test-support"))]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncBufReadExt;
+
+    #[tokio::test]
+    async fn accepted_finish_lost_ipc_reply_is_durably_fenced() {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("isolated case root"))
+            .join(format!(
+                "finish-{}",
+                crate::router::nexus_transport::monotonic_ns().expect("monotonic nonce")
+            ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("private helper case");
+        let installation = root.as_path().join("installation");
+        crate::router::nexus_bridge::installation::create(&installation)
+            .expect("current closed source installation");
+        let mut config = BridgeConfig {
+            python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("fixed SDK interpreter")),
+            script: installation.join("bridge.py"),
+            directory: root.as_path().into(),
+            environment: std::env::vars().collect(),
+        };
+        config.environment.insert(
+            "IDA_NEXUS_STATE_DIR".into(),
+            root.as_path().join("state").display().to_string(),
+        );
+        let mut helper = Helper::start(&mut config, &installation)
+            .await
+            .expect("real independent helper");
+        let initial = helper
+            .call(json!({"kind":"heartbeat"}))
+            .await
+            .expect("initial precise helper birth");
+        std::fs::write(
+            root.join("q2-initial.json"),
+            serde_json::to_vec_pretty(&initial).expect("helper identity JSON"),
+        )
+        .expect("initial precise birth evidence");
+        helper
+            .call(json!({"kind":"reserve_parent", "parent":"pending"}))
+            .await
+            .expect("exact pending responsibility");
+        assert!(helper.finish().await.is_err(), "pending finish must reject");
+        assert_eq!(
+            helper
+                .call(json!({"kind":"heartbeat"}))
+                .await
+                .expect("rejected finish must not fence")["parent_count"],
+            1
+        );
+        helper
+            .call(json!({"kind":"retire_parent", "parent":"pending"}))
+            .await
+            .expect("retire exact parent");
+        let actual = helper.endpoint.clone();
+        let proxy = root.as_path().join("p");
+        let listener =
+            tokio::net::UnixListener::bind(&proxy).expect("private real IPC fault relay");
+        std::fs::set_permissions(&proxy, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("private relay mode");
+        Arc::get_mut(&mut helper)
+            .expect("unique helper owner")
+            .endpoint = proxy.clone();
+        let relay = tokio::spawn(async move {
+            let (downstream, _) = listener.accept().await.expect("real finish IPC");
+            let mut reader = BufReader::new(downstream);
+            let mut request = Vec::new();
+            reader
+                .read_until(b'\n', &mut request)
+                .await
+                .expect("read exact request");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request).expect("finish request")["kind"],
+                "finish"
+            );
+            let mut upstream = UnixStream::connect(&actual)
+                .await
+                .expect("actual helper connection");
+            upstream
+                .write_all(&request)
+                .await
+                .expect("forward actual finish");
+            let mut reader_up = BufReader::new(upstream);
+            let mut reply = Vec::new();
+            reader_up
+                .read_until(b'\n', &mut reply)
+                .await
+                .expect("actual helper accepted reply");
+            let accepted: Value = serde_json::from_slice(&reply).expect("real helper reply");
+            assert_eq!(accepted["ok"], true, "finish was actually accepted");
+            // Drop the real downstream without delivering any response byte.
+            drop(reader);
+            accepted
+        });
+        let finish_result = helper.finish().await;
+        tokio::time::timeout(Duration::from_secs(2), helper.child.lock().await.wait())
+            .await
+            .expect("exact helper exit bound")
+            .expect("exact helper exit");
+        let accepted = relay.await.expect("fault relay completed");
+        assert_eq!(accepted["ok"], true);
+        let late = helper.call(json!({"kind":"heartbeat"})).await;
+        let late_snapshot = late.as_ref().ok().cloned();
+        if late.is_ok() {
+            helper
+                .finish()
+                .await
+                .expect("precise cleanup of incorrectly restarted helper");
+        }
+        std::fs::write(root.join("q2-lost-reply.json"), serde_json::to_vec_pretty(&json!({
+            "initial":initial,"accepted_reply_not_delivered":accepted,
+            "finish_error":finish_result.as_ref().err().map(ToString::to_string),
+            "late_heartbeat":late_snapshot,"restarts":helper.restarts.load(std::sync::atomic::Ordering::Acquire),
+            "forced":false,
+        })).expect("lost reply evidence JSON")).expect("lost reply evidence");
+        finish_result.expect("recover exact durable acceptance despite lost response");
+        assert!(late.is_err(), "late heartbeat recreated empty helper");
+        let registry = root.as_path().join("helper-state.json");
+        let bytes = std::fs::read(&registry).expect("durable helper finish");
+        let saved: Value = serde_json::from_slice(&bytes).expect("registry JSON");
+        assert_eq!(saved["finishing"], true);
+        assert!(
+            helper.call(json!({"kind":"heartbeat"})).await.is_err(),
+            "late heartbeat revived helper"
+        );
+        assert_eq!(
+            std::fs::read(&registry).expect("unchanged finish tombstone"),
+            bytes
+        );
+        assert_eq!(
+            helper.restarts.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(
+            !root.as_path().join("h").exists(),
+            "accepted helper has not exited"
+        );
+        // A restarted observer independently honors the same durable tombstone.
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            Command::new(&config.python)
+                .arg("-I")
+                .arg("-B")
+                .arg(installation.join("bootstrap.py"))
+                .arg("proof_helper")
+                .arg(root.as_path().join("h"))
+                .arg(&helper.incarnation)
+                .arg("256")
+                .env_clear()
+                .envs(&config.environment)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("bounded restart")
+        .expect("restart exact finished observer");
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        assert!(
+            !root.as_path().join("h").exists(),
+            "restarted helper recreated endpoint"
+        );
+        std::fs::write(root.join("q2-evidence.json"), serde_json::to_vec_pretty(&json!({
+            "initial":initial,"accepted_reply_not_delivered":accepted,"durable_finish":saved,
+            "late_heartbeat_rejected":true,"restart_exit":status.status.to_string(),"restarts":0,
+            "forced":false,
+        })).expect("finish evidence JSON")).expect("finish evidence");
+        std::fs::remove_file(proxy).expect("remove only owned fault relay socket");
     }
 }

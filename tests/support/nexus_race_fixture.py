@@ -360,12 +360,13 @@ else:
         proof_verdict(self, operation_id)
     bridge.Bridge.confirm_stop = confirm_stop
 cancelled_ids = []
+owner_started_at = time.time()
 handle_module.http.client.HTTPConnection = lambda *_a, **_k: Connection(control=True)
 DatabaseHandle._rpc_connection_for = lambda *_: Connection()
 
 def opened(path, **_options):
     instance = SimpleNamespace(record_id="shared-owner", pid=os.getpid(), idb_path=str(ROOT / "input.i64"),
-                               backend="idalib", managed=True, port=1, _token=os.urandom(16).hex())
+                               started_at=owner_started_at, backend="idalib", managed=True, port=1, _token=os.urandom(16).hex())
     result = DatabaseHandle(path, instance)
     handles.append(result)
     if SCENARIO == "open-pre-disconnected" and len(handles) == 2:

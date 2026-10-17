@@ -40,6 +40,34 @@ cleanup_handles = {}
 incarnation = uuid.uuid4().hex
 
 
+def attach_cleanup(instance):
+    """Use the checked bridge's private gate sources inside the native owner."""
+    import builtins
+    import time
+    import types
+    from ida_nexus import DatabaseHandle
+    sources = globals()['_target_gate_sources']
+    modules = {}
+    def isolated_import(name, *args, **kwargs):
+        if name not in sources:
+            return builtins.__import__(name, *args, **kwargs)
+        if name not in modules:
+            module = modules[name] = types.ModuleType(name)
+            module.__dict__['__builtins__'] = dict(vars(builtins), __import__=isolated_import)
+            exec(compile(sources[name], '<ida-cli checked gate>', 'exec'), module.__dict__)
+        return modules[name]
+    Target = isolated_import('target_coordination').Target
+    Journal = isolated_import('target_journal').Journal
+    identity = isolated_import('owner_identity')
+    with Target(instance.idb_path) as target:
+        with target.locked(deadline=time.monotonic()+5):
+            target.business_admission()
+            journal = Journal(target)
+            journal.gate(identity.state_identity())
+            journal.check_owner(identity.owner_key(instance))
+            return DatabaseHandle.attach(instance)
+
+
 def cleanup_disconnected(handle, context, expected_incarnation, release_handle):
     """Close an auxiliary lease only after a fresh owner protection check."""
     key = tuple(context)
@@ -96,11 +124,11 @@ def watch_lease(context):
         try:
             if channel.recv(1):
                 raise RuntimeError("unexpected lifetime data")
-            from ida_nexus import DatabaseHandle, discover_databases
+            from ida_nexus import discover_databases
             entries = [item.instance for item in discover_databases()
                        if item.instance.record_id == context[2]]
             if entries:
-                handle = DatabaseHandle.attach(entries[0])
+                handle = attach_cleanup(entries[0])
                 from _ida_cli_release_protocol_v1 import release_handle
                 cleanup_disconnected(handle, context, incarnation, release_handle)
         except Exception:

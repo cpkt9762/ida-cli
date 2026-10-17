@@ -35,6 +35,10 @@ with Boundary(owner_root, os.environ.get('R3A_SCENARIO', 'healthy')) as boundary
     original_get = handler.do_GET
     original_post = handler.do_POST
     scenario = os.environ.get('R3A_SCENARIO', 'healthy')
+    r9 = scenario.startswith('r9-')
+    if r9:
+        import ida_netnode
+        ida_netnode.netnode.exist = staticmethod(lambda _:False)
     def get_input(request):
         query = parse_qs(urlsplit(request.path).query)
         if 'sse' in query:
@@ -76,6 +80,23 @@ with Boundary(owner_root, os.environ.get('R3A_SCENARIO', 'healthy')) as boundary
     handler.do_GET, handler.do_POST = get_input, post_input
     original_reply = handler.reply
     def analysis_response(request, payload, status=200):
+        if request.path == '/release_lease' and r9 and not (root/'r9-successor').exists():
+            boundary.release_owner()
+            (root/'r9-public-exit').touch()
+            if scenario == 'r9-proof-before-release':
+                from r0_transport import barrier
+                barrier(root, 'r9-release')
+            # Replace only external owner/IDA inputs after real lifetime unlock.
+            from r0_transport import install_ida_inputs
+            for name in ('_ida_cli_save_guard_v1', '_ida_cli_release_protocol_v1'):
+                sys.modules.pop(name, None)
+            install_ida_inputs(boundary.path)
+            boundary.registration = InstanceRegistration(REGISTRY_DIR,
+                InstanceIdentity(str(boundary.path), str(boundary.path), 'idalib', True), token=secrets.token_hex(24))
+            boundary.instance = boundary.registration.publish(boundary.server.server_port)
+            boundary.released = False
+            (root/'release-requested').unlink(missing_ok=True)
+            (root/'r9-successor').touch()
         if request.path == '/wait_autoanalysis' and payload.get('ok') is True:
             payload = payload['result']
         return original_reply(request, payload, status)
@@ -127,6 +148,47 @@ with Boundary(owner_root, os.environ.get('R3A_SCENARIO', 'healthy')) as boundary
     sys.argv = [str(installation / 'bootstrap.py'), 'bridge', *sys.argv[1:]]
     try:
         runtime = vars(runpy.run_path(sys.argv[0], run_name='verified_fixture')['load_entry']())
+        if r9:
+            from acquisition import Custodian
+            original_receive = runtime['Bridge'].receive
+            delayed = []
+            def retire_input(self, channel, message):
+                receipt = message.get('custody_retired')
+                if receipt and receipt['acquisition']['ordinal'] == 1:
+                    current = next(iter(self.acquisitions.values()), None)
+                    ordinal = current.acquisition['ordinal'] if current else None
+                    if scenario == 'r9-retire-after' and ordinal == 1:
+                        delayed[:] = [message]
+                        (root/'r9-retirement-delayed').touch()
+                        return
+                    original_receive(self, channel, message)
+                    (root/'r9-retirement.json').write_text(json.dumps({'current_ordinal':ordinal, 'receipt':receipt}))
+                    return
+                return original_receive(self, channel, message)
+            runtime['Bridge'].receive = retire_input
+            send_release = runtime['Channel'].send
+            def release_return_input(self, message):
+                if message.get('event') == 'released' and not (root/'r9-release-sent').exists():
+                    (root/'r9-release-sent').touch()
+                    marker = root/('r9-retirement-delayed' if scenario == 'r9-retire-after' else 'r9-retirement.json')
+                    deadline = __import__('time').monotonic()+8
+                    while not marker.exists():
+                        if __import__('time').monotonic() >= deadline:
+                            raise TimeoutError('exact prior retirement barrier')
+                        threading.Event().wait(.005)
+                return send_release(self, message)
+            runtime['Channel'].send = release_return_input
+            original_obtained = Custodian.obtained
+            def obtained_input(self, handle, context):
+                original_obtained(self, handle, context)
+                if self.acquisition['ordinal'] == 2:
+                    (root/'r9-next-ordinal').touch()
+                    if delayed:
+                        message = delayed.pop()
+                        original_receive(self.bridge, None, message)
+                        (root/'r9-retirement.json').write_text(json.dumps({'current_ordinal':2, 'receipt':message['custody_retired']}))
+                    assert self.bridge.custodians[self.lease['lease_id']] is self
+            Custodian.obtained = obtained_input
         if scenario == 'proof-ack-barrier':
             original_receive = runtime['Bridge'].receive
             def proof_acknowledgement_input(self, channel, message):

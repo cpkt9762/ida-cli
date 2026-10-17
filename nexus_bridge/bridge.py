@@ -18,10 +18,11 @@ if '__verified_source__' not in globals():
     sys.path.insert(0, str(Path(__file__).resolve().parent / "custody"))
 
 
-def module_source(name):
+def module_source(name, *, custody=False):
     if '__verified_source__' in globals():
         return sys._ida_cli_verified_sources[name]
-    return Path(__file__).with_name(name).read_text(encoding='utf-8')
+    path = Path(__file__).parent / ('custody' if custody else '') / name
+    return path.read_text(encoding='utf-8')
 from tools import METHODS as TOOL_METHODS
 from type_tools import TYPE_METHODS
 from edit_tools import EDIT_METHODS, WRITE_METHODS
@@ -72,7 +73,10 @@ TOOL_SOURCE += ("\n_tools_metadata = {}\n"
                 + f"exec({METADATA_SOURCE!r}, _tools_metadata)\n"
                 + "install_tools(_tools_metadata)\n")
 RELEASE_SOURCE = module_source('lifecycle.py')
+SLICE_GATE_SOURCES = {name: module_source(name + '.py', custody=True) for name in (
+    'target_coordination', 'custody_process_identity', 'origin', 'owner_identity', 'target_journal')}
 SLICE_SOURCE = ("import sys, types\n"
+    + f"_target_gate_sources = {SLICE_GATE_SOURCES!r}\n"
     "if '_ida_cli_release_protocol_v1' not in sys.modules:\n"
     "    _release_module = types.ModuleType('_ida_cli_release_protocol_v1')\n"
     f"    exec({RELEASE_SOURCE!r}, _release_module.__dict__)\n"
@@ -263,7 +267,8 @@ class Bridge(LifetimeListener):
                 lease = receipt.get('lease')
                 custody = self.custodians.get(lease['lease_id']) if lease else None
                 if custody is not None:
-                    if custody.lease != receipt['lease'] or custody.watch != receipt['watch']:
+                    if (custody.lease != receipt['lease'] or custody.watch != receipt['watch']
+                            or custody.acquisition != receipt['acquisition']):
                         raise ValueError('ProtocolMismatch: retired custody identity')
                     self.custodians.pop(receipt['lease']['lease_id'])
                     held = self.handles.get(receipt['lease']['lease_id'])
@@ -634,6 +639,8 @@ class Bridge(LifetimeListener):
             channel.send({"event": "cancel_ack", "attempt": attempt,
                           "accepted": outcome["status"] == "cancelled", "outcome": outcome})
         elif kind == "release":
+            with self.lock:
+                release_custodian = self.custodians.get(lease['lease_id'])
             public_started[0] = True
             context = [self.identity, lease["lease_id"], lease["instance_id"], lease["generation"], self.lifetime_path]
             cleanup_code = ("import sys\nmodule = sys.modules.get('_ida_cli_nexus_slices_v1')\n"
@@ -663,7 +670,16 @@ class Bridge(LifetimeListener):
                                     timeout=max(0, deadline-time.monotonic())):
                                 return {'close_safe': True}
                             raise RuntimeError('save protection unavailable; exact lease retained; no default close')
-                        cleanup_handle = self.Handle.attach(instances[0])
+                        from target_coordination import Target
+                        from target_journal import Journal
+                        from owner_identity import state_identity, owner_key
+                        with Target(instances[0].idb_path) as target:
+                            with target.locked(deadline=deadline):
+                                target.business_admission()
+                                journal = Journal(target)
+                                journal.gate(state_identity())
+                                journal.check_owner(owner_key(instances[0]))
+                                cleanup_handle = self.Handle.attach(instances[0])
                         with self.lock:
                             self.cleanup_handles[lease['lease_id']] = cleanup_handle
                     checked = cleanup_handle.execute_python(cleanup_code,
@@ -704,10 +720,9 @@ class Bridge(LifetimeListener):
                 self.metadata_contexts.pop(lease["lease_id"], None)
             channel.send({"event": "released", "attempt": attempt, "outcome": outcome,
                           "save_guard_error": outcome["save_guard_error"]})
-            custodian = self.custodians.get(lease['lease_id'])
-            if custodian is not None:
-                custodian.release_outcome = outcome
-                custodian.release_event.set()
+            if release_custodian is not None:
+                release_custodian.release_outcome = outcome
+                release_custodian.release_event.set()
         elif kind == "shutdown":
             public_started[0] = True
             handle.execute_python(guarded_source('pass',

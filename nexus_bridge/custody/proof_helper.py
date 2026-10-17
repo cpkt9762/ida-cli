@@ -85,6 +85,7 @@ class Observer:
         self.finishing = False
         self.identity = capture(os.getpid())
         self.storage = storage
+        self.pending_registry = None
         self.recovered = False
         if storage is not None:
             try:
@@ -98,6 +99,9 @@ class Observer:
                         or not isinstance(saved.get('items'), dict) or len(saved['items']) > capacity):
                     raise RuntimeError('ObservationRecoveryBlocked: helper registry identity/schema')
                 self.seq, self.items = saved['seq'], saved['items']
+                self.finishing = saved.get('finishing', False)
+                if type(self.finishing) is not bool or (self.finishing and (self.items or saved.get('parents'))):
+                    raise RuntimeError('ObservationRecoveryBlocked: invalid finish tombstone')
                 self.parents = saved.get('parents', {})
                 if (not isinstance(self.parents, dict) or len(self.parents)*4 > capacity
                         or any(not isinstance(p, dict) or set(p) != {'parent', 'budget'}
@@ -109,15 +113,34 @@ class Observer:
                                    for i in self.items.values()) > p['budget'] for p in self.parents.values())):
                     raise RuntimeError('ObservationRecoveryBlocked: parent reservation table')
                 self.recovered = True
+                # A killed heartbeat may leave a duplicate/partial write of the
+                # already committed snapshot. Complete only that exact value
+                # before restore_facts adds recovery diagnostics. A different
+                # pending snapshot remains blocked, never overwritten.
+                try:
+                    os.stat('helper-state.json.new', dir_fd=storage.fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    storage.retry_immutable('helper-state.json', saved, immutable=False)
                 self.restore_facts()
 
     def persist(self):
         with self.lock:
-            if self.storage is not None:
-                self.storage.durable('helper-state.json', {'schema':1, 'helper':self.incarnation,
-                    'state_root':self.state, 'capacity':self.capacity, 'seq':self.seq,
-                    'parents':self.parents,
-                    'items':{k:self.public_item(v) for k,v in self.items.items()}})
+            if self.storage is None:
+                return
+            value = {'schema':1, 'helper':self.incarnation,
+                     'state_root':self.state, 'capacity':self.capacity, 'seq':self.seq,
+                     'parents':self.parents, 'finishing':self.finishing,
+                     'items':{k:self.public_item(v) for k,v in self.items.items()}}
+            # A failed write can only resume the exact snapshot that reserved it.
+            # Finish that slot before writing a newer view; never discard .new.
+            if self.pending_registry is not None:
+                self.storage.retry_immutable('helper-state.json', self.pending_registry, immutable=False)
+                self.pending_registry = None
+            self.pending_registry = json.loads(encoded(value))
+            self.storage.retry_immutable('helper-state.json', self.pending_registry, immutable=False)
+            self.pending_registry = None
 
     def restore_facts(self):
         """Recover only exact immutable facts; absence never discharges a watch."""
@@ -205,30 +228,38 @@ class Observer:
 
     def publish(self, item, kind, **facts):
         # Caller serializes this producer. I/O never needs the target writer's EX.
-        self.seq += 1
-        # Reserve sequence durably before writing a fact. Recovery scans exact
-        # watch namespaces for a fact committed before the registry update.
-        self.persist()
-        record = dict(schema=1, helper=self.incarnation, seq=self.seq,
-                      observation_id=f'{self.incarnation}-{self.seq}', kind=kind,
-                      state_root=self.state, watch=item['watch'], coord_key=item['coord_key'],
-                      owner=item.get('owner'), acquisition=item['acquisition'],
-                      launch=item.get('launch'), os_identity=item.get('os_identity'),
-                      eligibility=False, subscription_epoch=item.get('subscription_epoch'), **facts)
-        with Target(item['target']) as target:
-            if target.key != item['coord_key']:
-                raise RuntimeError('ObservationFailed: target identity changed')
-            if 'origin_binding' not in item:
-                item['origin_binding'] = creation_scope(target.directory.path, self.incarnation)
+        pending = item.setdefault('pending_facts', {})
+        slot = digest([kind, facts])
+        record = pending.get(slot)
+        if record is None:
+            with Target(item['target']) as target:
+                if target.key != item['coord_key']:
+                    raise RuntimeError('ObservationFailed: target identity changed')
+                if 'origin_binding' not in item:
+                    item['origin_binding'] = creation_scope(target.directory.path, self.incarnation)
+            self.seq += 1
+            record = dict(schema=1, helper=self.incarnation, seq=self.seq,
+                          observation_id=f'{self.incarnation}-{self.seq}', kind=kind,
+                          state_root=self.state, watch=item['watch'], coord_key=item['coord_key'],
+                          owner=item.get('owner'), acquisition=item['acquisition'],
+                          launch=item.get('launch'), os_identity=item.get('os_identity'),
+                          eligibility=False, subscription_epoch=item.get('subscription_epoch'), **facts)
             record['origin_binding'] = item['origin_binding']
             record['helper_registration'] = {'endpoint':getattr(self, 'endpoint', None),
                 'identity':self.identity, 'state_root':self.state}
+            pending[slot] = record
+        # Reusing the reserved record also handles commit-before-registry/ACK loss.
+        self.persist()
+        with Target(item['target']) as target:
+            if target.key != item['coord_key']:
+                raise RuntimeError('ObservationFailed: target identity changed')
             container = target.directory.child('proofs' if kind == 'PublicOwnerLifetime' else 'observations')
             try:
                 producer = container.child(digest(item['owner']) if kind == 'PublicOwnerLifetime' else digest(item['watch'].encode()))
                 try:
                     name = record['observation_id'] + '.json'
-                    producer.durable(name, record, immutable=True)
+                    producer.retry_immutable(name, record)
+                    pending.pop(slot)
                     return {'path':str(producer.path / name), 'sha256':digest(record), 'record':record}
                 finally:
                     producer.close()
@@ -255,10 +286,17 @@ class Observer:
             raise ValueError('ProtocolMismatch: subscription epoch')
         with self.lock:
             if kind == 'finish':
-                if any(not item.get('consumer') for item in self.items.values()) or self.parents:
+                if self.items or self.parents:
                     raise RuntimeError('ObservationPending: helper still owns observations')
                 self.finishing = True
+                try:
+                    self.persist()
+                except BaseException:
+                    self.finishing = False
+                    raise
                 return {}
+            if self.finishing:
+                raise RuntimeError('ObservationClosed: helper finish was durably accepted')
             if kind == 'heartbeat':
                 self.last_router = self.clock()
                 result = {'state_root':self.state, 'identity':self.identity,
@@ -455,9 +493,7 @@ class Observer:
             entry = {'instance':instance, 'watches':set(), 'released':False, 'stop':threading.Event()}
             self.owners[key] = entry
         entry['watches'].add(item['watch'])
-        if entry['released'] and not item.get('proof'):
-            item['proof'] = self.publish(item, 'PublicOwnerLifetime', evidence_type='public_owner_lifetime')
-        elif not entry.get('started'):
+        if not entry.get('started'):
             thread = threading.Thread(target=self.observe, args=(key, entry), daemon=True)
             entry['thread'] = thread
             try:
@@ -471,33 +507,36 @@ class Observer:
 
     def observe(self, key, entry):
         from ida_nexus import wait_database_released
-        try:
-            while not entry['stop'].is_set():
-                released = wait_database_released(entry['instance'], timeout=.2)
-                if released is True:
-                    break
-                if released is not False:
-                    raise RuntimeError('public lifetime wait returned without proof')
-            else:
+        delay = .05
+        while not entry['stop'].is_set():
+            try:
+                if not entry['released']:
+                    released = wait_database_released(entry['instance'], timeout=.2)
+                    if released is False:
+                        continue
+                    if released is not True:
+                        raise RuntimeError('public lifetime wait returned without proof')
+                    entry['released'] = True
+                with self.lock:
+                    for watch in entry['watches']:
+                        item = self.items[watch]
+                        if not item.get('consumer') and not item.get('proof'):
+                            item['proof'] = self.publish(item, 'PublicOwnerLifetime', evidence_type='public_owner_lifetime')
+                    self.persist()
+                    entry['started'] = False
                 return
-            with self.lock:
-                entry['released'] = True
-                for watch in entry['watches']:
-                    item = self.items[watch]
-                    if not item.get('consumer') and not item.get('proof'):
-                        item['proof'] = self.publish(item, 'PublicOwnerLifetime', evidence_type='public_owner_lifetime')
-                self.persist()
-        except Exception as exc:
-            with self.lock:
-                for watch in entry['watches']:
-                    item = self.items[watch]
-                    item['observation_error'] = type(exc).__name__ + ': ' + str(exc)
-                    # A write failure retains the original source and exit block.
+            except Exception as exc:
+                with self.lock:
+                    for watch in entry['watches']:
+                        self.items[watch]['observation_error'] = type(exc).__name__ + ': ' + str(exc)
+                    self.exit_blocked = type(exc).__name__ + ': ' + str(exc)
                     try:
-                        item['failed'] = self.publish(item, 'ObservationFailed', cause=item['observation_error'])
+                        self.persist()
                     except Exception as write_error:
                         self.exit_blocked = type(write_error).__name__ + ': ' + str(write_error)
-                self.persist()
+                # Original object and the one reserved proof slot remain owned.
+                entry['stop'].wait(delay)
+                delay = min(1.0, delay * 2)
 
     def orphan_done(self):
         with self.lock:

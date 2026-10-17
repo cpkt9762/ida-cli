@@ -31,6 +31,10 @@ def fact(receipt, target, *, kind=None):
             raise RuntimeError('CoordinationBlocked: immutable fact schema/producer/sequence mismatch')
         if digest(data) != receipt['sha256'] or record != receipt['record'] or record['coord_key'] != target.key:
             raise RuntimeError('CoordinationBlocked: immutable receipt content/identity mismatch')
+        namespace = 'proofs' if record['kind'] == 'PublicOwnerLifetime' else 'observations'
+        key = digest(record['owner']) if namespace == 'proofs' else digest(record['watch'].encode())
+        if relative.parts != (namespace, key, record['observation_id'] + '.json'):
+            raise RuntimeError('CoordinationBlocked: immutable fact namespace/identity mismatch')
         if kind is not None and record['kind'] != kind:
             raise RuntimeError('CoordinationBlocked: receipt evidence type mismatch')
         return {'path':str(path), 'sha256':digest(data), 'inode':[info.st_dev, info.st_ino], 'kind':record['kind']}
@@ -189,59 +193,101 @@ class Journal:
                                + ','.join(self.value['file_intents']))
         return self.value
 
-    def recover_public_proofs(self):
-        """A new writer can consume an already durable exact helper fact.
+    def referenced_record(self, reference):
+        relative = Path(reference['path']).relative_to(self.target.directory.path)
+        container = self.target.directory.child(relative.parts[0], create=False)
+        try:
+            directory = container.child(relative.parts[1], create=False)
+            try:
+                record, info, data = directory.read(relative.name)
+                if digest(data) != reference['sha256'] or [info.st_dev, info.st_ino] != reference['inode']:
+                    raise RuntimeError('ObservationRecoveryBlocked: authorized source fact replaced')
+                fact({'path':reference['path'], 'record':record, 'sha256':reference['sha256']}, self.target)
+                return record
+            finally:
+                directory.close()
+        finally:
+            container.close()
 
-        This does not close an old producer or erase its last references. Those
-        need their own acknowledgement; missing public evidence stays blocked.
-        """
+    def authorized_producers(self, item, kinds):
+        records = [self.referenced_record(f) for f in item['facts'] if f['kind'] in kinds]
+        for r in records:
+            if (r['watch'] != item['watch'] or r['acquisition'] != item['acquisition']
+                    or r['subscription_epoch'] != item['epoch'] or r['coord_key'] != self.target.key):
+                raise RuntimeError('ObservationRecoveryBlocked: authorized source binding mismatch')
+        return {r['helper'] for r in records}
+
+    def scan_facts(self, namespace, key):
+        try:
+            container = self.target.directory.child(namespace, create=False)
+        except FileNotFoundError:
+            return []
+        try:
+            try:
+                directory = container.child(key, create=False)
+            except FileNotFoundError:
+                return []
+            try:
+                names = os.listdir(directory.fd)
+                if len(names) > 4096:
+                    raise RuntimeError('ObservationRecoveryBlocked: fact namespace budget')
+                result = []
+                for name in names:
+                    if name.endswith('.new'):
+                        raise RuntimeError('ObservationRecoveryBlocked: pending immutable fact retained')
+                    record, _, data = directory.read(name)
+                    result.append({'path':str(directory.path/name), 'sha256':digest(data), 'record':record})
+                return result
+            finally:
+                directory.close()
+        finally:
+            container.close()
+
+    def recover_public_proofs(self):
+        """Adopt authorized durable facts without closing any old producer."""
         for item in list(self.value['entries'].values()):
+            if item.get('launch') and not item.get('owner'):
+                authorized = self.authorized_producers(item, ('SpawnIntent', 'Spawned'))
+                for receipt in self.scan_facts('observations', digest(item['watch'].encode())):
+                    r = receipt['record']
+                    if (r.get('kind') == 'StartupOwnerSubscribed' and r.get('helper') in authorized
+                            and r.get('watch') == item['watch'] and r.get('acquisition') == item['acquisition']
+                            and r.get('subscription_epoch') == item['epoch']):
+                        self.startup_owner({'watch':item['watch'], 'receipt':receipt})
             if not item.get('owner') or item.get('proof'):
                 continue
-            subscriptions = [f for f in item['facts'] if f['kind'] in ('Subscribed', 'StartupOwnerSubscribed')]
-            if not subscriptions:
-                continue
-            producer_id = None
-            for subscription in subscriptions:
-                path = Path(subscription['path'])
-                container = self.target.directory.child('observations', create=False)
-                try:
-                    producer = container.child(path.parent.name, create=False)
-                    try:
-                        record, info, data = producer.read(path.name)
-                        if (digest(data) != subscription['sha256'] or [info.st_dev, info.st_ino] != subscription['inode']):
-                            raise RuntimeError('ObservationRecoveryBlocked: original subscription replaced')
-                        producer_id = record['helper']
-                    finally:
-                        producer.close()
-                finally:
-                    container.close()
-            try:
-                namespace = self.target.directory.child('proofs', create=False)
-            except FileNotFoundError:
-                continue
-            try:
-                try:
-                    producer = namespace.child(digest(item['owner']), create=False)
-                except FileNotFoundError:
-                    continue
-                try:
-                    names = os.listdir(producer.fd)
-                    if len(names) > 4096:
-                        raise RuntimeError('ObservationRecoveryBlocked: public proof namespace budget')
-                    for name in names:
-                        record, _, data = producer.read(name)
-                        if (record.get('kind') == 'PublicOwnerLifetime' and record.get('helper') == producer_id
-                                and record.get('watch') == item['watch'] and record.get('owner') == item['owner']
-                                and record.get('acquisition') == item['acquisition']
-                                and record.get('subscription_epoch') == item['epoch']):
-                            self.proof({'watch':item['watch'], 'proof':{'path':str(producer.path/name),
-                                        'sha256':digest(data), 'record':record}})
-                            break
-                finally:
-                    producer.close()
-            finally:
-                namespace.close()
+            authorized = self.authorized_producers(item, ('Subscribed', 'StartupOwnerSubscribed', 'BridgeSubscribed'))
+            for receipt in self.scan_facts('proofs', digest(item['owner'])):
+                r = receipt['record']
+                if (r.get('kind') == 'PublicOwnerLifetime' and r.get('helper') in authorized
+                        and r.get('watch') == item['watch'] and r.get('owner') == item['owner']
+                        and r.get('acquisition') == item['acquisition'] and r.get('subscription_epoch') == item['epoch']):
+                    self.proof({'watch':item['watch'], 'proof':receipt})
+                    break
+
+    def bridge_signed(self, receipt):
+        r = receipt['record']
+        item = self.item(r['watch'], r['subscription_epoch'])
+        if (r['owner'] != item['owner'] or r['acquisition'] != item['acquisition']
+                or r['state_root'] != item['owner']['state_root']):
+            raise RuntimeError('CoordinationBlocked: bridge producer binding mismatch')
+        verified = fact(receipt, self.target, kind='BridgeSubscribed')
+        existing = self.authorized_producers(item, ('BridgeSubscribed',))
+        if existing and existing != {r['helper']}:
+            raise RuntimeError('CoordinationBlocked: conflicting bridge producer')
+        if verified not in item['facts']:
+            item['facts'].append(verified)
+        self.save()
+
+    def abort_unstarted(self, watch):
+        item = next(i for i in self.value['entries'].values() if i['watch'] == watch)
+        if item['lease'] or item.get('launch') or any(f['kind'] != 'BridgeSubscribed' for f in item['facts']):
+            raise RuntimeError('CoordinationBlocked: cannot abort a signed/possibly attached observation')
+        item['producer_closed'] = item['consumer_closed'] = item['detached'] = item['bridge_closed'] = True
+        item['unacked_events'] = False
+        item['no_attach'] = True
+        self.save()
+        self.settle()
 
     def file_intent(self, path, status, attempts):
         intents = self.value.setdefault('file_intents', {})
@@ -336,7 +382,10 @@ class Journal:
         receipt = value['proof']
         record = receipt['record']
         item = self.item(value['watch'], record['subscription_epoch'])
-        if (record['evidence_type'] != 'public_owner_lifetime' or record['owner'] != item['owner']
+        if (record.get('helper') not in self.authorized_producers(item, ('Subscribed', 'StartupOwnerSubscribed', 'BridgeSubscribed'))
+                or record['watch'] != item['watch']
+                or record['state_root'] != item['owner']['state_root']
+                or record['evidence_type'] != 'public_owner_lifetime' or record['owner'] != item['owner']
                 or record['acquisition'] != item['acquisition']):
             raise RuntimeError('CoordinationBlocked: proof owner/acquisition mismatch')
         verified = fact(receipt, self.target, kind='PublicOwnerLifetime')
@@ -494,7 +543,10 @@ class Journal:
         item = self.item(value['watch'], record['subscription_epoch'])
         launch = item.get('launch') or item.get('launch_identity')
         owner = record['owner']
-        if (record['kind'] != 'StartupOwnerSubscribed' or record['acquisition'] != item['acquisition']
+        if (record.get('helper') not in self.authorized_producers(item, ('SpawnIntent', 'Spawned'))
+                or record['watch'] != item['watch'] or record.get('launch') != launch
+                or record['state_root'] != owner['state_root']
+                or record['kind'] != 'StartupOwnerSubscribed' or record['acquisition'] != item['acquisition']
                 or not launch or not owner['record_id'].endswith('-' + launch['suffix'])
                 or owner['canonical_idb_path'] != launch['target'] or owner['backend'] != launch['backend']):
             raise RuntimeError('StartupUnconfirmed: discovered owner binding mismatch')

@@ -31,6 +31,7 @@ class OpenTests(unittest.TestCase):
         self.mocks = [patch.dict(os.environ, {'IDA_CLI_HOME': str(self.root/'home')}),
             patch.object(recovery, 'public_owner_probe', return_value=None),
             patch.dict(sys.modules, {'ida_nexus': types.SimpleNamespace(
+                get_state_dir=lambda: Path(os.environ['IDA_NEXUS_STATE_DIR']),
                 probe_database_state=lambda *a, **kw: {'idb_path': str(self.target),
                     'state': 'crashed' if self.recovering else 'packed'},
                 wait_database_released=self.wait)})]
@@ -155,6 +156,10 @@ class OpenTests(unittest.TestCase):
         original = recovery.Snapshot.failed
         for fails in (False, True):
             with self.subTest(snapshot_error=fails):
+                self.source = self.root/('user-snapshot-' + str(fails))
+                self.source.mkdir()
+                self.target = self.source/'input.i64'
+                self.target.write_bytes(b'original packed')
                 self.make_crashed()
                 self.losses, self.close_safe = 1, True
                 self.handles.clear()
@@ -176,6 +181,10 @@ class OpenTests(unittest.TestCase):
     def test_no_lifetime_or_no_lease_proof_never_rolls_back(self):
         for lease, lifetime in ((True, False), (False, True)):
             with self.subTest(lease=lease, lifetime=lifetime):
+                self.source = self.root/('user-proof-' + str(lease) + str(lifetime))
+                self.source.mkdir()
+                self.target = self.source/'input.i64'
+                self.target.write_bytes(b'original packed')
                 self.recovering, self.losses = True, 1
                 self.lease, self.lifetime = lease, lifetime
                 self.handles.clear()

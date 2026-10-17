@@ -86,6 +86,7 @@ class TransportCustodian:
         self.handle = None
         self.originals, self.launches = {}, {}
         self.running = True
+        self.target = None  # Transport-only double has no native target snapshot.
 
     def gate(self, _target):
         return nullcontext()

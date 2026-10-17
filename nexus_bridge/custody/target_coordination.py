@@ -157,6 +157,74 @@ class Directory:
         finally:
             os.close(fd)
 
+    def retry_immutable(self, name, value, *, immutable=True):
+        """Resume only this producer's durably reserved exact immutable slot."""
+        data = encoded(value)
+        if len(data) > MAX_RECORD or Path(name).name != name:
+            raise ValueError('invalid immutable fact slot')
+        temporary = name + '.new'
+        # Publication can fail between link and unlink. Only the two exact
+        # names of this reserved slot may share the completed immutable inode.
+        if immutable:
+            try:
+                final = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+                pending = os.stat(temporary, dir_fd=self.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                if (identity(final) == identity(pending) and final.st_nlink == 2
+                        and stat.S_ISREG(final.st_mode) and final.st_uid == os.getuid()
+                        and stat.S_IMODE(final.st_mode) == 0o600):
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
+                    try:
+                        if identity(os.fstat(fd)) != identity(final) or os.read(fd, MAX_RECORD+1) != data:
+                            raise RuntimeError('ObservationRecoveryBlocked: linked fact conflict')
+                        self.verify()
+                        if identity(os.stat(temporary, dir_fd=self.fd, follow_symlinks=False)) != identity(final):
+                            raise RuntimeError('ObservationRecoveryBlocked: pending link changed')
+                        os.unlink(temporary, dir_fd=self.fd)
+                        os.fsync(self.fd)
+                    finally:
+                        os.close(fd)
+        try:
+            current, _, raw = self.read(name)
+        except FileNotFoundError:
+            pass
+        else:
+            if immutable:
+                if raw != data or current != value:
+                    raise RuntimeError('ObservationRecoveryBlocked: immutable fact conflict')
+                os.fsync(self.fd)
+                return
+        try:
+            fd = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=self.fd)
+        except FileExistsError:
+            fd = os.open(temporary, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
+        try:
+            before = checked(fd)
+            prefix = os.read(fd, MAX_RECORD + 1)
+            if not data.startswith(prefix) or len(prefix) != before.st_size:
+                raise RuntimeError('ObservationRecoveryBlocked: reserved fact partial content conflict')
+            self.verify()
+            if identity(before) != identity(os.stat(temporary, dir_fd=self.fd, follow_symlinks=False)):
+                raise RuntimeError('ObservationRecoveryBlocked: reserved fact inode changed')
+            view = memoryview(data)[len(prefix):]
+            while view:
+                count = os.write(fd, view)
+                if count <= 0:
+                    raise OSError('short immutable fact write')
+                view = view[count:]
+            os.fsync(fd)
+            if immutable:
+                os.link(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd, follow_symlinks=False)
+                os.unlink(temporary, dir_fd=self.fd)
+            else:
+                os.replace(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            os.fsync(self.fd)
+        finally:
+            os.close(fd)
+
     def lock(self, name='lock', *, shared=False, deadline=None, nb=False):
         created = False
         try:
@@ -264,6 +332,22 @@ class Target:
         except BaseException:
             self.close()
             raise
+
+    def business_admission(self):
+        """Evidence/GC access keeps its identity; business may only use live payload."""
+        if self.target_fd is None:
+            raise RuntimeError('business admission requires target EX')
+        if self.root is not None:
+            live = self.root.path / 'generations' / self.key['gid']
+            isolated = self.root.path / 'quarantine' / self.key['gid']
+            if isolated.exists():
+                raise RuntimeError('TargetQuarantined: payload is reserved for GC/evidence')
+            if not live.exists():
+                raise RuntimeError('TargetRetired: payload is reserved for GC/evidence')
+            if self.target.parent.parent.name == 'quarantine':
+                raise RuntimeError('TargetQuarantined: quarantine is not a business path')
+            if identity(os.stat(live, follow_symlinks=False)) != self.binding['group']:
+                raise RuntimeError('CoordinationBlocked: live payload identity changed')
 
     @contextmanager
     def locked(self, *, deadline=None, nb=False):

@@ -1,5 +1,5 @@
 """Bounded initial-open retries and conservative, post-recovery rollback."""
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -45,6 +45,54 @@ def open_locks(root, target, deadline):
         for fd in reversed(descriptors):
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
+
+
+class OpenGate:
+    """Target admission for compatible opens before full custody migration."""
+    def __init__(self, root, target, deadline):
+        self.root, self.path, self.deadline = root, target, deadline
+        self.target = self.guard = self.legacy = None
+
+    def __enter__(self):
+        from target_coordination import Target
+        from target_journal import Journal
+        from owner_identity import state_identity
+        try:
+            self.target = Target(self.path)  # Actual managed root SH precedes home locks.
+            self.legacy = open_locks(self.root, self.path, self.deadline)
+            self.legacy.__enter__()
+            self.lock()
+            self.target.business_admission()
+            Journal(self.target).gate(state_identity())
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def lock(self):
+        self.guard = self.target.locked(deadline=self.deadline)
+        self.guard.__enter__()
+
+    def unlock(self):
+        if self.guard is not None:
+            self.guard.__exit__(None, None, None)
+            self.guard = None
+
+    @contextmanager
+    def file_gate(self):
+        if self.guard is not None:
+            yield
+        else:
+            with self.target.locked(deadline=self.deadline):
+                yield
+
+    def __exit__(self, *_):
+        self.unlock()
+        if self.legacy is not None:
+            self.legacy.__exit__(None, None, None)
+            self.legacy = None
+        if self.target is not None:
+            self.target.close()
 
 
 def stable_stat(value):
@@ -254,13 +302,20 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
     target = Path(output).resolve()
     if target.suffix not in ('.i64', '.idb'):
         target = Path(str(target) + '.i64')
-    locking = custodian.gate(target) if custodian else open_locks(root, target, deadline)
+    locking = custodian.gate(target) if custodian else OpenGate(root, target, deadline)
     with locking:
+        coordination = custodian.target if custodian else locking.target
         state = probe_database_state(path, output_database=options.get('output_database'))
-        snapshot = Snapshot(root, target, deadline, coordination=custodian.target if custodian else None) if state['state'] in ('crashed', 'unpacked') else None
+        snapshot = Snapshot(root, target, deadline, coordination=coordination) if state['state'] in ('crashed', 'unpacked') else None
         for number in range(1, 4):
             logging.getLogger('ida_cli.open').debug('open attempt %d/3: %s', number, target)
             attempt_context = dict(context, open_attempt=number, deadline=deadline)
+            if not custodian and number > 1:
+                locking.lock()
+                locking.target.business_admission()
+                from target_journal import Journal
+                from owner_identity import state_identity
+                Journal(locking.target).gate(state_identity())
             starting()
             current_options = dict(options, startup_timeout=remaining(deadline))
             if custodian:
@@ -268,6 +323,7 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
             else:
                 handle = Handle.open(path, options=Options(**current_options))
                 acquired(handle, attempt_context)
+                locking.unlock()
             attempt_context['record_id'] = handle.instance.record_id
             try:
                 code = guarded_source('import ida_kernwin\nresult = ida_kernwin.get_kernel_version()', attempt_context)
@@ -299,7 +355,7 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                 observed, observation_error = None, None
                 if snapshot and proof['initial']:
                     try:
-                        with custodian.file_gate() if custodian else nullcontext():
+                        with custodian.file_gate() if custodian else locking.file_gate():
                             observed = snapshot.failed(number)
                     except Exception as error:
                         observation_error = error
@@ -316,7 +372,7 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                     raise RuntimeError('open runtime check failed; no initial Root retry: ' + str(exc)
                                        + '; ' + (outcome['save_guard_error'] or '')) from exc
                 if snapshot:
-                    with custodian.file_gate() if custodian else nullcontext():
+                    with custodian.file_gate() if custodian else locking.file_gate():
                         snapshot.rollback(observed)
                 if number == 3:
                     raise RuntimeError('Root Node initial open failed after 3 attempts; '
@@ -325,7 +381,7 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                     custodian.next_retry()
                 continue
             if snapshot:
-                with custodian.file_gate() if custodian else nullcontext():
+                with custodian.file_gate() if custodian else locking.file_gate():
                     snapshot.complete()
             if number > 1:
                 logging.getLogger('ida_cli.open').warning(

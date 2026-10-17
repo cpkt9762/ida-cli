@@ -788,3 +788,161 @@ async fn gc(
     );
     Ok(value["result"].clone())
 }
+
+#[tokio::test]
+async fn r9_late_ordinal_retirement_and_public_proof_before_release_return() {
+    let base = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private test root"));
+    for scenario in [
+        "r9-retire-before",
+        "r9-retire-after",
+        "r9-proof-before-release",
+    ] {
+        let root = base.join(scenario);
+        std::fs::create_dir_all(&root).expect("isolated r9 scenario");
+        let router = RouterState::new().expect("real N1 router");
+        let mut environment: BTreeMap<String, String> = std::env::vars().collect();
+        environment.insert("R3A_CASE_ROOT".into(), root.display().to_string());
+        environment.insert("R3A_SCENARIO".into(), scenario.into());
+        environment.insert("HOME".into(), root.join("home").display().to_string());
+        environment.insert(
+            "IDA_NEXUS_STATE_DIR".into(),
+            root.join("state").display().to_string(),
+        );
+        let bridge = router
+            .connect_nexus(BridgeConfig {
+                python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("fixed SDK")),
+                script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/support/r3a_bridge_fixture.py"),
+                directory: root.join("i"),
+                environment,
+            })
+            .await
+            .expect("real bridge/helper/SDK");
+        let mut events = bridge.subscribe();
+        let client = ClientId::new(scenario).expect("test client");
+        let opened = bridge
+            .endpoint()
+            .transition(|s, t| {
+                s.open(
+                    &client,
+                    AcceptedRequest::new(
+                        &SystemClock,
+                        RequestId::new("r9-open")?,
+                        None,
+                        "open",
+                        json!({"timeout_secs":20}),
+                    )?,
+                    OpenSpec {
+                        operation_id: OperationId::new("r9-open")?,
+                        path: root.join("tiny.i64").display().to_string(),
+                        options: json!({"spawn":false,"wait_analysis":false}),
+                    },
+                    t,
+                )
+            })
+            .expect("reserve production open");
+        let mut evidence = Vec::new();
+        let result = async {
+            if scenario == "r9-proof-before-release" {
+                tokio::time::timeout(Duration::from_secs(12), async {
+                    loop {
+                        let event = events.recv().await?;
+                        evidence.push(event.clone());
+                        if event["event"] == "owner_released" {
+                            break Ok::<_, anyhow::Error>(());
+                        }
+                    }
+                })
+                .await??;
+                anyhow::ensure!(
+                    root.join("r9-release.arrived").exists(),
+                    "proof did not precede release return barrier"
+                );
+                // Wait for retirement while the actual SDK detach response is withheld.
+                wait_for(|| Ok(root.join("r9-retirement.json").exists())).await?;
+                std::fs::write(root.join("r9-release.release"), b"")?;
+            }
+            let terminal = tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let event = events.recv().await?;
+                    evidence.push(event.clone());
+                    if event["attempt"]["target"]["kind"] == "open"
+                        && ["opened", "failed", "uncertain"]
+                            .iter()
+                            .any(|kind| event["event"] == *kind)
+                    {
+                        break Ok::<_, anyhow::Error>(event);
+                    }
+                }
+            })
+            .await??;
+            anyhow::ensure!(terminal["event"] == "opened", "r9 failed: {terminal}");
+            wait_for(|| Ok(root.join("r9-retirement.json").exists())).await?;
+            let retirement: Value =
+                serde_json::from_slice(&std::fs::read(root.join("r9-retirement.json"))?)?;
+            if scenario == "r9-retire-after" {
+                anyhow::ensure!(
+                    retirement["current_ordinal"] == 2,
+                    "not actually late: {retirement}"
+                );
+            } else {
+                anyhow::ensure!(
+                    retirement["current_ordinal"] == 1,
+                    "prior retirement did not precede next ordinal: {retirement}"
+                );
+            }
+            anyhow::ensure!(
+                root.join("r9-next-ordinal").exists(),
+                "next ordinal not acquired"
+            );
+            let (lease, failure) = bridge
+                .endpoint()
+                .transition(|s, _| s.open_progress(&client, &opened))?;
+            anyhow::ensure!(failure.is_none(), "parent failed: {failure:?}");
+            let lease = lease.ok_or_else(|| anyhow::anyhow!("new lease missing"))?;
+            anyhow::ensure!(
+                bridge
+                    .endpoint()
+                    .transition(|s, _| s.status(&client, &lease))?
+                    .phase
+                    == SessionPhase::Active,
+                "new ordinal retired by old receipt"
+            );
+            bridge
+                .endpoint()
+                .transition(|s, t| s.release(&client, &lease, t))?;
+            wait_for(|| Ok(root.join("release-requested").exists())).await?;
+            std::fs::write(root.join("owner-release"), b"")?;
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    let event = events.recv().await?;
+                    evidence.push(event.clone());
+                    if event["event"] == "custody_settled" && event["acquisition"]["ordinal"] == 2 {
+                        break Ok::<_, anyhow::Error>(());
+                    }
+                }
+            })
+            .await??;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        std::fs::write(root.join("r9-release.release"), b"")
+            .expect("release private response barrier");
+        std::fs::write(root.join("owner-release"), b"").expect("release private lifetime input");
+        let shutdown = bridge.shutdown().await;
+        let forced = if shutdown.is_err() {
+            Some(
+                bridge
+                    .test_helper_fault(true)
+                    .await
+                    .expect("owned failed-case cleanup"),
+            )
+        } else {
+            None
+        };
+        std::fs::write(root.join("q1-evidence.json"),serde_json::to_vec_pretty(&json!({"events":evidence,
+            "error":result.as_ref().err().map(ToString::to_string),"shutdown":shutdown.as_ref().err().map(ToString::to_string),"forced":forced})).expect("evidence JSON")).expect("save evidence");
+        result.expect("r9 production barrier assertions");
+        shutdown.expect("natural bridge/helper exit");
+    }
+}
