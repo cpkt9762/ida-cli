@@ -1,8 +1,8 @@
 # Nexus 释放与打开协议：N7a-R 设计
 
-状态：第一阶段 r2 设计修订，已落实 U1–U4，待增量设计复审；不代表实现、测试或 N7 验收通过。
+状态：第一阶段 r3 设计修订，落实 U1–U5 与 r2 聚焦复审，待本轮增量复审；不代表实现、测试或 N7 验收通过。
 日期：2026-10-17。设计基线：`feat/nexus-backend`，`f47dd2301b096f1c4b6643906f6e8976e8663469`。
-设计输入提交：`ff81992412187cf966b1e02c74b3dc1cad02713f`；产品与测试仍为上述 f47dd23。
+设计输入提交：`36ed13ce51dc75c54604179cccbc8fc0a3d1f4d0`（r2；其父设计为 ff81992）；产品与测试仍为上述 f47dd23。
 第二阶段须另行派单；本阶段只提交本文件及主计划 N7 中的引用。
 
 ## 1. 依据、目标与保留边界
@@ -16,6 +16,8 @@
 - `/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/review-astra/report.md` 全文（D1–D5、§3–6）。
 - r2 委托 `prompt-design-r2.md`（SHA256 `c7e195bef5f9f6ff187e48e7d8884adb1399a640caaab5bd1d14e5a3c570986a`）中的 U1–U4，已裁定结论见 §10.3；逐条回应见外部 `review-response-r2.md`。
 - `/tmp/n7audit-repro.5EnFte/{harness/src/main.rs,stub_bridge.py,run.sh}`、两位 reviewer 的 `/tmp/n7rdr-repro.{wzQ1QG,GMAiQAHD}/` 及固定 Nexus 源码只读参考；不执行旧 run.sh，不改现场。
+- r2 增量复审 `/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/rereview-{claude,astra}/report.md` 全文，含 N1–N9、R2-F1/R2-F2 和两份 W1 建议。
+- r3 委托 `prompt-design-r3.md`（SHA256 `c08a53c210781fca1b08ea8799783c491d29ccb2fbffb86287d3cf2f0f2c638a`）及 U5；逐条回应/行号见外部 `review-response-r3.md`。U1–U4 不重开。
 - 固定 Nexus 0.13.4 加三个本地补丁，`handle.py` SHA256 `aa5d7ea42caaa922ef494d7d8a1406396537a4ea88d9e833825e08c8d279025e`；本轮只读其公开契约。
 
 目标是把四个事实分开：调用方结果、一次命令的投递、自己的 lease 是否 detach、精确 owner 是否释放数据库。
@@ -60,7 +62,9 @@ auxiliary 即使在父用户结果结束后获取，也引用持久保留的父�
 
 `LaunchIdentity` 包含 parent/acquisition、launch suffix、Popen 身份及启动时刻、log_path、目标/state 根和预期 backend。
 launcher PID/退出不等于实际 owner PID/退出；不能由启动观察到期推出没有写入者。
-`RecoveryId` 是目标身份下的唯一事务编号；其 journal 和锁在目标旁，与 IDA_CLI_HOME 无关。
+`RecoveryId` 是稳定 `CoordKey` 下的唯一事务编号。直接用户 IDB 的 CoordKey 由 Nexus identity_key 与父目录身份确定；受管代际由实际 store 根身份与不可复用 generation id 确定，原/隔离路径映射同一 CoordKey，见 §6.2。
+`OSBirthIdentity` 记录 boot_id、pid、原生出生时间/精度、start_time_us、sid/pgid、平台方法与 eligibility；与 OwnerKey/LaunchIdentity 绑定，见 §3.4。
+LaunchIdentity 的预分配 suffix 在 Popen 前已进入 spawn intent，实际 Popen 身份创建后立即交付；不能等 log_path 创建成功后才登记。
 
 ### 2.2 逐层状态、事件与转移
 
@@ -70,9 +74,9 @@ launcher PID/退出不等于实际 owner PID/退出；不能由启动观察到�
 | Nexus 服务端：lease 成员与 owner 生命周期 | Live → Detached；最后引用按 keepalive 进入 Draining → 数据库关闭 → lifetime 释放 | 公共 release 或 SSE EOF；detach ACK 可先于保存结束；GUI/其他引用继续存活 | 不改服务端、不新增协议 |
 | 客户端 handle：公开调用边界及原始 detach outcome | Connected → CloseIssued → AckDetached / DetachUnknown；连接状态正交 | 调用前锁存一次性请求；有效 last/nonlast ACK 均记录 lease_released；异常保留原始字段；同 handle 不重复发请求 | 不让 status='uncertain' 掩盖已取得的最后 ACK，不把 EOF 当 owner 释放 |
 | Python bridge：物理 handle 账本与调用阶段 | Acquired/Preparing → Ready 或 CleanupRequired → DetachIssued → Detached/Uncertain；BlockedBeforeSend 可退回 CleanupRequired | acquired 立即登记；ready 才交付；失败转清理；每个 handle 独立 guard 与一次 detach；保存拒绝累积 | 删除 release_group 证明传播；不自行推断 N1 phase，不用通用 public_started 猜所有命令 |
-| 独立 proof helper：公共 owner-exit 证据 | Watching → Exited；观察异常 → ObservationFailed → 只读重新观察 | 每 OwnerKey 一个 wait_database_released(instance, timeout=None) 线程；True 才发 owner_exited；异常发 owner_observation_error | 不发 release、不等待控制帧预算、不关闭 sibling/GUI |
+| 独立 proof helper：公共 owner-exit 证据 | Watching → Exited；观察异常 → ObservationFailed → 只读重新观察 | 每 OwnerKey 一个 wait_database_released(instance, timeout=None) 线程；公共 True 或通过 §3.4 的 os_process_exit 分型发事件；异常发 owner_observation_error | 不发 release、不等待控制帧预算、不关闭 sibling/GUI；OS 证据不补 ACK/N1 停止 |
 | Rust 事件泵：相关性与交付可靠性 | pending command / acquisition custody / owner subscription，三张分开的有界表 | 命令结果只结算对应 attempt；owner_exited 按 helper 身份、watch_id+OwnerKey 投递；重复命令幂等、未知命令丢弃；迟到 custody/stop/proof 仍消费各自责任 | 不持有第二套 lease 释放状态，不因未知消息 fail 整桥 |
-| N1：逻辑会话、操作、投递及清理责任 | 会话新增 Preparing；Preparing → Active 或 ReleaseRequired → ReleaseRequested → Released；Disconnected 正交保留责任 | opened 登记；带 disposition 的 custody_ack 不代替内部 operation grant；open_ready 发布；失败转 ReleaseRequired；NotSent 恢复清理阶段；Uncertain 不重发；匹配 ACK 或 owner 证明确认 detach | 不把 Released 当 owner 已停止；调用方终态、execution_stopped 和投递状态继续分离 |
+| N1：逻辑会话、操作、投递及清理责任 | 会话新增 Preparing；Preparing → Active 或 ReleaseRequired → ReleaseRequested → Released；Disconnected 正交保留责任 | opened 登记；带 disposition 的 custody_ack 不代替内部 operation grant；open_ready 发布；失败转 ReleaseRequired；NotSent 恢复清理阶段；Uncertain 不重发；匹配 ACK 或 public_owner_lifetime 确认 detach；os_process_exit 只交 Tools 退出义务 | 不把 Released 当 owner 已停止；调用方终态、execution_stopped 和投递状态继续分离 |
 | Tools：对外记录、owner 保护与文件锁 | PreparingRecord → ActiveRecord → DetachedRetained → Retired；异常为 CleanupBlocked / OwnerObservationFailed / RecoveryBlocked | N1 Released 使 token 失效并退出活动列表；last/Uncertain 保留 owner 根 SH，nonlast 释放本次 lease guard；startup/recovery 有独立持有者与终态 | 不用 15s/120s 到时推断释放，不轮询第二套 owner 状态 |
 
 Tools 的 owner 保留表是资源账本；N1 是会话状态的唯一权威。Python 的状态是原始 handle 调用事实，不能直接改 Tools。
@@ -108,9 +112,9 @@ close_outcome(wait_for_database=False)。detach 控制预算仍最多 2s，不�
 |---|---|---|
 | 有效 nonlast ACK | Released / Confirmed | 本 lease guard 释放；只保留轻量 OwnerKey/诊断，不阻整根 GC |
 | 有效 last ACK，shutdown_pending=True | Released / Confirmed | owner draining；Tools 保留该 owner 根 SH，最终保存不占控制预算 |
-| 请求已可能发出，ACK 丢失/坏 JSON/传输失败 | ReleaseRequested + Uncertain | 不重发；保留精确 lease、owner 与根 SH；等公共 owner proof |
+| 请求已可能发出，ACK 丢失/坏 JSON/传输失败 | ReleaseRequested + Uncertain | 不重发；保留精确责任，公共 owner proof 可结 N1；U5 仅可独立结 owner/file 义务，不伪造 ACK/Released |
 | close_outcome 尚未调用 | NotSent，退回 ReleaseRequired 或原 phase | 可新 attempt；内部 RPC 停止责任与保护失败仍独立存在 |
-| owner-exit 先于 detach 结果 | 锁存 proof，仅结清同物理 owner 的旧 lease | 不伪造 ACK、不改变原投递、不丢保存错误 |
+| public_owner_lifetime 先于 detach 结果 | 锁存 proof，仅结清同物理 owner 的旧 lease | 不伪造 ACK、不改变原投递、不丢保存错误 |
 
 SSE 证据另分为 LocalStreamClosed（本地 shutdown/close 成功）、PeerEOF（读到 EOF）、StreamCloseFailed。
 它们均不是 detach ACK 或 owner proof，不能将 Uncertain 改为 Released，不能借 heartbeat 到期宣告停止。
@@ -119,7 +123,7 @@ Claude 的真实 stub 实验在 heartbeat=0.5s 下约 1.34s 自动 detach，说�
 **Uncertain 不阻止附加同一健康 OwnerKey**：新请求在目标 gate 下公开发现并精确匹配同一 owner，
 健康 attach 可继续，旧 Uncertain 责任单独保留。这样共享 GUI 长存也不会阻断同 owner 的新 opener。
 只在服务端仍健康且 heartbeat/调度推进的故障模型下预期断流有界回收；没有 owner proof 时未知记录不伪收敛。
-不同 OwnerKey 的新建必须先取得旧 owner proof；没有精确 instance 或 proof 则 pending/blocked，而非等待固定秒数放行。
+不同 OwnerKey 的新建须先结清旧 owner-held 条件及其余 gate 义务：公共 proof 或合格 U5 证据只各结其允许的范围；没有可信来源则 pending/blocked，而非等待固定秒数放行。
 
 primary 与自有 auxiliary 各有独立 LeaseKey、AcquisitionId、N1 清理责任与 release attempt。
 auxiliary 在创建前登记 cleanup-only；先推进所有可请求成员，每成员只发一个终态，删除组内 donor/二轮协调。
@@ -129,71 +133,125 @@ primary ACK + auxiliary NotSent 时前者保持 Released，后者可在停止/�
 辅助检查失败返回原错误并保留 handle；primary 成功不能掩盖它。
 
 删除 release_unconfirmed；每 attempt 只有一个命令终态，后来的 owner 证明走独立通道。
-N1 `owner_released(OwnerKey, proof)` 核对 owner→lease 绑定，结清旧 lease，包括实际已退出的 NotSent/Disconnected 清理项；
+N1 `owner_released(OwnerKey, proof)` 仅接受 public_owner_lifetime，核对 owner→lease 绑定，结清旧 lease，包括实际已退出的 NotSent/Disconnected 清理项；
 原 ACK、投递和调用方确定结果保持，不能让 owner 退出把失败业务改成成功。
 
-### 3.2 必需 proof helper、owner 表与立即重开
+### 3.2 必需 proof helper、持久证明与立即重开
 
-proof helper 是协议的**必需组件**，由 Rust 启动/管理，与业务 bridge 不在同一进程、线程池或父进程死亡域。
-它只通过公共 discover/wait_database_released 工作，不执行用户业务，不发 release/shutdown，不加载 IDA。
-Rust 在 resolved 阶段发送非敏感 OwnerKey，helper 自行公开 discover、逐字段匹配，持有返回的真实 instance。
-`subscribe_ack(OwnerKey, helper_incarnation, watch_id)` 必须在 acquisition 继续 attach/准备之前签收；
-已建立 SSE 的获取回调若尚未完成订阅，则仅保留 custody，不准开始准备。订阅失败不能丢 handle 或靠 absence 放行。
-同 OwnerKey 合并 watcher，使用 wait_database_released(instance, timeout=None)；线程无限等待仅属后台观察，不阻用户请求。
+proof helper 是协议的**必需组件**，由 Rust 管理，独立于业务 bridge，不执行业务/release/shutdown，不加载 IDA。
+**每个 (router 管理域, state_root_identity) 一个 helper**：同一 router 涉及多根就各启一个并分别 admission；
+同根不同 router 默认不共享 helper。固定 SDK 的 REGISTRY_DIR 在 import 时由环境决定，helper 启动前设置绝对 IDA_NEXUS_STATE_DIR，
+握手返回实际 state 根/device/inode；订阅根不符拒绝，运行中不得改环境或模块全局“切根”。进程数按 router 的 state 根上限计费，各根 watcher 上限再计 owner 数。
+Rust 在 resolved 阶段向对应 helper 发非敏感 OwnerKey；helper 公开 discover 取得真实 instance，逐字段核对并记录 §3.4 OS 身份。
+`subscribe_ack(OwnerKey, helper_incarnation, watch_id)` 必须在**将要附加的新 owner**的 acquisition 继续之前签收。
+helper 再发现时旧 draining owner 已 reap 不代表退出证据丢失，先用下述旧对象/证明交接路径；不为观察一个已退出旧 owner 强求新的 subscribe_ack。
 
-helper/Rust 使用私有 0700 运行目录下的 0600 Unix socket，校验同 uid、peer credentials、endpoint device/inode、协议版本和 helper incarnation。
-端点定位及非敏感 helper 身份记录进相关目标 journal；home 仅可放定位副本，不能成为恢复 gate 的权威。
-消息含 physical OwnerKey、watch_id、helper incarnation、单调 proof_seq；Rust/bridge incarnation 只校验本连接，不参与物理证明有效性。
-helper 取得 True 后先以 temp+fsync+rename+目录 fsync 落盘非敏感 proof spool，再重发 owner_exited 直到 Rust 签收。
-Rust 先更新可靠 owner 表/必要 journal 再 ACK；按 (OwnerKey, proof_seq) 去重，重复订阅立即返回锁存事实。
-重连建立新 watch_id 时以 OwnerKey 继承已核验的旧事实；旧 bridge 的命令事件不能污染新连接，但不能因此丢弃真实 helper proof。
-instance 及其 SDK 内部认证字段只留 helper 内存，既不 IPC 传 token 也不落盘；磁盘 proof 是受保护的本地观察记录，不是 release 授权。
+U5 要求 bridge 的 owner-observation 表独立保留**原真实 instance 强引用**，last/nonlast ACK 或 handle 清理不丢它，
+只用于同 state 根的公开 wait_database_released；不在 IPC/磁盘序列化 token，不重建 instance。
+每不同 OwnerKey 一项，按对象条数与估算保留字节单独计费，不与物理 lease 槽混计；预算满在取得下一 owner 前 Busy，已有对象不驱逐。
+只有匹配证明已持久化、Rust 已 durable 接管并给出 proof_custody_ack 后才释放该备用引用；若 owner 长存则明确占用，见 §3.5。
+helper 持真实 instance 后每 OwnerKey 一个公共 wait 线程（不占 release/业务/stop 池），公共 True 才产生 public_owner_lifetime。
 
-仅 last-ACK 和 Uncertain 的 retained owner 持根 SH、计 `max_pending_per_tenant` 不确定容量；
-nonlast ACK 移出本次活动/不确定容量、释放本 lease 根 SH，轻量记录计单独 owner 观察表，不能阻整根 GC。
-其他尚活本地 lease、startup 或 recovery 自己的 guard 仍保留；nonlast 不能释放这些独立义务。
-正常成功 open 的 content/open EX 在发布结束释放；失败 open 的文件保护按各自义务保留；但无失败恢复意图、无 startup/文件写入且所有内部 operations 已停止时，
-在目标锁下把未知 detach 的 content/open EX 转交为 root SH + durable 精确 owner 记录，允许随后仅附加同一健康 owner，不能因此另建 owner。
-真实 failed-owner-held/恢复事务仍阻断任何新 open，直到双证明与事务结清；未知 detach 本身不伪造文件失败意图。
-owner proof 先到要等本地清理与错误归集，不删除后来的 saving refused 所需墓碑。
-外部 owner 的 GC 保护仍靠公共占用、隔离和宽限期，不能靠轻量记录冒充根锁。
+helper/Rust 使用私有 0700 运行目录、0600 Unix socket，核验同 uid/peer credentials、endpoint inode、版本与 helper incarnation。
+**proof 固定持久位置**为 §6.2 的协调目录下 `proofs/<OwnerKeyHash>/<proof_id>.json`，不放 IPC/tmp 或会随 router 退出删除的目录。
+每项包含 CoordKey、state_root_identity、OwnerKey/LaunchIdentity、evidence_type、producer、seq、OS 身份/条件（若适用）、内容校验和；0600/O_EXCL/O_NOFOLLOW，temp+fsync+rename+目录 fsync 后才可发事件。
+协调目录的 `owners/<OwnerKeyHash>.json` 与各 recovery.json 都持久引用 proof 路径、id、hash；跨目标共享 owner 时先给每个未结目标落可独立验证的副本/引用再撤备用来源。
+proof_id 全局唯一且包含 producer incarnation；proof_seq 仅在 producer 内单调，去重用 (physical OwnerKey, proof_id)，不能拿新 helper 从 1 开始的 seq 覆盖旧事实。
+Rust 先入可靠 owner 表、由目标 journal 写入者 durable 接管再 ACK，缓存事件重发直到确认；新 watch_id 按物理身份继承原事实，不因 bridge/router 换代丢弃。
+**ACK 不是删除许可**：proof 与引用至少保留至全部关联义务结清并 durable 归档；最后一份 proof 不能因 ACK、IPC 清理、root GC 或换 router 删除，之后仍按证据保留/人工归档规则处理。
+订阅、startup 交付与 ObservationAbandoned 同样写唯一不可变观察记录，由目标锁持有者归并 owners/journal；helper 不能并发 replace 权威 journal。
+订阅 ACK 只待自身记录 durable，原目标锁持有者负责引用落盘；orphan 退出前引用仍指向该 producer 的固定记录目录，下一 gate 枚举并核验未归并记录。
+public True→fsync 之间仍有故障窗口；写入失败留 ObservationFailed 和原对象，不假称 durable。持目标锁的线程不能等一个需要同锁才能写完的证明，锁规则见 §6.2。
 
-立即重开采用一条统一规则：
+last-ACK、Uncertain 以及 **bridge EOF 后无 ACK 的 Disconnected** retained 项持根 SH 并计不确定容量。
+EOF 不改已确认的 nonlast ACK；该项只留轻量 OwnerKey/观察和 §3.4 所需记录，不持本 lease 根 SH，也不阻根 GC。
+其他活动 lease、startup/recovery 自有 guard 仍保留。正常 open 的 content/open EX 在发布结束释放；目标 EX 更早在实际 attach/owner 登记后释放，见 §6.2。
+失败 open 若无失败恢复意图、无 startup/文件写入且所有 operations 已 stopped，可在目标锁下把 content/open EX 转为 root SH+durable owner 责任，仅准随后精确同健康 owner attach。
+真正 failed-owner-held 仍阻任何新 open，不能借此绕过事务 gate。保存错误墓碑不随 owner 证明先到而删除。
+nonlast 释放本 lease guard 后 GC 仍需公共占用检查、隔离和宽限期；健康 payload 的回收与稳定协调区分离，见 §6.2。
 
-1. 同 router：Tools 在派发新 open 前查目标 owner 表。last-ACK/draining 在**该新请求原有预算内**等匹配 owner_exited，收到后在 gate 下重核再打开；预算耗尽返回 Busy，附 OwnerKey、stage 和等待方式。Uncertain 只准附加同一健康 owner，不准另建 owner。
-2. 跨 router：目标 gate 下，attach 结构化 503/busy 或 resolve busy，且公开发现存在精确目标 instance 时，bridge 交 helper 签收观察并在新请求剩余预算内等待公共 lifetime；退出后**只重新 resolve 一次**，再按公开 API attach。SDK 原 open 已有的连接失败重解析也计入这个一次额度，不叠加外层重试，不重放业务或可能成功的 attach。
-3. 无匹配 instance 或等待未完成时返回明确 Busy/UnknownOutcome，不能路径猜配、重置 deadline 或轮询无限重开。r9 的三次双证明重开是另一受限流程，不增加本规则的重解析次数。
+跨 router 立即重开按以下有界规则执行：
 
-小库在与 f47dd23 同样的新请求预算内，close→立即 reopen→读回修改应一次请求成功，不把正常 draining 直接透出为 Busy；
-慢保存超出该预算才可 Busy，之后新请求继续消费原 proof。§9 同时验收小库无体验回退和大库诚实 pending。
-只需立即拷贝的调用方：close 后从现有 status 取得非敏感 owner_observation_ref，在同一 status 等待路径指定 wait_owner_exit 与自己的预算；
-返回 exited 才拷贝/备份或重开，pending/observation_failed 不称保存完成。等待不新增 lease，不复用 close token，也不宣称退出必然保存成功。
+1. 同 router：Tools 在新请求原预算内等待已知 last/draining owner 的退出，再在目标 gate 下重核后 open；未到预算不能只因正在 draining 直接 Busy。Uncertain 允许附加同一健康 owner，不准另建 owner。
+2. 跨 router 的 SDK 原 open 仍最多执行原有的 resolve→attach、NexusConnectionError 后一次内部 resolve→attach。U1 outcome 交付每阶段的类型化 503/busy/lease_absent、首次真实 resolved instance 与 observation_ref，以及 `sdk_reconnect_used`；不能把它们藏在最终异常里。
+3. **SDK 内部连接失败重试不消耗退出证明后的那一次重新 resolve 额度**。只有前段所有 attach 都类型化确定未取得 lease、或 custody 交付了真实资源并由 N1 结清后，才可进入独立 `post_exit_resolve_used=false` 阶段；任何可能成功而未知的 attach 不重放。
+4. B 已取得原 instance/ref 而 helper 再发现落空时，按同 physical OwnerKey 顺序使用既有 helper 结果/持久 spool、B（或仍存活原 bridge）的原真实对象公共 wait；这些来源都不可用后才检查 §3.4 os_process_exit。没有任何可信来源才 UnknownOutcome/blocked；absence 本身不是证明。
+5. 原对象的 public True 直接走同一 durable proof 接管路径，不需要为已退出旧 owner 重新 discover。原真实对象必须在其原 state 根进程中观察，不能送到另一根 helper 改环境使用。A 的 helper/spool 仅在已认证 locator/目标引用精确匹配时消费，不按 PID/路径猜配。
+6. 退出证据已持久接管且新请求尚有预算时，设置 post_exit_resolve_used，**只重新 resolve 一次**；所得新 instance 在 attach 前必须由其根 helper 新签收，最终 attach 的结构化入口不再隐含触发另一层连接重试。故最多是原 SDK 两次 resolve 加证明后一次 resolve；全部是无 lease 的生命周期获取，不重放业务。
+7. 预算全程不重置；有 lease/outcome 未知、证据源暂故障或新阶段无余量时保留精确责任与 stage 返回，不不断尝试；r9 三次双证明是独立受限编排，不借此加次数。
 
-### 3.3 helper/bridge/router 故障、版本与关停
+小库在与 f47dd23 同预算内 close→立即 reopen→读回修改应一次新请求成功；慢保存仅预算耗尽才 Busy。
+需立即拷贝/备份的 caller 用 status 返回的非敏感 owner_observation_ref，在 status 等待路径指定 wait_owner_exit/自己的预算，exited 后才复制；
+不新增 lease、不复用 close token，不把 owner 退出当保存成功。status 必须分型 public_owner_lifetime、os_process_exit、manual_offline_recovery。
 
-启动顺序：Rust 统一解析 home/state → 启动 helper 并版本/hash 握手 → 启动 bridge 并握手 → admission → subscribe_ack → acquisition/准备 grant。
-helper 是每 router 管理的一项服务进程，router 崩溃不连带退出；端点可由下一 router 按 journal 定位、核验后接管。
-正常关停先拒绝新 acquisition/业务、停止内部 operations、清理自有 lease，再等待或明确转交 owner/startup/recovery 责任；
-bridge 可先退出，helper 最后在所有订阅已签收结清且无保护转交后关停。用户关停预算不足时返回仍 pending 的责任，不能杀共享 owner 或丢 spool。
+### 3.3 helper、startup 与跨进程责任的生命周期
+
+启动顺序：Rust 统一 home/state → 对每根启 helper 并握手 → bridge 握手 → admission → helper 订阅签收 → acquisition/准备 grant。
+helper 用 **setsid/start_new_session**，不继承 router 的终端、业务 pipe、父死亡信号或 group kill；标准流重定向私有日志，Unix socket 独立重连。
+独立 session 避免终端 SIGHUP，但不承诺抵抗宿主 cgroup/进程树强杀、注销、断电或重启，均列 §10.3 共因故障。
+helper 的 durable 注册在各协调目录写 helper_id、state 根、endpoint 身份与管理 router；status 按这些记录列 orphan helper、订阅数、OS 身份、最后连接与退出期限，不靠进程名扫描猜配。
+
+router 断连后 helper 继续观察：所有订阅已得到 durable proof、startup 已结清/转交且无需保活责任时，落完引用后立即退出，不必等一个不存在的 router ACK。
+仍有活 owner 而无 router 重连，**orphan_idle_timeout=300s** 后先将每项 ObservationAbandoned、原原因、最后真实观察、OS 身份和可恢复 locator durable 记录，释放内存 watcher 后正常退出；期限只结束 helper 观察，不能结清 owner/lease 或解除 gate。
+其守护线程可随 helper 进程退出，不给 owner 发信号；有写盘/引用失败时 status 报退出受阻，不能删除唯一证据来满足空闲期限。
+下一 router 按记录重新公开发现、原对象备用、持久 proof 或 OS 证据恢复；live 但无法发现且 OS 身份仍活则 blocked，绝不把 abandoned 当 exited。
+正常关停先拒新 acquisition、停止 operations、清理自有 lease；bridge 可先停，helper 在结清/明确转交或上述 durable abandon 后最后退出，不能强关共享 owner。
+
+**startup 观察权威**是 Rust startup 表，实际后台观察交给对应 state 根 helper，在 Popen **之前**先签收 launch suffix/target/spawn_intent，并记录本机作用域与当前 boot_id。
+SDK 在创建直接 Popen 后立即回调交 pid、OS 出生身份和 sid/pgid；helper/Rust durable 签收后才等 ready/log_path，其失败保留 intent。
+固定 POSIX spawner 直接启动 console script worker 且 start_new_session=True；不是以中间 shell/daemonize launcher 代替身份。
+R0 必须核验该直接子进程与实际 worker exec-stable 关系；换平台/包装器不能证实时不靠其退出清 startup。
+bridge EOF 后 helper 继续查精确 LaunchIdentity 的 OS 生命周期和按 target+suffix 的**公开发现**；找到精确 owner 后先订阅签收，再把 startup 保护无缝转给 owner。
+实际启动进程/其合格 session 已退出可用 os_process_exit 结清 startup；只留下预分配 suffix 而无 OS 身份时，公开发现可补已出现实例，**未发现 suffix 不证明没启动**，同 boot 下仍 startup-unconfirmed，必要时离线维护。若 intent 已绑定本机/旧 boot，即使缺 Popen pid，本机 boot 改变仍可按 §3.4 结旧启动退出义务。
+router 已退出时 helper 把 startup/proof 事实写协调区，由下一 router 的 gate 消费；OS 释放旧 Rust flock，durable gate 不消失。
 
 | 故障 | 证明与推进规则 |
 |---|---|
-| bridge 崩溃，owner 正在关闭 | helper 持真实 instance 独立等待；owner 已 reap 也能用该对象观察，proof 重发到 Rust；无新 bridge 重建 instance |
-| helper 通道断开但进程存活 | Rust 保留表/guard，在有界连接预算内重连、重订阅、重放缓存 proof；连接超时只报告 ObservationFailed，后台退避继续 |
-| helper 自身崩溃，owner 仍存活可发现 | 新 helper 版本握手后公开 discover 精确匹配真实 instance、签收；Rust 保留原物理身份与全部义务，恢复只读观察 |
-| helper 崩溃，owner 已退出且注册被 reap | 若已持久 proof spool 或 Rust 已签收 proof 则核验重用；无 proof 且业务 bridge 仍持原始 instance 时由它公共 wait 取证；所有原始对象都丢失则显式 blocked，不用重建 instance |
-| helper 与 bridge 同时丢失 | 先消费已落盘 proof；owner live 时重新公开订阅；owner 已 reap 且无 proof 时进入 §10.3 的残余故障窗口 |
-| router 在 failed-owner-held 下重启 | 目标 gate 先读取 journal/OwnerKey/helper 端点，接管存活 helper 或其持久 proof；只读恢复失败时 blocked，不能以无旧活动 session 为由解除 gate |
+| bridge 崩溃、owner 正在关闭 | helper 持真实 instance 独立等待并 durable proof；旧 bridge 不必重启，N1 只按各自证据转换 |
+| helper 单故障、owner live | 新同根 helper 公开匹配并签收，或 bridge 原真实对象只读观察；原责任与 guard 保留 |
+| helper 单故障、owner reap | 优先消费持久 proof/原真实对象；全部公共来源丢失后用合格 os_process_exit，仅结 owner/startup 义务 |
+| bridge 先失效、稍后 helper 失效 | 不要求同一瞬间；仍依同一来源优先序和 OS 门禁，失败则 W1 residual blocked |
+| router failed-owner-held 重启 | 同目标 gate 读取 helper/owners/proofs，重连或消费 durable 证据；不复活旧 session/client/release 授权 |
+| 多 state 根或根被替换 | 各根独立 helper；旧根对象不改绑新 REGISTRY_DIR，根 inode 变化报 ObservationFailed，OS 同机身份可补退出，不能用错误根下的 absence |
 
-观察异常发 owner_observation_error，保留原原因/guard，有界退避只重试只读观察；不重发 detach。
-helper 容量在获取前预留：每不同 OwnerKey 一槽/一个等待线程、共享 owner 引用计数；每 tenant 有 watcher 与 retained owner 上限。
-spool/墓碑有独立条数和字节上限；达到上限拒绝新 admission，不能丢未签收 proof 腾槽。线程不占 release/业务/stop 池。
-router 退出 OS 会释放其 flock，故跨重启保护靠目标侧 durable gate、公开占用及 GC 原有检查；不能声称 flock 自动跨进程复活。
-startup 和 recovery 的未结记录必须在有副作用前进入目标 journal；启动扫描只加速，真正放行仍按每次目标 gate。
-新 router 不恢复用户 session/client/attempt，不持久化可重放 release 授权；后台只结清旧责任，用户 open 用新请求。
+### 3.4 U5：os_process_exit 的严格证据边界
 
-已批准的故障模型是：单个业务 bridge 故障可自动恢复；helper 单故障在仍有真实 instance 或持久 proof 时可自动恢复。
-所有观察者和未持久证明同时丢失、owner 已 reap 时**不承诺自动恢复**，执行 §10.3 的离线人工流程；不能私读 token 或静默切 record_id 重建。
+生产实现放在独立只读 `nexus_bridge/process_identity.py`（第二阶段新增并打包，不导入 tests/support），Rust 管理/消费，helper/bridge 只调用同一实现。
+记录 `OSBirthIdentity`：本机作用域、boot_id、pid、native_birth、start_time_us、birth_precision、sid/pgid、读取方法版本、OwnerKey/LaunchIdentity、eligibility 与观察原因；非敏感，写 owners/startup journal。
+macOS 用 libproc proc_pidinfo(PROC_PIDTBSDINFO) 的 pbi_start_tvsec/tvusec（真正微秒）、getpgid/getsid，boot 用 kern.bootsessionuuid；用 proc_listallpids/对应公开进程接口枚举 session/进程组成员。
+Linux 用 `/proc/sys/kernel/random/boot_id`、`/proc/<pid>/stat` 的 start_ticks/session/pgrp 与 SC_CLK_TCK，保留原始 tick 元组，再整数换算 start_time_us；
+**换算不提高 tick 分辨率**。R0 必须证明所选 Linux 原生身份方法满足出生身份/复用门禁，不能把 tick 装成原生微秒；若无法提供所需精度/唯一性，同 boot 的 OS 证据标为平台不支持并 BLOCKED。已核验本机 boot 变化分支不依赖 tick 的亚周期精度。
+不使用秒级 ps/lstart；短读、EACCES/EPERM、未知 ABI、枚举不全或不支持的平台都为 Unknown，不把异常/读不到当进程消失。
+
+helper 订阅签收时，在公共 instance 的 pid 上读取完整出生身份，再用**原真实 instance**做 timeout=0 的公共 lifetime 检查：
+True 直接 durable public proof；False 则再次采样出生身份，前后相同且 instance/启动归属可信才把 OS 身份 durable 绑定 OwnerKey 后 ACK。
+仅 lifetime=False 并不能证明“当前 pid 就是原 owner”；还须 SDK 的实例启动身份与 OS 出生时刻/已观察连续实例匹配，冲突或首次捕获恰逢退出/复用时 OS eligibility=false，只用原对象公共证明。
+Popen 直接子进程从创建时捕获身份，保持 exec-stable；预分配 suffix 辅助 ready 关联，不能代替出生身份。
+
+只有公共观察来源/持久 public proof 都不可用时才启用这条证据路径，且满足：
+
+1. 当前 boot 与已绑定 birth 对比：同 boot 下精确 pid 已不存在（ESRCH/完整 proc 检查）、僵尸/已退出、或同 pid 出生身份已变，才认定**原进程**结束；PID 存在但 birth 读失败不行。PID 复用只证明旧进程结束，不能对新 pid 发信号。
+2. **进程退出不等于锁释放**。同 boot 还必须完整确认旧 sid（及记录 pgid）已无成员，并证实锁 FD 不能逃逸到未跟踪的 fork/setsid 子进程或被传给外部进程；默认 close-on-exec 只挡 exec，不挡 fork-without-exec。
+3. eligibility 仅对 R0 实证的受控 managed worker/直接 startup 进程类开放；GUI、未知插件/launcher、未覆盖派生进程的 session 不默认启用。任意用户 run_script/可能派生并转移锁的扩展执行后将同 boot eligibility 收紧为 false，不能靠一次空 session 扫描重新打开。
+4. R0 必须用私有 flock+真实 fork/exec/setsid 的子进程验证“父退出子仍持锁时不放行”、session/pgid 扫描完整性、PID 复用、读权限错误和直接 worker exec 关系；若逃逸/传 FD 无法被排除，该进程类门禁失败，**保持 blocked**，不能为了过测禁用反例。
+5. 同一受支持本机/本地卷，已核验 boot_id 变化意味着旧 boot 的全部进程和继承 FD 都已结束，可直接结旧退出类义务；复制到别机的 journal、无法确认本机作用域或远程文件系统锁不适用。重启后仍检查 journal 完整性/当前占用，不能把旧 boot proof 当新 owner 的证明。
+
+合格结果单独 durable 为 `evidence_type=os_process_exit`，保留原始 OS 查询、身份、session/fork 条件、R0 capability id 与时间。
+它**只结清 owner-exit/startup-exit 类义务**：回收相应 retained owner、根 SH、startup 保护、解除对应 owner-held 条件；文件恢复仍需其余条件和 §6 的事务核验。
+它不是 SDK ACK、public_owner_lifetime、N1 原操作结果或 execution_stopped proof；不把 Uncertain/Disconnected 的 N1 phase 伪改 Released、不覆盖失败、不重放 release。
+OS 证据可将旧不可用 lease 的文件/owner 责任迁为已结清诊断墓碑（不再占活 admission/guard），N1 保留原 UnknownOutcome；若恢复流程必须本 lease ACK/公共 owner 双证明，不能用 OS 证据冒充它，只能独立结“等旧 owner 退出”的 gate 条件，剩余 detach/stop 责任按原契约或人工维护处理。
+status、日志、journal、事件都显示证据类型与适用义务，不能用一个泛化 `owner_exited=True` 隐去差异。
+
+### 3.5 保留量、Disconnected 与影响面
+
+Disconnected 未有有效 ACK 时按未知 detach 保根 SH；有先前 nonlast ACK 不因桥 EOF 重新加锁。已有业务/内部 operation unknown 另按 N1 停止义务保留，OS 证据不替它证明停止。
+根 SH 挡的是**同实际 cache 根全部 GC**，不挡同根 SH 普通业务；目标 failed gate 直接挡本目标，不能把一个坏 journal 直接拒绝全根 open。
+helper 一个进程观察多 OwnerKey，一次故障可使多个目标失去来源。watcher/备用 instance/retained owner/startup/spool/归档证据各按条数/字节计入 status 的 used/limit。
+冻结 warning=80%、critical=95%、full=100% 三档；每天首次 status/维护巡检列需要人工归档的已结事务与累计量，不生成新 schedule、不自动删除。
+任一配额将满在**新副作用前**拒绝需要该配额的新 admission（Busy+quota kind/target/cache root/used/limit/最大占用来源/维护办法）；允许现有会话继续、停止/清理/只读 status 与维护。
+同 tenant/router 共用配额耗尽会影响无关目标的新 acquisition，协调证据占满全 store 磁盘预算时影响该 store 全局新事务；不能隐瞒为“只影响这一库”，不关闭已有会话或丢未签收事实腾槽。
+证据写入预留 cleanup/proof 应急字节与条数，不能把空间全分给新 admission；物理 ENOSPC 时明确 ObservationFailed/blocked 保对象/现场，不能声称预留保证任意磁盘故障。
+所有证据/稳定锁都不自动删；健康 payload 仍按 §6.2 隔离与宽限期回收，已归档证据的人工导出/备份需要明确授权且不能删最后证明。
 
 ## 4. 精确副作用标记、预算与错误传播
 
@@ -208,7 +266,7 @@ guard RPC 超时只说明 detach 未发送，不代表 guard RPC 未执行/已�
 准备、fresh guard、自有分片清理都经 §5.2 的内部操作准入/grant。每个 operation 带精确 lease/acquisition、operation_id、purpose、attempt 和期限。
 保留 guard/cleanup RPC 的停止门禁：NotSent 可排队新的逻辑 close attempt，但在旧内部 operation 真正停止前，不发下一次清理/guard/detach。
 不采纳 Claude P2-3 去除停止门禁的建议，原因是 U4/D1 要求保留 N1 停止证明；幂等不等于已停止，已进入 native 的 RPC 不一定被 lease detach 撤回。
-取消可以用已有公共 cancel_operation_outcome，只有精确返回、因果停止或匹配 owner-exit 才补 execution_stopped，不能用 SSE EOF/用户到期代替。
+取消可以用已有公共 cancel_operation_outcome，只有精确返回、因果停止或匹配 public_owner_lifetime 才补 execution_stopped，不能用 SSE EOF/用户到期代替。
 
 | N1 状态 | 重试规则 |
 |---|---|
@@ -264,7 +322,7 @@ prepare disposition 不是无限授权；每次 operation grant 原子复核父�
 每 parent 按需最多两个物理槽（一个当前 acquisition + 一个必要的 cleanup auxiliary），不预留七个；第二槽不足在获取 auxiliary 前 Busy，不能先获取再找槽。
 正常串行复用已结清槽，AcquisitionId/LeaseKey/ordinal 永不复用。父用户结果结束后，父资源记录仍可定位 cleanup 子项。
 在既有 tenant 总容量计 parent/物理槽，不静默乘容量；helper watcher/retained owner 与墓碑分别按 §3.3 上限计费。
-已结清身份墓碑按条数/字节上限淘汰最旧**无未结义务**项；未签收事件或 proof 不能因容量被删，满则拒绝新 admission。
+仅内存中的已结清身份诊断墓碑可按条数/字节上限淘汰最旧**无未结义务**项；这不删除持久 journal/proof/归档证据。未签收事件或 proof 不能因容量被删，满则拒绝新 admission。
 
 custody 采用现有 dispatch_ready/grant 的有界往返模式：相同 AcquisitionId+LeaseKey 重发 opened，Rust 幂等返回相同 custody 决定；
 后续取消可把 disposition 收紧为 cleanup-only（递增 grant_epoch），不能恢复 prepare。身份冲突隔离当前 acquisition 并保留原资源。
@@ -285,7 +343,7 @@ bridge 正常停止必须先移交/停止 operations；bridge 真正 EOF 时 SSE
 | 完成 | 匹配公共 RPC 返回/明确 RemoteError(operation_timeout) 确认该调用已返回，写 outcome 与 execution_stopped；成功可推进下一个准备阶段 |
 | 传输超时 / bridge EOF | 可能投递的 operation 为 UnknownOutcome，保留停止责任；不能由父失败、socket 关闭或 detach ACK 推出 stopped |
 | 取消/超期 | 撤销未来准备 grant，对已发 operation 发公共精确 cancel；cancel 请求本身不是停止证明，stop_pool 独立推进 |
-| 停止证明 | 精确执行返回、匹配因果 cancel proof 或同物理 owner-exit 才补 stopped；迟到事实不改 caller 已确定失败 |
+| 停止证明 | 精确执行返回、匹配因果 cancel proof 或同物理 public_owner_lifetime 才补 stopped；迟到事实不改 caller 已确定失败 |
 | ReleaseRequired | 父失败即转清理阶段，但只有该 lease 的全部内部/业务 operations 停止后才准 fresh guard 与 detach；guard 自己也按本表登记、返回后才进入 detach |
 | Ready | 所有必需准备成功、无 unknown/still-running 操作、能力实测匹配、父仍有效时才 Active；用户业务之前无执行权限 |
 
@@ -303,7 +361,7 @@ verification 有独立 acquisition/OwnerKey，副本只在 owner-exit 后清理�
 不改服务端、不在 bridge monkeypatch 私有函数、不手写 HTTP/SSE、不解析异常字符串；原公共签名与返回/异常契约兼容。
 
 公开获取结果含 stage、handle 或 None、resolved public instance 或 None、类型化 failure_kind、启动义务完整 LaunchIdentity 列表及文件事务引用。
-每次真实 attach 之前公开 stage callback 记录 BeforeAttach/AttachMayBeSent；resolved 交付时先完成 helper 订阅。
+每次真实 attach 之前公开 stage callback 记录 BeforeAttach/AttachMayBeSent；resolved 交付即保留原真实对象，将要 attach 的 owner 必须先完成 helper 订阅。旧 draining owner 在签收前退出按 §3.2 消费原对象/已有证明，不因此提前 Busy。
 SSE 建立后立即 acquired callback 把可 cleanup 的 handle 转给 custodian，**早于 monitor thread.start()**；
 SDK 先保有强引用，回调正常签收才完成物理交付。回调异常时 outcome 仍交付同 handle+cause，SDK 保留强引用直到 bridge 显式接管，不能自动 close 掩盖资源归属。
 已交付后的 monitor 初始化失败返回 handle+cleanup_required；不再报无 acquisition。
@@ -314,10 +372,11 @@ _open_lease 返回后已知构造缺口是 threading.Thread(...).start() 失败�
 探针需覆盖这些真实边界和 callback 异常，分别确认本地流关闭事实与资源交付；即使本地流关闭也不把它当 detach ACK。
 确定 busy、参数/resolve/probe/worker_cwd 拒绝不置 AttachMayBeSent；503/draining 按 §3.2 的公开等待与一次重解析规则。
 attach 后传输/解析失败按真实 stage 与已存 handle 分类，不能按异常类名或字符串一刀切；未获 handle 也必须交付启动/文件责任。
-原 Handle.open 是 resolve→attach，NexusConnectionError 后 resolve→attach 一次；新 adapter 只接入这一生命周期次数，不额外叠加重试。
+原 Handle.open 是 resolve→attach，NexusConnectionError 后 resolve→attach 一次；U1 outcome 保留该内部次数/首次真实对象/类型化拒绝。
+§3.2 退出证明后的单次重新 resolve 是独立计数，仅在未取得 lease/无可能成功的未知 attach 时准入；最终结构化 attach 不再隐含一轮 open 重试。
 
 启动观测在 SDK 内部现有 spawner 注入口采集 Popen、log_path、launch suffix 等事实，公开传出；
-spawn 意图先由 Rust 持久登记，Popen 创建后在等待 ready 前立即交付 LaunchIdentity 并签收。
+spawn 意图由 Rust/helper 在 Popen **之前**持久登记预分配 suffix；Popen 创建后立即交付 OSBirthIdentity/sid/pgid 并签收，早于 log_path 处理和等待 ready。
 若进程已创建但身份交付失败，spawn_intent 未结清且明确 startup-unconfirmed，不允许以没有 handle 释放保护。
 
 close-proof 补丁锁存 parsed ACK 与 ack_kind/lease_released，local cleanup_failure 独立；后续清理异常不能将 ACK 改写成 uncertain。
@@ -335,7 +394,7 @@ close-proof 补丁锁存 parsed ACK 与 ack_kind/lease_released，local cleanup_
 startup 只有在公开发现得到精确物理 owner、helper subscribe_ack 完成、Rust owner 表与 guard 交接落盘后才转为 owner 保护；
 不得先放 startup guard 再申请 owner guard。launcher 已退出但实际 worker 仍可能 ready 时不结清。
 没有可证真实启动身份/派生进程退出时保持 startup-unconfirmed/blocked，交 R0 API 原型验收，不能按 20s 或 absence 推导安全。
-router 重启不杀无权管理的 owner；若 startup 事实不足按 §10.3 离线恢复，而非伪造停止。
+bridge EOF 后由原 state 根 helper 接续 startup 观察（§3.3），合格 os_process_exit 只结启动退出义务；router 重启不杀无权管理的 owner。事实不足或进程类 OS 门禁失败才按 §10.3 保 blocked，而非伪造停止。
 
 resolver 在 attach 前创建 crash 备份只是复制，不能等同原组件已移动/损坏。
 resolve 失败后，job 在目标锁下核对 before/after 目录身份、原组件 hash/mode、无未结 startup/owner/operation；
@@ -351,45 +410,70 @@ startup 与事务可同时存在，三行表按义务并集处理，任何一项
 本设计保证：最终路径从不暴露截断文件；协作 ida-cli opener 在 journal 提交前不能进入 Nexus；崩溃后可继续还原或明确拒绝。
 不承诺外部忽略锁的 opener 永远看不到组件间的中间状态。整组目录替换只适合独占新代际，不能移动任意用户父目录或改变其路径身份。
 
-### 6.2 U3：目标旁事务目录、身份与持锁步骤
+### 6.2 U3 与 R2-F1：稳定协调区和可回收 payload 分离
 
-权威 journal **本身放在目标旁**，不采用跨 home 指针作为权威，减少跨根身份/可用性依赖。
-目标为原 canonical IDB 路径；门禁 key 精确采用 Nexus identity_key 规则（realpath/abspath/expanduser；darwin casefold、win32 normcase、其余保留），
-锁名用其 UTF-8 的完整 SHA256，身份值只用于比较，不把 casefold 字符串当文件路径。
-同目标的大小写别名必须落同一 key/锁；目标父目录 device/inode 和真实 basename 是额外一致性约束。
+选择 reviewer 的**受管代际固定协调位置**方案，不采用随 payload 删除空闲锁目录的方案。
+理由：稳定锁/证据与会 rename/rmtree 的 payload 分离，不需要销毁并重建锁 inode；固定位置仍在实际目标 store 的同一卷，所有 home/直接路径调用方都能由目标推导。
+journal 本身留目标侧协调区，不以当前 home 中的指针为权威。定义 `R` 为实际 payload 所在的 cache store 根（例如 `<home>/idb`），不是调用方配置的 home。
 
-布局为 `<target-parent>/.ida-cli-txn-<key>/`（稳定 0700 协调目录），包含稳定 `lock`（0600）、
-每事务唯一 `<RecoveryId>/recovery.json`、不可变 snapshot、failed-files-N、staging-N、quarantine-N。
-staging 与 quarantine 都在这个私有 sibling 内，检查 st_dev 与目标父目录相同，不会因 IDA_CLI_HOME 跨卷触发 EXDEV。
-文件/目录全用受核验 parent dirfd 的相对访问，目录 O_DIRECTORY/O_NOFOLLOW，创建 O_EXCL/O_NOFOLLOW，普通文件 0600 后按快照恢复 mode；
-并发 mkdir/EEXIST 后核验既存对象，不能接管 symlink、他人 uid、非预期 mode/类型或被替换的 inode。
-身份清单记录 target key、uid、父目录和协调目录 device/inode、事务目录/锁 inode、组件 device/inode/size/hash/mode、OwnerKey、LaunchIdentity、helper locator、每步意图及完成证据。
-所有 reopen/移动之前 fstat+目录身份复核，拒绝路径穿越、额外文件、硬链接身份冲突和未知覆盖。
-目标父目录不可写、无法可靠 fsync/锁、无法建立同卷事务目录或保证非覆盖 rename 时，在任何 probe/Handle.open/worker 启动之前明确拒绝并给路径/cause，不退回 home。
+| 目标类型 | 稳定 CoordKey 与协调目录 | 可隔离/删除单元及 gate 定位 |
+|---|---|---|
+| 直接用户 IDB（含不受管 legacy flat） | Nexus identity_key（realpath/abspath/expanduser，darwin casefold、win32 normcase）完整 hash + 父目录身份；`<target-parent>/.ida-cli-txn-<key>/` | 不把用户父目录/稳定协调目录交 GC；普通直接库/legacy flat 沿用保留规则，恢复只移动清单内组件至本协调区 quarantine。空闲时也保留目录/lock，允许明确授权后归档已结证据但不删锁，永久少量空间/status 明示 |
+| 受管 `R/generations/<gid>/input.i64` | `(R 的 uid/device/inode, 不可复用 gid)`；`R/.nexus-coordination/generations/<gid>/`，**在 `<gid>` payload 之外**，0700、同卷 | GC 仅整组隔离 `R/generations/<gid>`→`R/quarantine/<gid>`，宽限后删除此 payload；两路径都映射同一固定协调目录/lock，绝不随组移动/删除协调区 |
+
+Nexus 折叠 identity_key 仅比较/命名，不当实际路径使用。受管原/隔离路径的 Nexus owner 身份仍分别按真实路径判断；共享的是 GC/恢复 CoordKey，不是给不同 owner 共用退出证明。
+受管 generation.json 和协调 `target.json` 固定原 canonical path、gid、store/目录身份与 coordination schema；gid 由创建者唯一生成，删除后也不复用。
+每次 open/GC 从**目标实际路径祖先**识别受管 generations/quarantine 形态，先核验实际 R、`.cache.lock`、协调标记和 manifest，不依赖自己的 IDA_CLI_HOME。
+即使原 payload 已隔离/删除，也可由 R+gid 找 target.json；隔离路径必须验证到同一 gid/原路径。坏 manifest/缺映射/身份冲突时拒绝相关目标，不能退为“直接用户库”另建 sibling 锁。
+已有合法旧代际在首次新 gate 下幂等创建固定 target.json/lock 并升级 manifest 引用，创建 intent 在副作用前 durable；升级/目录创建中断只恢复同一固定路径，不生成备用锁。
+任何受支持 router 若直接指定协调区内部 snapshot/staging/恢复 quarantine 的 IDB 路径，须由已核验的祖先 target.json 映射回原 CoordKey，并拒绝把证据作为业务目标；不能在隔离证据旁另建一把 sibling 锁。原路径和这些隔离路径因此同锁，独立忽略锁的外部 opener 仍是已登记窗口。
+直接指定受管路径的另一个 home opener 也取 **实际 R 的根 SH** 和同一 CoordKey lock；不能只取自己 home 的锁。隔离中的直接路径 opener 返回 quarantined/retired，不从原路径再建协调锁或重新造库。
+GC root EX→目标 EX 下核对 fd 与路径 inode、target.json/manifest/原/隔离 payload 身份，记录 payload_state/isolation intent 后非覆盖 rename、fsync 双目录、记录 quarantined；恢复碰撞则保留两边。
+宽限期/两轮复核、epoch/时钟回拨重置、公开占用与未知注册/陌生组件拒绝的已批准条件继续；删除前再目标 gate 核验无未结失败/启动/owner-held/文件 job，并审计原路径未被重建。
+只删除健康 payload，durable payload_deleted 留稳定 tombstone，不删除 lock/owners/proofs/journal；协调记录与证据单独计保留字节。
+未结/blocked 失败事务保留原 payload、快照、failed 产物全部字节；已结且已归档失败证据仍原样在固定协调区，可回收的是独立健康 payload，不能给额外目录白名单后整组误删。
+
+两类协调区内部同构：稳定 `lock`（0600）、target.json、owners/、proofs/，以及 `<RecoveryId>/{recovery.json,snapshot,failed-files-N,staging-N,quarantine-N}`。
+staging/quarantine（恢复证据）不同于 R/quarantine 的健康 payload 隔离单元；两者均验证与目标 parent 同 st_dev。
+所有创建/访问用已核验 dirfd，目录 O_DIRECTORY/O_NOFOLLOW、文件 O_EXCL/O_NOFOLLOW/0600；核验 uid、mode、device/inode/普通文件类型和完整 size/hash/mode，拒绝穿越/symlink/未知硬链接与覆盖。
+并发 EEXIST 重核身份；lock **永不 unlink/recreate**，不以空闲回收腾空间。目标父目录/受管协调区不可写、不能可靠 fsync/锁/同卷非覆盖 rename，在 probe/open/spawn 前明确拒绝，不退 home。
+首次 mkdir/lock/target.json 各 fsync 文件及父目录；journal temp+fsync+replace+目录 fsync，只 replace 自有核验 journal，不覆盖用户数据。
+
+### 6.2.1 锁序、持有区间与 fd 移交（N2）
+
+| 阶段 | 锁序/持有者 | 释放或移交边界 |
+|---|---|---|
+| 普通 open/acquisition | 实际 cache root SH → content EX（如需）→ Rust open EX → CoordKey lock EX；多个根/目标按身份排序，不反向升级 | 目标 EX 只覆盖 gate/probe/resolve/attach 及可靠 owner/custody 登记，公开 instance 已对应实际 IDB 占用后就释放；Preparing/runtime/analysis **不持目标 EX**，另一 home 可并发附同 owner；N1 父状态仍仲裁各自发布 |
+| 初开 snapshot/失败意图 | 同序，目标 EX 持目录核验/复制/意图落盘；占用等待前先 durable pending | 等 lease/owner/停止证明时释放目标 EX，再获取后重读 gate/身份/新占用；未结 journal 挡协作 opener，不能一直持锁等需要同锁提交的 proof |
+| 回滚 job | 将已持 root SH/目标 EX/dirfd 的 guard 整体移交单一 job；若此前已释放则按同序重新获取并核验 | 同进程 move fd，跨进程 SCM_RIGHTS 交**同一 open file description**并签收后关闭发送侧副本；移交成功前发送侧不放锁，失败仍由原持有者负责 |
+| GC payload 隔离/删除 | 实际 R 根 EX（非阻塞）→ CoordKey lock EX，lock-then-verify-inode | 只移动/删 payload；固定协调路径/inode 不动。阶段完成后释放目标锁，后续宽限轮再取并重核 |
+| proof/订阅可靠写入 | helper 只在 proofs/ 以唯一 id 写不可变记录；目标 journal 由当前目标 EX 持有者/接收其 guard 的 job 单写 | proof 先自身 fsync 即可通知/签收订阅，不等对目标锁的重入；Rust durable 归并/ACK 另按目标 EX 串行，不持 N1 短锁等待 IPC/fsync |
+
+发送者移交 fd 后不得调用 LOCK_UN（会解掉同一个 open description 的锁）、不得再使用 guard，只保有 job 状态 future；
+job **不能重新 open 同 lock 加 flock**，也不能 open 一边持锁一边等它重新加锁。接管方签收后才成为唯一释放者。
+目标 EX 持有者读到 helper immutable proof 后自行核验并提交 journal，不等待一个必须先取同锁的回调；N1 内存短锁只做状态仲裁，异步 I/O 先释放锁再按 epoch 复核。
+大库首次 snapshot 的实际文件事务可串行，但正常非恢复 packed/共享 owner 的分析不因此串行；这种区别须在状态/trace 可见。
+
+### 6.2.2 恢复步骤、持久顺序与保留
 
 journal v2：snapshotting → ready → failed-owner-held → staging → prepared → isolating → publishing → restored → opened；
-异常为 blocked（原阶段/原因）；startup_pending/备份义务是正交子记录，不用 ready 伪称全部结束。
-快照/事务意图先 durable 再允许 Nexus 恢复；更新均 temp(O_EXCL)+文件 fsync+原子 journal replace+目录 fsync。
-替换只用于自有、已核验 journal，不用于用户数据。首次建立协调目录/锁/事务目录后分别 fsync 父目录，lock 永不 unlink/recreate，避免两个锁 inode。
+blocked 保留原阶段，startup/backup 为正交义务。每步先 durable intent 后文件副作用，实际 inode/hash 消除崩溃歧义。
 
-1. 统一锁序 root SH → content EX（如需）→ Rust open EX → **目标侧 lock EX**。不同 home 的前几把锁可以不同，但最终必须争用同一目标锁；任何持目标锁的恢复 job 不反向索取 home 锁。GC 仅根 EX 非阻塞，不反向等待目标锁。
-2. 在目标锁下检查 §6.3 gate，再创建/校验 snapshot 并 fsync，持久 ready 后才准 Nexus 恢复；spawn 意图与备份 before 清单也先入 journal。snapshotting 不完整不能用来还原。
-3. 首次 Root 失败先写 failed-owner-held 失败意图、抓取失败组件；等待 lease detach + 精确 owner-exit 双证明及所有 N1 停止义务。第三方持有或证明未知时保留 gate，绝不回滚/新建 owner。
-4. 已开始回滚交独立恢复 job，自持 root SH/目标 lock EX/dirfd，用户期限不取消 job，drop 不提前解锁。Rust 保存 job_id、阶段、目录、bytes、cause 到 status；job 崩溃后锁由 OS 释放，但 journal gate 仍在，下一 open 接续。
-5. 先复制全部 snapshot 到同卷私有 staging，核对 size/hash/mode、fsync 每个文件和 staging 目录，再 durable prepared。复制不直写最终路径，不使用 open 剩余期限中断数据搬运。
-6. 重新核对目标目录、组件与公共占用，逐文件先 journal 移动意图、fsync，再非覆盖 rename 到同卷 quarantine，fsync 源/目标目录后落完成项；未知变化停止。不得以跨卷 copy+unlink 静默替代 rename。
-7. staging 完整组件按清单逐项非覆盖原子 rename 到原路径；每步 journal 意图、双方目录 fsync、完成项及新 inode。中断可以留下“部分完整组件”，gate 阻止协作 opener 读它们。
-8. 全组 hash/mode/目录身份与公共无占用复核、staging/quarantine 清单一致后，durable restored 才解除本次失败意图 gate。原 open 仍有余量才下一 acquisition；成功 open 标 opened；三次失败也留 restored/原因。
+1. gate/目标身份核验后生成完整 immutable snapshot、校验及 fsync ready，再允许 Nexus 恢复；startup suffix/备份 before 也先 durable。
+2. 首次 Root 失败写 failed-owner-held 并保存失败组件；后台等 lease detach、owner 退出与 N1 停止责任。U5 证据严格分型，不能伪造双证明或停止。无证据时保 gate、释放目标互斥锁而非文件保护。
+3. 需要回滚时按 §6.2.1 移交已加锁 guard 给 job；open 到期/drop 不取消 job 或提前解锁，status 含 job_id、目录、进度、bytes/cause。
+4. snapshot 全部复制至同卷 staging，校验 size/hash/mode、逐文件及目录 fsync，再 durable prepared；不直写最终路径，不用用户 open 剩余预算截断搬运。
+5. 重核公共占用/目录/组件身份；逐文件 intent→非覆盖 rename 到恢复 quarantine→源/目标目录 fsync→完成日志。未知变化停止，不用 copy+unlink 兜 EXDEV。
+6. staged 完整组件按同一 intent/fsync/完成顺序逐项非覆盖 rename 回原路径，记录新 inode；中断半组由 gate 阻止读取。
+7. 全组/目录/占用核验后 durable restored 再解除本失败 gate；有余量才下一 acquisition，成功标 opened，第三次失败也必须完成还原。job 崩溃由下一 gate 持锁续跑，不能旧 open 自动重放。
 
-ENOSPC、权限、fsync、EXDEV、内容/身份冲突保留 journal/snapshot/staging/quarantine，并报告确切阶段，不能只报 open timed out。
-事务全部字节（包括同卷副本）计恢复保留量，不混作可回收缓存；用户库按 target/uid 计一次，跨 home 汇总用 RecoveryId 去重。
-新事务 admission 先检查保留条数/空间预算，不足就拒绝；启动/owner-held/blocked 记录不能因超额丢弃。
-**GC 永不删除**协调目录、journal、快照、staging、quarantine、合法 crash 备份和人工恢复证据；status 展示目录、状态、原因、保留字节和归属。
-已完成证据只能在离线维护、备份核验及明确授权后人工归档；稳定 lock 仍保留，不把“已归档”自动等同可删除。
+ENOSPC、权限、fsync、EXDEV、内容/身份冲突保留全部证据并附阶段。所有协调记录/原始 proof/快照/failed/staging/恢复 quarantine/crash 备份 **GC 永不删除**。
+健康 payload 可独立回收，但证据占用继续按 CoordKey/RecoveryId 去重计入预算/status；新事务前检查空间，已开始义务不因配额丢弃，阈值/全局影响见 §3.5。
+人工离线导出/归档已结记录需核验新副本、明确授权，不删除稳定锁或最后一份证明；直接用户库空闲协调目录同样保持，不能暗中递归清掉。
 
 ### 6.3 每个受支持 router 的目标 gate 与 v1 升级
 
-任何受支持的新协议 router，**与 IDA_CLI_HOME 无关**，在任何 probe 或 Handle.open 之前都在目标 lock EX 下读取目标标记/journal，
+任何受支持的新协议 router，**与 IDA_CLI_HOME 无关**，在任何 probe 或 Handle.open 之前都在 §6.2 推导的稳定 CoordKey lock EX 下读取目标标记/journal，
 重新核验身份与未结义务。启动扫描/各 home 中的索引只是加速或诊断，不能代替目标侧逐次检查。
 锁竞争按本请求预算等待；持锁者退出后重读 journal，不以获得锁或 discover absence 认定可开。
 损坏/未知版本 journal、目录身份变化时拒绝该目标并显示目录，不能忽略坏 JSON 或猜测它不相关。
@@ -398,14 +482,14 @@ ENOSPC、权限、fsync、EXDEV、内容/身份冲突保留 journal/snapshot/sta
 v1 或 v2 的 snapshotting/ready **无失败意图**时，归档保留且不以该 ready 阻断、不要求现场与快照相同；
 Nexus 可能已合法修改组件，这不是自动 rollback 的理由。独立 StartupPending/活跃文件 job 仍按各自责任等待，不能被 ready 归档清除。
 v1 failed-owner-held/rolling-back 及 v2 staging/prepared/isolating/publishing 必须升级/续跑或明确 blocked。
-升级在目标锁下核对原 journal 身份/target/清单/hash，将必要证据完整复制到同卷事务目录、fsync 后发布 v2 标记，最后把旧记录归档为已迁移指向；中断时至少一份完整证据仍在。
+升级在目标锁下核对原 journal 身份/target/清单/hash，将必要证据完整复制到 §6.2 相应同卷固定协调区的事务目录、fsync 后发布 v2 标记，最后把旧记录归档为已迁移指向；中断时至少一份完整证据仍在。
 不跨卷 rename 旧 home 的证据，导入失败保留两边并阻断；同 RecoveryId 导入幂等。
 首次升级须离线盘点已使用的 home 中旧 v1 记录并导入目标侧，未导入的其他 home 旧记录无法凭空发现；
 混用不执行目标 gate 的旧 router 不属受支持协作集，升级期间先关停旧 router，不宣称它也受新 gate 保护。
 
 v2 根据每个意图的 source/destination device/inode/hash 幂等续跑，来源不明或内容不同绝不覆盖。
 failed-owner-held 在重启后按 §3.3 从存活 helper/持久 proof 恢复，匹配旧 physical owner 后才推进；
-owner 已 reap 且所有 proof 丢失按 §10.3 blocked。恢复 job 的失败/续跑均由 status 报告，完成不重放旧用户 open。
+owner 已 reap 且 public proof/原真实对象全部不可用时，先核验 §3.4 合格 os_process_exit，仅结旧退出类义务；其余 gate 条件未结或 OS 门禁不合格才按 §10.3 blocked。恢复 job 的失败/续跑均由 status 报告，完成不重放旧用户 open。
 
 ### 6.4 F7：Nexus 自己的 crash 备份
 
@@ -471,10 +555,24 @@ Rust 启动 bridge/helper/恢复 job 时传递计算好的绝对 `ida_cli_home`�
 
 | 责任 | 权威决策/证据持有 | 结清条件 |
 |---|---|---|
-| 准备/cleanup RPC | N1 精确 operation 表；bridge/SDK 只交付调用事实 | 返回、因果停止或同 owner-exit；父失败不是停止 |
+| 准备/cleanup RPC | N1 精确 operation 表；bridge/SDK 只交付调用事实 | 返回、因果停止或同 owner public_owner_lifetime；OS 证据/父失败不是停止 |
 | startup 无 lease | Rust startup 表 + durable target journal；SDK/spawner 给 LaunchIdentity | 实际启动义务退出或无缝转交已订阅 owner，超期不解锁 |
-| owner 观察 | 必需 helper 的真实公共 instance / proof spool；Rust 可靠 owner 表消费 | physical OwnerKey 的公共 lifetime proof，独立于各 incarnation |
+| owner 观察 | 必需 helper 的真实公共 instance / 固定 proof；Rust 可靠 owner 表消费 | public_owner_lifetime 或合格 os_process_exit 按类型结相应义务，独立于各 incarnation；后者不结 N1 |
 | recovery | durable target journal + 单一恢复 job；Tools 持资源引用 | restored/归档可结清，blocked 保留 gate；open 终态不撤销 |
+
+r3 增量问题映射（已在本轮落文，尚未运行新协议）：
+
+| r2 复审问题 | r3 决定与责任 | 决定性证据 |
+|---|---|---|
+| R2-F1 / N1 | §6.2 固定受管协调区/直接 sibling、实际根锁、原/隔离单锁、payload/证据分离 | packed open-close-proof 后 GC；两个 home 直接路径与隔离真实竞争，失败证据不变 |
+| N2 / astra §4 锁风险 | §6.2.1 区间/锁序/同 fd 移交、immutable proof 不重入、N1 不持短锁等 IPC | open 内触发 rollback 无死锁；分析期第二 opener、proof 提交与目标锁并发 |
+| N3/N4 | §3.2–3.3 helper setsid、300s orphan durable abandon、每根一个 helper、容量与 status | SIGHUP/孤儿重连与退出、多根拒错订阅不观察错锁 |
+| N5 / R2-F2 | §3.2 首次真实对象/观察引用保留、SDK 内部与 post-exit 单次额度分开 | B 已 resolve 而 helper 未签收时退出/reap，预算足够仍消费真实 proof 单次重解析 |
+| N6 | §10.1 已知 f47 v1 只清理兼容表/预算，unknown 明确维护出路 | 已知旧版 fresh guard/拒绝错误到 caller、unknown 不无限 preparing/不默认保存 |
+| N7 / U5 suffix | §3.3、§5.3 helper 在 Popen 前签收 suffix，之后接 OS 身份观察 startup | Popen/回调/log_path 前后 EOF、不在未发现时放 startup |
+| N8 | §10.3 绝对脚本路径维护、安装 manifest | 安装产物 arbitrary CWD/env-i 导入/help/dry-run/实际维护演练 |
+| N9 / W1 影响 | §3.5、§10.1/10.3 Disconnected 根 SH、80/95/100 配额、同根 GC/多目标影响 | 同根 EX 被挡/其他根可用、quota 满拒无关新 acquisition而现有会话正常 |
+| U5 / 两份 W1 | §3.2–3.4、§10.3 备用对象/固定证明/预启动标识/os_process_exit | microsecond/原生精度、fork/session/重启/平台拒绝及证据分型，不改 N1/ACK |
 
 ### 8.3 I1–I6 的修正定义
 
@@ -482,23 +580,26 @@ Rust 启动 bridge/helper/恢复 job 时传递计算好的绝对 `ida_cli_home`�
 |---|---|
 | I1 保存保护 | 每个可能引起关闭写回的自有 handle 在一次 detach 前通过 fresh guard；缺 Root 只在 TEMP\|KILL 已确认时不保存释放；保护不可确认不发 detach；显式 save 先采样；中毒不可逆 |
 | I2 不重放 | 每个物理 handle 最多调用一次有副作用 release；NotSent 重试只针对确未请求者的独立 attempt，execute 无自动重放；从不重置 requested 来换取收敛 |
-| I3 证明充分 | N1 Released 有该 lease 有效 detach ACK，或精确 owner 公共 lifetime proof；last/Uncertain 的 owner 保护删除只据 owner_exited 且其余义务已结；nonlast 仅撤本 lease guard；EOF 不是 ACK；ACK/owner/停止三种证明不混用 |
+| I3 证明充分 | N1 Released 有该 lease 有效 detach ACK，或精确 owner 公共 lifetime proof；last/Uncertain/无 ACK Disconnected 的 owner/file 保护只据对应公共 owner proof 或合格 os_process_exit 且其余义务已结；后者不改变 N1 原结果/停止；nonlast 仅撤本 lease guard；EOF 不是 ACK，三种事实不混用 |
 | I4 错误到调用方 | 生产 guard/RPC 产生的每个保存拒绝到达 close/save 的 CLI、MCP 包装，NotSent/Uncertain/Released 都保留；不能由测试写私有 errors 造证据 |
 | I5 有条件收敛 | 前提为 **owner 在期限内真正释放**，事件通道/只读观察健康且调度可推进时，已发请求的保留责任在规定观察断言期内结清；lease 数为零不是前提的替代品。这里期限是测试的 owner 观察期限，不是 2s 控制期限 |
-| I6 精确责任 | 仍需 owner 证明的未知 detach 成员保留精确 handle/LeaseKey/OwnerKey/guard；有效 nonlast ACK 的整个本组可报告 lease 已释放，第三方继续使用。只有 last/Uncertain 保留 owner 根 SH，nonlast 的轻量观察不阻整个根 GC；不能以 retained 诊断否定已释放 lease |
+| I6 精确责任 | 尚无对应 owner-exit 证据的未知 detach 成员保留精确 handle/LeaseKey/OwnerKey/guard；合格 OS 证据只结 owner/file guard，未知投递与 N1 诊断保留；有效 nonlast ACK 的整个本组可报告 lease 已释放，第三方继续使用。last/Uncertain/无 ACK Disconnected 在对应义务未结前保留 owner 根 SH，nonlast 的轻量观察不阻整个根 GC；不能以 retained 诊断否定已释放 lease |
 
 新增跨层约束：
 
 - C1 状态一致：Python 所有自有物理 handle（含 auxiliary）均有 Rust custody/pending acquisition；稳定点双方 LeaseKey/OwnerKey 集相符。owner 内 slices.cleanup_disconnected 创建的辅助 lease 若不由 adapter 托管，列为可能延迟 owner 退出的第三方，不能冒充已登记自有 lease；Released 后不可执行业务。
 - C2 无孤儿：handle acquired 到 Rust custody_ack 之间有已预留父 open 和 Python 强引用；所有失败、取消、断连、析构均转清理，不能仅报 failed 丢引用。
 - C3 可恢复：每个等待有状态、原原因与下一推进条件；有证据必消费，不会因旧 pending 被删永久卡住。guard 永久不可用/外部 owner 永不退出时明确 blocked，不能承诺强行释放。
-- C4 N1 停止语义：detach ACK 不证明业务停止或保存成功；unknown caller 终态不被 owner 退出改为 success；只补精确停止证据。真实 owner-exit 可证明其旧执行不再运行，不能作用新代际。
+- C4 N1 停止语义：detach ACK 不证明业务停止或保存成功；unknown caller 终态不被 owner 退出改为 success；只补精确停止证据。匹配 public_owner_lifetime 可补其旧执行停止，不能作用新代际；os_process_exit 不补 N1 停止。
 - C5 故障隔离：一个 lease/attempt/握手错误不改变其他 lease 的 phase、operation 或 bridge 存活状态；物理整桥断连仍诚实报告。
 - C6 文件完整性：原路径每个已发布文件均完整校验；未提交 journal 禁止协作 open；无覆盖未知文件、无路径穿越、无 symlink 跟随；快照与现场证据不自动删除。
 - C7 容量与交付：获取前预留 custody/helper watcher，串行按需最多两物理槽，startup/事务/墓碑分别计费；不能丢证据腾槽。consumer lag、future drop、120s 超时不撤销责任。
 - C8 授权与停止：custody_ack 带 disposition；prepare 仍需每 operation grant，取消先于 custody 时只清理；内部 RPC 未停止不 detach。
-- C9 故障域：helper 必需且先订阅签收；缓存 proof 重发按物理 owner 去重，不因 bridge/router 换代丢事实；全部观察丢失显式 blocked。
-- C10 目标门禁：任一受支持 router 在 probe/open 前争同一目标锁、查同卷 journal；不同 home、大小写别名不能绕过，GC 永不删事务证据。
+- C9 故障域：helper 按 state 根固定且先订阅签收；bridge 原 instance 保至 durable 接管；proof 固定目标侧，按物理 owner/proof_id 去重，不随 IPC/ACK 删除；公共来源丢失后查 U5，仍不能证实才 blocked。
+- C10 目标门禁：任一受支持 router 在 probe/open 前由实际目标推导同一 CoordKey/同卷 journal；原/隔离路径单锁，持有只跨 gate/attach/文件事务，分析不持目标 EX；GC 只删健康 payload 不动稳定锁/证据。
+
+- C11 OS 证据边界：出生身份与原 owner/startup durable 绑定，session/fork 与平台 R0 门禁合格才结退出类义务；boot 变化限定本机；OS 证据不充 ACK/N1 原结果或停止，不重放 release。
+- C12 稳定锁与并发：GC 不移动/删除稳定协调区；受管两路径/跨 home 用同 CoordKey，rollback move 同一已锁 fd；proof 写入与 N1/目标锁不存在互等。
 
 ## 9. 测试方案与红绿证据
 
@@ -536,22 +637,36 @@ owner lifetime 不再是每个 release 成员的证明共享维度；它仍是**
 | 文件恢复 | 每个 copy/fsync/rename/journal 意图前后注入真实子进程退出、ENOSPC、身份变化、symlink、备份目录；新 router gate 阻止读半组，重复恢复幂等 |
 | bridge 崩溃且 owner draining | 关闭 barrier 保持 owner，杀自有 bridge、再放 barrier；helper 独立 proof 自动结清旧 lease/锁，无新 bridge 伪造证明 |
 | close 立即 reopen：同 router | last ACK 后同请求预算等待 owner-exit 再开；小库与 f47dd23 同预算成功并读回修改，未退出时只在预算耗尽 Busy |
-| close 立即 reopen：跨 router | B 遇结构化 503/busy，公共 lifetime 等待后总共只重解析一次；不叠加 SDK 内重试，不重放有副作用请求 |
+| close 立即 reopen：跨 router | SDK 原一次内部连接重试不吃 post-exit 额度；前段已确定无 lease后公共退出证明到达再 resolve 一次，最终 attach 不隐含新重试，不重放未知 attach/业务 |
 | 大小写别名 | Foo.i64/foo.i64 按 Nexus identity_key 争同目标锁/标记；实际文件路径保留磁盘大小写 |
 | v1 升级 | 无失败 ready 即使现场已改变仍归档不挡；failed-owner-held/rolling-back 安全导入同卷，迁移中断不失证据 |
-| 旧 owner 模块 | 长存 owner 残留 v1 guard/release/slices；版本/能力错配明确拒绝，不重用旧模块或静默卸载 hook |
+| 旧 owner 模块 | 长存 owner 残留 v1 guard/release/slices；按 §10.1 已知指纹仅清理、unknown 明确拒绝；不复用为新协议业务模块或静默卸载 hook |
 | 早取消与晚 custody | 取消先于 acquired、custody 后仍有时间；ACK=cleanup-only，准备 RPC 计数为零；重复/丢 ACK 不漏资源 |
 | guard 超时后 NotSent | detach 次数零，但内部 operation UnknownOutcome/未停止；原 guard 真实停止前不发下一 guard/cleanup/detach |
 | 准备 RPC 发出后 bridge EOF | N1 已登记 operation；父 open 失败不证明停止，helper 独立保持 owner proof，迟到停止不改 caller 结果 |
 | 无 handle 的慢启动 | spawner barrier 在 Popen/ready/身份签收处暂停；StartupPending/20s 后 startup-unconfirmed 保留保护，launcher 退出不冒充 worker 退出 |
 | backup 后 resolve 失败 | 无 worker 且原字节不变时备份归档/事务结清；部分备份、组件变化、有 startup 时 blocked/续跑，不因 no_handle 丢 journal |
 | helper 崩溃：owner live | 新 helper 公共发现同物理 instance、签收重订阅；旧 owner 责任连续，未签收不准新 acquisition |
-| helper 崩溃：owner 已 reap | 持久 proof/仍在的真实 instance 可用；都无时明确 blocked 并给人工流程，不重建 instance |
-| helper 与 bridge 同时丢失 | proof 已持久与未持久两条分支；前者重放去重，后者 owner live 可发现、reap 必 blocked，不能伪称全部故障自动收敛 |
+| helper 崩溃：owner 已 reap | 持久 proof/仍在原真实 instance 优先，全部公共来源丢失后查合格 OS；缺身份/fork/session不符才 blocked，不重建 instance |
+| helper 与 bridge 同时/先后丢失 | proof 已持久与未持久分支；前者重发去重，后者 live 公开订阅或合格 OS 收敛退出类义务；不足则 blocked，N1未知结果仍未知 |
 | router failed-owner-held 重启 | 新 router 先目标 gate，重连存活 helper 或消费 spool；无 proof 不以 absence 解锁；不复活旧 release 授权 |
 | 不同 home 同 target 恢复中断 | A 在 publishing barrier 退出，B 的另一 home 争同目标锁并续跑 journal；probe/open 从未读半组，所有目录同卷 |
 | 目标目录不可写/同卷失败 | 在任何 Nexus probe/open/spawn 前明确拒绝；home 可写也不绕过；EXDEV 保留现场不 copy+unlink |
 | F9 握手替换竞态 | 在 send ok/安装/替换 barrier 断 lease 或取消，旧健康连接不误关；失效新条目撤销，A/B 与后续握手仍正常 |
+| 正常受管代际 GC 共存 | packed open→close→公共 owner proof→根 SH 回收，GC 按原隔离/两轮宽限删除 payload；固定协调 lock inode/proof 保留，不能靠豁免 gate 或白名单删证据 |
+| 两 home 直接路径与隔离并发 | 普通直接用户 IDB 的组件隔离与另 home opener 竞争同 sibling 锁，指定其恢复 quarantine 路径也映回同 key 并拒开证据；受管直接原/隔离路径取实际 R 根 SH+固定同锁与 GC 竞争，不能两把锁 |
+| 原路径/隔离路径单锁 | rename 前后/删除后从两路径定位相同 fd inode；第二锁申请被挡，重建原路径碰撞拒绝，不另建 sibling 锁 |
+| 失败事务与 payload 分离 | failed-owner-held/blocked 时 GC 拒删 payload；已归档失败证据和 proof 字节/hash 不变，健康 payload 可独立回收 |
+| open 内回滚 fd 移交 | barrier 在持目标 EX 时触发 job，同 fd/SCM_RIGHTS签收后发送侧仅 close 不 unlock；无空窗、不自锁；IPC失败原持有者仍负责 |
+| 分析不串行与证明无锁反转 | A 在 analysis barrier，另一 home 的 B 可在原预算取得目标锁并 attach；helper fsync proof/目标 journal/N1 仲裁竞争无互等 |
+| B 取得原实例后 reap | B 暂停于 resolved 真对象已持有、helper 尚未签收；旧 owner 真实退出/reap，既有helper/spool或原对象 public proof 消费后单次 post-exit resolve，剩余预算够就成功 |
+| helper 孤儿与多根 | setsid helper 不随自有router终端组SIGHUP退出；无接管300s用注入时钟触发durable abandon退出；每state根独立实例，拒错根订阅，status列orphan |
+| OS birth/fork/session | 私有子进程持flock，捕获出生/同pid复用；父退出但fork子仍持锁不放行、exec关闭与setsid逃逸/FD传递反例；无权限/部分枚举/GUI不合格blocked |
+| OS reboot/证据类型 | 本机boot变化后旧退出义务可结，新owner不继承；mac微秒字段/Linux原生tick精度与不支持拒绝；status/log/journal显式os_process_exit，N1/ACK原值不变 |
+| proof 可靠保留 | 公共True→fsync前/后、Rust durable前/后、ACK丢失、IPC目录清理/router换代；最后proof与journal引用仍可找；bridge原对象只在proof_custody_ack后释放 |
+| startup 断桥交接 | suffix intent已签收但Popen未建、Popen已建但回调/log_path失败、OS身份已durable但ready未到各自断桥；helper接续，不由suffix absence结清 |
+| 模块只清理与配额满 | 已知f47 v1 digest/代码指纹匹配可fresh guard后预算内cleanup-only；unknown及时明确blocked；Disconnected root SH与80/95/100%告警/无关admission拒绝、已有会话可继续 |
+| 安装产物边缘维护 | 不用源码树或-m；独立安装目录任意CWD/env-i，绝对脚本入口help/dry-run，正常/无snapshot/无startup身份/多目标、过期计划拒绝与中断续跑 |
 
 R8-F1 必须先移除预填取得真实红例，再经生产错误收集变绿；保存拒绝用公开执行响应/异常注入，最后从真实 close/save 调用方断言。
 I5 前提不成立的 owner-held 场景只检查 I1–I4/I6 和明确 pending；当 barrier 真释放 owner 后继续同一运行，检查 I5，不能启动第二次 release 或新建 router 掩盖问题。
@@ -601,19 +716,34 @@ timeout 150s cargo test --locked --test nexus_n7_fix1 s1_expired_observer_next_o
 | 状态投影 | Preparing、lease detached、owner pending/observation_failed、startup-unconfirmed、recovery job/目录/bytes/blocked 可在 status/meta.nexus/错误 data 查询 | 关闭后旧 token 作废并移出活动列表；不把轻量 owner 观察当活动 opener，不输出认证 token |
 | 错误分类 | 请求前 detach NotSent；可能发送而无证明 UnknownOutcome；503/busy 先按预算等公开 lifetime 再一次 resolve；保护/观察失败附 stage/cause | 原 -32602/-32601/-32000、NeverReplay、调用方确定终态不变；不解析异常字符串做重试 |
 | 再次 open | 同 router 先等已知 draining；跨 router 公开等待/一次重解析；小库关闭→重开→读回修改不弱于 f47dd23；同健康 owner 的 attach 不受旧 Uncertain 阻断 | 新请求总期限不重置；未知旧 owner 不放行另建 owner；r9 三次与双证明保留 |
-| GC 与容量 | nonlast 不额外持根 SH；last/Uncertain、startup/recovery 保留并计费；目标旁事务永不自动 GC | 新代际/flock/隔离/宽限期组合不变，不靠丢证据或关闭其他 owner 腾槽 |
+| GC 与容量 | nonlast 不额外持根 SH；last/Uncertain、startup/recovery 保留并计费；目标旁事务永不自动 GC | 保留新代际、实际根 flock、隔离与宽限期条件；布局改为固定协调区与可回收 payload 分离，须新增 GC 共存验收，不靠丢证据或关闭其他 owner 腾槽 |
 | 本地客户端补丁（U1 差异） | **偏离原先“不改三个补丁”的裁定**：有条件扩展公开阶段结果、handle 回调、启动身份、ACK/清理分离；R0 决定最小文件范围 | 不改 Nexus 服务端、不手写私有协议、不 monkeypatch；operation_id 已有，只接线 N1 |
-| helper（U2） | 必需的 Rust 管理独立 proof helper，持真实 instance，先订阅、可靠缓存重发；多一个有界进程/线程/证据成本 | 不用 record_id 重建 instance，不保存 token；全部观察丢失时 blocked |
-| 恢复目录（U3 差异） | 用户 IDB 旁新增 0700 sibling 事务目录及稳定锁；不同 home 同目标互斥；目录不可写/同卷条件不足在 probe/open 前拒绝 | 单文件原子与协作 gate 保证，任意外部 opener 不受锁约束；旧 v1 要离线盘点导入 |
+| helper（U2/U5） | 每 router 每 state 根的必需独立 session helper，300s orphan 空闲后 durable abandon 再退出；bridge 原 instance 保至 durable 接管，固定 proof 不随 IPC 清理 | 不重建 instance、不传/存 token；单个 helper 故障可能影响多个目标 |
+| U5 退出证据 | 公共观察来源丢失后，R0 门禁合格的 os_process_exit 可结 owner/startup 退出与相应文件 gate；本机 boot 变化可自动收敛旧进程义务 | status/log/journal 单独分型，不改 SDK ACK、N1 原结果/停止或重放 release；未知 session/fork/平台仍 blocked |
+| 保留量影响 | bridge EOF 无 ACK 的 Disconnected 保根 SH；同根 GC 可全挡；80/95/100% 配额告警，满时同 tenant/router 无关 admission 也可 Busy | 现有会话/停止/清理/status 可推进，不自动删证据；人工归档维护节奏与受影响根/目标可见 |
+| 恢复目录（U3 差异） | 直接用户 IDB 旁保留 0700 sibling；受管代际使用实际 store 根固定协调区，原/隔离路径共用同锁；不同 home 直接路径 opener 也遵守。目录不可写/同卷不足在 probe/open 前拒绝 | 单文件原子与协作 gate 保证，任意外部 opener 不受锁约束；旧 v1 要离线盘点导入 |
 | 日志/诊断 | 删除 release_unconfirmed/donor；新增 watch/custody/disposition/stop/startup/restore 阶段与保留原因 | r9 首次取证、次数、默认 stat-only、显式 forensic hash 选项保留，不新增比较豁免 |
 
 新旧 Rust/bridge/helper IPC 不混用：readiness 要求 release/open/owner observation protocol version、能力集与客户端 hash；
 任一错配启动/准入明确失败，不静默回落旧协议。wire frame v2 可保持，新增消息族单独带版本。
 
-长期存活 owner 内 `_ida_cli_save_guard_v1`、`_ida_cli_release_protocol_v1`、`_ida_cli_nexus_slices_v1` 也必须版本化。
-每个模块暴露 protocol/schema/content digest，安装前先查询；同名旧 digest/能力不足立即 ProtectionUnavailable/ProtocolMismatch，不能“存在就复用”。
-新模块名/内容版本随协议一致升级，但已有 hook 不能叠装、无检查卸载或自动替换以冒充新保护；不兼容活 owner 明确拒绝准备/写/自动 detach，保持已取得 custody 与诊断，待离线关闭后升级。
-GUI/第三方 owner 不为升级被强关；兼容性由真实旧模块 fixture 验证，不凭桥接 readiness 推断 owner 兼容。
+长期存活 owner 内 guard/release/slices 都校验 protocol/schema/content，不能“存在就复用”，也不叠装/静默卸 hook。
+**N6 采用已知旧版本只清理兼容表**，规则本轮已定，不推迟为 R0 再决定方向：
+
+| owner 模块状态 | 准入/有界出路 |
+|---|---|
+| 当前版本完整匹配 | 正常准备与业务，fresh guard/N1 停止门禁不变 |
+| 已知 f47dd23 v1 指纹完整匹配 | 仅 cleanup-only：在原 close/preflight 预算内用原 v1 close_status 重新采样，close_safe=True 且内部操作 stopped 时允许一次公开 detach；save_guard_error 仍签收交 caller。禁止准备/新写，不安装新 hook，不让旧 release/slices 协调器重放或代发 release |
+| 缺字段/未知 digest/部分组合或 fresh guard 不可确认 | 在版本检查的有限 2s IPC/剩余预算内返回 ProtocolMismatch/CleanupBlocked 与已取得 custody、具体模块/原因/恢复选项；不陷入无限重试循环、不默认保存/close |
+
+冻结 v1 来源 f47dd23：save_guard.py SHA256 `9246769e369f3c869ff9eaecb83ae7688a3b33ef547287391834a2e69442160e`，
+lifecycle.py `ad717157bb88693a6b66ba3ec6547a0b418b48c05905e0421db2a1f3471c125a`，
+slices.py `e09245f83953689f55cdb5db03998ee0f5fda34388f4f591000f13a2c06c7088`。
+v1 没有自报 digest 时，不能只信模块名：只读 RPC 取已加载 close_status/sample/install/hook 与相关 release/slices 的规范化代码指纹、Python ABI/依赖版本，与固定源码编译出的已知指纹表核对；
+不得通过执行未知模块的自报函数来“验证它自己”。R0 原型生成/核验这张表及 v1 close_status/TEMP|KILL 行为；无法核验的组合是 unknown，不能猜为兼容。
+unknown 的有界出路是立即失败并给出明确维护状态：caller 可等待真实公共 owner 退出，或由用户关闭其 GUI/第三方 owner 后消费证明；
+若这些来源不可用，合格 U5 证据只结 owner/file 义务，其他责任按状态保留；最后才走 §10.3 离线授权维护。不承诺未知保护下强制限时 detach。
+正常 bridge 不能为了清理未知版本主动关闭 SSE；实际进程故障仍诚实 Disconnected。status 显示 guard mismatch、retained lease/root、next_action 与所需授权，不让已失败 open 永远显示“仍在准备”。
 
 不迁移活 session；开发验证只重启自有 router。生产升级仍需离线备份、停止旧 router 与用户授权，不能让旧协议 opener 绕目标 gate。
 
@@ -627,34 +757,54 @@ N9 删除 native-linked/idat-compat 普通执行、dev 开关、旧依赖/选择
 `IDA_CLI_HOME` 默认值必须在取消 dev 开关前对齐。离线 sbx/idat 准备仍保留；旧版本对照依赖冻结可执行产物而非旧源码。
 清理后重跑 E00–E29 与新跨层用例；N8 旧结果不能替代。运行回退依赖旧发行版本及已关闭备份，不能运行时静默切旧后端。
 
-### 10.3 已裁定结论与剩余需用户裁定窗口
+### 10.3 已裁定 U1–U5 与 W1 剩余边缘窗口
 
-以下已由本轮用户 U1–U4 裁定，不再作为待选方案：
+以下已裁定，不再要求用户重选方向：
 
-1. U1：采用 astra 的有条件 SDK 扩展，R0 冻结结果契约并原型确定最小文件范围；删除准备 RPC 增加 operation_id 的错误要求。公开调用/服务端边界不变。
-2. U2：必需独立 proof helper，acquisition 继续前签收；不采纳 Rust 保存 record_id 后重建 instance 给新 bridge 的方案，也不把它留为 fallback。
-3. U3：journal 本身、staging、quarantine 与恢复锁都在目标侧同卷私有 sibling，所有受支持 router 在 probe/open 前锁下检查；home 不再分隔门禁。
-4. U4(a)：close 只证明自有 lease detach；nonlast 不持根 SH，last/Uncertain 保留；保存拒绝到 caller/status，立即重开与备份等待路径见 §3.2。
-5. U4(c)：Preparing、串行按需最多两槽、含 auxiliary/父身份的 acquisition；custody_ack 明示 disposition；本设计选择 N1 精确 operation 停止责任，不采纳去掉 guard/cleanup 停止门禁。
-6. U4(d)：单文件原子发布 + 可恢复 journal + 协作 gate；Nexus key、无失败 ready 归档、job 状态/续跑与外部 opener 的中间状态窗口均明示。
-7. U4 范围：先做 §11 必需核心；增强另派；原规模偏乐观，R0 API 原型/状态表完成后重估，不为行数削弱故障覆盖。
+1. U1：有条件扩展 SDK 阶段/资源交付/启动身份与 ACK 清理分离，operation_id 已有，只做 N1 接线；R0 原型决定最小文件范围。
+2. U2：必需独立 helper，先签收再附新 owner；不保存 record_id 重建 instance，也不作 fallback。
+3. U3：目标侧同卷权威 journal/gate，跨 home 一致；r3 细化为直接库 sibling、受管代际固定协调区，原/隔离路径单锁，不能豁免 managed gate。
+4. U4(a/c/d)：close 仅自有 lease，nonlast 不阻根 GC；Preparing/custody disposition、串行两槽、N1 精确内部 operation 停止；单文件原子+journal+协作 gate，原安全底线保留。
+5. U4 范围：K1–K6 必需核心，增强另派；R0 后重新估算，不为工期削故障覆盖。
+6. **U5 三项缓解**：bridge 原真实 instance 保至匹配 proof durable 接管；固定 proofs/ 与 journal 引用/ACK 后保留；预分配 suffix 在 Popen 前 durable，创建后立即交真实 OS 身份。
+7. **U5 os_process_exit**：纳入核心 K4 及 R0 必须门禁；只结 owner/startup 退出义务，OS 身份、fork/session 完整性、平台/boot 条件见 §3.4。门禁不过即 blocked，不降成 pid/absence/计时证明。
 
-**剩余需用户裁定的窗口 W1**：所有原始观察对象及未持久 proof 同时丢失、owner 已退出且注册被 reap。
-在禁止重建 instance/私读 token 的边界内，没有足够证据自动补旧 owner proof；状态必须是 ObservationRecoveryBlocked，
-保留目标 journal/已知身份/原错误，拒绝新建 owner、回滚与 GC。startup 身份交付同时丢失而无法证明退出也走同样离线门禁。
-编排者需请用户接受这个残余故障模型及逐目标离线恢复，或另行裁定更强公开观察 API；本轮不扩大 API/故障容忍承诺。
+W1 是**证据最终状态**，不要求两个进程恰好同时崩溃：某旧义务没有可核验 public proof、原真实对象/可发现精确 instance，
+再经 U5 OS 出生身份/boot/session 检查仍不能证实退出或转交，才为 ObservationRecoveryBlocked；有可用 OS 证据时按分型自动结退出类义务。
+startup 只有 suffix、实际进程身份交付丢失且无法公开补齐也属边缘情形。不是常规“单 bridge 故障就人工维护”。
+
+| 触发方式 | 优先来源 / U5 推进 | 仍需 blocked 的条件 |
+|---|---|---|
+| bridge 先崩、helper 随后在 proof fsync 前崩 | 原 bridge 对象若仍在、固定 durable proof、精确 live instance，其后合格 OS 退出 | 已无来源且出生身份缺失/门禁不合格，不以顺序故障称低概率而忽略 |
+| bridge 正常 close 后 helper 单故障 | last ACK 不删备用 instance；原对象公共观察并 durable 接管 | bridge 也已退出且无其余证明/OS 条件才 residual |
+| 重启/断电 | 已核验本机 boot_id 改变结旧进程/继承 FD 退出；恢复仍核验完整 journal/当前占用 | 关键身份/记录损坏、无法确认本机/卷或其他非退出义务未结 |
+| 注销、SIGHUP、进程组/cgroup 整体终止 | helper setsid 降低终端共因；OS 检查原生身份与 session | 同 boot 的锁可能逃逸/枚举不全或原进程仍活；进程分开不保证共同故障独立 |
+| Popen 已创建，回调/log_path/持久化失败 | 先有 suffix intent/helper 订阅，已有 OS 身份由 helper 接续；公开 ready 后可转 owner | 没有实际 OS 身份且未发现实例不证明未启动，保 startup-unconfirmed |
+| proof 损坏、不可访问、引用丢失/版本不能核验 | 原对象/另一可信副本/精确 live 观察、再 OS；暂时 I/O 问题先 ObservationFailed | 所有来源不可用或 journal 身份无法核验，保留原字节 |
+| owner 还活但原 state 根不可见/已更换 | 不改 helper REGISTRY_DIR；同机 OS 可确认仍活并阻 gate | 活进程不是退出证据，错误根的 absence 永不解锁 |
+| fork 不 exec 继承锁、脱离 session、未知 GUI/平台 | R0 合格类才用 OS；其他继续公共 lifetime | 父消失但 session 有子、逃逸/FD 传递不明、平台只提供不足身份时保持 blocked |
+
+不估计 W1 的百分比/“极低概率”，没有可量化数据；共同故障与顺序故障不能简单乘独立概率。
+影响按 §3.5 明示：target gate 直接挡本目标，根 SH 挡同根全部 GC，watcher/retained/证据配额满影响无关 admission；
+一个 state helper 可影响多个目标，维护停共享 router 也可能影响其他会话。status 必须同时给 targets、cache roots、quota/reason/next_action，而非只显示一个泛化 pending。
+router 退出释放 OS flock，但 durable gate 继续，重启只在合格 boot 证据/真实证明后收敛，不能当绕门禁办法。
+
+U5 已把 OS 证据与缓解措施裁定为必需；剩余**需具体授权的边缘维护**是身份/证明损坏、活 owner 但不可观察、fork/session 不合格或平台不支持。
+本设计不新增待选架构裁定；R0 若发现技术不可行须以证据 BLOCKED 交编排者，不能改 U1–U5 或静默选择更弱判据。
 
 W1 的人工恢复是受控维护，不能伪造 public_owner_lifetime，必须有单独 manual_offline_recovery 证据及明确授权。
-第二阶段 R4 必须在现有模块交付 `python -m nexus_bridge.open_recovery --maintenance` 维护入口（本轮尚未实现，不能现在执行），并用私有样本演练后才允许发布。维护者先从匹配候选的 prepared 环境取得 PREPARED_PYTHON，设置下列路径变量，均来自 status/核验后的清单：
+N8 更正：维护入口为 `"$PREPARED_PYTHON" "$BRIDGE_DIR/open_recovery.py" --maintenance ...`，以**绝对脚本路径**执行，与现有同目录顶层 cache_store/lifecycle 导入布局一致；不用失败的 `-m nexus_bridge.open_recovery`，也不依赖 CWD/PYTHONPATH。
+入口本身第二阶段 R4 实现，不声称当前 open_recovery.py 已解析这些参数。安装产物必须带匹配版本的整个 bridge 文件集及 manifest，Rust/status 返回实际已核验安装的 BRIDGE_DIR 与 Python 路径，不能用构建机 CARGO_MANIFEST_DIR 冒充安装路径。
+R0/R4/N9 必须从私有安装目录、任意 CWD、env -i 无仓库 sys.path 运行 help/dry-run，并完成维护演练；缺脚本/依赖/版本立即失败，不回退源码树。维护者设置的变量均来自 status/核验清单：
 
 1. 从 status 取得 target、RecoveryId、journal、state 根、helper locator 和全部相关进程/组件清单；停止所有可能打开该目标的 router、GUI、第三方与启动进程，禁止新 opener。跨用户/远程写入者不能排除时停止维护并继续 blocked。
 2. 用 `timeout 30s lsof -- "$TARGET"` 及对 journal 组件逐项的同类检查列出仍持 FD 的进程；检查所有登记启动树与公开 discover/probe。阴性只是辅助证据，**真正前提是维护者建立离线独占窗口**；不要删除 Nexus 注册/lock/token 文件。
-3. `timeout 30s cp -a "$TXN" "$EVIDENCE_COPY"` 备份完整事务及另存当前目标组件；大副本须先说明并改用 600s 上限。对照 journal 用 `timeout 30s shasum -a 256 -- "$SNAPSHOT_COMPONENT"` 逐项核验，保存 uid/device/inode、hash、mode 与操作人确认，不覆盖任何现场。
-4. 在独占维护窗口内，维护入口取得同一目标锁，以 `timeout 30s "$PREPARED_PYTHON" -m nexus_bridge.open_recovery --maintenance --offline-evidence "$OFFLINE_EVIDENCE" --target "$TARGET" --transaction "$RECOVERY_ID" --dry-run` 输出精确的保留/隔离/还原计划；证据必须绑定 target key、uid、目录 device/inode、快照清单与维护窗口，拒绝过期/错目标/身份变化。该 JSON 是人工证据，不能充作 SDK 退出证明。
-5. 用户审阅计划并授权后去掉 `--dry-run`，应用大库还原前说明复制/fsync 理由并使用 600s 上限；超时仍保留 journal 下次续跑。入口仍按 §6.2 的同卷 staging/非覆盖 rename/journal fsync 流程还原，所有新组件和旧现场保留。没有失败意图时只核验归档，不能无故 rollback。身份/占用/I/O 错误仍 blocked，不允许 `rm` marker 强开。
+3. EVIDENCE_COPY 必须是新的 0700 私有备份位置；`timeout 30s cp -a "$TXN" "$EVIDENCE_COPY"` 备份完整事务及另存当前目标组件；大副本须先说明并改用 600s 上限。对照 journal 用 `timeout 30s shasum -a 256 -- "$SNAPSHOT_COMPONENT"` 逐项核验，保存 uid/device/inode、hash、mode 与操作人确认，不覆盖任何现场。
+4. 在独占维护窗口内，维护入口取得同一目标锁，以 `timeout 30s "$PREPARED_PYTHON" "$BRIDGE_DIR/open_recovery.py" --maintenance --offline-evidence "$OFFLINE_EVIDENCE" --target "$TARGET" --transaction "$RECOVERY_ID" --dry-run` 输出精确的保留/隔离/还原计划；证据必须绑定 target key、uid、目录 device/inode、快照清单与维护窗口，拒绝过期/错目标/身份变化。该 0600 JSON 包含 schema/操作者/本机与目标身份/维护窗口开始和失效时刻/停止 opener 清单/组件现状指纹、dry-run 计划 hash；不是 SDK 退出证明。无法排除跨 uid/远程/自动重启 opener 时拒绝，无 snapshot 的 packed/startup-only 只核验归档，不要求不存在的快照。
+5. 用户审阅计划并授权后去掉 `--dry-run`，应用重新取同一目标锁并核验计划 hash、现场/窗口仍有效；变化/过期则拒绝并重新预览授权，不能把用户思考期间的短锁当持续独占。应用大库还原前说明复制/fsync 理由并使用 600s 上限；超时仍保留 journal 下次续跑。入口仍按 §6.2 的同卷 staging/非覆盖 rename/journal fsync 流程还原，所有新组件和旧现场保留。没有失败意图时只核验归档，不能无故 rollback。身份/占用/I/O 错误仍 blocked，不允许 `rm` marker 强开。
 6. 维护完成 durable restored/manual_offline_recovery，复核所有组件后恢复新协议 router，用**新请求** open/读回；旧失败结果、token 和 release attempt 不重放。保存维护报告，稳定 lock/证据不自动删除。
 
-维护入口命令/flags、锁/证据校验和 dry-run→明确授权→应用顺序是本轮冻结的恢复契约，R0 原型/R4 必须实证；没有该入口与演练证据不能声称 W1 的维护可用。
+维护入口命令/flags、锁/证据校验和 dry-run→明确授权→应用顺序是本轮冻结的恢复契约，R0 原型/R4 必须实证；没有该安装产物入口及完整成功、无写 dry-run、身份/计划变化拒绝、超时/进程退出续跑、无快照/无 startup 身份及多目标演练证据，不能声称边缘维护可用。
 其他已登记窗口（外部 opener 忽略锁可见组件中间状态、guard 安装前恢复写入、直接脚本/其他客户端保存、native 不可抢占）继续见 §1/§6.1；本轮未消除。
 
 ## 11. 核心范围、实施依赖与规模
@@ -666,10 +816,10 @@ W1 的人工恢复是受控维护，不能伪造 public_owner_lifetime，必须�
 | 必需核心 K1 | 两阶段 detach/owner、原 ACK 与错误分离、不重放、SSE 仅连接证据、健康同 owner attach、同/跨 router 立即重开与 status 等 owner-exit |
 | 必需核心 K2 | N1 Preparing、可靠 custody+disposition、精确内部 operation 准入/停止、串行两槽与 auxiliary/verification/r9 的三次双证明 |
 | 必需核心 K3 | U1 SDK 公开阶段/早期资源交付/LaunchIdentity/ACK 清理分离，已有 operation_id 的 adapter 接线，版本/hash 错配拒绝 |
-| 必需核心 K4 | U2 独立 helper：签收、原始 instance、IPC/重连/持久 proof、独立容量、单故障恢复、W1 blocked/人工维护 |
-| 必需核心 K5 | 无 lease 的 startup/文件事务责任表、目标侧 journal/gate、U3 同卷 staging/quarantine、fsync/身份校验、v1 升级/ready 归档、恢复 job/维护入口 |
+| 必需核心 K4 | U2/U5：每state根独立session helper、签收/orphan退出、bridge原对象保留、固定proof接管、预分配launch标识、os_process_exit与**R0平台/出生身份/fork/session必须门禁**，不合格blocked与边缘维护 |
+| 必需核心 K5 | 无 lease 的 startup/文件事务责任表、两类目标固定协调区/同锁、GC payload/证据分离、目标侧 journal/gate、U3 同卷 staging/quarantine、fsync/身份校验、v1 升级/ready 归档、恢复 job/维护入口 |
 | 必需核心 K6 | 接收器隔离、F9 竞态、统一 home、owner 内版本化、nonlast GC/容量投影及跨层动态矩阵、保留全部门禁与真实 E2E |
-| 可选增强 E1 | 第二个独立观察副本/更强公开只读 owner reference，仅用于减少 W1；必须另行接口与用户裁定，不替代必需 helper，不默认实施 |
+| 可选增强 E1 | 第二个独立观察副本/更强公开只读 owner reference，用于进一步减少剩余 W1；**不含已列核心的 os_process_exit**，必须另行接口与用户裁定，不替代必需 helper，不默认实施 |
 | 可选增强 E2 | 多 router helper 共享/线程复用、spool 压缩或专门诊断 UI，仅在不改变逐 owner 责任/签收/容量后另派；核心只提供现有 status/meta 数据 |
 
 不把任何安全门禁、原有验证、r9/hook/快照或共享隔离归入可选项；也不把 SSE 超时当第四类释放证明。
@@ -681,14 +831,14 @@ W1 的人工恢复是受控维护，不能伪造 public_owner_lifetime，必须�
 
 | 顺序 / 步骤 | 内容、依赖与归属 | 红证据 → 绿证据及声明范围 |
 |---|---|---|
-| 1 / R0 冻结与 API 原型 | K1–K6：冻结责任/消息/状态/故障域/预算；完整 baseline 客户端与重现 harness；SDK 阶段/回调异常/spawner/ACK 原型确定最小文件范围；登记 W1 维护入口 | 原 F/D 红例与所需轨迹落盘；只证明原型契约，不称产品已修；完成后重新估算 |
+| 1 / R0 冻结与 API 原型 | K1–K6：冻结责任/消息/状态/故障域/预算；完整 baseline 客户端与重现 harness；SDK 阶段/回调异常/spawner/ACK 原型确定最小文件范围；固定协调布局/锁序、已知v1兼容指纹、脚本安装入口及U5身份/boot/fork/session/平台能力门禁 | 原 F/D 与r2复审红例落盘；OS门禁失败标BLOCKED不启用该类证据；只证原型，完成重估 |
 | 2 / R5 提前基础 | K6：接收器分类/隔离、F9 替换竞态、统一 home/state 传递与版本握手；**第一种新消息上线前完成** | 原 56 序列、B 不受影响、F9/F10 表驱动；尚不宣称 custody/owner 收敛 |
 | 3 / R1 SDK 边界 | K3：U1 最小补丁、结构化失败/资源交付、启动身份、ACK 清理分离及 probe/hash；operation_id 只做已有参数接线 | 构造线程启动/回调失败、503/monitor、Popen/ready、parsed ACK 后清理红→原始事实绿；无孤儿需 R3a 跨层再证 |
-| 4 / R3a 基础 custody | K2/K4/K5：先落 AcquisitionId/schema/两槽、仅 final Preparing/disposition/内部 operations/startup；**在本步引入必需独立 helper** 与 target journal/gate 基础，先签收后准入 | 取消早于 custody、准备 EOF、慢启动/无 lease 责任与 helper 真实签收；只验证 final，不宣称 r9/auxiliary 全绿；恢复型 open 在 R4 完整前不纳入本步已验收声明 |
-| 5 / R2 两阶段释放 | K1/K4：已登记普通 lease 的 ACK、owner 表、helper 重发/故障、nonlast 根 SH、NotSent 预算、立即重开 | barrier 慢退出、丢 ACK、bridge EOF、helper live/reap、router 重启、同/跨 router 重开；辅助 lease 待 R3b schema 接入后补验，不能提前称全组无孤儿 |
-| 6 / R3b 编排迁移 | K2：依赖 R3a，迁移 r9/verification/auxiliary、父结果结束后 cleanup；完成 R2 辅助 lease 部分 | 两槽容量、三次双证明、NotSent/Uncertain 混合成员、不重放、实际双边 lease 集一致 |
-| 7 / R4 完整事务 | K5：在 target gate 基础上完成同卷 staging/quarantine、fsync/非覆盖发布、job/v1/备份结清、status 与 W1 维护入口演练 | 每文件/意图中断、不同 home、大小写/跨卷/不可写、backup resolve 失败、job/router 重启；完整还原或明确 blocked，外部 opener 窗口不扩大声明 |
-| 8 / R6 补齐清理 | K6：补剩余可达轨迹、删除私有错误预填/不当静态排除/重入伪证明与旧协议特判 | R8 原红例到实际 caller 绿；真实 Rust 检查 I1–I6/C1–C10；不是首次引入矩阵 |
+| 4 / R3a 基础 custody | K2/K4/K5：先落 AcquisitionId/schema/两槽、仅 final Preparing/disposition/内部 operations/startup；**在本步引入必需独立 helper** 与 target journal/gate 基础，先签收后准入 | 取消早于 custody、准备 EOF、慢启动/无 lease 责任、每根helper/orphan、固定协调区及正常open-close-proof-GC共存；只验证 final，不宣称 r9/auxiliary 全绿；恢复型 open 在 R4 完整前不纳入本步已验收声明 |
+| 5 / R2 两阶段释放 | K1/K4：已登记普通 lease 的 ACK、owner 表、helper 重发/故障、nonlast 根 SH、NotSent 预算、立即重开 | barrier 慢退出、丢 ACK、bridge EOF、helper live/reap、router 重启、原对象reap竞争/SDK次数、合格OS退出类义务与N1结果分离、quota影响；辅助 lease 待 R3b schema 接入后补验，不能提前称全组无孤儿 |
+| 6 / R3b 编排迁移 | K2：依赖 R3a，迁移 r9/verification/auxiliary、父结果结束后 cleanup；完成 R2 辅助 lease 部分 | 两槽容量、三次双证明、NotSent/Uncertain 混合成员、不重放、实际双边 lease 集一致；crash恢复字节的完整绿证据在R4后补齐 |
+| 7 / R4 完整事务 | K5：在 target gate 基础上完成同卷 staging/quarantine、fsync/非覆盖发布、job/v1/备份结清、status 与安装产物脚本入口/边缘维护演练 | 每文件/意图中断、不同 home、大小写/跨卷/不可写、backup resolve 失败、job/router 重启；完整还原或明确 blocked，外部 opener 窗口不扩大声明 |
+| 8 / R6 补齐清理 | K6：补剩余可达轨迹、删除私有错误预填/不当静态排除/重入伪证明与旧协议特判 | R8 原红例到实际 caller 绿；真实 Rust 检查 I1–I6/C1–C12；不是首次引入矩阵 |
 | 9 / R7 最终验收 | K1–K6：>100MB IDB 确认证据、真实保存/恢复/shared E2E、全部门禁、独立增量复审与编排者复验 | 同一最终 SHA、匹配环境、完整数量/uptime/资源审计；未测 Linux/GUI/debuggee 等不借此宣称通过 |
 
 R3a/R3b/R4 每个里程碑保留多轮评审余量，预计至少 2–3 轮，不能为缩短工期省略故障注入。
@@ -708,6 +858,6 @@ R0 完成 API 原型和状态表后按 K1–K6 分别重新估算；E1/E2 不计
 
 ## 12. 本阶段验证边界
 
-本轮 r2 只核对输入、源码契约与文档结构/链接/whitespace，实际命令、uptime、退出码及本地提交写在外部 design-summary-r2.md、review-response-r2.md、progress.md 与检查日志。
-没有运行真实 IDA、复现 harness 或产品测试，没有修改产品/测试/客户端补丁。
+本轮 r3 只核对输入、源码契约与文档结构/链接/whitespace，实际命令、uptime、退出码及本地提交写在外部 design-summary-r3.md、review-response-r3.md、progress.md 与检查日志。
+没有运行真实 IDA、新协议跨层 harness 或产品测试，没有修改产品/测试/客户端补丁；仅在仓库外以假 payload/源码副本验证现有目录规则、本地 flock 和绝对脚本导入布局，不算新协议运行证明。
 F1 自然关闭耗时、准备 RPC 停止身份、startup 后台写入、hook 写盘前保护和 journal 故障恢复均是第二阶段必须实证的验收项。
