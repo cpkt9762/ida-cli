@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Installation bootstrap prototype. Invoke only via r0_maintenance_launch.sh."""
 import sys
-import os
+
+# os/posixpath must already be frozen, before any path-based import is possible.
+os = sys.modules.get('os')
+if os is None or os.__spec__.origin != 'frozen' or os.path.__spec__.origin != 'frozen':
+    raise RuntimeError('trusted frozen os and path required')
 
 # A closed installation, including the complete current bridge module closure.
 REQUIRED = frozenset(('r0_bootstrap.py', 'r0_maintenance_payload.py', 'analysis_tools.py',
@@ -11,18 +15,47 @@ REQUIRED = frozenset(('r0_bootstrap.py', 'r0_maintenance_payload.py', 'analysis_
 
 
 def main():
-    if os.__spec__.origin != 'frozen':
-        raise RuntimeError('trusted frozen os required')
-    trusted = os.path.realpath(sys.base_prefix)
-    venv = os.path.realpath(sys.prefix)
-    sys.path[:] = [p for p in sys.path if p and os.path.isabs(p) and
-                   any(os.path.realpath(p).startswith(base + os.sep) for base in (trusted, venv))]
+    root = os.path.dirname(os.path.realpath(__file__))
+    excluded = {root, os.path.realpath(os.path.dirname(sys.argv[0])), os.path.realpath(os.getcwd())}
+    version = f'python{sys.version_info.major}.{sys.version_info.minor}'
+    base = os.path.realpath(sys.base_prefix)
+    prefix = os.path.realpath(sys.prefix)
+    stdlib = os.path.realpath(os.path.join(base, sys.platlibdir, version))
+    if not sys._stdlib_dir or os.path.realpath(sys._stdlib_dir) != stdlib:
+        raise RuntimeError('unrecognized interpreter stdlib layout')
+    # Derive exact directories from builtin interpreter facts, never sysconfig
+    # or another module that the installation could shadow. Prefix descendants
+    # are not implicitly trusted. Canonical aliases of excluded paths also go.
+    allowed = {stdlib, os.path.join(stdlib, 'lib-dynload'),
+               os.path.join(prefix, 'lib', version, 'site-packages')}
+    verified_paths = []
+    for path in sys.path:
+        if not path or not os.path.isabs(path):
+            continue
+        canonical = os.path.realpath(path)
+        if canonical not in allowed or canonical in excluded:
+            continue
+        # The prepared interpreter is the trust anchor. Check every directory
+        # from the exact search directory back to that anchor, without imports.
+        anchor = prefix if canonical.startswith(prefix + os.sep) else base
+        current = canonical
+        while True:
+            info = os.lstat(current)
+            if (info.st_mode & 0o170000 != 0o040000 or info.st_uid not in (0, os.getuid())
+                    or info.st_mode & 0o022):
+                raise RuntimeError('untrusted interpreter search directory')
+            if current == anchor:
+                break
+            current = os.path.dirname(current)
+        verified_paths.append(canonical)
+    if stdlib not in verified_paths:
+        raise RuntimeError('verified interpreter stdlib required')
+    sys.path[:] = verified_paths
     import hashlib
     import importlib.abc
     import importlib.util
     import json
     import stat
-    root = os.path.dirname(os.path.realpath(__file__))
 
     def verified_read(name):
         path = os.path.join(root, name)

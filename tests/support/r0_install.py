@@ -17,6 +17,43 @@ ROOT.mkdir(mode=0o700, parents=True)
 
 
 class InstallPrototype(unittest.TestCase):
+    def test_exact_interpreter_paths_exclude_installations_inside_and_outside_venv(self):
+        venv = ROOT / "private-venv"
+        created = subprocess.run(["timeout", "30s", sys.executable, "-I", "-B", "-m", "venv",
+                                  "--without-pip", str(venv)], capture_output=True, text=True)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        rows = []
+        for inside in (False, True):
+            for mode in ("ordinary", "isolated", "safe", "envsafe"):
+                for shadow in (None, "hashlib", "json"):
+                    label = f"paths-{inside}-{mode}-{shadow}"
+                    install = self.layout((venv if inside else ROOT) / label)
+                    alias = ROOT / (label + "-alias")
+                    alias.symlink_to(install, target_is_directory=True)
+                    sentinel = install / "EXECUTED"
+                    if shadow is not None:
+                        (install / (shadow + ".py")).write_text(
+                            f"open({str(sentinel)!r}, 'w').write('unverified')\n"
+                            "raise RuntimeError('unverified installation module executed')\n")
+                    command = ["timeout", "30s", "sh", str(REPO / "scripts/nexus/r0_maintenance_launch.sh"),
+                               str(venv / "bin/python"), str(alias), mode, "--help"]
+                    result = subprocess.run(command, cwd=alias, env={"PATH":os.environ["PATH"]},
+                                            capture_output=True, text=True)
+                    with self.subTest(inside=inside, mode=mode, shadow=shadow):
+                        self.assertNotEqual(result.returncode, 124)
+                        self.assertFalse(sentinel.exists(), "reject before executing unverified source")
+                        if shadow is None:
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(json.loads(result.stdout)["source"],
+                                             str(install / "r0_maintenance_payload.py"))
+                        else:
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn("unexpected executable source member", result.stderr)
+                    rows.append({"inside_venv":inside, "mode":mode, "shadow":shadow,
+                        "argv":command, "exit":result.returncode, "sentinel_executed":sentinel.exists(),
+                        "rejection":result.stderr.splitlines()[-1] if result.stderr else None})
+        (ROOT / "install-path-matrix.json").write_text(json.dumps(rows))
+
     def layout(self, folder):
         folder.mkdir(mode=0o700)
         for source in (REPO / "nexus_bridge").glob("*.py"):
