@@ -975,6 +975,9 @@ BeforeAttach 与 AttachMayBeSent 分开；参数拒绝不置 may-sent；503 保�
 前次 unknown 不被后次503/成功或本地流关闭结清，成功 handle 与旧 unknown 同时交付。SSE 后、thread.start 前交付同 handle；回调/monitor 初始化失败
 由 SDK 强引用保留，显式 claim/close 后解除。LaunchIntent 在 Popen 前，Spawned 在 log/ready 前，
 observer 取得实际 Popen 并采集原生出生身份；未签收 intent 保持 startup-unconfirmed。
+AttachSucceeded/AttachFailed 通知自身失败也保留同一 handle 和原 cause，禁止进入连接重试；
+若获取与失败通知同时出错，原 cause 与独立 observer_errors 都可诊断。获取前的 observer
+异常同样不当作 transport 失败重试；真正未 acquired 的原内部两次连接尝试保持。
 parsed `ack_kind=last/nonlast`、`lease_released` 在任何 response/connection 清理之前锁存；
 last/nonlast × OSError/ValueError/RuntimeError 与重入均验证，cleanup_failures 独立可见，无有效ACK仍unknown；
 最后 ACK 的 owner_pending 独立，unknown close 不重放；已有 operation_id 参数实测原样贯通。
@@ -1008,6 +1011,9 @@ rename后先核验已发布inode/内容并结清owner记录，再消费/删除in
 安装入口要求schema1完整16成员（payload、bootstrap与全部当前bridge模块闭包），逐项身份/权限/hash核验；
 自定义loader执行同FD已读并核验的内存源码，禁止已有pyc，绝不以-B代替字节绑定。
 漏项/权限错/正确源码配不同timestamp-pyc和启动前sitecustomize均有拒绝对照，完整维护应用仍属R4。
+R0-F2 在首个非 builtin/frozen 导入前，只保留由解释器自身事实推导并核验的确切 stdlib、
+lib-dynload 与固定 site-packages 目录；安装/脚本/CWD 及规范化等价路径均排除，
+安装位于 venv prefix 内也不例外。venv 内外的四模式正例与 hashlib/json 同名哨兵拒绝矩阵均覆盖。
 
 R0 后重估以下为**工程人日区间**，含各项定向实现与故障验证，不含 E1/E2；文件集有交叠，不能相加文件数。
 不为节省估算删门禁；跨 boot 产品实验仍依赖独立批准的可重启环境。

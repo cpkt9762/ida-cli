@@ -944,3 +944,13 @@ R0-F1 outputs belong in a new report/root; preserve the old R0 reports/logs.
 The primitives runner includes durable/v1_checks/contract_checks. Baseline review
 probe exit0 only means a counterexample completed; green tests assert safe
 behavior against the new candidate and final validator, not their old fixed paths.
+
+R0-F2 adds post-acquired AttachSucceeded/AttachFailed observer exception pairs,
+pre-acquisition observer/transport separation, and an inside/outside-venv × four
+modes × hashlib/json shadow matrix (plus normal layouts and canonical aliases).
+Run the full SDK/install groups and a fresh real tiny IDB with the new candidate.
+The real result binds the three actually imported candidate files by SHA256.
+For unchanged groups, `r0_freeze.py --historical-validation <prior-validation.jsonl>`
+verifies current dependency and log hashes and marks them `historical-fixed-bytes`;
+SDK/install/real must be fresh. Historical records stay out of the new validation
+log. This does not turn historical Rust/OS experiments into a new execution.

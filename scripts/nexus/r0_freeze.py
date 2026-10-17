@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--real", type=Path)
     parser.add_argument("--v1-checks", type=Path)
     parser.add_argument("--candidate", type=Path)
+    parser.add_argument("--historical-validation", type=Path,
+                        help="unchanged groups only; verify dependency/log hashes and label historical")
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     run = load(args.run)
@@ -43,8 +45,10 @@ def main():
         stages["records"] / "bounded-results.json", stages["records"] / "quota-results.json", stages["install"] / "install-results.json",
         stages["real"] / "result.json"]
     raw.extend([args.sdk / "ack-matrix.json", args.sdk / "no-ack.json", args.sdk / "attempts.json",
+        args.sdk / "stage-errors.json", args.sdk / "observer-errors.json",
         stages["durable"] / "durable-results.json", stages["durable"] / "durable-rejections.json",
         stages["install"] / "install-rejections.json", stages["v1_checks"] / "v1-results.json",
+        stages["install"] / "install-path-matrix.json",
         stages["v1_checks"] / "interpreter-0.json", stages["v1_checks"] / "interpreter-1.json",
         stages["contract_checks"] / "scope-results.json",
         stages["real"] / "v1-observed.json", stages["real"] / "v1-expected.json"])
@@ -59,7 +63,27 @@ def main():
     assert real["packed_before"] == real["packed_after"]
     candidate = args.candidate or Path(run["candidate"])
     hashes = load(candidate.parent / "sdk-candidate-hashes.json")
+    for name, expected in hashes["files"].items():
+        if hashlib.sha256((candidate / "ida_nexus" / name).read_bytes()).hexdigest() != expected:
+            raise RuntimeError("candidate hash mismatch: " + name)
+    if real["client_candidate"] != hashes["files"]:
+        raise RuntimeError("real client did not execute the frozen candidate")
+    stages_errors = load(args.sdk / "stage-errors.json")
+    if (len(stages_errors) != 4 or any(row["accepted"] != 1 or row["acquired"] != 1
+            or row["failure_kind"] != "cleanup_required" or row["release_calls"] != 1
+            or "ReconnectResolved" in row["events"] for row in stages_errors)):
+        raise RuntimeError("missing safe post-acquired observer matrix")
+    install_paths = load(stages["install"] / "install-path-matrix.json")
+    if (len(install_paths) != 24 or any(row["sentinel_executed"] or row["exit"] == 124
+            or (row["exit"] == 0) != (row["shadow"] is None) for row in install_paths)):
+        raise RuntimeError("missing safe exact interpreter path matrix")
     validations = [json.loads(line) for line in (args.report / "validation.jsonl").read_text().splitlines()]
+    origins = {entry["log"]:"fresh" for entry in validations}
+    if args.historical_validation is not None:
+        historical = [json.loads(line) for line in args.historical_validation.read_text().splitlines()]
+        origins.update({entry["log"]:"historical-fixed-bytes" for entry in historical})
+        validations = historical + validations
+        raw.append(args.historical_validation)
     required_files = {"os":"r0_os.py", "sdk":"r0_sdk.py", "transfer":"r0_transfer.py",
                       "records":"r0_records.py", "install":"r0_install.py", "real":"r0_real_ida.py",
                       "durable":"r0_durable.py", "v1_checks":"r0_v1_checks.py", "contract_checks":"r0_contract_checks.py"}
@@ -78,12 +102,18 @@ def main():
     if not rust_records:
         raise RuntimeError("missing successful exact Rust target record")
     checked["rust"] = rust_records[-1]
+    for stage, entry in checked.items():
+        if stage in ("sdk", "install", "real") and origins[entry["log"]] != "fresh":
+            raise RuntimeError("affected experiment must be freshly executed: " + stage)
+        if hashlib.sha256(Path(entry["log"]).read_bytes()).hexdigest() != entry["log_sha256"]:
+            raise RuntimeError("recorded log hash mismatch: " + stage)
     dependencies = {stage:["tests/support/" + filename, "tests/support/r0_common.py"]
                     for stage,filename in required_files.items()}
     dependencies["sdk"] += ["tests/support/r0_transport.py", "scripts/nexus/r0_sdk_candidate.py"]
     dependencies["durable"] += ["tests/support/r0_records.py"]
     dependencies["v1_checks"] += ["tests/support/r0_v1.py"]
     dependencies["real"] += ["tests/support/r0_v1.py"]
+    dependencies["real"] += ["scripts/nexus/r0_sdk_candidate.py"]
     dependencies["contract_checks"] += ["scripts/nexus/r0_contract.py"]
     dependencies["install"] = ["tests/support/r0_install.py", "scripts/nexus/r0_bootstrap.py", "scripts/nexus/r0_maintenance_launch.sh"]
     dependencies["rust"] = ["tests/nexus_r0_prototypes.rs","Cargo.toml","tests/support/r0_bridge_fixture.py","tests/support/r0_transport.py","tests/support/r0_common.py"]
@@ -126,7 +156,10 @@ def main():
             "cross-helper revocation authority", "compaction ENOSPC/EACCES"],
         "true_r0_api_blockers":[],"production_expected_red":reds,
         "validated_current_source":{stage:{"log":entry["log"],"exit":entry["exit"],"source_sha256":
-            {path:entry["source_sha256"][path] for path in dependencies[stage]}} for stage,entry in checked.items()},
+            {path:entry["source_sha256"][path] for path in dependencies[stage]},
+            "execution":origins[entry["log"]], "started":entry["started"],
+            "uptime_before":entry["uptime_before"], "uptime_after":entry["uptime_after"]}
+            for stage,entry in checked.items()},
         "evidence":[evidence(path) for path in raw]}
     contract = {"schema":1, "contract":"N7a-R-r4-R0", "production_enabled":False,
         "source_plans":[evidence(REPO / "docs/plan/nexus-release-protocol.md"),
@@ -135,10 +168,10 @@ def main():
             "candidate_files":["ida_nexus/handle.py","ida_nexus/_resolver.py","ida_nexus/options.py"],
             "hashes":hashes,"diff":evidence(candidate.parent / "sdk-candidate.diff"),
             "additive_public_api":["attach_outcome","open_outcome","on_acquired","on_stage","acquisition_observer","claim_acquired"],
-            "acquisition_fields":["stage","handle","instance","first_instance","failure_kind","cause","launches","sdk_reconnect_used","attempts","unresolved_attempts"],
+            "acquisition_fields":["stage","handle","instance","first_instance","failure_kind","cause","observer_errors","launches","sdk_reconnect_used","attempts","unresolved_attempts"],
             "attempt_fields":["attempt","instance","stage","handle","failure_kind","cause","http_status","obligation"],
             "stages":["BeforeResolve","LaunchIntent","Spawned","LogReady","Resolved","BeforeAttach","AttachMayBeSent","Acquired","AttachFailed","AttachSucceeded","ReconnectResolved"],
-            "rule":"each internal attach retains original instance and unknown obligation; later rejection/success or local stream close never discharges earlier unknown; callback custody failure retains exact handle until explicit claim/close; no post-acquired reconnect",
+            "rule":"each internal attach retains original instance and unknown obligation; later rejection/success or local stream close never discharges earlier unknown; callback/stage failure retains exact handle and original cause until explicit claim/close; AttachFailed observer errors remain independently diagnosable; observer errors never enter transport retry; no post-acquired reconnect",
             "close_fields":["status","ack_kind","lease_released","shutdown_pending","owner_released","owner_pending","failure","cleanup_failure","cleanup_failure_type","cleanup_failures"],
             "request_rule":"one-shot release; parsed ACK immutable; no unknown replay; operation_id already public"},
         "authority":{"business_result":"Rust N1","physical_custody_and_capacity":"Rust custody table",
@@ -187,7 +220,7 @@ def main():
             "verification":"complete equality of module/function/hook sets, normalized executable code and parameter kinds/order/defaults/kwdefaults/function-default content, canonical dependency binding/version/source; two independent interpreters match real owner; no unknown self-report",
             "allow":"known exact set may cleanup only; never new admission; unknown combination rejects"},
         "bootstrap":{"modes":["ordinary","-I","-P","PYTHONSAFEPATH"],
-            "rule":"official env-i launcher excludes startup injection before interpreter initialization; schema1 exact16-member closure, permissions/identity/hash checked; custom loader executes only verified in-memory source bytes, existing bytecode rejected",
+            "rule":"official env-i launcher excludes startup injection before interpreter initialization; before first nonfrozen import, only exact verified interpreter stdlib/lib-dynload/fixed site-packages directories remain, excluding installation/script/CWD and canonical equivalents even inside prefix; schema1 exact16-member closure, permissions/identity/hash checked; custom loader executes only verified in-memory source bytes, existing bytecode rejected",
             "scope":"entry prototype; maintenance dry-run/apply/restart remain R4"},
         "next_order":["R5","R1","R3a","R2","R3b","R4","R6","R7"],
         "evidence":capabilities["evidence"]}
