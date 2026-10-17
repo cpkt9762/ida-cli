@@ -892,9 +892,9 @@ adapter20项含189/56回放、23项readiness反例、生产F2及真实IDA9.5小�
 Rust输入未改，本轮运行复用核验过的固定测试二进制并加载最终Python字节；编译/静态检查与新运行来源分开记录。
 独立复验见`/tmp/n7r5f1v.fRRvfA/report/verification.md`；
 聚焦复审见`/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/r5-rereview1/report.md`，无新增P0/P1/P2。
-F1/F4仍留对应后续阶段；真实跨boot、GUI/Linux/大库、完整维护和N7a最终验收没有由本次结果替代。下一步委托R1 SDK边界。
+F1/F4仍留对应后续阶段；真实跨boot、GUI/Linux/大库、完整维护和N7a最终验收没有由本次结果替代。当时下一步为R1 SDK边界；R1最终验收见下文。
 
-R1 SDK边界实现（待44ad独立复验/审查，未验收）：新增静态第四补丁
+R1 SDK边界实现（2026-10-18，已含关闭边界返修验收为R3a输入）：新增静态第四补丁
 `client-acquisition.patch`，只改固定SDK的handle/_resolver/options，旧三补丁与R0生成器不改。
 公开typed outcome、阶段observer、早期精确handle交付/claim、Popen前intent及立即Spawned、
 逐次unknown责任和ACK先于清理锁存；回调错误不触发transport重试，原cause与次因分别保留。
@@ -904,3 +904,19 @@ R0实验prepare显式保留aa5基线；正式SDK和实验模式不自动兼容�
 `/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/r1/`。
 已有N1业务execute/wait身份继续透传；Preparing原子准入、启动/handle durable custody及helper保留给R3a，
 本轮不将生产open切到半套协议。F1/F4仍为后续阶段的生产expected-red，R2两阶段、R4事务、R6/R7门禁未由SDK事实替代。
+
+R1最终验收对象为`f2718b357a6760ef4f9d72d505eaea0cf932210e`，包含初版40317eb及一次局部返修。
+原审查R1-F1/R1-F2两项P2已关闭：legacy close保留原观察异常对象并维持release主错优先；
+单一稳定结果缓存提前发布有效ACK，并发短预算close读取该ACK，等待标记只写本次返回副本，不重发release。
+编排者在五个新隔离安装和新Rust target上重新验证SDK12、Python124项/81项子测试、
+安装3项、N0 37项/19项子测试、Rust N1/transport/bridge共93项及receiver21项、
+189条回放（含56条历史致命序列）、31项readiness反例、生产F2、三个旧probe绿路径和真实IDA9.5 SDK/Tools小库链。
+30条本轮命令全部exit0，fmt/check/Clippy及修改Python/实际SDK静态检查通过；
+66个登记PID与71个稳定锁审计无残留。最终源码、安装模块、原始日志和case证据哈希均已核对。
+独立执行见`/tmp/n7r1f1v.SKUOv0/report/verification.md`；
+聚焦复审见`/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/r1-rereview1/report.md`，无相关新增P0/P1/P2。
+作者sdk2真实probe清场失败仍保留为失败；sdk3及本轮root新真实链先有界等待精确Popen自然退出，
+之后再审计，无forced cleanup，不能用后续通过覆盖旧失败。
+本次仅验收R1 SDK边界；R3a的Preparing、内部operation、startup/helper和目标gate，
+R2两阶段、R3b恢复编排、R4文件事务及GUI/Linux/大库/真实跨boot均保持后续责任。
+下一步按既定顺序委托R3a，F1/F4仍不宣称已修复。
