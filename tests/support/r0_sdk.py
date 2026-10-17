@@ -1,0 +1,232 @@
+"""Candidate U1 public API with controlled HTTP/SSE and real direct children."""
+import http.client
+import inspect
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, os.environ["R0_CANDIDATE"])
+from ida_nexus import DatabaseHandle, DatabaseOpenOptions
+from ida_nexus.handle import _ACQUIRED_PENDING
+import ida_nexus._resolver as resolver
+from process_identity import identity
+from r0_common import durable
+from r0_transport import Boundary
+
+ROOT = Path(os.environ["R0_CASE_ROOT"]).resolve()
+ROOT.mkdir(parents=True, exist_ok=True)
+
+
+class SDKPrototypes(unittest.TestCase):
+    def test_observer_is_keyword_only_and_old_positional_options_stay_compatible(self):
+        self.assertFalse(DatabaseOpenOptions(False).spawn)
+        self.assertEqual(resolver.WorkerLaunchOptions(None, "/private/tmp").worker_cwd, "/private/tmp")
+        for options in (DatabaseOpenOptions, resolver.WorkerLaunchOptions):
+            self.assertEqual(inspect.signature(options).parameters["acquisition_observer"].kind,
+                             inspect.Parameter.KEYWORD_ONLY)
+            self.assertTrue(options.__doc__)
+
+    def test_early_acquired_callback_and_thread_failure_custody(self):
+        events = []
+        original_start = threading.Thread.start
+        with Boundary(ROOT / "acquired") as boundary:
+            def start(thread):
+                if thread.name.startswith("ida-nexus-lease-"):
+                    self.assertEqual(events[-1][0], "acquired")
+                    raise RuntimeError("controlled monitor start failure")
+                return original_start(thread)
+            with patch.object(threading.Thread, "start", start):
+                outcome = DatabaseHandle.attach_outcome(boundary.instance,
+                    on_acquired=lambda handle: events.append(("acquired", handle)))
+            self.assertIs(outcome["handle"], events[0][1])
+            self.assertIs(_ACQUIRED_PENDING[id(outcome["handle"])], outcome["handle"])
+            self.assertEqual(outcome["failure_kind"], "cleanup_required")
+            self.assertEqual(len(boundary.leases), 1)
+            # start failed: join on the unstarted thread currently also fails.
+            # Its ACK must survive that independent cleanup error.
+            closed = outcome["handle"].close_outcome(wait_for_database=False, timeout=1)
+            self.assertTrue(closed["lease_released"])
+            self.assertNotIn(id(outcome["handle"]), _ACQUIRED_PENDING)
+            self.assertEqual(closed["cleanup_failure_type"], "RuntimeError")
+        with Boundary(ROOT / "callback") as boundary:
+            def fail(handle):
+                events.append(("callback", handle))
+                raise ValueError("controlled custody callback failure")
+            result = DatabaseHandle.attach_outcome(boundary.instance, on_acquired=fail)
+            self.assertIs(result["handle"], events[-1][1])
+            self.assertIsInstance(result["cause"].cause, ValueError)
+            self.assertTrue(result["handle"].close_outcome(wait_for_database=False, timeout=1)["lease_released"])
+
+    def test_open_reconnect_and_operation_identity(self):
+        with Boundary(ROOT / "reconnect", "reject") as boundary:
+            outcome = DatabaseHandle.open_outcome(str(boundary.path), options=DatabaseOpenOptions(spawn=False))
+            self.assertEqual(outcome["failure_kind"], "lease_absent")
+            self.assertTrue(outcome["sdk_reconnect_used"])
+            self.assertEqual(outcome["first_instance"], boundary.instance)
+            self.assertEqual(outcome["instance"], boundary.instance)
+            self.assertEqual(sum(x["endpoint"] == "lease_rejected" for x in boundary.requests), 2)
+        with Boundary(ROOT / "operation") as boundary:
+            outcome = DatabaseHandle.open_outcome(str(boundary.path), options=DatabaseOpenOptions(spawn=False))
+            self.assertIsNone(outcome["cause"])
+            handle = outcome["handle"]
+            try:
+                self.assertEqual(handle.execute_python("result=42", operation_id="r0-exact-operation")["result"], 42)
+                self.assertEqual(boundary.requests[-1]["operation_id"], "r0-exact-operation")
+            finally:
+                self.assertTrue(handle.close_outcome(wait_for_database=False, timeout=1)["lease_released"])
+
+    def test_attach_transport_boundaries_are_not_certain_absence(self):
+        connection_class = http.client.HTTPConnection
+        results = []
+        with Boundary(ROOT / "handshake") as boundary:
+            validation = DatabaseHandle.attach_outcome(boundary.instance, keepalive=-1)
+            self.assertEqual(validation["failure_kind"], "not_sent")
+            self.assertEqual(validation["stage"], "BeforeAttach")
+            for failure in ("request", "getresponse", "missing_socket"):
+                def factory(*args, **kwargs):
+                    connection = connection_class(*args, **kwargs)
+                    if failure in ("request", "getresponse"):
+                        def fail(*_a, **_kw):
+                            raise OSError("controlled " + failure)
+                        setattr(connection, failure, fail)
+                    else:
+                        original = connection.getresponse
+                        def response():
+                            value = original()
+                            connection.sock = None
+                            # Keep real transport reachable for explicit cleanup.
+                            value.fp.raw._sock.close()
+                            value.fp = None
+                            return value
+                        connection.getresponse = response
+                    return connection
+                with patch.object(http.client, "HTTPConnection", factory):
+                    outcome = DatabaseHandle.attach_outcome(boundary.instance)
+                self.assertIsNone(outcome["handle"])
+                self.assertEqual(outcome["failure_kind"], "unknown_attach")
+                results.append({"input": failure, "outcome": outcome["failure_kind"]})
+        durable(ROOT / "attach.json", results)
+
+    def test_parsed_ack_survives_response_and_rpc_cleanup_unknown_never_replays(self):
+        connection_class = http.client.HTTPConnection
+        results = []
+        for failure in ("response", "rpc"):
+            with Boundary(ROOT / ("ack-" + failure)) as boundary:
+                first = DatabaseHandle.attach(boundary.instance)
+                second = DatabaseHandle.attach(boundary.instance)
+                def factory(*args, **kwargs):
+                    connection = connection_class(*args, **kwargs)
+                    original = connection.getresponse
+                    def response():
+                        result = original()
+                        close = result.close
+                        def fail():
+                            close()
+                            raise OSError("controlled response cleanup")
+                        result.close = fail
+                        return result
+                    connection.getresponse = response
+                    return connection
+                if failure == "response":
+                    with patch.object(http.client, "HTTPConnection", factory):
+                        outcome = first.close_outcome(wait_for_database=False, timeout=1)
+                else:
+                    first.execute_python("result=1")
+                    connection = first._rpc_connection
+                    close = connection.close
+                    def fail():
+                        close()
+                        raise OSError("controlled rpc cleanup")
+                    connection.close = fail
+                    outcome = first.close_outcome(wait_for_database=False, timeout=1)
+                self.assertEqual(outcome["ack_kind"], "nonlast")
+                self.assertTrue(outcome["lease_released"])
+                self.assertIn("cleanup_failure", outcome)
+                last = second.close_outcome(wait_for_database=False, timeout=1)
+                self.assertEqual(last["ack_kind"], "last")
+                self.assertEqual(last["status"], "final_pending")
+                results.append({"fault": failure, "nonlast": outcome, "last": last})
+        with Boundary(ROOT / "unknown", "lost-ack") as boundary:
+            handle = DatabaseHandle.attach(boundary.instance)
+            first = handle.close_outcome(wait_for_database=False, timeout=1)
+            second = handle.close_outcome(wait_for_database=False, timeout=1)
+            self.assertFalse(first["lease_released"])
+            self.assertEqual(first, second)
+            self.assertEqual(sum(x["endpoint"] == "/release_lease" for x in boundary.requests), 1)
+            results.append({"unknown": first, "release_calls": 1})
+        durable(ROOT / "ack.json", results)
+
+    def test_spawn_intent_direct_child_identity_before_log_failure(self):
+        path = ROOT / "direct-child"
+        # The executable is an OS input; SDK Popen and launch options are real.
+        path.write_text("#!/bin/sh\nexec /bin/sleep 1\n")
+        path.chmod(0o700)
+        records, children = [], []
+        def observe(stage, value):
+            records.append(stage)
+            if stage == "Spawned":
+                process = value["process"]
+                children.append(process)
+                records.append({"pid": process.pid, "identity": identity(process.pid)})
+                self.assertIsNotNone(records[-1]["identity"])
+                raise RuntimeError("controlled post-Popen pre-log fault")
+        options = resolver.WorkerLaunchOptions(acquisition_observer=observe)
+        try:
+            with patch.object(resolver, "_find_console_script", return_value=str(path)):
+                with self.assertRaisesRegex(RuntimeError, "post-Popen"):
+                    resolver.spawn_worker(str(ROOT / "input"), str(ROOT / "input.i64"), 1, options)
+            self.assertEqual(records[:2], ["LaunchIntent", "Spawned"])
+            self.assertEqual(len(children), 1)
+            # cat can already exit on DEVNULL; creation evidence remains authoritative.
+            self.assertIsInstance(children[0], subprocess.Popen)
+        finally:
+            for child in children:
+                child.wait(timeout=3)
+        durable(ROOT / "spawn.json", {"events": records, "children_reaped": True,
+                "obligation": "Spawned exception retains exact direct-child responsibility"})
+
+    def test_ready_failure_retains_spawn_and_launch_intent_precedes_creation(self):
+        executable = ROOT / "never-ready"
+        executable.write_text("#!/bin/sh\nexec /bin/sleep 0.1\n")
+        executable.chmod(0o700)
+        source = ROOT / "never-ready-input"
+        source.write_bytes(b"private OS input; no IDA launch")
+        stages, children, identities = [], [], []
+        def observe(stage, value):
+            stages.append(stage)
+            if stage == "Spawned":
+                children.append(value["process"])
+                identities.append({"pid":value["pid"], "identity":identity(value["pid"])})
+                self.assertEqual(stages[:2], ["LaunchIntent", "Spawned"])
+        try:
+            with patch.object(resolver, "_find_console_script", return_value=str(executable)):
+                outcome = DatabaseHandle.open_outcome(str(source),
+                    options=DatabaseOpenOptions(startup_timeout=2), observer=observe)
+            self.assertIsNone(outcome["handle"])
+            self.assertIsNotNone(outcome["cause"])
+            self.assertEqual([stage for stage,_ in outcome["launches"]], ["LaunchIntent","Spawned","LogReady"])
+            self.assertEqual(len(children), 1)
+        finally:
+            for child in children:
+                child.wait(timeout=3)
+        # Intent callback failure is definitely before Popen; it still remains
+        # a durable startup obligation until its origin reconciles the intent.
+        def refuse(stage, _value):
+            if stage == "LaunchIntent":
+                raise RuntimeError("controlled before-Popen refusal")
+        with patch.object(resolver, "_find_console_script", return_value=str(executable)):
+            outcome = DatabaseHandle.open_outcome(str(source),
+                options=DatabaseOpenOptions(startup_timeout=2), observer=refuse)
+        self.assertEqual([stage for stage,_ in outcome["launches"]], ["LaunchIntent"])
+        self.assertIsNone(outcome["handle"])
+        durable(ROOT / "ready.json", {"stages":stages, "children_reaped":True,
+            "child_processes":identities,
+            "before_popen":"LaunchIntent only", "failure_obligation":"startup_unconfirmed"})
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

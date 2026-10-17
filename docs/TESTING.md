@@ -868,3 +868,63 @@ Use `--bridge <efbee3c-bridge-copy>` for the unchanged red assertions.
 `r9_reopen.py --product-reopen` runs the product helper in both groups; JSON
 reports natural initial failures separately from failures after retries. Run
 at least 100 trials per group in bounded batches (each trial opens A and B).
+
+### N7a-R R0 prototypes and current-product red baseline
+
+R0 changes test/support only. `scripts/nexus/r0_run.py` refuses an existing case
+root, runs each shard serially with shell `timeout`, and records argv, cwd,
+environment variable names, source hashes, exit and before/after uptime through
+`r0_record.py`. Use a new short `/tmp/n7r0.*` root, private HOME/state/IPC and a
+fresh environment prepared by the existing preparer. Offline inputs may use
+`r0_prepare.py --source <verified-fixed-source> --wheels <verified-wheels>` with
+the preparer's ordinary remaining arguments; fixed SHA/wheel/patch checks remain.
+Never run this on a user's environment, open IDB or installed CLI.
+
+```sh
+timeout 180s python3 scripts/nexus/r0_run.py --environment "$R0_ENV" --root "$R0_ROOT" --report "$R0_REPORT" --stage primitives --stage sdk --stage real
+timeout 180s python3 scripts/nexus/r0_run.py --environment "$R0_ENV" --root "$R0_RUST_ROOT" --report "$R0_REPORT" --stage rust --idasdk "$IDASDK"
+timeout 30s python3 scripts/nexus/r0_audit.py --root "$R0_ROOT" --root "$R0_RUST_ROOT" --output "$R0_REPORT/audit.json"
+```
+
+Cold Rust FFI builds may need the runner's per-command 180s allowance; each
+fault shard is bounded at 120s and each ordinary check at 30s. Declare reasons
+in progress before increasing a limit. An explicit `--target-dir` may reuse
+only this task's private cache, with exactly one serial writer. Never count 124
+as a pass. The Rust target is `--features nexus-test-support --test
+nexus_r0_prototypes current_product_red_baselines -- --exact --test-threads=1`;
+the runner checks and Clippies that actual feature/target. Format-check the
+changed Rust test with `timeout 30s rustfmt --edition 2024 --check
+tests/nexus_r0_prototypes.rs`. Python checks use compile/AST plus Ruff F/E9;
+the shell launcher needs `sh -n`.
+
+`r0_os` observes native birth/exec, escaped descendants, inherited/queued FDs,
+public occupancy limitations, and separately labels injected U6/revocation
+inputs. `r0_transfer` checks actual writer PID/epoch and action counts, not just
+external lock exclusion. `r0_records` exercises bounded summaries/ref epochs and
+durable crash boundaries; its I/O errors are injected. `r0_install` runs from a
+private complete bridge installation, challenges sitecustomize before launch,
+and checks ordinary/-I/-P/PYTHONSAFEPATH and manifest tampering.
+
+`r0_sdk` generates and exercises a temporary three-file U1 candidate; production
+patches stay unchanged. `r0_real_ida` uses one disposable tiny IDB and a second
+independent public client; it verifies loaded v1 code/ABI/dependencies against
+fixed source, then deliberately removes Root only in that IDB to test TEMP|KILL
+and packed-byte retention. Its owned workers are registered, waited and audited.
+No large database, GUI or full-feature E2E belongs to this shard.
+
+The Rust harness uses actual RouterState/Tools/N1, production bridge and pinned
+SDK. Only HTTP/SSE and native IDA input boundaries are controlled. F1 uses real
+Tools open/close/reopen; F4 uses N1's wait_analysis acquisition path (direct IDBs
+in Tools intentionally disable analysis); F2 disconnects a real SSE stream,
+loses release ACKs and observes auxiliary cleanup plus unrelated B. The target
+passes by asserting **current production defects**; no `Released`/private errors
+are injected and no open/attach/guard/lifecycle method is replaced. Product fixes
+must replace those expected-red assertions in the owning later milestone.
+
+`r0_freeze.py --run <primitives-run.json> --os <os-case> --sdk <sdk-case> --rust
+<rust-cases> --report <report-dir>` emits `capabilities.json` and
+`contract-freeze.json` linked to actual evidence. It requires successful recorded
+experiments. Audit after failed runs too: `r0_audit --cleanup-stale` can remove
+only explicitly attributed dead test registrations/sockets; it sends no signal,
+keeps stable lock files and reports unknown/live residue. Real macOS product
+reboot, Linux product capability, full maintenance and R1–R7 remain later gates.

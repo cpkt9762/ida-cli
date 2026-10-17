@@ -947,8 +947,69 @@ R0 完成 API 原型和状态表后按 K1–K6 分别重新估算；E1/E2 不计
 120s 后放弃观察的分散 observer、过期 open except 直接 close、Snapshot.copy 直写最终路径、静态不可达过滤与测试重入协调。
 保留一次性 close 锁存、原始 ACK、保存拒绝累计、N1 停止/终态竞争、N5 分片/EOF 精确清理、N7 锁/代际/隔离/宽限与全部严格业务断言。
 
+### 11.4 R0 实测冻结（2026-10-17）
+
+R0 原型位于 `tests/support/r0_*`、`scripts/nexus/r0_*` 和独立
+`nexus_r0_prototypes` test target。它们不接入生产。机器可读契约、能力表、命令与原始证据由
+`r0_freeze.py` 从本轮记录生成，交付在外部 `n7a-refactor/r0/`；复跑入口见 TESTING。
+输入保持 Nexus 0.13.4/d60ff58 与三个既有补丁，生产 handle hash 仍为
+`aa5d7ea42caaa922ef494d7d8a1406396537a4ea88d9e833825e08c8d279025e`。
+
+| 实测范围 | R0 结论与后续门禁 |
+|---|---|
+| 同 uid 独立入口 | 私有真实小库上，另一个进程经公开 discover/attach/execute 成功执行 owner 代码，取得 nonlast ACK；当前公开 managed idalib 类的同 boot OS 退出资格为 Unsupported。GUI/插件无闭合入口证明同样默认 false，但本轮未运行 GUI |
+| fork/session/FD | native birth 在 exec 前后相同；fork、setsid、可继承 exec、SCM_RIGHTS 在途 FD 均保留 flock；owner 已 reap 而脱离 session 的后代仍持锁。sid/pgid 枚举不能覆盖任意 FD 接收者 |
+| occupancy | 公开 probe 检出继承的 ID0 flock；普通未加锁的继承 FD 不可见。这是占用检查的边界，不产生同 boot 资格 |
+| U6 | IOPlatformUUID、APFS VolumeUUID、bootsessionuuid 可读取，本机非 hypervisor/local internal APFS；仅输出必要 hash/可用性。注入模型拒绝别机/卷/namespace/新 incarnation/坏日志及占用，关闭真实旧 guards，保留由 sent+EOF 产生的 UnknownOutcome。真实 macOS/Nexus 重启链未测，Linux VM 历史证据仍仅 OS 模型 |
+| 事务移交 | 真跨进程 SCM_RIGHTS；ACK 确实不发送、双端退出、错误身份、重复 FD、在途 FD、独立 fence 均覆盖；journal 逐动作记录 actor/epoch/PID，旧 actor 拒写。旧显式 LOCK_UN 破坏共享 OFD 的反例仍保留 |
+| routine | 两个固定目标各 128 轮；引用洞保留、64 项 closed 区间 summary、16384 byte 摘要、96 条工作预算含 8 条收尾预留；满额健康历史先自动压缩，活引用满与 retained 配额满分类，已有收尾可写；summary/intent/unlink/fsync 中断幂等续跑。EACCES/ENOSPC 是注入 I/O，分别保留 errno，不作真实磁盘耗尽声明 |
+| 安装入口 | 新私有安装布局包含完整 bridge 集，env-i 官方启动器在 Python 初始化前去除注入；普通/-I/-P/PYTHONSAFEPATH 四模式验证实际 import 目录及篡改拒绝。完整维护 dry-run/apply/续跑归 R4 |
+| 真实 IDA 小库 | 公开 open/attach/execute、生产 guard 与空 batch_rename 安装成功；已加载 guard/release/slices 逐函数规范化 bytecode 与固定源码相符，记录 ABI/deps/Python 版本；真实 close_status 置 TEMP\|KILL，last ACK + owner lifetime 后 packed hash 不变、解包组件消失、无强杀和注册残留 |
+| 当前生产红例 | 真实 Tools/N1/生产 bridge/固定 SDK，仅替 HTTP/SSE 与 IDA OS 输入：F1 慢关闭后重开仍 CancelPending；F4 分析及 cleanup RemoteError 后物理 lease 未交付 N1；F2 丢 ACK 加辅助清理使无关 B Disconnected。标准 target 断言这些已知缺陷，不能将 target 绿解释成产品已修复 |
+
+U1 候选最小改动为 `handle.py`、`_resolver.py`、`options.py`，生成器只写新临时副本与 diff/hash。
+冻结公开 additive API：`open_outcome`、`attach_outcome`、`on_acquired`、阶段 observer、
+`claim_acquired`。新增 options observer 为 keyword-only，保留原 positional options 顺序与类 docstring。
+BeforeAttach 与 AttachMayBeSent 分开；参数拒绝不置 may-sent；503 保留原
+两次 attach 和首次/替换 instance。SSE 后、thread.start 前交付同 handle；回调/monitor 初始化失败
+由 SDK 强引用保留，显式 claim/close 后解除。LaunchIntent 在 Popen 前，Spawned 在 log/ready 前，
+observer 取得实际 Popen 并采集原生出生身份；未签收 intent 保持 startup-unconfirmed。
+parsed `ack_kind=last/nonlast`、`lease_released` 不因 response/RPC/monitor 清理错误丢失；
+最后 ACK 的 owner_pending 独立，unknown close 不重放；已有 operation_id 参数实测原样贯通。
+这是实验结果形状；R1 仍须固化类型、取消/并发/兼容签名、prepare/hash/probe。
+
+权威与消息字段冻结：N1 独占业务结果；Rust custody 独占物理义务/容量；每根 helper 持原始 instance、
+订阅 epoch 与 proof；target journal 持唯一 executor_epoch。消息绑定 schema、router incarnation、
+AcquisitionId、OwnerKey、CoordKey、subscription_epoch、sequence；签收原对象/义务持久化在 ACK 前。
+Preparing/custody_ack、subscribe/subscribe_ack、lease_detached、owner_released、
+startup_unconfirmed、resource_retired 的 wire 编码/版本拒绝由 R5/R1/R3a 接入后验证，R0 不伪造生产消息。
+Timeout 不是证明，NotSent 要求执行前事实；may-sent 保 unknown。keeper/helper 签收前原持有者不撤保护。
+transfer_id 绑定 RecoveryId/epoch/双方 incarnation/FD kind/inode/nonce；FrozenOffer 后禁止双方抢写，
+只有 Accepted 接收者可写，重复 FD 仅 close；恢复者先关自身旧引用，再开独立 OFD fence。
+所有写者 root SH→target EX；GC 两级 NB；稳定 gid/锁 inode 不随 payload 删除。
+routine 记录固定 epoch/refs/producer_closed/consumer_closed/unacked_events/failure/last_safety_evidence，
+摘要为 closed_through/closed_after_holes（闭区间，不能逐健康 epoch 累积墓碑）；两侧 epoch 关闭且无引用才删除，revision/inode/hash 固定压缩意图。
+known v1 表按真实 loaded code/ABI/deps 与 Python ABI 限定，只允许清理，未知组合拒绝；不得执行未知自报函数。
+
+R0 后重估以下为**工程人日区间**，含各项定向实现与故障验证，不含 E1/E2；文件集有交叠，不能相加文件数。
+不为节省估算删门禁；跨 boot 产品实验仍依赖独立批准的可重启环境。
+
+| 核心 | 预计主要文件/模块 | 人日 | 风险与验收责任 |
+|---|---|---:|---|
+| K1 | lifecycle、bridge release、N1 session/delivery、Tools owner 表 | 3–5 | R2 将 F1 的 detach/owner 分离，真实下一次 open 在原预算中等 proof |
+| K2 | Rust custody/Preparing、open_recovery 编排、slices/verification | 6–9 | R3a/R3b 精确内部 operation、两槽与父终态后的义务仍在；F4 转绿 |
+| K3 | SDK 三文件候选、补丁/prepare/probe、bridge observer 接线 | 3–5 | R1 强类型/取消/回调异常；签收失败不得丢 handle/child，兼容旧公开调用 |
+| K4 | 每根 helper、原生身份/能力、startup/owner journal | 6–10 | R3a/R2 接入，R4/R7 验跨 boot；当前同 boot 类 Unsupported 不得被实现偷开 |
+| K5 | 稳定协调区、target gate、移交、发布/恢复、压缩、安装维护 | 9–14 | R3a 基础、R4 完整；逐文件动作与所有 durable 边界、配额/应急与完整维护 |
+| K6 | receiver、transport 分类、Tools home、v1 table、跨层矩阵 | 5–8 | R5 必须先行；R6 增量矩阵；R7 真实库/共享保存/立即重开/全门禁 |
+
+总量约 32–51 工程人日，另保留 R3a/R3b/R4 各 2–3 轮评审返修余量；不是交付日期承诺。
+生产新增/重写约 2,200–3,600 行，测试/support 约 2,500–4,000 行；未知平台与完整维护可能上浮。
+执行次序保持 R5→R1→R3a→R2→R3b→R4→R6→R7，不在本阶段发布任何半套协议。
+
 ## 12. 本阶段验证边界
 
+以下首段是 r4 设计交付的历史范围；R0 本轮新增实验以 §11.4、TESTING 与外部 r0/validation.jsonl 为准。
 本轮r4只核对设计输入、文档格式/链接、状态/回应/范围一致性；实际命令、uptime、exit、SHA/hash写在外部design-summary-r4.md、review-response-r4.md、design-validation-r4.json与progress.md。
 没有运行真实IDA/新协议harness/产品测试或重跑VM，没有修改产品/测试/补丁；历史实验仅设计依据，不计本轮运行通过。静态检查不能证明协议正确，尚未验收N7a，聚焦双复审通过后才另派R0。
 F1 自然关闭耗时、准备 RPC 停止身份、startup 后台写入、hook 写盘前保护和 journal 故障恢复均是第二阶段必须实证的验收项。

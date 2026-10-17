@@ -844,3 +844,13 @@ GC 在同一根锁下计入容量并报告保留，因不能证明取证/回滚�
 恢复成功也保留。磁盘占用随恢复和失败次数增长，暂无自动迁移或清理命令；只能在明确
 人工维护、停止客户端且独立确认原/隔离库无占用后归档或清理审阅过的恢复证据目录。
 普通 packed 打开无额外副本或全库哈希；验证见 TESTING 的 r9 initial-open retry 小节。
+
+N7a-R R0（2026-10-17）：已加入可复跑原型，契约与 K1–K6 重估见
+`nexus-release-protocol.md` §11.4，入口见 TESTING 的 N7a-R R0 小节。
+SDK 候选仅在私有临时副本改 handle/_resolver/options 三文件；生产补丁、默认后端和公开工具路径未变。
+真实 IDA 9.5 小库验证已加载 v1 guard/release/slices 代码指纹、close_status/TEMP|KILL 及公共 ACK/lifetime；
+同 uid 独立公共客户端可以执行 owner 代码，当前 managed idalib 类同 boot OS 退出资格明确 Unsupported。
+macOS 来源候选可读取；U6 仅判定/资源投影原型通过，真实产品跨 boot 和 Linux 产品能力未测。
+真实 Rust Tools/N1/生产 bridge 原版本 F1/F4/F2 红事实已形成独立测试 target，生产仍有这三类缺陷。
+R0 的脚本/模型绿不验收生产 N7a，不改 U1–U6，不取消后续任何门禁。
+后续顺序 R5→R1→R3a→R2→R3b→R4→R6→R7；合计约 32–51 工程人日另计多轮复审余量。
