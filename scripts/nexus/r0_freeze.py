@@ -17,6 +17,23 @@ def evidence(path):
     return {"path":str(path.resolve()), "sha256":hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
+def product_results(root):
+    """Keep immutable R0 red evidence separate from the R5 fixed assertion."""
+    reds, fixed, paths = [], [], []
+    for name in ("slow-owner", "early-analysis", "lost-ack"):
+        path = root / name / "rust-result.json"
+        red = load(path)
+        if name == "lost-ack" and red["scope"] == "R5-production-isolation":
+            assert red["fact"]["unrelated_b"] == "Active"
+            assert red["fact"]["query"]["result"]["result"] == 42
+            fixed.append(red["fact"])
+        else:
+            assert red["scope"] == "current-product-expected-red"
+            reds.append(red["fact"])
+        paths.append(path)
+    return reds, fixed, paths
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, required=True)
@@ -52,13 +69,8 @@ def main():
         stages["v1_checks"] / "interpreter-0.json", stages["v1_checks"] / "interpreter-1.json",
         stages["contract_checks"] / "scope-results.json",
         stages["real"] / "v1-observed.json", stages["real"] / "v1-expected.json"])
-    reds = []
-    for name in ("slow-owner", "early-analysis", "lost-ack"):
-        path = args.rust / name / "rust-result.json"
-        red = load(path)
-        assert red["scope"] == "current-product-expected-red"
-        reds.append(red["fact"])
-        raw.append(path)
+    reds, fixed, paths = product_results(args.rust)
+    raw.extend(paths)
     assert real["close"]["owner_released"] and not real["remaining_registry"]
     assert real["packed_before"] == real["packed_after"]
     candidate = args.candidate or Path(run["candidate"])
@@ -136,7 +148,8 @@ def main():
             or actual_key != real["v1_validation"]["expected_key"]
             or real["loaded_v1"]["ida"] != real["runtime"] or real["runtime"] != "9.5"):
         raise RuntimeError("incomplete or inconsistent real v1 comparison")
-    capabilities = {"schema":1,"scope":"R0-experiments-only","production_protocol_changed":False,
+    capabilities = {"schema":1,"scope":"R0-experiments-only","production_protocol_changed":bool(fixed),
+        "production_regression_scope":"R5-production-isolation" if fixed else "current-product-expected-red",
         "platform":platform, "supported":[
             "Darwin native birth survives exec", "public last/nonlast ACK and real owner lifetime",
             "SCM_RIGHTS close-only transfer with independent recovery fence",
@@ -154,7 +167,7 @@ def main():
             "complete maintenance application", "R1-R7 production integration", ">100MB or full E2E"],
         "injected_only":["U6 machine/volume/namespace/new-owner/journal rejection and resource retirement",
             "cross-helper revocation authority", "compaction ENOSPC/EACCES"],
-        "true_r0_api_blockers":[],"production_expected_red":reds,
+        "true_r0_api_blockers":[],"production_expected_red":reds,"production_fixed":fixed,
         "validated_current_source":{stage:{"log":entry["log"],"exit":entry["exit"],"source_sha256":
             {path:entry["source_sha256"][path] for path in dependencies[stage]},
             "execution":origins[entry["log"]], "started":entry["started"],
@@ -220,7 +233,7 @@ def main():
             "verification":"complete equality of module/function/hook sets, normalized executable code and parameter kinds/order/defaults/kwdefaults/function-default content, canonical dependency binding/version/source; two independent interpreters match real owner; no unknown self-report",
             "allow":"known exact set may cleanup only; never new admission; unknown combination rejects"},
         "bootstrap":{"modes":["ordinary","-I","-P","PYTHONSAFEPATH"],
-            "rule":"official env-i launcher excludes startup injection before interpreter initialization; before first nonfrozen import, only exact verified interpreter stdlib/lib-dynload/fixed site-packages directories remain, excluding installation/script/CWD and canonical equivalents even inside prefix; schema1 exact16-member closure, permissions/identity/hash checked; custom loader executes only verified in-memory source bytes, existing bytecode rejected",
+            "rule":"official env-i launcher excludes startup injection before interpreter initialization; before first nonfrozen import, only exact verified interpreter stdlib/lib-dynload/fixed site-packages directories remain, excluding installation/script/CWD and canonical equivalents even inside prefix; schema1 exact19-member closure, permissions/identity/hash checked; custom loader executes only verified in-memory source bytes, existing bytecode rejected",
             "scope":"entry prototype; maintenance dry-run/apply/restart remain R4"},
         "next_order":["R5","R1","R3a","R2","R3b","R4","R6","R7"],
         "evidence":capabilities["evidence"]}

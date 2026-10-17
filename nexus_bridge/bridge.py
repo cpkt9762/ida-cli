@@ -24,6 +24,9 @@ from search_tools import SEARCH_METHODS
 from lifecycle import database_diagnostics, release_handle, release_errors, release_group
 from metadata import idb_context
 from open_recovery import open_checked
+from config import ida_cli_home, startup_paths
+from protocol import HANDLE_SHA, admission
+from lifetime import LifetimeListener
 
 GUARD_SOURCE = Path(__file__).with_name('save_guard.py').read_text(encoding='utf-8')
 
@@ -46,7 +49,6 @@ def guarded_source(code, context, refuse=True):
 
 TOOL_METHODS = (*TOOL_METHODS, *TYPE_METHODS, *EDIT_METHODS, *ANALYSIS_METHODS, *STRUCT_METHODS, *QUERY_METHODS, *SEARCH_METHODS, "batch_rename")
 
-HANDLE_SHA = "aa5d7ea42caaa922ef494d7d8a1406396537a4ea88d9e833825e08c8d279025e"
 METHODS = {"execute_python": "may_write", "database_info": "read_only",
            "rename_address": "may_write", "read_name": "read_only"}
 METHODS.update({method: "may_write" if method in WRITE_METHODS else "read_only"
@@ -75,6 +77,8 @@ def error(code, message):
 
 def readiness():
     try:
+        paths = startup_paths()
+        protocol = admission()
         import ida_nexus
         versions = [importlib.metadata.version(name) for name in ("ida-nexus", "ida-domain")]
         if versions != ["0.13.4", "0.5.1"]:
@@ -96,7 +100,7 @@ def readiness():
         return {"ready": False, "error": error("runtime_unavailable", exc)}
     return {"ready": True, "capabilities": {"runtime": {
         "ida": ida, "python": list(sys.version_info[:3]), "nexus": [0, 13, 4], "domain": [0, 5, 1]},
-        "methods": METHODS}, "client_cancel_patch": True}
+        "methods": METHODS}, "client_cancel_patch": True, "protocol": protocol, "paths": paths}
 
 
 def validate_response_depth(message):
@@ -164,8 +168,9 @@ class Channel:
             self.stopped.set()
 
 
-class Bridge:
+class Bridge(LifetimeListener):
     def __init__(self, business, control, capacity):
+        startup_paths()
         from ida_nexus import DatabaseHandle, DatabaseOpenOptions
         self.Handle = DatabaseHandle
         self.Options = DatabaseOpenOptions
@@ -193,45 +198,13 @@ class Bridge:
         # Adapter-owned lifetime lane, never a Nexus wire protocol. Owner-side
         # watchers use only public Nexus APIs to release our jobs after EOF.
         self.lifetime_path = str(Path(business).with_name("l"))
-        self.lifetime_socket = socket.socket(socket.AF_UNIX)
-        self.lifetime_socket.bind(self.lifetime_path)
-        self.lifetime_inode = Path(self.lifetime_path).lstat().st_ino
-        self.lifetime_socket.listen(capacity)
-        self.lifetimes = {}
+        self.init_lifetimes(capacity)
         threading.Thread(target=self.accept_lifetimes, daemon=True).start()
         self.business = Channel(business, capacity, self.receive, self.stopped)
         self.control = Channel(control, 8, self.receive, self.stopped)
         self.initialized.set()
         threading.Thread(target=self.discover, daemon=True).start()
         threading.Thread(target=self.proofs, daemon=True).start()
-
-    def accept_lifetimes(self):
-        while not self.stopped.is_set():
-            try:
-                connection, _ = self.lifetime_socket.accept()
-                connection.settimeout(2)
-                raw = connection.recv(256)
-                lease_id = raw.decode("ascii")
-                with self.lock:
-                    if lease_id not in self.handles:
-                        connection.close()
-                        continue
-                    previous = self.lifetimes.get(lease_id)
-                    self.lifetimes[lease_id] = connection
-                    if previous is not None:
-                        previous.close()
-                connection.sendall(b"ok")
-                connection.settimeout(None)
-            except OSError:
-                if not self.stopped.is_set():
-                    self.stopped.set()
-                return
-
-    def drop_lifetime(self, lease_id):
-        with self.lock:
-            connection = self.lifetimes.pop(lease_id, None)
-        if connection is not None:
-            connection.close()
 
     def discover(self):
         from ida_nexus import discover_databases
@@ -264,7 +237,8 @@ class Bridge:
                 owners = list(self.owners)
                 verifications = list(self.verification_probes)
             channel.send({"event": "local_status", "id": message["local_status"],
-                          "held": held, "owners": owners, "verification_probes": verifications})
+                          "held": held, "owners": owners, "verification_probes": verifications,
+                          "lifetime_listener_healthy": self.lifetime_healthy})
             return
         frame = message
         command = frame["payload"]["command"]
@@ -372,7 +346,7 @@ class Bridge:
             attach = options.pop("attach_instance", None)
             options["startup_timeout"] = max(0.001, deadline - time.monotonic())
             options["worker_env"] = dict(os.environ)
-            options["worker_cwd"] = os.environ["IDA_CLI_HOME"]
+            options["worker_cwd"] = str(ida_cli_home())
             if verification is not None:
                 original = Path(command["path"])
                 copy_hash = hashlib.sha256(Path(verification).read_bytes()).digest()
@@ -393,7 +367,7 @@ class Bridge:
 
                 probe, _, _ = open_checked(self.Handle, self.Options, str(verification),
                     {'auto_analysis': False, 'worker_env': dict(os.environ),
-                     'worker_cwd': os.environ['IDA_CLI_HOME']}, deadline, guarded_source,
+                     'worker_cwd': str(ida_cli_home())}, deadline, guarded_source,
                     dict(metadata_context, method='verification-open'), track_probe, release_probe,
                     lambda: public_started.__setitem__(0, True))
                 try:
@@ -576,7 +550,8 @@ class Bridge:
                         timeout=max(.001, deadline-time.monotonic()))
                 return dict(checked['result'], close_safe=True)
             def publish(name, outcome):
-                channel.send({'event': name, 'attempt': attempt, 'outcome': outcome,
+                channel.send({'event': 'release_observation', 'schema': 1, 'release_protocol': 1,
+                              'observation': name, 'attempt': attempt, 'outcome': outcome,
                               'save_guard_error': outcome.get('save_guard_error'),
                               'error': error('cancel_pending', 'lease release unconfirmed; owner retained')})
             # Request every own lease before waiting for an owner that those
@@ -589,7 +564,14 @@ class Bridge:
                     errors=release_errors(handle), request_only=True)
             errors = tuple(message for member in participants for message in release_errors(member))
             outcomes = release_group(participants, deadline, publish, errors=errors)
+            errors = tuple(message for member in participants for message in release_errors(member))
             if any(outcome is None for outcome in outcomes):
+                details = {'attempt': attempt, 'error': error('cancel_pending',
+                    'lease release unconfirmed; owner retained'),
+                    'save_guard_error': '; '.join(dict.fromkeys(errors)) or None,
+                    'outcome': {'save_guard_error': '; '.join(dict.fromkeys(errors)) or None}}
+                channel.send({'event': 'uncertain', **details})
+                channel.send({'event': 'release_unconfirmed', **details})
                 return
             outcome = next((item for item in reversed(outcomes) if item.get('owner_released')),
                            outcomes[-1])

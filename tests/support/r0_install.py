@@ -141,7 +141,7 @@ class InstallPrototype(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["source"], str(install / "r0_maintenance_payload.py"))
             self.assertEqual(json.loads(result.stdout)["execution"], "verified-source-bytes")
-            self.assertEqual(len(json.loads(result.stdout)["manifest_members"]), 16)
+            self.assertEqual(len(json.loads(result.stdout)["manifest_members"]), 19)
             self.assertFalse(sentinel.exists(), "sitecustomize must be excluded BEFORE interpreter startup")
             results.append({"mode":mode, "argv":command, "exit":result.returncode})
         (install / "r0_maintenance_payload.py").write_text("raise RuntimeError('tampered')")

@@ -56,3 +56,8 @@ idalib-build = { path = "3rd-github/idalib/idalib-build" }
 
 [dev-dependencies]
 rstest = "0.25"
+
+[[test]]
+name = "nexus_r5"
+path = "tests/nexus_r5.rs"
+required-features = ["nexus-test-support"]

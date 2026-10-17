@@ -34,6 +34,7 @@ async fn n4_fix_open_delivery_survives_broadcast_lag() {
         pending: Mutex::new(HashMap::new()),
         leases: Mutex::new(HashMap::new()),
         release_errors: Mutex::new(HashMap::new()),
+        rejected_acquisitions: Mutex::new(Default::default()),
         events,
         open_replies: Mutex::new(HashMap::new()),
         open_reply_capacity: 8,
@@ -147,6 +148,7 @@ async fn n5_old_delivery_callbacks_preserve_second_attempt_and_terminal_state() 
         pending: Mutex::new(HashMap::new()),
         leases: Mutex::new(HashMap::new()),
         release_errors: Mutex::new(HashMap::new()),
+        rejected_acquisitions: Mutex::new(Default::default()),
         events,
         open_replies: Mutex::new(HashMap::new()),
         open_reply_capacity: 8,
@@ -214,7 +216,7 @@ async fn n5_old_delivery_callbacks_preserve_second_attempt_and_terminal_state() 
         if index == 1 {
             assert!(state.pending.lock().unwrap().is_empty());
             for event in ["completed", "yielded", "uncertain", "stopped"] {
-                event_received(json!({"event":event,"attempt":attempts[0],"result":"old",
+                receiver::receive_event(json!({"event":event,"attempt":attempts[0],"result":"old",
                     "checkpoint":{"index":999},"error":{"code":"disconnected","message":"dispatch gap"}}), &writer, &state, false)
                     .await.expect("old callback in real dispatch/pending gap must be harmless");
             }
@@ -242,7 +244,7 @@ async fn n5_old_delivery_callbacks_preserve_second_attempt_and_terminal_state() 
         );
         attempts.push(attempt.clone());
         if index == 0 {
-            event_received(
+            receiver::receive_event(
                 json!({"event":"yielded","attempt":attempt,"checkpoint":{"index":1}}),
                 &writer,
                 &state,
@@ -254,7 +256,7 @@ async fn n5_old_delivery_callbacks_preserve_second_attempt_and_terminal_state() 
     }
     for terminal in [false, true] {
         if terminal {
-            event_received(
+            receiver::receive_event(
                 json!({"event":"completed","attempt":attempts[1],"result":"second"}),
                 &writer,
                 &state,
@@ -264,7 +266,7 @@ async fn n5_old_delivery_callbacks_preserve_second_attempt_and_terminal_state() 
             .unwrap();
         }
         for event in ["completed", "yielded", "uncertain", "stopped"] {
-            event_received(json!({"event":event,"attempt":attempts[0],"result":"old",
+            receiver::receive_event(json!({"event":event,"attempt":attempts[0],"result":"old",
                 "checkpoint":{"index":999},"error":{"code":"disconnected","message":"late old callback"}}),&writer,&state,false).await.expect("old callbacks must be harmless, including to the physical channel");
             let snapshot = endpoint
                 .transition(|s, _| s.operation_status(&lease.client_id, &op))

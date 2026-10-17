@@ -2,10 +2,12 @@
 pub mod cache;
 pub mod cache_lock;
 pub mod generations;
+pub mod protocol;
+mod receiver;
 use super::nexus_transport::{Delivery, NexusEndpoint, NexusWireFrame};
 use crate::nexus::*;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -37,6 +39,7 @@ struct State {
     pending: Mutex<HashMap<u64, Pending>>,
     leases: Mutex<HashMap<LeaseId, SessionLease>>,
     release_errors: Mutex<HashMap<LeaseId, (SessionLease, String)>>,
+    rejected_acquisitions: Mutex<HashSet<SessionLease>>,
     events: broadcast::Sender<Value>,
     open_replies: Mutex<HashMap<OperationId, tokio::sync::oneshot::Sender<Value>>>,
     open_reply_capacity: usize,
@@ -198,8 +201,32 @@ impl NexusBridge {
             .remove(&lease.lease_id)
             .and_then(|(exact, message)| (exact == *lease).then_some(message))
     }
-    pub async fn start(router: &super::RouterState, config: BridgeConfig) -> anyhow::Result<Self> {
+    pub async fn start(
+        router: &super::RouterState,
+        mut config: BridgeConfig,
+    ) -> anyhow::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
+        let startup_cwd = std::env::current_dir()?;
+        let ida_home: PathBuf = startup_cwd
+            .join(crate::idb_store::ida_home_from(
+                config
+                    .environment
+                    .get("IDA_CLI_HOME")
+                    .map(std::ffi::OsStr::new),
+                config.environment.get("HOME").map(std::ffi::OsStr::new),
+            ))
+            .components()
+            .collect();
+        let home = ida_home
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Nexus home is not UTF-8"))?;
+        config
+            .environment
+            .insert("IDA_CLI_HOME".into(), home.into());
+        config.environment.insert(
+            "IDA_CLI_NEXUS_PROTOCOL".into(),
+            serde_json::to_string(&protocol::Protocol::current())?,
+        );
         std::fs::create_dir(&config.directory)?;
         std::fs::set_permissions(&config.directory, std::fs::Permissions::from_mode(0o700))?;
         let mut owner = StartupGuard {
@@ -214,6 +241,7 @@ impl NexusBridge {
         let log = std::fs::File::create(config.directory.join("stderr.log"))?;
         owner.child = Some(
             Command::new(&config.python)
+                .current_dir(&startup_cwd)
                 .arg(&config.script)
                 .arg(&business_path)
                 .arg(&control_path)
@@ -248,7 +276,24 @@ impl NexusBridge {
             if ready["ready"] != true {
                 anyhow::bail!("Nexus readiness: {}", ready["error"]);
             }
+            protocol::Protocol::validate(ready["protocol"].clone())?;
+            anyhow::ensure!(
+                ready["paths"]["ida_cli_home"].as_str() == ida_home.to_str(),
+                "ProtocolMismatch: bridge home differs from startup home"
+            );
+            let state_dir = ready["paths"]["state_dir"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("ProtocolMismatch: missing Nexus state root"))?;
+            anyhow::ensure!(
+                std::path::Path::new(state_dir).is_absolute(),
+                "ProtocolMismatch: Nexus state root must be absolute"
+            );
             let caps: NexusCapabilities = serde_json::from_value(ready["capabilities"].clone())?;
+            anyhow::ensure!(
+                caps.runtime.nexus == Some(Version(0, 13, 4))
+                    && caps.runtime.domain == Some(Version(0, 5, 1)),
+                "ProtocolMismatch: fixed client versions required"
+            );
             caps.runtime.validate()?;
             let (b, _) = business.accept().await?;
             let (c, _) = control.accept().await?;
@@ -276,6 +321,7 @@ impl NexusBridge {
             pending: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
             release_errors: Mutex::new(HashMap::new()),
+            rejected_acquisitions: Mutex::new(HashSet::new()),
             events,
             open_replies: Mutex::new(HashMap::new()),
             open_reply_capacity: capacity,
@@ -530,7 +576,7 @@ impl tokio::io::AsyncWrite for CountingWriter<'_> {
 
 // One in-flight decoder, queued by the existing control stream reader. No
 // try-acquire, no CLI control encoder permit, no increase in lane admission.
-async fn decode_control(line: String) -> anyhow::Result<Result<Value, serde_json::Error>> {
+async fn decode_control(line: Vec<u8>) -> anyhow::Result<Result<Value, serde_json::Error>> {
     static GATE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
         std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
     let permit = GATE.clone().acquire_owned().await?;
@@ -539,7 +585,7 @@ async fn decode_control(line: String) -> anyhow::Result<Result<Value, serde_json
         .name("nexus-control-decode".into())
         .spawn(move || {
             let _permit = permit;
-            let _ = send.send(serde_json::from_str(&line));
+            let _ = send.send(serde_json::from_slice(&line));
         })?;
     Ok(receive.await?)
 }
@@ -549,9 +595,9 @@ fn start_channel(stream: UnixStream, state: Arc<State>, control: bool) -> Writer
     let writer = Arc::new(AsyncMutex::new(write));
     let responding = writer.clone();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(read).lines();
+        let mut lines = BufReader::new(read);
         loop {
-            let next = tokio::select! { _ = state.stop.cancelled() => break, next = lines.next_line() => next };
+            let next = tokio::select! { _ = state.stop.cancelled() => break, next = receiver::read_line(&mut lines) => next };
             match next {
                 Ok(Some(line)) => {
                     let decoded = if control {
@@ -560,20 +606,37 @@ fn start_channel(stream: UnixStream, state: Arc<State>, control: bool) -> Writer
                             .map_err(|e| crate::error::ToolError::IdaError(e.to_string()))
                     } else {
                         crate::blocking::request_decode(move || {
-                            serde_json::from_str::<Value>(&line)
+                            serde_json::from_slice::<Value>(&line)
                         })
                         .await
                     };
                     let event = match decoded {
                         Ok(Ok(value)) => value,
-                        other => {
-                            tracing::error!(?other, "invalid bridge event");
+                        Ok(Err(error)) => {
+                            receiver::rejected(
+                                &state,
+                                None,
+                                format!("invalid complete JSON line: {error}"),
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "bridge decoder unavailable");
                             break;
                         }
                     };
-                    if let Err(error) = event_received(event, &responding, &state, control).await {
-                        tracing::error!(%error, "bridge event failed");
-                        break;
+                    match receiver::receive_event(event, &responding, &state, control).await {
+                        Ok(receiver::ReceiveOutcome::Accepted) => {}
+                        Ok(
+                            receiver::ReceiveOutcome::Dropped(reason)
+                            | receiver::ReceiveOutcome::ResourceRetained(reason),
+                        ) => {
+                            tracing::debug!(%reason, "Nexus isolated event rejection");
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "bridge physical event write failed");
+                            break;
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -604,6 +667,25 @@ async fn event_received(
             crate::blocking::request_decode(move || serde_json::from_value(encoded)).await??
         };
         let sequence = frame.attempt.sequence.get();
+        anyhow::ensure!(
+            state
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&sequence)
+                .is_some_and(|p| p.attempt == frame.attempt && !p.granted),
+            "unknown, mismatched or duplicate dispatch request"
+        );
+        anyhow::ensure!(
+            control
+                == matches!(
+                    frame.payload,
+                    SessionCommand::Cancel { .. }
+                        | SessionCommand::Release { .. }
+                        | SessionCommand::Shutdown { .. }
+                ),
+            "dispatch request on wrong lane"
+        );
         let mut output = writer.lock().await;
         let attempt = frame.attempt.clone();
         let expires = frame.expires_monotonic_ns;
@@ -611,8 +693,13 @@ async fn event_received(
         // grant carries remaining duration only, never the absolute clock.
         let endpoint = state.endpoint.clone();
         let checking = attempt.clone();
+        let resource_state = state.clone();
         let consume = move || {
             frame.consume().and_then(|(command, _)| {
+                if matches!(command, SessionCommand::Open { .. })
+                    && !resource_state.rejected_acquisitions.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    return Err(invalid("unregistered acquired handle retained by bridge; new acquisition blocked for protocol cleanup"));
+                }
                 endpoint.transition(|s, _| s.send_eligible(&command, &checking))?;
                 Ok(command)
             })
@@ -664,7 +751,10 @@ async fn event_received(
         };
         let mut bytes = serde_json::to_vec(&reply)?;
         bytes.push(b'\n');
-        output.write_all(&bytes).await?;
+        output
+            .write_all(&bytes)
+            .await
+            .map_err(receiver::EventIoError)?;
         drop(output);
         if let Some(command) = garbage {
             crate::blocking::response(move || drop(command)).await?;
@@ -688,11 +778,12 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
             .unwrap_or_else(|e| e.into_inner())
             .get(&lease.lease_id)
             .cloned();
-        if registered.is_some() {
+        if registered.as_ref() == Some(&lease) {
             state
                 .endpoint
                 .transition(|s, _| s.lease_disconnected(&lease))?;
         } else {
+            anyhow::ensure!(registered.is_none(), "disconnect lease identity mismatch");
             let attempt: DeliveryAttempt = decode(event["attempt"].clone())?;
             let DeliveryTarget::Open { identity } = &attempt.target else {
                 return Err(invalid("disconnect open correlation missing").into());
@@ -723,6 +814,27 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
         return Ok(());
     }
     let name = event["event"].as_str().unwrap_or("");
+    anyhow::ensure!(
+        matches!(
+            name,
+            "ack"
+                | "opened"
+                | "completed"
+                | "yielded"
+                | "stopped"
+                | "cancel_ack"
+                | "released"
+                | "shutdown_completed"
+                | "remote_error"
+                | "failed"
+                | "not_sent"
+                | "uncertain"
+                | "stop_unconfirmed"
+                | "release_unconfirmed"
+                | "release_observation"
+        ),
+        "unknown or unsupported message family (custody/helper/owner observation not implemented)"
+    );
     // Clone/decode potentially large results and errors before taking N1's lock.
     // Business callbacks already run on the bounded response worker.
     let mut value = event.get("result").cloned().unwrap_or(Value::Null);
@@ -736,6 +848,19 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
     let _ordered = state.callbacks.lock().unwrap_or_else(|e| e.into_inner());
     let attempt: DeliveryAttempt = serde_json::from_value(event["attempt"].clone())?;
     let sequence = attempt.sequence.get();
+    let target_matches = match name {
+        "opened" => matches!(attempt.target, DeliveryTarget::Open { .. }),
+        "completed" | "yielded" | "stopped" | "stop_unconfirmed" => {
+            matches!(attempt.target, DeliveryTarget::Execute { .. })
+        }
+        "released" | "release_unconfirmed" | "release_observation" => {
+            matches!(attempt.target, DeliveryTarget::Release { .. })
+        }
+        "cancel_ack" => matches!(attempt.target, DeliveryTarget::Cancel { .. }),
+        "shutdown_completed" => matches!(attempt.target, DeliveryTarget::Shutdown { .. }),
+        _ => true,
+    };
+    anyhow::ensure!(target_matches, "event family/command target mismatch");
     let (known, superseded) = {
         let pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
         (
@@ -746,44 +871,66 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
         )
     };
     if !known {
-        // A confirmed slice may have been delivered again, or already ended.
-        // Its old callbacks must not invalidate the shared physical connection.
-        let stopped_boundary = if let DeliveryTarget::Execute { identity } = &attempt.target {
-            state
+        if name == "opened" {
+            // Pending is a command table, not acquisition authority. N1 retains
+            // exact opening tombstones after failure/cancellation.
+            let DeliveryTarget::Open { identity } = &attempt.target else {
+                anyhow::bail!("open target mismatch");
+            };
+            let lease: SessionLease = decode(event["lease"].clone())?;
+            let registered = state
+                .leases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&lease.lease_id)
+                .cloned();
+            if registered.as_ref() == Some(&lease) {
+                return Err(
+                    invalid("duplicate acquired lease; existing responsibility retained").into(),
+                );
+            }
+            state.endpoint.transition(|s, _| {
+                s.delivery_status(&identity.client_id, &attempt)?;
+                s.open_progress(&identity.client_id, identity)?;
+                Ok::<_, NexusError>(())
+            })?;
+        } else if name == "released" {
+            let DeliveryTarget::Release { lease } = &attempt.target else {
+                anyhow::bail!("release target mismatch");
+            };
+            let delivery = state
                 .endpoint
-                .transition(|s, _| {
-                    s.operation_progress(&identity.lease.client_id, identity)
-                        .map(|progress| {
-                            progress.execution_stopped
-                                && (progress.status == OperationStatus::Queued
-                                    || progress.status.is_terminal())
-                        })
-                })
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        // F2/P2-a: N1 publishes the attempt atomically with dispatch, before
-        // this physical pump can register pending. Consult that authority too.
-        let dispatched_again = state
-            .endpoint
-            .transition(|s, _| s.delivery_superseded(&attempt));
-        if superseded || dispatched_again || stopped_boundary {
-            return Ok(());
-        }
-        if event["event"] == "stopped" {
+                .transition(|s, _| s.delivery_status(&lease.client_id, &attempt))?;
+            anyhow::ensure!(
+                delivery.state != DeliveryState::Confirmed,
+                "duplicate release terminal"
+            );
+        } else if name == "stopped" {
             state.endpoint.transition(|s, _| {
                 let DeliveryTarget::Execute { identity } = &attempt.target else {
                     return Err(invalid("stop target mismatch"));
                 };
+                // Old slices cannot stop a newer physical delivery.
                 s.delivery_status(&identity.lease.client_id, &attempt)?;
-                s.execution_stopped(identity)?;
+                if !s.execution_stopped(identity)? {
+                    return Err(invalid("duplicate stop terminal"));
+                }
                 Ok::<_, NexusError>(())
             })?;
             state.emit(event);
             return Ok(());
+        } else {
+            let reason = if superseded
+                || state
+                    .endpoint
+                    .transition(|s, _| s.delivery_superseded(&attempt))
+            {
+                "superseded bridge attempt"
+            } else {
+                "unknown, mismatched or duplicate bridge attempt"
+            };
+            return Err(invalid(reason).into());
         }
-        anyhow::bail!("unknown or mismatched bridge attempt");
     }
     let result = state.endpoint.transition(|s, _| -> Result<(), NexusError> {
         match name {
@@ -796,11 +943,15 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
                 let DeliveryTarget::Open { identity } = &attempt.target else {
                     return Err(invalid("open target mismatch"));
                 };
-                state
-                    .leases
+                let disconnected = state
+                    .pending
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(lease.lease_id.clone(), lease.clone());
+                    .get(&sequence)
+                    .and_then(|p| p.open_disconnected.clone());
+                if disconnected.as_ref().is_some_and(|old| old != &lease) {
+                    return Err(invalid("opened lease differs from buffered disconnect"));
+                }
                 match s.opened(identity, lease.clone(), caps)? {
                     OpenDisposition::Ready(_) => {}
                     OpenDisposition::ReleaseRequired { .. } => {
@@ -808,11 +959,12 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
                         // full control lane must not discard lease responsibility.
                     }
                 }
-                let pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(disconnected) = pending
-                    .get(&sequence)
-                    .and_then(|p| p.open_disconnected.as_ref())
-                {
+                state
+                    .leases
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(lease.lease_id.clone(), lease.clone());
+                if let Some(disconnected) = disconnected.as_ref() {
                     if disconnected != &lease {
                         return Err(invalid("opened lease differs from buffered disconnect"));
                     }
@@ -905,6 +1057,14 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
                 };
                 s.complete(identity, completion)?;
             }
+            "release_observation" => {
+                if !matches!(attempt.target, DeliveryTarget::Release { .. })
+                    || event["schema"] != 1
+                    || event["release_protocol"] != 1
+                {
+                    return Err(invalid("release observation identity/version mismatch"));
+                }
+            }
             "stop_unconfirmed" | "release_unconfirmed" => {}
             "uncertain" => {
                 s.delivery_failed(&attempt, DispatchFailure::Uncertain(take_error()?))?;
@@ -940,7 +1100,9 @@ fn apply_event(event: Value, state: &State) -> anyhow::Result<()> {
         .is_some_and(|p| {
             (name == "uncertain" && !p.stopped) || (name == "stopped" && !p.uncertain)
         });
-    if !matches!(name, "ack" | "stop_unconfirmed") && !waiting_for_outcome_or_proof {
+    if !matches!(name, "ack" | "stop_unconfirmed" | "release_observation")
+        && !waiting_for_outcome_or_proof
+    {
         state
             .pending
             .lock()
@@ -960,3 +1122,7 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, NexusError>
 #[cfg(test)]
 #[path = "../../tests/support/n4_bridge.rs"]
 mod n4_fix_regressions;
+
+#[cfg(test)]
+#[path = "../../tests/support/r5_receiver.rs"]
+mod r5_receiver_tests;

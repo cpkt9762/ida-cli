@@ -11,7 +11,8 @@ if os is None or os.__spec__.origin != 'frozen' or os.path.__spec__.origin != 'f
 REQUIRED = frozenset(('r0_bootstrap.py', 'r0_maintenance_payload.py', 'analysis_tools.py',
     'bridge.py', 'cache_store.py', 'edit_tools.py', 'lifecycle.py', 'metadata.py',
     'open_recovery.py', 'query_tools.py', 'save_guard.py', 'search_tools.py',
-    'slices.py', 'struct_tools.py', 'tools.py', 'type_tools.py'))
+    'slices.py', 'struct_tools.py', 'tools.py', 'type_tools.py',
+    'config.py', 'protocol.py', 'lifetime.py'))
 
 
 def main():

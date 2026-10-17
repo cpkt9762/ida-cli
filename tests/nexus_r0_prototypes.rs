@@ -1,11 +1,10 @@
-//! Expected-red facts on the current product, using its actual Tools/N1/bridge.
-//! Assertions keep the ordinary target green while recording the unfixed defects.
+//! R0 historical F1/F4 expected-red facts and R5 production F2 isolation.
 use ida_mcp::{
     nexus::*,
     preprocess::Preparation,
-    router::{RouterState, nexus_bridge::BridgeConfig, nexus_bridge::NexusBridge},
+    router::{nexus_bridge::BridgeConfig, nexus_bridge::NexusBridge, RouterState},
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 
@@ -115,9 +114,9 @@ impl Rig {
         .expect("public proof JSON");
         assert_eq!(owner_proof["public_lifetime_released"], true);
         let shutdown = self.bridge.shutdown().await;
-        // F2 intentionally has a disconnected bridge; record its cleanup result.
+        // Preserve cleanup evidence for both historical red and R5 fixed scenarios.
         let path = self.root.join("rust-result.json");
-        let value = json!({"scope":"current-product-expected-red", "fact":fact,
+        let value = json!({"scope":if fact["id"] == "F2" {"R5-production-isolation"} else {"current-product-expected-red"}, "fact":fact,
             "events":self.evidence,"public_owner_proof":owner_proof,"shutdown":format!("{shutdown:?}")});
         std::fs::write(
             path,
@@ -261,18 +260,73 @@ async fn current_product_red_baselines() {
         .transition(|s, t| s.release(&a, &lease_a, t))
         .expect("real N1 release");
     group.event("release_unconfirmed").await;
-    group.event("bridge_disconnected").await;
+    let control = group.bridge.status("r5-b-control").await;
+    if control.is_ok() {
+        loop {
+            let event = group
+                .events
+                .recv()
+                .await
+                .expect("control or physical failure");
+            group.evidence.push(event.clone());
+            if matches!(
+                event["event"].as_str(),
+                Some("local_status" | "bridge_disconnected")
+            ) {
+                break;
+            }
+        }
+    }
     let status = group
         .bridge
         .endpoint()
         .transition(|s, _| s.status(&b, &lease_b))
         .expect("B status");
+    let mut query = None;
+    if status.phase == SessionPhase::Active {
+        let operation = group
+            .bridge
+            .endpoint()
+            .transition(|s, t| {
+                let operation = s.queue(
+                    &b,
+                    &lease_b,
+                    AcceptedRequest::new(
+                        &SystemClock,
+                        RequestId::new("r5-b-query").expect("query request"),
+                        None,
+                        "execute_python",
+                        json!({"code":"result = 42"}),
+                    )
+                    .expect("accept B query"),
+                    OperationId::new("r5-b-query").expect("query identity"),
+                )?;
+                s.dispatch(&b, &operation, t)?;
+                Ok::<_, NexusError>(operation)
+            })
+            .expect("B query dispatch remains available");
+        query = Some(group.event("completed").await);
+        let snapshot = group
+            .bridge
+            .endpoint()
+            .transition(|s, _| s.operation_status(&b, &operation))
+            .expect("N1 B query result");
+        assert_eq!(snapshot.status, OperationStatus::Succeeded);
+    }
+    let query_result = query
+        .as_ref()
+        .map(|event| event["result"]["result"].clone());
+    group
+        .finish(
+            json!({"id":"F2", "unrelated_b":format!("{:?}",status.phase),
+        "control":format!("{control:?}"), "query":query}),
+        )
+        .await;
     assert_eq!(
         status.phase,
-        SessionPhase::Disconnected,
-        "F2 unrelated B still loses bridge"
+        SessionPhase::Active,
+        "R5: unrelated B must remain Active"
     );
-    group
-        .finish(json!({"id":"F2", "unrelated_b":format!("{:?}",status.phase)}))
-        .await;
+    assert!(control.is_ok(), "B control must remain usable");
+    assert_eq!(query_result, Some(json!(42)), "real SDK B query result");
 }

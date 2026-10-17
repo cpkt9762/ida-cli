@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from config import ida_cli_home
 import stat
 import time
 import uuid
@@ -228,7 +229,7 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                  acquired=lambda *_: None, released=lambda *_: None, starting=lambda: None):
     """Retry only a guard-confirmed *first* sample failure, never a business call."""
     from ida_nexus import probe_database_state
-    root = Path(os.environ['IDA_CLI_HOME']).resolve()/'idb'
+    root = ida_cli_home()/'idb'
     state = probe_database_state(path, output_database=options.get('output_database'))
     target = Path(state['idb_path']).resolve()
     with open_locks(root, target, deadline):

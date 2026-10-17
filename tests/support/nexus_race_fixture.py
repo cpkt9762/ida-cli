@@ -1,6 +1,5 @@
 """Test-only public client transport and barriers; real bridge and two Unix lanes."""
 import http.client
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -243,7 +242,7 @@ if SCENARIO == 'n9-aux-refusal':
     ida_nexus.wait_database_released = lambda *_a, **_k: True
 bridge.readiness = lambda: {"ready": True, "capabilities": {
     "runtime": {"ida": [9, 5, 0], "python": [3, 11, 0], "nexus": [0, 13, 4], "domain": [0, 5, 1]},
-    "methods": bridge.METHODS}}
+    "methods": bridge.METHODS}, "protocol": bridge.admission(), "paths": bridge.startup_paths()}
 
 def fault():
     while not (ROOT / "disconnect-first").exists():

@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-fn ida_home_from(explicit: Option<&OsStr>, home: Option<&OsStr>) -> PathBuf {
+pub(crate) fn ida_home_from(explicit: Option<&OsStr>, home: Option<&OsStr>) -> PathBuf {
     if let Some(explicit) = explicit.filter(|value| !value.is_empty()) {
         return PathBuf::from(explicit);
     }

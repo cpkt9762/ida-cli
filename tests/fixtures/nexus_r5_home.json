@@ -1,0 +1,88 @@
+[
+ {
+  "environment": {},
+  "cwd": "/private/startup",
+  "expected": "/tmp/.ida"
+ },
+ {
+  "environment": {
+   "HOME": "/private/home"
+  },
+  "cwd": "/private/startup",
+  "expected": "/private/home/.ida"
+ },
+ {
+  "environment": {
+   "HOME": ""
+  },
+  "cwd": "/private/startup",
+  "expected": "/private/startup/.ida"
+ },
+ {
+  "environment": {
+   "HOME": "relative"
+  },
+  "cwd": "/private/startup",
+  "expected": "/private/startup/relative/.ida"
+ },
+ {
+  "environment": {
+   "IDA_CLI_HOME": "",
+   "HOME": "/private/home"
+  },
+  "cwd": "/private/startup",
+  "expected": "/private/home/.ida"
+ },
+ {
+  "environment": {
+   "IDA_CLI_HOME": ""
+  },
+  "cwd": "/private/startup",
+  "expected": "/tmp/.ida"
+ },
+ {
+  "environment": {
+   "IDA_CLI_HOME": "relative",
+   "HOME": "/private/home"
+  },
+  "cwd": "/private/startup",
+  "expected": "/private/startup/relative"
+ },
+ {
+  "environment": {
+   "IDA_CLI_HOME": "/private/explicit",
+   "HOME": ""
+  },
+  "cwd": "/private/startup",
+  "expected": "/private/explicit"
+ },
+ {
+  "environment": {
+   "IDA_CLI_HOME": "~/literal"
+  },
+  "cwd": "/private/startup",
+  "expected": "/private/startup/~/literal"
+ },
+ {
+  "environment": {
+   "IDA_CLI_HOME": "",
+   "HOME": ""
+  },
+  "cwd": "/private/startup",
+  "expected": "/private/startup/.ida"
+ },
+ {
+  "environment": {
+   "IDA_CLI_HOME": "./relative//./home/"
+  },
+  "cwd": "/private/startup",
+  "expected": "/private/startup/relative/home"
+ },
+ {
+  "environment": {
+   "IDA_CLI_HOME": "symlink/../home"
+  },
+  "cwd": "/private/startup",
+  "expected": "/private/startup/symlink/../home"
+ }
+]

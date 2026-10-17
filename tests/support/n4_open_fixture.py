@@ -1,11 +1,14 @@
 """Internal bridge wire fixture for production Rust open_owned fault injection."""
 import json,os,socket,sys,threading,time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]/'nexus_bridge'))
+from protocol import admission
+from config import startup_paths
 root=Path(os.environ['IDA_CLI_HOME'])
 fault=os.environ.get('N4_F2_OPEN_FAULT','')
 (root/'bridge-process.json').write_text(json.dumps({'pid':os.getpid()}))
 caps={'runtime':{'ida':[9,5,0],'python':[3,11,0],'nexus':[0,13,4],'domain':[0,5,1]},'methods':{'get_database_info':'read_only'}}
-print(json.dumps({'ready':True,'capabilities':caps}),flush=True)
+print(json.dumps({'ready':True,'capabilities':caps,'protocol':admission(),'paths':startup_paths()}),flush=True)
 lock=threading.Lock();first=[True]
 def send(stream,obj):
     stream.sendall((json.dumps(obj)+'\n').encode())

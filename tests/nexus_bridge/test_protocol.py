@@ -248,8 +248,18 @@ def test_release_uncertainty_retains_handle_until_public_proof(harness, monkeypa
         return proven
     monkeypatch.setattr("ida_nexus.wait_database_released", wait)
     harness.dispatch(1, {"command": "release", "lease": harness.lease})
-    assert harness.receive(1)["event"] == "uncertain"
-    assert harness.receive(1)["event"] == ("released" if proven else "release_unconfirmed")
+    observation = harness.receive(1)
+    assert observation["event"] == "release_observation"
+    assert observation["schema"] == 1 and observation["release_protocol"] == 1
+    assert observation["observation"] == "uncertain"
+    if proven:
+        assert harness.receive(1)["event"] == "released"
+    else:
+        observation = harness.receive(1)
+        assert observation["event"] == "release_observation"
+        assert observation["observation"] == "release_unconfirmed"
+        assert harness.receive(1)["event"] == "uncertain"
+        assert harness.receive(1)["event"] == "release_unconfirmed"
     assert len(waits) == 1 and 0 <= waits[0] <= 2
     assert (harness.lease["lease_id"] in harness.bridge.handles) is not proven
 
