@@ -954,3 +954,49 @@ For unchanged groups, `r0_freeze.py --historical-validation <prior-validation.js
 verifies current dependency and log hashes and marks them `historical-fixed-bytes`;
 SDK/install/real must be fresh. Historical records stay out of the new validation
 log. This does not turn historical Rust/OS experiments into a new execution.
+
+
+### N7a-R R5 receiver, lifetime and startup admission
+
+R5 changes the production adapter while retaining fixed Nexus 0.13.4/d60ff58
+and the three original client patches. `--lib r5_` exercises the actual N1
+endpoint, event pump and bounded physical reader: 189 complete historical wire
+sequences (including all 56 historically fatal rows), bad complete JSON lines,
+wrong identities/families, duplicate terminals, late acquired resources/stop
+proof, release observation sideband, real EOF/partial EOF and closed-peer writes.
+Each replay records accepted/rejected inputs, authoritative A/B state and B
+query/control availability. The historical static reachability exclusions remain;
+this is receiver robustness evidence, not R6 dynamic coverage or owner convergence.
+Unknown valid acquired leases remain owned by Python and explicitly diagnosed;
+a bounded exact-identity diagnostic latch blocks further acquisitions for that
+bridge incarnation without blocking existing sessions. R5 does not reconcile
+that latch into custody or synthesize Released.
+
+`tests/test_nexus_r5.py` shares a 12-row home table with Rust, checks public Nexus
+state rules, exact protocol/hash/capability admission, seven deterministic
+send/install barriers, bad AF_UNIX handshakes and listener recovery. Only the
+failed connection closes; listener recovery may unlink its exact inode, retries
+failed rebinds and refuses a foreign endpoint. Home preserves literal `~` and
+symlink/`..` semantics. Missing HOME fallback is calculation-only; real runs use
+a private HOME. State continues to use public `get_state_dir`.
+
+`--features nexus-test-support --test nexus_r5` contains readiness-only rejection
+cases (no grants/acquisitions; exact child/socket cleanup) and the separately
+selected real tiny IDA chain. Admission requires wire2/schema1/release1/open1,
+owner_observation0, the fixed handle hash and exactly the four implemented
+capabilities; capability order is immaterial and duplicates fail. No helper,
+custody or owner-observation capability is advertised. Member release progress
+uses nonterminal release_observation schema1/release_protocol1; N1 remains the
+only business-result authority. Owner v1 guard/lifecycle/slices code is unchanged.
+
+Use shell timeout and before/after uptime for each command, a fresh short root,
+private HOME/state/tmp/IPC, copied sample and a serial private Cargo target.
+Run affected N1/transport/bridge and Python regressions, fmt/check/Clippy and
+Python Ruff F/E9 plus syntax. Real tiny IDA permits 180s after recording why;
+fault shards permit 120s. Do not rerun GUI/large/full E2E for this stage.
+The mixed `nexus_r0_prototypes current_product_red_baselines` target now requires
+F2 B=Active plus real SDK query/control success (`R5-production-isolation`),
+while F1/F4 remain `current-product-expected-red`. `r0_freeze.py` records those
+separately and the current installation closure is 19 members. Historical R0
+freezes and logs remain immutable; neither replay nor the real tiny chain accepts
+N7a or supplies R1/R3 custody, R2 release, R4 transactions, R6 or R7 evidence.

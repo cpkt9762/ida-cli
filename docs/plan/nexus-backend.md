@@ -851,7 +851,7 @@ SDK 候选仅在私有临时副本改 handle/_resolver/options 三文件；生�
 真实 IDA 9.5 小库验证已加载 v1 guard/release/slices 代码指纹、close_status/TEMP|KILL 及公共 ACK/lifetime；
 同 uid 独立公共客户端可以执行 owner 代码，当前 managed idalib 类同 boot OS 退出资格明确 Unsupported。
 macOS 来源候选可读取；U6 仅判定/资源投影原型通过，真实产品跨 boot 和 Linux 产品能力未测。
-真实 Rust Tools/N1/生产 bridge 原版本 F1/F4/F2 红事实已形成独立测试 target，生产仍有这三类缺陷。
+真实 Rust Tools/N1/生产 bridge 原版本 F1/F4/F2 红事实已形成独立测试 target，这是R0时的生产基线；R5状态见下文。
 R0 的脚本/模型绿不验收生产 N7a，不改 U1–U6，不取消后续任何门禁。
 后续顺序 R5→R1→R3a→R2→R3b→R4→R6→R7；合计约 32–51 工程人日另计多轮复审余量。
 
@@ -869,3 +869,15 @@ R0最终验收（2026-10-17）：对象为`a1cbe3055d1b1179ac521daa2650e2b02b798
 本次只验收候选、原型和冻结契约为R5/R1输入；生产F1/F2/F4仍为已知红例，
 同boot公开managed类资格仍Unsupported，真实跨boot产品链、Linux/GUI/大库与完整维护仍待后续验证。
 下一阶段按协议§11.2先实施R5接收器隔离、F9竞态、统一home/state与版本握手；不提前宣称custody或owner收敛。
+
+
+R5提前基础（2026-10-17，本地实现，待独立复验）：生产接收器将完整坏JSON行、
+错身份/旧attempt/重复终态与真实EOF/帧越界/物理写失败分开；迟到取得和停止仍核N1权威身份。
+原189条完整wire（含56历史致命）通过真实Rust接收器回放，范围仅为健壮性；
+实际生产F2另断言B保持Active、公共SDK查询42与控制可用，F1/F4仍expected-red。
+F9单握手隔离，send ok后同锁复核lease/incarnation/取消/断连再替换，listener显式恢复；
+F10以Rust既有home规则固定绝对输入，Python独立入口同表，state沿用公开get_state_dir。
+就绪握手严格核wire/schema/消息族版本、能力和固定handle hash，owner_observation=0；
+未知携资源事件保留Python实际handle并阻止本桥新取得，不宣称custody或释放证明。
+测试入口和阶段边界见TESTING的R5小节。固定SDK/三补丁、owner v1、默认后端和dev开关未变；
+后续仍按R1→R3a→R2→R3b→R4→R6→R7推进，R5不验收N7a。
