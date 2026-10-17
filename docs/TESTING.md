@@ -901,16 +901,27 @@ the shell launcher needs `sh -n`.
 public occupancy limitations, and separately labels injected U6/revocation
 inputs. `r0_transfer` checks actual writer PID/epoch and action counts, not just
 external lock exclusion. `r0_records` exercises bounded summaries/ref epochs and
-durable crash boundaries; its I/O errors are injected. `r0_install` runs from a
+durable crash boundaries; its I/O errors are injected. `r0_durable` additionally
+exits inside writes for summary/intent/state at five flush/fsync/rename/directory
+boundaries and recovers in a fresh process. Pending writes require a private
+inode/content-bound ownership record; unknown/partial/conflicting slots remain
+explicit errors. `r0_contract_checks` rejects OS/boot evidence for N1 consumers. `r0_install` runs from a
 private complete bridge installation, challenges sitecustomize before launch,
-and checks ordinary/-I/-P/PYTHONSAFEPATH and manifest tampering.
+and checks ordinary/-I/-P/PYTHONSAFEPATH, exact schema/closure, every member
+permission/hash, omitted payload/dependency and mismatched preexisting pyc. The
+loader executes only the verified in-memory source bytes; -B alone is insufficient.
 
 `r0_sdk` generates and exercises a temporary three-file U1 candidate; production
 patches stay unchanged. `r0_real_ida` uses one disposable tiny IDB and a second
 independent public client; it verifies loaded v1 code/ABI/dependencies against
-fixed source, then deliberately removes Root only in that IDB to test TEMP|KILL
+fixed source by whole-object equality, then deliberately removes Root only in that IDB to test TEMP|KILL
 and packed-byte retention. Its owned workers are registered, waited and audited.
-No large database, GUI or full-feature E2E belongs to this shard.
+No large database, GUI or full-feature E2E belongs to this shard. `r0_v1_checks`
+compares independent-interpreter keys and rejects missing/extra functions/hooks,
+changed parameter/default/function-default values and dependency bindings/versions.
+The key is for trusted-owner compatibility, not an arbitrary-code sandbox. SDK
+regressions include parsed ACK vs all cleanup exception classes and each original
+internal attach attempt: a later rejection/success never clears an earlier unknown.
 
 The Rust harness uses actual RouterState/Tools/N1, production bridge and pinned
 SDK. Only HTTP/SSE and native IDA input boundaries are controlled. F1 uses real
@@ -928,3 +939,8 @@ experiments. Audit after failed runs too: `r0_audit --cleanup-stale` can remove
 only explicitly attributed dead test registrations/sockets; it sends no signal,
 keeps stable lock files and reports unknown/live residue. Real macOS product
 reboot, Linux product capability, full maintenance and R1–R7 remain later gates.
+
+R0-F1 outputs belong in a new report/root; preserve the old R0 reports/logs.
+The primitives runner includes durable/v1_checks/contract_checks. Baseline review
+probe exit0 only means a counterexample completed; green tests assert safe
+behavior against the new candidate and final validator, not their old fixed paths.

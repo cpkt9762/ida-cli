@@ -14,24 +14,9 @@ from r0_common import durable
 
 REPO = Path(__file__).resolve().parents[2]
 
-# Executed in both the local compiler and the actual IDA owner. Excludes only
-# location/debug fields, not executable bytecode, ABI, names or exception table.
-FINGERPRINT = '''
-import hashlib as _fh, json as _fj, types as _ft
-def _norm(value):
-    if isinstance(value, _ft.CodeType):
-        return {k: _norm(getattr(value,k)) for k in (
-            'co_code','co_consts','co_names','co_varnames','co_freevars','co_cellvars',
-            'co_argcount','co_posonlyargcount','co_kwonlyargcount','co_nlocals',
-            'co_stacksize','co_flags','co_exceptiontable')}
-    if isinstance(value, bytes): return {'bytes':value.hex()}
-    if isinstance(value, (tuple,list)): return [_norm(x) for x in value]
-    if isinstance(value, frozenset): return {'frozenset':sorted((_norm(x) for x in value),key=repr)}
-    if value is None or isinstance(value,(str,int,float,bool)): return value
-    return {'type':type(value).__name__, 'repr':repr(value)}
-def _hash_code(code):
-    return _fh.sha256(_fj.dumps(_norm(code),sort_keys=True).encode()).hexdigest()
-'''
+# The same externally supplied inspector is used locally and in the real owner.
+from r0_v1 import expected_snapshot, validate
+VALIDATOR = Path(__file__).with_name('r0_v1.py').read_text()
 
 
 def main():
@@ -115,43 +100,17 @@ finally:
         result["slice"] = handle.execute_python(bridge.guarded_source(code, {"method":"r0-slice"}))["result"]
         handshake_thread.join(10)
         assert result["slice"]["ok"] and not handshake_thread.is_alive()
-        loaded_code = FINGERPRINT + '''
-import sys as _fs, inspect as _fi
-result={name:{'functions':{key:_hash_code(value.__code__) for key,value in vars(_fs.modules[name]).items()
-    if isinstance(value,_ft.FunctionType) and value.__module__ in (name,None)},
-    'abi':{key:str(_fi.signature(value)) for key,value in vars(_fs.modules[name]).items()
-        if key in ('close_status','release_handle','release_lease','step')},
-    'dependencies':sorted(key for key,value in vars(_fs.modules[name]).items() if isinstance(value,_ft.ModuleType))}
-    for name in ('_ida_cli_save_guard_v1','_ida_cli_release_protocol_v1','_ida_cli_nexus_slices_v1')}
-_guard=_fs.modules['_ida_cli_save_guard_v1']
-_hook=(_guard._state or _guard._failed_state).get('hook')
-result['_ida_cli_save_guard_v1']['hook_functions']={value.__qualname__:_hash_code(value.__code__)
-    for value in vars(type(_hook)).values() if isinstance(value,_ft.FunctionType)}
-result['_ida_cli_save_guard_v1']['hook_bases']=[(base.__module__,base.__name__) for base in type(_hook).__mro__]
-result['_ida_cli_nexus_slices_v1']['live_counter']=_fs.modules['_ida_cli_nexus_slices_v1'].counter is not None
-'''
+        loaded_code = VALIDATOR + f"\nresult=snapshot({{name:sys.modules[name] for name in NAMES}}, ida_version={result['runtime']!r})"
         loaded = handle.execute_python(loaded_code)["result"]
-        local = {}
-        exec(FINGERPRINT, local)
-        sources = dict(zip(loaded, (bridge.GUARD_SOURCE, bridge.RELEASE_SOURCE, bridge.SLICE_SOURCE)))
-        for name, value in loaded.items():
-            # compile in the same Python ABI; top-level declared functions only.
-            compiled = compile(sources[name], "<expected>", "exec")
-            expected = {c.co_name:local["_hash_code"](c) for c in compiled.co_consts if isinstance(c, type(compiled))}
-            assert value["functions"], (name, "no loaded functions")
-            assert all(expected.get(k) == v for k,v in value["functions"].items()), name
-            nested = {}
-            def visit(code):
-                nested[code.co_qualname] = local["_hash_code"](code)
-                for child_code in code.co_consts:
-                    if isinstance(child_code, type(code)):
-                        visit(child_code)
-            visit(compiled)
-            assert all(nested.get(k) == v for k,v in value.get("hook_functions", {}).items()), name
-        assert len(loaded['_ida_cli_save_guard_v1']['hook_functions']) == 2
-        assert ["ida_idp", "IDB_Hooks"] in loaded['_ida_cli_save_guard_v1']['hook_bases']
-        assert not loaded['_ida_cli_nexus_slices_v1']['live_counter']
+        expected = expected_snapshot(REPO, Path(json.loads((env.root / "environment.json").read_text())["ida_dir"]))
+        durable(case / "v1-observed.json", loaded)
+        durable(case / "v1-expected.json", expected)
+        compatibility_key = validate(loaded, expected)
         result["loaded_v1"] = loaded
+        result["v1_compatibility_key"] = compatibility_key
+        result["v1_validation"] = {"comparison":"complete-equality", "passed":True,
+            "validator_sha256":hashlib.sha256(VALIDATOR.encode()).hexdigest(),
+            "expected_key":compatibility_key, "actual_key":compatibility_key}
         result["fingerprint_python_abi"] = list(sys.version_info[:3])
         handle.save_database()
         packed = Path(handle.instance.idb_path)

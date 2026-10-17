@@ -971,10 +971,12 @@ U1 候选最小改动为 `handle.py`、`_resolver.py`、`options.py`，生成器
 冻结公开 additive API：`open_outcome`、`attach_outcome`、`on_acquired`、阶段 observer、
 `claim_acquired`。新增 options observer 为 keyword-only，保留原 positional options 顺序与类 docstring。
 BeforeAttach 与 AttachMayBeSent 分开；参数拒绝不置 may-sent；503 保留原
-两次 attach 和首次/替换 instance。SSE 后、thread.start 前交付同 handle；回调/monitor 初始化失败
+两次 attach 和首次/替换 instance；每次 attempt 记录原 instance、阶段、类型化结果和未结义务，
+前次 unknown 不被后次503/成功或本地流关闭结清，成功 handle 与旧 unknown 同时交付。SSE 后、thread.start 前交付同 handle；回调/monitor 初始化失败
 由 SDK 强引用保留，显式 claim/close 后解除。LaunchIntent 在 Popen 前，Spawned 在 log/ready 前，
 observer 取得实际 Popen 并采集原生出生身份；未签收 intent 保持 startup-unconfirmed。
-parsed `ack_kind=last/nonlast`、`lease_released` 不因 response/RPC/monitor 清理错误丢失；
+parsed `ack_kind=last/nonlast`、`lease_released` 在任何 response/connection 清理之前锁存；
+last/nonlast × OSError/ValueError/RuntimeError 与重入均验证，cleanup_failures 独立可见，无有效ACK仍unknown；
 最后 ACK 的 owner_pending 独立，unknown close 不重放；已有 operation_id 参数实测原样贯通。
 这是实验结果形状；R1 仍须固化类型、取消/并发/兼容签名、prepare/hash/probe。
 
@@ -983,13 +985,29 @@ parsed `ack_kind=last/nonlast`、`lease_released` 不因 response/RPC/monitor �
 AcquisitionId、OwnerKey、CoordKey、subscription_epoch、sequence；签收原对象/义务持久化在 ACK 前。
 Preparing/custody_ack、subscribe/subscribe_ack、lease_detached、owner_released、
 startup_unconfirmed、resource_retired 的 wire 编码/版本拒绝由 R5/R1/R3a 接入后验证，R0 不伪造生产消息。
+N1 的 owner_released.scope 仅 public_owner_lifetime；同boot OS 另用 owner_exit_observed，
+只供 Tools 结 owner/startup 退出及对应 guard，绝不进入 N1 Released/停止/lease_detached。
+U6 resource_retired 同样只投影旧boot资源，不补历史ACK/停止/业务结果；冻结器按完整消费者表拒绝扩权。
 Timeout 不是证明，NotSent 要求执行前事实；may-sent 保 unknown。keeper/helper 签收前原持有者不撤保护。
 transfer_id 绑定 RecoveryId/epoch/双方 incarnation/FD kind/inode/nonce；FrozenOffer 后禁止双方抢写，
 只有 Accepted 接收者可写，重复 FD 仅 close；恢复者先关自身旧引用，再开独立 OFD fence。
 所有写者 root SH→target EX；GC 两级 NB；稳定 gid/锁 inode 不随 payload 删除。
 routine 记录固定 epoch/refs/producer_closed/consumer_closed/unacked_events/failure/last_safety_evidence，
 摘要为 closed_through/closed_after_holes（闭区间，不能逐健康 epoch 累积墓碑）；两侧 epoch 关闭且无引用才删除，revision/inode/hash 固定压缩意图。
-known v1 表按真实 loaded code/ABI/deps 与 Python ABI 限定，只允许清理，未知组合拒绝；不得执行未知自报函数。
+known v1 表按完整 module/function/hook 集合、规范化 code、参数种类/顺序、defaults/kwdefaults
+（函数默认值递归规范化可执行内容）、实际依赖绑定/版本/源字节及 Python ABI 做整对象相等比较。
+两个独立解释器兼容键须相同，并匹配真实小库；缺函数/改默认值/换依赖/缺hook均拒绝。
+仅限已接受的可信owner兼容模型，不构成任意恶意Python/native代码沙箱；只允许清理，未知组合拒绝，不调用未知自报函数。
+
+R0-F1（独立审查返修）补充：原23用例未覆盖上述组合，旧r0产物保留为历史，不作为最终冻结输入。
+持久写的 temp_written/file_fsynced/before_rename/after_rename/directory_fsynced 内部故障，
+在 summary/intent/state 三类各由真实子进程退出，再由新进程恢复。单目标EX下固定.new与.new.owner
+双槽绑定写者格式、目标、dev/inode、UID/mode/nlink及内容hash；仅精确自有完整写入可接续。
+rename后先核验已发布inode/内容并结清owner记录，再消费/删除intent；未知、半写、冲突或symlink保留报错，
+不盲删、不无限创建临时名。任意系统调用内部断裂/owner记录尚未完整落盘不宣称自动恢复，保留为显式错误。
+安装入口要求schema1完整16成员（payload、bootstrap与全部当前bridge模块闭包），逐项身份/权限/hash核验；
+自定义loader执行同FD已读并核验的内存源码，禁止已有pyc，绝不以-B代替字节绑定。
+漏项/权限错/正确源码配不同timestamp-pyc和启动前sitecustomize均有拒绝对照，完整维护应用仍属R4。
 
 R0 后重估以下为**工程人日区间**，含各项定向实现与故障验证，不含 E1/E2；文件集有交叠，不能相加文件数。
 不为节省估算删门禁；跨 boot 产品实验仍依赖独立批准的可重启环境。

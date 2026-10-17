@@ -12,8 +12,8 @@ from process_identity import identity, same_process
 
 def audit(root, cleanup):
     root = root.resolve(strict=True)
-    if not root.name.startswith("n7r0.") or root.parent != Path("/private/tmp").resolve():
-        raise ValueError("audit accepts only explicitly named /tmp/n7r0.* roots")
+    if not root.name.startswith(("n7r0.", "n7rf1.")) or root.parent != Path("/private/tmp").resolve():
+        raise ValueError("audit accepts only explicitly named /tmp/n7r0.* or /tmp/n7rf1.* roots")
     records = []
     for pattern in ("**/process.json", "**/owned-processes/*.json"):
         for path in root.glob(pattern):

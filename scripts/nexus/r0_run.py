@@ -53,10 +53,11 @@ def main():
 
     for stage in args.stage:
         if stage == "primitives":
-            for name in ("os", "transfer", "records", "install"):
+            for name in ("os", "transfer", "records", "durable", "install", "v1_checks", "contract_checks"):
                 case = root / name
                 run(name, [python, "-B", f"tests/support/r0_{name}.py"], 120,
-                    {"R0_CASE_ROOT":str(case), "IDA_NEXUS_STATE_DIR":str(case / "state")})
+                    {"R0_CASE_ROOT":str(case), "IDA_NEXUS_STATE_DIR":str(case / "state"),
+                     "R0_IDA_ROOT":manifest["ida_dir"]})
                 results["stages"][name] = str(case)
         elif stage == "sdk":
             site = list((environment / "venv/lib").glob("python*/site-packages"))
