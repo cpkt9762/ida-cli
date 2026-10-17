@@ -1103,3 +1103,73 @@ R3a dependencies. Production acquisition remains on its existing path pending
 that atomic admission. R2 owns two-phase Tools/N1 release; R4 owns transactions.
 F1/F4 remain explicit production expected-red cases. SDK raw facts, the F2
 isolation green and these probes do not establish no-orphan or N7a acceptance.
+
+### N7a-R R3a production custody (implementation, awaiting independent review)
+
+R3a replaces the final-acquisition path described in the historical R1 paragraph
+above. `open_outcome/on_acquired/claim_acquired` now transfers the same physical
+handle into N1 `Preparing` before preparation. N1 owns parent state and exact
+internal RPC grants; custody ACK alone permits no RPC. Tools publishes the
+verified input index after reliable custody and releases open/content/path locks
+before analysis. Dropped callers retain their supervised cleanup responsibility.
+
+The verified installation includes `custody/bootstrap.py` as `bootstrap.py`, the
+bridge dependency closure, the independent proof helper and target writer.
+Rust starts one helper for its fixed absolute state-root identity, in a separate
+session with private IPC/logs. Public owner lifetime produces immutable fsynced
+proof; target authority durably adopts it before ACK. Original instances remain
+available until the matching custody/producer closure. Startup intent is signed
+before Popen; exact birth identity follows Popen before readiness. Missing source
+or unsupported recovery remains explicitly blocked. Neither EOF nor PID absence
+proves release. Orphan clock injection at 300 seconds records abandonment only.
+
+Admission is wire=2/schema=1/release=1/open=1/sdk_boundary=1,
+owner_observation=custody=helper=target_gate=1, same_boot_exit=boot_retirement=0.
+The fixed R1 three SDK hashes and four patches are unchanged. Only the implemented
+`final_preparing_v1`, `internal_grant_v1`, `durable_public_proof_v1` and
+`target_gate_base_v1` capabilities are added. Full same-boot OS qualification
+remains Unsupported; cross-boot retirement is not enabled.
+
+Use a new prepared formal SDK, private HOME/state/IPC/case roots and independent
+`CARGO_TARGET_DIR`. Retain the ordinary toolchain/IDA SDK paths explicitly when
+isolating HOME. Tests require `F1_PYTHON=R3A_PYTHON=<env>/venv/bin/python`;
+the R1 suite also needs `R0_CANDIDATE=<env>/venv/lib/python3.14/site-packages`
+and a new `R1_CASE_ROOT`. Set `R3A_CASE_ROOT`, `R5_ROOT`, `F1_ROOT` and
+`N3_TEST_IPC_ROOT` inside the private test root. Real IDA requires `R5_ENV=<env>`
+and the Environment process-ledger wrapper used by earlier real probes.
+
+```sh
+timeout 30s cargo test --locked --features nexus-test-support --test nexus_contract
+timeout 120s cargo test --locked --features nexus-test-support --test nexus_r3a no_handle_terminal -- --test-threads=1
+timeout 120s cargo test --locked --features nexus-test-support --test nexus_r3a direct_fixed_target_128 -- --test-threads=1
+timeout 120s cargo test --locked --features nexus-test-support --test nexus_r3a managed_fixed_target_128 -- --test-threads=1
+timeout 30s cargo test --locked --features nexus-test-support --test nexus_r5 readiness_rejects
+timeout 30s "$R3A_PYTHON" -m pytest -q tests/nexus_bridge/test_custody_target.py tests/nexus_bridge/test_custody_helper.py
+```
+
+The 120-second allowance is for the explicit fault matrix or 128 actual
+open/close/public-proof rounds. The real tiny Tools and startup targets allow
+180 seconds for IDA initialization. `tools_future_drop` additionally requires
+`IDA_CLI_NEXUS_DEV=1`, `IDA_NEXUS_PYTHON` and `IDA_NEXUS_IPC_ROOT`; do not enable
+the dev selector for unrelated lib tests. Python bootstrap attacks require
+`R3A_INSTALLATION` naming an installation produced by the current Rust build.
+Run fmt/check/all-target Clippy `-D warnings`, affected Python/R5/R1 and explicit
+`nexus_bridge_regressions` targets with shell timeout and before/after uptime.
+The latter intentionally keeps its old simulated acquisition adapter; it proves
+transport regressions, while `nexus_r3a` proves the production custody chain.
+
+R3a evidence is in `/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/r3a/`:
+`validation.jsonl`, case index, hashes, raw logs, process/lock audit and report.
+F4 retains the original early-analysis failure, physical lease and failed
+cleanup/no-detach facts, then converges via real public proof. It no longer loses
+the acquired lease. Healthy direct/managed fixed-target runs each exercise 128
+epochs, bounded files/bytes, at most 64 summaries and stable lock inodes; managed
+GC checks both nonblocking locks and preserves the coordination namespace.
+Reference holes, unclosed producers, old epochs, live/routine/retained quotas,
+ENOSPC and interrupted compaction retain evidence or resume an exact intent.
+
+This is R3a implementation evidence awaiting independent acceptance. R2 still
+owns full two-phase release projection/immediate reopen (F1), R3b recovery and
+auxiliary orchestration, R4 full file transactions/maintenance/fault matrices,
+and R7 product acceptance. GUI/Linux/large database and cross-boot product tests
+are outside this run. Historical R0 expected-red evidence stays frozen.

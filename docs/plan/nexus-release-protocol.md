@@ -1042,3 +1042,25 @@ R0 后重估以下为**工程人日区间**，含各项定向实现与故障验�
 本轮r4只核对设计输入、文档格式/链接、状态/回应/范围一致性；实际命令、uptime、exit、SHA/hash写在外部design-summary-r4.md、review-response-r4.md、design-validation-r4.json与progress.md。
 没有运行真实IDA/新协议harness/产品测试或重跑VM，没有修改产品/测试/补丁；历史实验仅设计依据，不计本轮运行通过。静态检查不能证明协议正确，尚未验收N7a，聚焦双复审通过后才另派R0。
 F1 自然关闭耗时、准备 RPC 停止身份、startup 后台写入、hook 写盘前保护和 journal 故障恢复均是第二阶段必须实证的验收项。
+
+### 12.1 R3a实现记录（2026-10-18，待独立验收）
+
+§11.2的R3a已接普通final生产路径：正式SDK早期取得保同一handle，经Rust custody/N1原子登记Preparing，
+取消/父失败仅cleanup-only，逐准备RPC登记精确operation_id并再取grant；传输不确定保停止义务，迟到ACK/公共proof不改变原调用错误。
+公共proof先到时允许仍live的原detach DeliveryAttempt补真实ACK，proof本身不伪造ACK。
+每state根独立helper先签收观察/launch，Popen后签真实出生身份；helper和bridge原instance双来源在durable公共proof接管后才闭合。
+同incarnation基础重连不重置容量；已有精确公共proof可由新writer消费，缺来源明确ObservationRecoveryBlocked。
+300秒注入时钟只落ObservationAbandoned，写盘失败保责任且阻退出，不构造Released。
+
+生产入口为`src/ida/nexus/custody.rs`、`src/router/nexus_bridge/{custody_wire,helper,installation}.rs`、
+`nexus_bridge/custody/{acquisition,proof_helper,target_coordination,target_journal}.py`；同一verified bootstrap覆盖bridge/helper/GC/target writer，
+所有成员按固定完整闭包核验后执行已读源码，拒绝CWD/PYTHONPATH/pyc污染。R1固定三模块hash与四patch不变。
+协议wire2/schema1；owner_observation/custody/helper/target_gate=1，same_boot_exit/boot_retirement=0。同boot OS资格仍Unsupported/default false。
+
+目标侧实际CoordKey/稳定锁/rootSH→targetEX gate、GC根/目标双NB、健康routine summary≤64与exact deletion intent已接线。
+最后producer/consumer/未签收事件/文件意图未闭合不得压缩；引用洞与迟到epoch不复活；live/routine/retained/namespace分账，满额拒新准入但留cleanup/proof/status应急写空间。
+基础压缩中断可消费原精确intent续跑，损坏或身份变化保场拒绝；不声称已覆盖R4全部durable故障边界或完整移交/维护。
+
+本轮实测入口与隔离环境见TESTING的R3a小节，原始输出/uptime/最终hash/实际case/PID锁审计在外部`r3a/`报告目录。
+最终direct与managed各128轮、五startup断桥barrier和新真实IDA9.5 Rust Tools链已实跑；F4保持原analysis失败/残留lease/cleanup失败事实后公共proof结算。
+这不是N7a验收；R2两阶段和F1、R3b完整恢复编排、R4事务/维护、R7及跨boot产品实证仍保留后续责任。

@@ -920,3 +920,14 @@ R1最终验收对象为`f2718b357a6760ef4f9d72d505eaea0cf932210e`，包含初版
 本次仅验收R1 SDK边界；R3a的Preparing、内部operation、startup/helper和目标gate，
 R2两阶段、R3b恢复编排、R4文件事务及GUI/Linux/大库/真实跨boot均保持后续责任。
 下一步按既定顺序委托R3a，F1/F4仍不宣称已修复。
+
+R3a实现交付（2026-10-18，待编排者独立复验/review，不作阶段验收）：普通final路径已用正式SDK早期on_acquired接N1 Preparing；
+父终态、grant_epoch与逐RPC内部operation由N1唯一仲裁，ACK只托管不授执行权；Tools可靠登记后发布索引并释放analysis不应持的open/content/path锁。
+生产职责入口为`src/ida/nexus/custody.rs`、`src/router/nexus_bridge/{custody_wire,helper,installation}.rs`与`nexus_bridge/custody/`。
+每固定state根独立helper、Popen前durable launch intent/Popen后出生身份、公共wait immutable proof、目标journal先接管后ACK及原instance备用来源均已接线；
+同boot OS资格仍Unsupported/default false，协议owner_observation/custody/helper/target_gate=1，same_boot_exit/boot_retirement=0，R1三模块hash及四patch未改。
+直接/受管目标的实际CoordKey、跨home稳定锁、基础gate、GC双NB与健康routine结算已接通；缺证据/坏journal/文件意图仍阻断并保场。
+最终各128轮direct/managed、真实Rust Tools+IDA9.5 tiny、startup五barrier、F4原事实、R1/R5/receiver及相关回归证据见外部`r3a/`报告与TESTING入口。
+F4的analysis主错、服务端lease与失败cleanup事实保持，N1不再丢lease，之后由真实公共proof结算；历史R0 expected-red未改写。
+R2完整两阶段/立即重开F1、R3b恢复/verification/auxiliary编排、R4全事务/维护/完整durable故障矩阵、R7及跨boot产品实验未由本轮验收。
+本轮仅交付R3a，后续仍按既定顺序由编排者派单；默认后端和native功能保留。
