@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import socket
 import array
+import stat
 
 
 def fork():
@@ -30,21 +31,113 @@ def read(path):
     return json.loads(Path(path).read_text())
 
 
-def durable(path, value):
-    path = Path(path)
-    temp = path.with_name(path.name + ".new")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+def durable_boundary(path, stage):
+    """Fault barrier inside the atomic write; the normal path has no action."""
+
+
+def private_info(fd):
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+        raise RuntimeError("UntrustedPendingWrite:identity_or_permissions")
+    return info
+
+
+def pending_owner(owner):
+    fd = os.open(owner, os.O_RDONLY | os.O_NOFOLLOW)
     try:
-        data = json.dumps(value, sort_keys=True).encode()
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, path)
+        info = private_info(fd)
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            record = json.loads(stream.read(4096))
+        return record, info
+    finally:
+        os.close(fd)
+
+
+def unlink_owned(path, info):
+    current = path.lstat()
+    if (current.st_dev, current.st_ino, current.st_mode, current.st_nlink) != (
+            info.st_dev, info.st_ino, info.st_mode, info.st_nlink):
+        raise RuntimeError("UntrustedPendingWrite:identity_changed")
+    path.unlink()
+
+
+def pending_record(path, info, data):
+    return {"schema":1, "writer":"r0-durable", "target":path.name,
+            "inode":info.st_ino, "device":info.st_dev, "sha256":digest(data)}
+
+
+def finish_renamed(path, owner):
+    """A crash after rename can leave just the bound ownership record."""
+    record, owner_info = pending_owner(owner)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = private_info(fd)
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            data = stream.read()
+        if record != pending_record(path, info, data):
+            raise RuntimeError("UntrustedPendingWrite:published_identity_or_content")
+        sync_dir(path.parent)
+        unlink_owned(owner, owner_info)
         sync_dir(path.parent)
     finally:
-        if temp.exists():
-            temp.unlink()
+        os.close(fd)
+
+
+def durable(path, value):
+    """Single writer; exact pending inode/content and private ownership record.
+
+    Callers serialize each path (target EX for Store). Unknown/partial/conflicting
+    slots are preserved as explicit errors, even if their bytes happen to match.
+    At most one temporary plus one ownership record per destination is retained.
+    """
+    path = Path(path)
+    temp = path.with_name(path.name + ".new")
+    owner = temp.with_name(temp.name + ".owner")
+    data = json.dumps(value, sort_keys=True).encode()
+    if not temp.exists() and owner.exists():
+        finish_renamed(path, owner)
+    try:
+        fd = os.open(temp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        created = True
+    except FileExistsError:
+        fd = os.open(temp, os.O_RDWR | os.O_NOFOLLOW)
+        created = False
+    try:
+        info = private_info(fd)
+        record = pending_record(path, info, data)
+        if created:
+            marker_fd = os.open(owner, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(marker_fd, 'wb') as stream:
+                stream.write(json.dumps(record, sort_keys=True).encode())
+                stream.flush()
+                os.fsync(stream.fileno())
+            sync_dir(path.parent)
+        stored, owner_info = pending_owner(owner)
+        if stored != record:
+            raise RuntimeError("UntrustedPendingWrite:ownership_or_content")
+        with os.fdopen(fd, "r+b", closefd=False) as stream:
+            if not created and stream.read() != data:
+                raise RuntimeError("UntrustedPendingWrite:content_conflict")
+            stream.seek(0)
+            stream.write(data)
+            stream.flush()
+            durable_boundary(path, "temp_written")
+            os.fsync(stream.fileno())
+            durable_boundary(path, "file_fsynced")
+        current = temp.lstat()
+        if (current.st_dev, current.st_ino, current.st_mode, current.st_nlink) != (
+                info.st_dev, info.st_ino, info.st_mode, info.st_nlink):
+            raise RuntimeError("UntrustedPendingWrite:identity_changed")
+        durable_boundary(path, "before_rename")
+        os.replace(temp, path)
+        durable_boundary(path, "after_rename")
+        sync_dir(path.parent)
+        durable_boundary(path, "directory_fsynced")
+        unlink_owned(owner, owner_info)
+        sync_dir(path.parent)
+    finally:
+        os.close(fd)
 
 
 def sync_dir(path):

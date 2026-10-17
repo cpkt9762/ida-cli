@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import unittest
 
-from r0_common import fork, digest, durable, ordered, read, sync_dir
+from r0_common import fork, digest, durable, finish_renamed, ordered, read, sync_dir
 
 ROOT = Path(os.environ["R0_CASE_ROOT"])
 ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -78,6 +78,13 @@ class Store:
 
     def compact(self, crash=None, io_error=None):
         with ordered(self.path / "root.lock", self.path / "target.lock"):
+            # Reconcile completed renames before consuming/unlinking an intent;
+            # otherwise its ownership record could outlive the published file.
+            for name in ("summary.json", "intent.json", "state.json"):
+                path = self.path / name
+                owner = path.with_name(path.name + ".new.owner")
+                if not path.with_name(path.name + ".new").exists() and owner.exists():
+                    finish_renamed(path, owner)
             state = read(self.path / "state.json")
             intent_path = self.path / "intent.json"
             if intent_path.exists():
