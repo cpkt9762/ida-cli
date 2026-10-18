@@ -8,6 +8,8 @@
 
 2026-10-18 增量验收：R3a及fix1最终对象`ef4fc3b`已完成编排者独立执行验证并由用户人工复审通过，验收为R2输入。后续按R2→R3b→R4→R6→R7→N7b/N7c→N8→N9推进；完整验收来源与边界见本计划末尾。
 
+2026-10-18 增量验收：R2及两轮返修最终对象`a941b9a0`已通过编排者68条新执行、完整性与资源审计及原reviewer聚焦复审，验收为R3b输入。RF1–RF6及RR1-F1/Q1已关闭；后续从R3b继续，完整来源与范围见本计划末尾及释放协议§12.5。
+
 执行约束（2026-10-17用户后续指定覆盖历史配置）：实现用 `dev / codex-worker / gpt-6.1-sol / full-access / high`；常规只读审查用 `review / gpt-6-astra / xhigh`，provider/modeId以每次实际profile核验为准。本阶段保留已批准的Claude/xhigh独立交叉复审。继续使用既有独立worktree与分支；不为每一阶段重建工作区，不修改全局配置。
 
 ## 1. 目标与验收范围
@@ -955,9 +957,27 @@ Rust库565项（2既有ignored）、Python155项/102子测试、SDK12、readines
 后续委托R2普通lease两阶段释放、owner保留表、立即重开及相应证据scope投影；保持既定保护、不重放与文件门禁。
 
 
-R2实现接续（待编排者独立复验与审查）：普通lease ACK与owner保存/退出独立，last/unknown保精确owner保护，
+R2实现接续（已验收，依据见下文）：普通lease ACK与owner保存/退出独立，last/unknown保精确owner保护，
 nonlast撤本lease SH；有界公平preflight/detach/stop、durable保存错误、同跨router原预算立即重开已接通。
 单次post-exit公开resolve保持总最多三次/未知不重放；U6独立资源退休保原Unknown/ACK/stop及完整诊断，
 sameboot资格仍Unsupported，真实跨boot/大库未由注入模型验收。协议/29成员闭包与当前SDK contract严格匹配。
 当前证据、失败保留和资源审计交付在`n7a-refactor/r2-handoff/`，测试入口见TESTING的R2小节。
 R3a七项返修保持；完整R3b辅助编排、R4事务/维护、R7及后续N7b/N7c/N8/N9仍按原顺序推进。
+
+R2最终验收（2026-10-18）：对象`a941b9a0dad40f284c8f06b227bc26d75160aa87`，包含R2实现与两轮返修。
+原reviewer7194f在`n7a-refactor/r2-rereview1/report.md`关闭RF1–RF6，
+在`n7a-refactor/r2-rereview2/report.md`关闭最后签收deadline的RR1-F1/Q1；
+相邻ACK合并无新增相关P0/P1/P2或阻断存疑，建议验收。
+编排者在新环境`/tmp/n2gv.rzw7Vm`完成68条执行（67条准备/构建/静态/测试记录及1条审计），全部exit0，
+包括15个R2入口、最后AttachMayBeSent及原Resolved两个超时窗口、真实IDA保存/共享/立即重开、
+库569项（2既有ignored）、Python bridge124项/48子测试、17个独立Python文件、SDK6/12与真实probe、
+R3a两组128轮、五startup及必要静态/旧回归；不把执行记录和重叠子测试当作独立功能数相加。
+最终4273条身份记录、260把锁无存活/未知/持有/未闭合或审计错误；
+18329冻结blob、268当前源码、60套完整29成员安装、7SDK根及13产物hash无错配。
+完整独立报告为`/tmp/n2gv.rzw7Vm/report/verification.md`，机器证据SHA256为
+`d610c9232b5d487e697113684716929121d5752701d778c99867bd1825995d9f`；
+原reviewer最终报告SHA256为`fc0914e58594757d74b2ad2c18563cdccd24a2b0e79c2c607dc84a1697fc7bd8`。
+验收前又核当前源码/产物、日志/manifest及seal共451项一致；历史失败、过渡mixed快照和进度更正仍保留。
+本次仅验收R2普通lease两阶段、owner保留、立即重开和既定资源投影，作为R3b输入。
+sameboot仍Unsupported，U6注入不等于真实重启；R3b完整r9/verification/auxiliary编排、
+R4事务/维护、R7大库/跨boot及N7b/N7c/N8/N9继续按序，不声称N7a或唯一后端迁移已完成。

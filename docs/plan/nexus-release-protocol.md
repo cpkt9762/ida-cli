@@ -1,9 +1,9 @@
 # Nexus 释放与打开协议：N7a-R 设计
 
-状态：第一阶段 r4 已经 Astra 与 Claude 聚焦双复审，编排者核验并补齐 R4-F1/T1/T2 文字澄清后验收。第二阶段 R0、R5、R1及各自返修已验收；R3a及fix1经编排者独立执行验证、用户人工复审通过后，已验收为R2输入，依据见§12.3。不代表 N7 产品验收通过。
+状态：第一阶段 r4 已经 Astra 与 Claude 聚焦双复审，编排者核验并补齐 R4-F1/T1/T2 文字澄清后验收。第二阶段 R0、R5、R1及各自返修已验收；R3a及fix1验收依据见§12.3。R2及两轮返修已通过编排者独立执行与原reviewer复审，验收为R3b输入，依据见§12.5。不代表 N7 产品验收通过。
 日期：2026-10-17。设计基线：`feat/nexus-backend`，`f47dd2301b096f1c4b6643906f6e8976e8663469`。
 设计输入提交：`460f0966cc6db174d49342a5536a1a54e046ebd8`（r3；前序设计为 ff81992、36ed13c）；当时产品与测试为上述 f47dd23。
-第一阶段只提交本文件及主计划 N7 中的引用。第二阶段按 §11.2 逐步委托；R3a最终对象`ef4fc3bc9949f0aa55ba09f3f3133ef74359d01c`于2026-10-18通过独立执行验证与用户人工复审，下一步为R2两阶段释放。
+第一阶段只提交本文件及主计划 N7 中的引用。第二阶段按 §11.2 逐步委托；R2最终对象`a941b9a0dad40f284c8f06b227bc26d75160aa87`于2026-10-18通过独立执行验证与原reviewer复审，下一步为R3b编排迁移。
 设计验收对象为 `8eb0d88e21dffed38fc5208b0cf473ec2adba11c`；双评审见 `/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/rereview4-{astra,claude}/report.md`。两位均确认无新增 P0/P1，并允许编排者直接核验下述三处文字同步；完整运行能力按 §11.2 从 R0 实证，不重复将文档回应计为产品测试。
 
 ## 1. 依据、目标与保留边界
@@ -1091,7 +1091,7 @@ R3a基础托管/helper/gate/routine及返修验收为R2输入；同boot OS资格
 R2完整释放/立即重开、R3b完整编排、R4事务/维护和跨boot产品实证仍由后续阶段完成。
 
 
-### 12.4 R2实现记录（待编排者独立复验与审查）
+### 12.4 R2实现记录（已验收，依据见§12.5）
 
 普通lease由fresh保护/精确N1停止门禁后一次公开detach，有效last/nonlast ACK结本lease；
 Tools按物理OwnerKey保owner/rootSH，nonlast只撤本lease保护，公共proof独立结owner。
@@ -1112,3 +1112,19 @@ MCP/CLI保存原Nexus结构化错误。停止前CancelPending不消耗实际rele
 长owner等待使用独立有界观察容量，断连撤销只读等待，control编码独立有界背压；status/cancel容量保留。
 post-exit最终签收/Resolved返回后、副作用前再核原deadline，额度、原实例及launch/prior outcome不丢。
 定向红绿和后续验证见外部`n7a-refactor/r2-fix1/`；本记录不自行验收R2或启动R3b。
+
+### 12.5 R2最终验收（2026-10-18）
+
+对象为`a941b9a0dad40f284c8f06b227bc26d75160aa87`。RF1–RF6经原reviewer第一轮复审关闭；
+fix2在最后attach_attempt helper签收/记账后重核原deadline，SDK真实NotSent自然结清未attach义务，
+并有界合并排队/在途的相同custody_retired_ack、owner_proof_ack，保首份及后续重传。
+原reviewer最终复审`n7a-refactor/r2-rereview2/report.md`关闭RR1-F1/Q1，无新增相关需修项。
+编排者新根`/tmp/n2gv.rzw7Vm`的68条新执行全部exit0，含15个R2入口、两个deadline窗口、
+完整受影响回归、真实IDA保存/共享/立即重开、两组128轮和五startup；详情与准确计数见主计划及
+`/tmp/n2gv.rzw7Vm/report/verification.md`。4273身份记录/260锁无残留，源码/安装/SDK/产物hash一致。
+机器证据SHA256为`d610c9232b5d487e697113684716929121d5752701d778c99867bd1825995d9f`；
+最终复审报告SHA256为`fc0914e58594757d74b2ad2c18563cdccd24a2b0e79c2c607dc84a1697fc7bd8`。
+验收前451项当前字节/日志/manifest/seal复核通过；旧失败、forced/mixed历史和进度更正不抹除。
+R2验收范围是普通lease两阶段释放、owner保留、立即重开及既定scope资源投影，作为R3b输入。
+sameboot仍Unsupported，U6仅OS输入注入；完整r9/verification/auxiliary编排、crash文件事务、
+维护、大库/真实跨boot和后续唯一后端收敛不由本次验收替代。
