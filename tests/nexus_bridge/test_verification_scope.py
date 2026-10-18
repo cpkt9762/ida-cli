@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 REPO=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(REPO/'nexus_bridge'))
@@ -106,6 +107,32 @@ class VerificationScope(unittest.TestCase):
                     self.assertEqual((probe.read_bytes(),(target.directory.path/'custody.json').read_bytes()),before)
                     with self.assertRaises(RuntimeError,msg='late initialization cannot erase any earlier epoch'):
                         self.initialize(target)
+
+    def test_missing_scope_rejects_before_resuming_pending_compaction(self):
+        with Target(self.probe) as target,target.locked():
+            self.initialize(target)
+            journal=Journal(target)
+            epoch=journal.begin({'parent':PARENT,'purpose':'verification','ordinal':1},'pending-compaction')
+            # Actual settle persists its deletion intent; only the interruption
+            # before recovery is injected. No public owner proof is claimed.
+            journal.value['entries'][str(epoch)].update(producer_closed=True,consumer_closed=True,
+                detached=True,bridge_closed=True,unacked_events=False)
+            with patch.object(Journal,'resume_compaction',side_effect=RuntimeError('test interrupted after durable intent')):
+                with self.assertRaisesRegex(RuntimeError,'test interrupted'):
+                    journal.settle()
+            value,_,_=target.directory.read('custody.json')
+            self.assertIsNotNone(value['compaction'])
+            value.pop('verification_scope')
+            target.directory.durable('custody.json',value)
+            before=(target.directory.path/'custody.json').read_bytes()
+            with self.assertRaises(RuntimeError):
+                verification_probe_cleanup(target,state_identity(),PARENT)
+            after=(target.directory.path/'custody.json').read_bytes()
+            evidence={'rejected':True,'journal_unchanged':before==after,'probe_retained':self.probe.exists(),
+                'before':json.loads(before),'after':json.loads(after)}
+            (self.root.parent/(self.root.name+'-pending-compaction.json')).write_text(json.dumps(evidence))
+            self.assertEqual(after,before,'missing authorization must be rejected before journal recovery mutates the scene')
+            self.assertTrue(self.probe.exists())
 
     def test_initialization_is_once_before_any_epoch_and_normal_cleanup_works(self):
         with Target(self.probe) as target,target.locked():

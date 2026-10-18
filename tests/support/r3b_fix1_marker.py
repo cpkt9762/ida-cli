@@ -18,6 +18,12 @@ def metadata(path):
 bridge=Bridge.__new__(Bridge)
 bridge.lock=threading.RLock()
 bridge.verification_probes={str(probe):SimpleNamespace(verification_seed=metadata(probe), acquisition={"parent":{"client_id":"file-fixture","operation_id":"file-issuer","request_id":"file-issuer","task_id":None}})}
+# Production initializes authority at acquisition, before cleanup. This
+# file-consumer fixture has no SDK acquisition, so establish that phase here.
+from target_coordination import Target
+from target_journal import verification_scope
+with Target(probe) as target,target.locked():
+    verification_scope(target,bridge.verification_probes[str(probe)].acquisition['parent'])
 bridge.finish_verification_copy(str(probe))
 print(json.dumps({'issuer':'actual Bridge.finish_verification_copy','directory':str(root),
                   'probe_present':probe.exists(),'marker_size':(root/'closed').stat().st_size,

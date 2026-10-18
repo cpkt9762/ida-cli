@@ -56,7 +56,7 @@ def fact(receipt, target, *, kind=None):
 
 
 class Journal:
-    def __init__(self, target):
+    def __init__(self, target, *, recover=True):
         if target.target_fd is None:
             raise RuntimeError('target authority requires stable target EX')
         self.target = target
@@ -76,7 +76,8 @@ class Journal:
                 or not isinstance(v.get('closed_after_holes'), list)):
             raise RuntimeError('CoordinationBlocked: unknown/corrupt custody journal')
         self.validate()
-        self.resume_compaction()
+        if recover:
+            self.resume_compaction()
 
     def validate(self):
         v = self.value
@@ -850,7 +851,7 @@ def validate_verification_scope(scope,target):
 def require_verification_scope(target,parent):
     """Cleanup consumes existing authority; it never initializes or repairs it."""
     verification_parent(parent)
-    journal=Journal(target)
+    journal=Journal(target,recover=False)
     if 'verification_scope' not in journal.value:
         raise RuntimeError('VerificationCleanupBlocked: existing copy authority missing')
     scope=validate_verification_scope(journal.value['verification_scope'],target)
@@ -858,13 +859,14 @@ def require_verification_scope(target,parent):
         raise RuntimeError('VerificationCleanupBlocked: copy ownership changed')
     if journal.value.get('verification_cleanup_conflict'):
         raise RuntimeError('VerificationCleanupBlocked: newer journal responsibility retained')
+    journal.resume_compaction()
     return journal
 
 
 def verification_scope(target,parent):
     """Initialize once, before any persisted journal or acquisition history."""
     verification_parent(parent)
-    journal=Journal(target)
+    journal=Journal(target,recover=False)
     if 'verification_scope' in journal.value:
         return require_verification_scope(target,parent)
     if (journal.info is not None or journal.value['next_epoch'] != 1
