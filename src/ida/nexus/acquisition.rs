@@ -10,9 +10,44 @@ pub(super) struct AcquisitionReservation {
     pub primary: Option<SessionLease>,
     pub publish_parent: bool,
     pub owner_proof: bool,
+    pub sdk_finished: bool,
 }
 
 impl<C: Clock> NexusSessions<C> {
+    pub fn acquisition_watch_bound(&self, id: &AcquisitionId, watch: &str) -> bool {
+        self.startup_origins
+            .get(watch)
+            .is_some_and(|(bound, _)| bound == id)
+    }
+    pub fn finish_acquisition(&mut self, id: &AcquisitionId) -> Result<(), NexusError> {
+        self.open_progress(&id.parent.client_id, &id.parent)?;
+        let acquisition = self
+            .openings
+            .get_mut(&id.parent.operation_id)
+            .and_then(|o| o.acquisitions.iter_mut().find(|a| a.identity == *id))
+            .ok_or_else(|| {
+                NexusError::new(
+                    NexusErrorCode::InvalidIdentity,
+                    "SDK completion acquisition missing",
+                )
+            })?;
+        acquisition.sdk_finished = true;
+        Ok(())
+    }
+    pub fn acquisition_sdk_finished(&self, id: &AcquisitionId) -> Result<bool, NexusError> {
+        self.open_progress(&id.parent.client_id, &id.parent)?;
+        self.openings[&id.parent.operation_id]
+            .acquisitions
+            .iter()
+            .find(|a| a.identity == *id)
+            .map(|a| a.sdk_finished)
+            .ok_or_else(|| {
+                NexusError::new(
+                    NexusErrorCode::InvalidIdentity,
+                    "SDK completion acquisition missing",
+                )
+            })
+    }
     /// Cancellation ends the caller's preparation wait before a cleanup result
     /// can be known. The retained parent still owns all acquisition obligations.
     pub fn open_wait_ended(&self, parent: &OpenIdentity) -> Result<bool, NexusError> {
@@ -59,7 +94,7 @@ impl<C: Clock> NexusSessions<C> {
         let reservation = opening
             .acquisitions
             .iter_mut()
-            .find(|a| a.identity == *id && !a.closed && a.lease.is_none())
+            .find(|a| a.identity == *id && a.lease.is_none())
             .ok_or_else(|| {
                 NexusError::new(
                     NexusErrorCode::InvalidIdentity,
@@ -224,6 +259,7 @@ impl<C: Clock> NexusSessions<C> {
             primary,
             publish_parent: purpose == AcquisitionPurpose::Final,
             owner_proof: false,
+            sdk_finished: false,
         });
         Ok(identity)
     }
@@ -352,7 +388,8 @@ impl<C: Clock> NexusSessions<C> {
                     .map(|op| op.snapshot.identity.operation_id.clone()).collect();
                 serde_json::json!({"acquisition":a.identity,"lease":a.lease,"primary":a.primary,
                     "phase":phase,"physical_slot":slot,"settled":a.closed,"resource_retired":retired,
-                    "publish_parent":a.publish_parent,"public_operation_ids":operations,"public_owner_proof":a.owner_proof})
+                    "publish_parent":a.publish_parent,"public_operation_ids":operations,"public_owner_proof":a.owner_proof,
+                    "sdk_acquisition_finished":a.sdk_finished})
             }).collect();
             serde_json::json!({"parent":opening.identity,"cancelled":opening.cancel_requested,
                 "failure":opening.failure,"post_exit_resolve_used":opening.post_exit_resolve_used,

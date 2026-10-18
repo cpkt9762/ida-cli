@@ -269,6 +269,7 @@ fn target_path(root: &std::path::Path) -> PathBuf {
 async fn no_handle_terminal_attempt_and_unknown_attach_have_distinct_custody() {
     for scenario in [
         "attach-rejected",
+        "observe-handoff-failed",
         "attach-eof",
         "early-cancel",
         "helper-crash",
@@ -414,10 +415,15 @@ finally:
         let (lease, _) = bridge
             .endpoint()
             .transition(|s, _| s.open_progress(&client, &identity))?;
-        if scenario == "attach-rejected" {
+        if scenario == "attach-rejected" || scenario == "observe-handoff-failed" {
             anyhow::ensure!(lease.is_none(), "rejected attach acquired a lease");
             anyhow::ensure!(terminal["event"] == "failed", "typed lease_absent must have a definite failed parent");
+            if scenario == "observe-handoff-failed" {
+                anyhow::ensure!(terminal["error"]["message"].as_str().is_some_and(|m|m.contains("controlled observation handoff NotSent")),
+                    "cleanup must preserve the original callback error: {terminal}");
+            }
             // The owner is still alive. Only the typed no-attach watch can close.
+            if !evidence.iter().any(|event| event["event"] == "custody_settled") {
             tokio::time::timeout(Duration::from_secs(4), async {
                 loop {
                     let event = events.recv().await?;
@@ -428,6 +434,7 @@ finally:
                 }
             })
             .await??;
+            }
             anyhow::ensure!(
                 !root.join("owner-released").exists(),
                 "no-attach fabricated public release"
@@ -476,6 +483,13 @@ finally:
                 }
             })
             .await??;
+        }
+        if lease.is_none() {
+            let status=bridge.endpoint().transition(|s,_|Ok::<_,NexusError>(s.acquisition_status()))?;
+            let parent=status["parents"].as_array().expect("parents").iter().find(|p|p["parent"]==serde_json::to_value(&identity).expect("identity"))
+                .ok_or_else(||anyhow::anyhow!("parent diagnostic missing"))?;
+            anyhow::ensure!(parent["acquisitions"].as_array().expect("acquisitions").iter().all(|a|a["physical_slot"]==false),
+                "proved absent/closed physical resources still consume a tenant slot: {parent}");
         }
         Ok::<(), anyhow::Error>(())
     }

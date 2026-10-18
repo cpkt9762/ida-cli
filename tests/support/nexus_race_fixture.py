@@ -111,7 +111,7 @@ class Connection:
                 cancelled = index == 0
             return json.dumps({"result": {"cancelled": cancelled}}).encode()
         code = self.payload.get("code", "")
-        if '_g.close_status()' in code:
+        if '_g.close_status()' in code or '_r9_guard.close_status()' in code:
             refusal = 'Root Node missing; saving refused' if SCENARIO == 'n9-aux-refusal' else None
             return json.dumps({'ok': True, 'result': {'result': {
                 'close_safe': True, 'save_guard_error': refusal}}}).encode()
@@ -161,7 +161,8 @@ def outcome_event(**values):
 instance_bridge = [None]
 # These pre-custody transport regressions intentionally mock DatabaseHandle.open
 # and owner identity. Freeze their previous acquisition adapter explicitly;
-# execute/cancel/release still use the current production bridge and real N1.
+# execute/cancel use the current production bridge and real N1. The release
+# wrapper below is an explicit custody boundary double, not helper/proof evidence.
 # This fixture cannot establish R3a custody/helper/proof correctness. The separate
 # nexus_r3a target uses the formal SDK and verified installation for that claim.
 production_invoke = bridge.Bridge.invoke
@@ -294,6 +295,13 @@ def legacy_transport_open(self, channel, attempt, command, deadline, public_star
                       "capabilities": caps, "pid": instance.pid, "idb_path": instance.idb_path,
                       "recovery": handle.recovery})
         return
+    if kind == 'release':
+        from release_wrapper import install
+        lease = command['lease']
+        handle = self.handles[lease['lease_id']][1]
+        if lease['lease_id'] not in self.custodians:
+            auxiliary = opened(handle.instance.idb_path) if not handle.connected else None
+            install(self, lease, handle, auxiliary)
     return production_invoke(self, channel, attempt, command, deadline, public_started)
 original_invoke = legacy_transport_open
 

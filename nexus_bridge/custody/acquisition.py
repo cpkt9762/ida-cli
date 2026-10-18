@@ -182,7 +182,7 @@ class Custodian:
                 binding = self.bridge.backup_sources.bind(subscription)
                 Journal(self.target).bridge_signed(binding)
                 self.owner, self.watch = owner, watch
-                self.observations[watch] = {'owner':owner, 'receipt':None, 'attempts':{}}
+                self.observations[watch] = {'owner':owner, 'receipt':None, 'attempts':{}, 'transferred':False}
                 helper_started = True
                 try:
                     reply = self.helper_request(subscription)
@@ -223,6 +223,7 @@ class Custodian:
                 acquisition=self.acquisition, watch=self.watch,
                 owner=owner, receipt=self.subscription, target=self.target_path,
                 coord_key=self.coord_key)
+            self.observations[watch]['transferred'] = True
             self.admit_target(self.acquisition)
         elif stage == 'AttachMayBeSent':
             self.attach_fact(value, self.attach_ordinal, 'may_send')
@@ -289,12 +290,23 @@ class Custodian:
         for attempt in outcome['attempts']:
             state = 'exact_handle' if attempt['handle'] is not None else attempt['failure_kind']
             self.attach_fact(attempt['instance'], attempt['attempt'], state)
-        for watch,item in self.observations.items():
+        for watch,item in list(self.observations.items()):
             if item.get('proof'):
                 continue
             if any(a['state'] not in ('not_sent', 'lease_absent') for a in item['attempts'].values()):
                 continue
             status = self.helper_request({'kind':'lookup', 'watch':watch})['item']
+            if not item.get('transferred'):
+                # A signed helper receipt may precede a lost/failed Rust handoff.
+                # Reconcile that exact watch before closing it as NotSent. This
+                # transfers cleanup only and never authorizes another attach.
+                with self.file_gate(recovery=True) as target:
+                    Journal(target).owner_signed(item['receipt'])
+                self.unlock_target()
+                self.transact('observe', acquisition=self.acquisition, watch=watch,
+                    owner=item['owner'], receipt=item['receipt'], target=self.target_path,
+                    coord_key=self.coord_key)
+                item['transferred'] = True
             if status is not None and status.get('proof'):
                 continue
             if not item['attempts']:
@@ -304,7 +316,7 @@ class Custodian:
             if result is None:
                 continue
             closed, bridge = result
-            with self.file_gate():
+            with self.file_gate(recovery=True):
                 Journal(self.target).no_attach({'watch':watch, 'consumer':closed, 'bridge_consumer':bridge})
             # Authority already wrote the terminal before releasing EX. Rust's
             # next proof tick can now finish it without waiting on this writer.
@@ -383,7 +395,15 @@ class Custodian:
                 self.obtained(handle, context)
             handle.claim_acquired()
         self.outcome = outcome
-        self.reconcile_outcome(outcome)
+        try:
+            self.reconcile_outcome(outcome)
+            if handle is None:
+                self.transact('acquisition_finished', acquisition=self.acquisition,
+                    watches=list(self.observations)+[v['watch'] for v in self.launches.values()])
+        except Exception as cleanup_error:
+            if outcome.get('cause') is not None:
+                raise RuntimeError('acquisition cleanup unconfirmed: ' + str(cleanup_error)) from outcome['cause']
+            raise
         if outcome.get('cause') is not None:
             raise outcome['cause']
         if handle is None:
@@ -456,7 +476,15 @@ class Custodian:
             if self.decision is None:
                 self.obtained(handle, context)
             handle.claim_acquired()
-        self.reconcile_outcome(outcome)
+        try:
+            self.reconcile_outcome(outcome)
+            if handle is None:
+                self.transact('acquisition_finished', acquisition=self.acquisition,
+                    watches=list(self.observations)+[v['watch'] for v in self.launches.values()])
+        except Exception as cleanup_error:
+            if outcome.get('cause') is not None:
+                raise RuntimeError('attach cleanup unconfirmed: ' + str(cleanup_error)) from outcome['cause']
+            raise
         if outcome.get('cause') is not None:
             raise outcome['cause']
         if handle is None or (self.decision['disposition'] != 'prepare' and not cleanup):
@@ -500,7 +528,19 @@ class Custodian:
                     raise RuntimeError('CleanupBlocked: exact owner unavailable for auxiliary; no SDK attach')
                 child.obtain_attach(self.bridge.Handle, candidates[0], {},
                     {'method':'cleanup-auxiliary', 'parent':self.acquisition['parent']}, cleanup=True)
-        except Exception:
+        except Exception as original:
+            if child is not None and child.handle is None and child.outcome is None and child.subscription is not None:
+                # Resolved subscription runs before attach_outcome is entered.
+                # Its failed handoff therefore has no possible HTTP attach;
+                # use the existing signed NoAttach path, never a fake outcome.
+                try:
+                    child.reconcile_outcome({'attempts':[]})
+                    if child.transact('acquisition_status', acquisition=identity)['settled']:
+                        with self.bridge.lock:
+                            if self.bridge.cleanup_handles.get(self.lease['lease_id']) is child:
+                                self.bridge.cleanup_handles.pop(self.lease['lease_id'], None)
+                except Exception as cleanup_error:
+                    raise RuntimeError('auxiliary observation cleanup unconfirmed: ' + str(cleanup_error)) from original
             if child is None or (child.handle is None and not child.observations and not child.launches):
                 self.transact('unstarted_acquisition', acquisition=identity)
                 with self.bridge.lock:

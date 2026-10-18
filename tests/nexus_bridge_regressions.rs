@@ -388,7 +388,11 @@ async fn n9_auxiliary_save_refusal_reaches_close_caller() {
         .as_str()
         .expect("auxiliary saving refusal sideband")
         .contains("saving refused"));
-    assert!(sideband["outcome"]["owner_released"] == true);
+    assert!(sideband["outcome"]["lease_released"] == true);
+    assert!(
+        sideband["outcome"]["owner_released"] == false,
+        "transport ACK is not an independent owner proof"
+    );
     assert!(result
         .expect_err("close caller must receive the saving refusal")
         .to_string()

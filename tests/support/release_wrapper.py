@@ -39,7 +39,8 @@ class CustodyBoundary:
 
 def install(bridge, lease, primary, auxiliary=None):
     bridge.wrapper_preflights = []
-    bridge.detach_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    if not hasattr(bridge, 'detach_pool'):
+        bridge.detach_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     primary_custody = CustodyBoundary(bridge, lease, primary)
     bridge.custodians[lease['lease_id']] = primary_custody
     child = None

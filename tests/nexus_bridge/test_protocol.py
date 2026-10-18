@@ -86,6 +86,7 @@ class TransportCustodian:
         self.handle = None
         self.originals, self.launches = {}, {}
         self.running = True
+        self.recovery_snapshot = None
         self.target = None  # Transport-only double has no native target snapshot.
         self.release_event = threading.Event()
         self.watch, self.owner = 'transport-watch', {'record_id':'owner-1'}

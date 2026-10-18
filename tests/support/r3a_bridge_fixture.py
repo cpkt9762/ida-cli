@@ -202,6 +202,17 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
     sys.argv = [str(installation / 'bootstrap.py'), 'bridge', *sys.argv[1:]]
     try:
         runtime = vars(runpy.run_path(sys.argv[0], run_name='verified_fixture')['load_entry']())
+        if scenario == 'observe-handoff-failed':
+            from acquisition import Custodian
+            original_transfer = Custodian.transact
+            failed_transfer = [False]
+            def fail_observation_once(self, action, **fields):
+                if action == 'observe' and not failed_transfer[0]:
+                    failed_transfer[0] = True
+                    (root/'observe-handoff-failed').touch()
+                    raise RuntimeError('controlled observation handoff NotSent after helper subscribe')
+                return original_transfer(self, action, **fields)
+            Custodian.transact = fail_observation_once
         if scenario == 'r9-restore-held':
             import open_recovery
             from acquisition import Custodian

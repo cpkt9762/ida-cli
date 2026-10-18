@@ -227,6 +227,7 @@ impl<C: Clock> NexusSessions<C> {
                     primary: None,
                     publish_parent: purpose == AcquisitionPurpose::Final,
                     owner_proof: false,
+                    sdk_finished: false,
                 }],
                 root_attempts: 1,
                 post_exit_resolve_used: false,

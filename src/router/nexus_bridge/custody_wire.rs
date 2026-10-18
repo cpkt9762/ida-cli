@@ -36,6 +36,31 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
         .ok_or_else(|| anyhow::anyhow!("mandatory proof helper unavailable"))?;
     let mut response = json!({"custody_reply":nonce,"ok":true});
     match action {
+        "acquisition_finished" => {
+            let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
+            let watches: Vec<String> = decode(event["watches"].clone())?;
+            for watch in &watches {
+                anyhow::ensure!(
+                    state.endpoint.transition(|s, _| Ok::<_, NexusError>(
+                        s.acquisition_watch_bound(&acquisition, watch)
+                    ))?,
+                    "SDK completion lacks exact watch custody"
+                );
+            }
+            let pending = state
+                .startups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .any(|v| v["acquisition"] == json!(acquisition));
+            state.endpoint.transition(|s, _| {
+                s.finish_acquisition(&acquisition)?;
+                if !pending && s.acquisition_lease(&acquisition)?.is_none() {
+                    s.acquisition_absent(&acquisition)?;
+                }
+                Ok::<_, NexusError>(())
+            })?;
+        }
         "acquisition_status" => {
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
             response["settled"] = json!(state
@@ -1439,6 +1464,25 @@ async fn startup_proof(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&watch);
     let acquisition: AcquisitionId = decode(launch["acquisition"].clone())?;
+    let pending = state
+        .startups
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .any(|item| item["acquisition"] == json!(acquisition));
+    if !pending {
+        // Every exact startup watch has consumed public proof/producer closure.
+        // Release only the physical reservation; keep the original Unknown
+        // command history and allow a late disposed callback to bind its key.
+        state.endpoint.transition(|s, _| {
+            if s.acquisition_sdk_finished(&acquisition)?
+                && s.acquisition_lease(&acquisition)?.is_none()
+            {
+                s.acquisition_absent(&acquisition)?;
+            }
+            Ok::<_, NexusError>(())
+        })?;
+    }
     state
         .retired_open_resources
         .lock()

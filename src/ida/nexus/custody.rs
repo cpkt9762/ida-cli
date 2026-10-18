@@ -337,6 +337,7 @@ impl<C: Clock> NexusSessions<C> {
                 primary: None,
                 publish_parent,
                 owner_proof: false,
+                sdk_finished: false,
             });
         Ok(identity)
     }

@@ -1368,3 +1368,12 @@ real-IDA target and cold build, with the reason stated before execution. Preserv
 all nonzero/forced/124 runs. The external R3b report indexes frozen inputs,
 commands, exits, hashes, identity gaps and the final resource audit. R3b acceptance
 belongs to the independent reviewer and orchestrator.
+
+The R3a acquisition fault matrix additionally interrupts observation transfer
+after a real helper subscription and before Rust receives it. Cleanup re-signs
+that same watch/receipt, preserves the original callback error, and sends no
+attach. Actual SDK completion and exact public resource closure are separate
+facts: only both can return an unleased startup reservation, so an intermediate
+owner exit cannot free a slot while the SDK still resolves. A late disposed
+callback remains cleanup-only. The old transport fixtures use explicit boundary
+doubles and cannot provide production custody/proof evidence.
