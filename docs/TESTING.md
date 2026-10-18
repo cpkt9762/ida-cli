@@ -1326,7 +1326,7 @@ still completes; duplicates cannot block the control reader's custody RPC reply.
 
 ### N7a-R R3b K2 orchestration (implementation, awaiting independent review)
 
-The current adapter contract is wire2/schema1, release3/open2/custody3/helper2,
+The current adapter contract is wire2/schema1, release3/open2/custody4/helper2,
 SDK boundary2 and target_gate1. The fixed SDK modules and four patches are
 unchanged; partial installations and mismatched capability sets are rejected.
 `nexus_r3b` exercises actual N1, installed bridge/helper and the fixed SDK over
@@ -1360,6 +1360,27 @@ endpoint is live; a truly absent endpoint leaves the owner-local handle as C1
 third-party responsibility. Public proof never replaces the original close or
 save command error. Verification payload deletion additionally requires current
 occupancy and file-identity checks; stable coordination/proof files remain.
+
+The fix1 regression target `nexus_r3b_fix1` adds real N1/transport NotSent
+capacity checks and installed bridge/helper/SDK auxiliary handoff windows. Gate,
+probe, Options and pre-resolver failures retain their cause and close only the
+exact resource-free reservation; Unknown and old ordinal obligations remain.
+Custody4 requires `unstarted_absence_v1` and `verification_removal_v1` together;
+old custody3 and partial capability upgrades fail admission.
+
+Verification database payload is deleted by the Python authority holding target
+EX after checking the current journal, public owners and database occupancy.
+Rust consumes the exact completed-removal receipt and unchanged journal, never
+an empty historical `closed` file. A new probe or journal responsibility blocks
+consumption and input publication. Immutable input uses its original identity
+and content binding; stable coordination and proof files remain.
+
+`nexus_r3b_startup` exercises the actual legacy-copy preparation and
+RetainedOpen.verification chain at LaunchIntent and PopenReturn before acquired,
+with cancellation, EOF and callback failure. Run each phase/fault in a fresh SDK
+environment. Public proof plus all producer closures completes late cleanup;
+unproven LaunchIntent retains copy and capacity even after ObservationAbandoned.
+These are actual private IDA startup cases, distinct from controlled HTTP inputs.
 
 Run each integration target in a fresh private HOME/state/tmp/IPC and case root,
 recording before/after uptime. Use `timeout 120s cargo test --locked --features
