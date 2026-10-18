@@ -83,60 +83,61 @@ impl PreparedOpen {
                     directory.join("closed").is_file(),
                     "legacy verification close unconfirmed"
                 );
-                if let Some(cleanup) = &cleanup {
-                    cleanup.validate_closure()?;
-                }
-                let snapshot = directory.join("input");
-                let source = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open(&snapshot)?;
-                let snapshot_identity = source.metadata()?;
-                anyhow::ensure!(
-                    snapshot_identity.is_file() && snapshot_identity.nlink() == 1,
-                    "verification input snapshot identity changed"
-                );
-                anyhow::ensure!(
-                    Some(digest_file(source, &preparing)?) == expected_hash,
-                    "verification input snapshot changed after custody"
-                );
-                let stage = StagedArtifact::create(&destination)?;
-                let current = std::fs::symlink_metadata(&snapshot)?;
-                anyhow::ensure!(
-                    current.is_file()
-                        && (current.dev(), current.ino())
-                            == (snapshot_identity.dev(), snapshot_identity.ino()),
-                    "verification input snapshot replaced before publication"
-                );
-                std::fs::hard_link(&snapshot, &stage.output)?;
-                if let Err(error) = stage.publish(&preparing) {
-                    preparing.check()?;
-                    if !destination.exists()
-                        || digest(&destination, &preparing)? != digest(&snapshot, &preparing)?
-                    {
-                        return Err(error.into());
-                    }
-                    // An identical independently published snapshot is safe; never
-                    // replace a collision or touch the packed database itself.
-                }
-                // publish() links rather than renames. Retire this exact owned
-                // stage link before checking for unknown extra hard links;
-                // StagedArtifact's asynchronous directory cleanup may run later.
-                let staged = std::fs::symlink_metadata(&stage.output)?;
-                anyhow::ensure!(
-                    staged.is_file()
-                        && (staged.dev(), staged.ino())
-                            == (snapshot_identity.dev(), snapshot_identity.ino()),
-                    "verification stage identity changed"
-                );
-                std::fs::remove_file(&stage.output)?;
-                drop(stage);
-                if let Some(cleanup) = cleanup {
+                let cleanup = cleanup
+                    .ok_or_else(|| anyhow::anyhow!("verification publication authority missing"))?;
+                cleanup.publish_with_closure(|| {
+                    #[cfg(feature = "nexus-test-support")]
+                    super::test_barriers::blocking(
+                        "publication_validated",
+                        serde_json::json!({"directory":directory,"destination":destination}),
+                    )?;
+                    let snapshot = directory.join("input");
+                    let source = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(&snapshot)?;
+                    let snapshot_identity = source.metadata()?;
                     anyhow::ensure!(
-                        cleanup.complete(true)?,
-                        "verification closure not confirmed"
+                        snapshot_identity.is_file() && snapshot_identity.nlink() == 1,
+                        "verification input snapshot identity changed"
                     );
-                }
+                    anyhow::ensure!(
+                        Some(digest_file(source, &preparing)?) == expected_hash,
+                        "verification input snapshot changed after custody"
+                    );
+                    let stage = StagedArtifact::create(&destination)?;
+                    let current = std::fs::symlink_metadata(&snapshot)?;
+                    anyhow::ensure!(
+                        current.is_file()
+                            && (current.dev(), current.ino())
+                                == (snapshot_identity.dev(), snapshot_identity.ino()),
+                        "verification input snapshot replaced before publication"
+                    );
+                    std::fs::hard_link(&snapshot, &stage.output)?;
+                    if let Err(error) = stage.publish(&preparing) {
+                        preparing.check()?;
+                        if !destination.exists()
+                            || digest(&destination, &preparing)? != digest(&snapshot, &preparing)?
+                        {
+                            return Err(error.into());
+                        }
+                        // An identical independently published snapshot is safe; never
+                        // replace a collision or touch the packed database itself.
+                    }
+                    // publish() links rather than renames. Retire this exact owned
+                    // stage link before checking for unknown extra hard links;
+                    // StagedArtifact's asynchronous directory cleanup may run later.
+                    let staged = std::fs::symlink_metadata(&stage.output)?;
+                    anyhow::ensure!(
+                        staged.is_file()
+                            && (staged.dev(), staged.ino())
+                                == (snapshot_identity.dev(), snapshot_identity.ino()),
+                        "verification stage identity changed"
+                    );
+                    std::fs::remove_file(&stage.output)?;
+                    drop(stage);
+                    Ok::<_, anyhow::Error>(())
+                })?;
                 Ok::<_, anyhow::Error>(())
             }))
             .await?

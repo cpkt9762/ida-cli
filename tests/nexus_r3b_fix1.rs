@@ -608,6 +608,20 @@ async fn f3_actual_consumer_retains_a_probe_replaced_after_production_issuer() {
         cleanup.validate_closure().is_err(),
         "a later probe invalidates closure before input publication"
     );
+    let callback_ran = std::cell::Cell::new(false);
+    assert!(
+        cleanup
+            .publish_with_closure(|| {
+                callback_ran.set(true);
+                Ok(())
+            })
+            .is_err(),
+        "replacement must reject permission before publication"
+    );
+    assert!(
+        !callback_ran.get(),
+        "invalid closure cannot run the publication callback"
+    );
     let result = cleanup.complete(true);
     fs::write(root.join("f3-replacement.json"),serde_json::to_vec_pretty(&json!({"result":format!("{result:?}"),
         "old":[before.dev(),before.ino()],"replacement":[after.dev(),after.ino()],"replacement_exists":directory.join("probe.i64").exists(),

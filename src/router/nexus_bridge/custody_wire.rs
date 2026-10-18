@@ -19,6 +19,36 @@ pub(super) struct Resource {
     pub cache_guard: Arc<Mutex<Option<Arc<cache_lock::CacheGuard>>>>,
 }
 
+/// Both facts meet under startups -> N1, the same order used to register a
+/// watch. No snapshot crosses these locks and no synchronous guard spans await.
+fn settle_unleased_acquisition(
+    state: &State,
+    id: &AcquisitionId,
+    sdk_finished: bool,
+) -> anyhow::Result<bool> {
+    join_acquisition_completion(&state.endpoint, &state.startups, id, sdk_finished)
+}
+fn join_acquisition_completion(
+    endpoint: &NexusEndpoint,
+    startups: &Mutex<HashMap<String, Value>>,
+    id: &AcquisitionId,
+    sdk_finished: bool,
+) -> anyhow::Result<bool> {
+    let startups = startups.lock().unwrap_or_else(|e| e.into_inner());
+    let pending = startups
+        .values()
+        .any(|item| item["acquisition"] == json!(id));
+    Ok(endpoint.transition(|s, _| {
+        if sdk_finished {
+            s.finish_acquisition(id)?;
+        }
+        if !pending && s.acquisition_sdk_finished(id)? && s.acquisition_lease(id)?.is_none() {
+            s.acquisition_absent(id)?;
+        }
+        s.acquisition_closed(id)
+    })?)
+}
+
 pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result<Value> {
     let nonce = event["nonce"]
         .as_str()
@@ -47,19 +77,21 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                     "SDK completion lacks exact watch custody"
                 );
             }
-            let pending = state
-                .startups
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .values()
-                .any(|v| v["acquisition"] == json!(acquisition));
-            state.endpoint.transition(|s, _| {
-                s.finish_acquisition(&acquisition)?;
-                if !pending && s.acquisition_lease(&acquisition)?.is_none() {
-                    s.acquisition_absent(&acquisition)?;
-                }
-                Ok::<_, NexusError>(())
-            })?;
+            #[cfg(feature = "nexus-test-support")]
+            {
+                let pending = state
+                    .startups
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .any(|v| v["acquisition"] == json!(acquisition));
+                super::test_barriers::asynchronous(
+                    "sdk_pending",
+                    json!({"acquisition":acquisition,"pending":pending}),
+                )
+                .await?;
+            }
+            settle_unleased_acquisition(state, &acquisition, true)?;
         }
         "acquisition_status" => {
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
@@ -313,22 +345,7 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
             helper
                 .call(json!({"kind":"retire_parent","parent":acquisition.parent}))
                 .await?;
-            let pending = state
-                .startups
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .values()
-                .any(|item| item["acquisition"] == json!(acquisition));
-            if !pending
-                && state
-                    .endpoint
-                    .transition(|s, _| s.acquisition_lease(&acquisition))?
-                    .is_none()
-            {
-                state
-                    .endpoint
-                    .transition(|s, _| s.acquisition_absent(&acquisition))?;
-            }
+            settle_unleased_acquisition(state, &acquisition, false)?;
         }
         "observe" | "launch" | "spawned" => {
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
@@ -931,13 +948,18 @@ pub(super) async fn proofs(state: &Arc<State>, writer: &Writer) -> anyhow::Resul
         .is_some()
     {
         for receipt in retirements {
-            if receipt["acquisition"]["purpose"] != "verification"
+            #[cfg(feature = "nexus-test-support")]
+            super::test_barriers::asynchronous("verification_dispatch", receipt.clone()).await?;
+            let acquisition: AcquisitionId = decode(receipt["acquisition"].clone())?;
+            let verification = state
+                .endpoint
+                .transition(|s, _| s.acquisition_verifies_copy(&acquisition))?;
+            if !verification
                 || receipt["verification_removed"] == true
                 || receipt["target"].is_null()
             {
                 continue;
             }
-            let acquisition: AcquisitionId = decode(receipt["acquisition"].clone())?;
             let ready = state.endpoint.transition(|s, _| {
                 Ok::<_, NexusError>(
                     s.open_wait_ended(&acquisition.parent)?
@@ -1379,6 +1401,16 @@ async fn observe_resource(
         s.settle_internal_custody(&resource.lease)?;
         s.acquisition_settled(&resource.acquisition, &resource.lease)
     })?;
+    if state
+        .endpoint
+        .transition(|s, _| s.acquisition_verifies_copy(&resource.acquisition))?
+    {
+        state
+            .retired_open_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(resource.acquisition.parent.operation_id.clone());
+    }
     state
         .custody_resources
         .lock()
@@ -1506,6 +1538,8 @@ async fn startup_proof(
             .unwrap_or_else(|e| e.into_inner())
             .insert(watch.clone(), launch.clone());
     }
+    #[cfg(feature = "nexus-test-support")]
+    super::test_barriers::asynchronous("proof_before_retire", launch.clone()).await?;
     helper
         .call(json!({"kind":"retire","watch":watch,"sha256":launch["consumer"]["sha256"]}))
         .await?;
@@ -1523,38 +1557,14 @@ async fn startup_proof(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&watch);
     let acquisition: AcquisitionId = decode(launch["acquisition"].clone())?;
-    let pending = state
-        .startups
+    // Waitpid ends only the SDK actor; the public proof and every closure
+    // above are still required before this last watch can be removed.
+    let exited = state
+        .bridge_exit
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .any(|item| item["acquisition"] == json!(acquisition));
-    if !pending {
-        // Every exact startup watch has consumed public proof/producer closure.
-        // Release only the physical reservation; keep the original Unknown
-        // command history and allow a late disposed callback to bind its key.
-        let exited = state
-            .bridge_exit
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some();
-        state.endpoint.transition(|s, _| {
-            // Exact waitpid ends this SDK actor only. Public proof and all
-            // producer/consumer closures above remain independently required.
-            if exited {
-                s.finish_acquisition(&acquisition)?;
-            }
-            if s.acquisition_sdk_finished(&acquisition)?
-                && s.acquisition_lease(&acquisition)?.is_none()
-            {
-                s.acquisition_absent(&acquisition)?;
-            }
-            Ok::<_, NexusError>(())
-        })?;
-    }
-    let acquisition_closed = state
-        .endpoint
-        .transition(|s, _| s.acquisition_closed(&acquisition))?;
+        .is_some();
+    let acquisition_closed = settle_unleased_acquisition(state, &acquisition, exited)?;
     state
         .retired_open_resources
         .lock()
@@ -1572,4 +1582,106 @@ async fn startup_proof(
     state
         .emit(json!({"event":"startup_settled","acquisition":launch["acquisition"],"watch":watch}));
     Ok(())
+}
+
+#[cfg(test)]
+mod completion_contracts {
+    use super::*;
+    fn authority() -> (NexusEndpoint, AcquisitionId, NexusCapabilities) {
+        let caps = NexusCapabilities {
+            runtime: NexusRuntime {
+                ida: Version(9, 5, 0),
+                python: Version(3, 14, 7),
+                nexus: Some(Version(0, 13, 4)),
+                domain: Some(Version(0, 5, 1)),
+            },
+            methods: BTreeMap::new(),
+        };
+        let endpoint = NexusEndpoint::with_capabilities(2, Ok(caps.clone()));
+        let client = ClientId::new("join-contract").expect("client");
+        let parent = endpoint
+            .transition(|s, t| {
+                s.open(
+                    &client,
+                    AcceptedRequest::new(
+                        &SystemClock,
+                        RequestId::new("join")?,
+                        None,
+                        "open",
+                        json!({"timeout_secs":30}),
+                    )?,
+                    OpenSpec {
+                        operation_id: OperationId::new("join")?,
+                        path: "/private/join-contract.i64".into(),
+                        options: json!({}),
+                    },
+                    t,
+                )
+            })
+            .expect("N1 parent reservation");
+        (
+            endpoint,
+            AcquisitionId {
+                parent,
+                purpose: AcquisitionPurpose::Final,
+                ordinal: 1,
+            },
+            caps,
+        )
+    }
+    #[test]
+    fn other_watch_blocks_completion_and_sdk_actor_must_end_independently() {
+        // Watch presence is the explicit registry boundary here, not a public
+        // owner proof. The positive runtime test uses real helper closures.
+        let (endpoint, id, _) = authority();
+        let watches = Mutex::new(HashMap::from([
+            ("one".into(), json!({"acquisition":id})),
+            ("two".into(), json!({"acquisition":id})),
+        ]));
+        assert!(!join_acquisition_completion(&endpoint, &watches, &id, true)
+            .expect("SDK ends with two watches"));
+        watches.lock().expect("watch registry").remove("one");
+        assert!(
+            !join_acquisition_completion(&endpoint, &watches, &id, false)
+                .expect("other exact watch retains capacity")
+        );
+        watches.lock().expect("watch registry").remove("two");
+        assert!(join_acquisition_completion(&endpoint, &watches, &id, false)
+            .expect("both independent facts now joined"));
+        let (endpoint, id, _) = authority();
+        let watches = Mutex::new(HashMap::new());
+        assert!(
+            !join_acquisition_completion(&endpoint, &watches, &id, false)
+                .expect("resolve still running, no owner proof may end SDK")
+        );
+        assert!(join_acquisition_completion(&endpoint, &watches, &id, true)
+            .expect("exact SDK end without watches"));
+    }
+    #[test]
+    fn existing_lease_never_becomes_unleased_absence() {
+        let (endpoint, id, caps) = authority();
+        let lease = SessionLease {
+            client_id: id.parent.client_id.clone(),
+            lease_id: LeaseId::new("owned").expect("lease"),
+            instance_id: InstanceId::new("owner").expect("owner"),
+            generation: 1,
+            owner: OwnerKind::Managed,
+        };
+        assert!(matches!(
+            endpoint
+                .transition(|s, _| s.opened(&id.parent, lease.clone(), caps))
+                .expect("N1 lease callback boundary"),
+            OpenDisposition::Ready(_)
+        ));
+        assert!(
+            !join_acquisition_completion(&endpoint, &Mutex::new(HashMap::new()), &id, true)
+                .expect("SDK completion retains physical lease")
+        );
+        assert_eq!(
+            endpoint
+                .transition(|s, _| s.acquisition_lease(&id))
+                .expect("lease identity"),
+            Some(lease)
+        );
+    }
 }

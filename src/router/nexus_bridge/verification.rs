@@ -153,7 +153,7 @@ impl Cleanup {
                 Ok(_) => {}
             }
         }
-        let result = self.consume(handed_off, true);
+        let result = self.consume_with(handed_off, true, || Ok(()));
         match result {
             Ok(()) => {
                 self.done.store(true, std::sync::atomic::Ordering::Release);
@@ -166,10 +166,36 @@ impl Cleanup {
             }
         }
     }
+    #[cfg(test)]
     pub(super) fn validate_closure(&self) -> anyhow::Result<()> {
-        self.consume(true, false)
+        self.consume_with(true, false, || Ok(()))
     }
-    fn consume(&self, handed_off: bool, remove: bool) -> anyhow::Result<()> {
+    /// Validate, publish, and retire the immutable input while the same target
+    /// EX remains owned. Normal target admission cannot enter between them.
+    pub(super) fn publish_with_closure(
+        &self,
+        publish: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut error = self.error.lock().unwrap_or_else(|e| e.into_inner());
+        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        let result = self.consume_with(true, true, publish);
+        match &result {
+            Ok(()) => {
+                self.done.store(true, std::sync::atomic::Ordering::Release);
+                *error = None;
+            }
+            Err(failure) => *error = Some(format!("{failure:#}")),
+        }
+        result
+    }
+    fn consume_with(
+        &self,
+        handed_off: bool,
+        remove: bool,
+        publish: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let parent = fs::symlink_metadata(&self.path)?;
         anyhow::ensure!(
             parent.is_dir() && (parent.dev(), parent.ino()) == self.identity,
@@ -352,6 +378,7 @@ impl Cleanup {
         if !remove {
             return Ok(());
         }
+        publish()?;
         payload.sort_by_key(|(name, _, _)| name == "closed");
         for (name, path, _) in payload {
             if name == "closed" {

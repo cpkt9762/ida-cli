@@ -8,6 +8,8 @@ pub(crate) mod installation;
 pub mod protocol;
 mod receiver;
 #[cfg(feature = "nexus-test-support")]
+mod test_barriers;
+#[cfg(feature = "nexus-test-support")]
 mod test_process_ledger;
 pub(crate) mod verification;
 

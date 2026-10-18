@@ -29,6 +29,30 @@ impl<C: Clock> NexusSessions<C> {
         self.finish_acquisition(id)?;
         self.acquisition_absent(id)
     }
+    /// Existing reservations carry the verification obligation across root
+    /// retries. A final or auxiliary acquisition can never gain it by name.
+    pub fn acquisition_verifies_copy(&self, id: &AcquisitionId) -> Result<bool, NexusError> {
+        self.open_progress(&id.parent.client_id, &id.parent)?;
+        let opening = &self.openings[&id.parent.operation_id];
+        let reservation = opening
+            .acquisitions
+            .iter()
+            .find(|a| a.identity == *id)
+            .ok_or_else(|| {
+                NexusError::new(
+                    NexusErrorCode::InvalidIdentity,
+                    "verification provenance acquisition missing",
+                )
+            })?;
+        Ok(!reservation.publish_parent
+            && matches!(
+                id.purpose,
+                AcquisitionPurpose::Verification | AcquisitionPurpose::InitialRootRetry
+            )
+            && opening.acquisitions.iter().any(|a| {
+                a.identity.purpose == AcquisitionPurpose::Verification && !a.publish_parent
+            }))
+    }
     pub fn acquisition_watch_bound(&self, id: &AcquisitionId, watch: &str) -> bool {
         self.startup_origins
             .get(watch)
