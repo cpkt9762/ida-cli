@@ -1105,3 +1105,10 @@ U6通过已绑定宿主/本地卷/boot的生产消费者仅退休旧资源和当
 当前sameboot资格继续Unsupported；注入OS来源不作为真实重启，R3b/R4/R7边界不变。
 协议release/custody/helper=2、sdk_boundary=2、boot_retirement消费者=1，严格闭包为28源码+manifest。
 实现/所有失败/当前字节验证及资源审计见外部`n7a-refactor/r2-handoff/`；本节不自行验收R2或启动R3b。
+
+R2 RF1–RF6/Q1返修补足持久退休证据重读校验与目标锁内退休fence；public proof结当前资源不代替原attempt终态，
+MCP/CLI保存原Nexus结构化错误。停止前CancelPending不消耗实际release attempt，已受理cleanup在原deadline后
+仅通过原有有界proof池继续精确停止观察，不重置原请求deadline或重放native执行；保护失败/真实尝试耗尽明确CleanupBlocked。
+长owner等待使用独立有界观察容量，断连撤销只读等待，control编码独立有界背压；status/cancel容量保留。
+post-exit最终签收/Resolved返回后、副作用前再核原deadline，额度、原实例及launch/prior outcome不丢。
+定向红绿和后续验证见外部`n7a-refactor/r2-fix1/`；本记录不自行验收R2或启动R3b。

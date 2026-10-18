@@ -1277,3 +1277,37 @@ ordinary R2 case retains 30 seconds. Multiple-process R3a matrices/128 rounds us
 reason stated before running. These shell limits do not change product budgets.
 Full auxiliary/r9/verification orchestration remains R3b, file transactions and
 maintenance remain R4, and large databases/real cross-boot/platform E2E remain R7.
+
+#### R2 targeted boundary regressions (RF1–RF6 / Q1)
+
+Retirement evidence is a strict schema1 certificate bound to the exact target,
+origin, acquisition, epoch, owner and lease. Every reread validates its digest
+and qualified boot scope before admission/accounting; late writers recheck under
+EX and cannot modify retired history. `test_boot_retirement.py` includes a queued
+independent writer, corrupt-certificate rereads and unchanged historical bytes.
+The Rust `late_real_ack_after_boot_retirement_never_rewrites_target` delays an
+actual SDK ACK until after retirement. Boot-source injection remains a model of
+OS inputs, with a consistent current boot for target writers, bridge creation
+and the helper heartbeat; it is not a host reboot.
+
+`dropped_close_detaches_once_after_late_native_stop_with_owner_held` drops the
+caller, holds native execution past the old retry window, then supplies causal
+stop through the public SDK while the owner lifetime stays held. Eligibility
+waits consume no release attempt. Cleanup stop observation uses the existing
+bounded proof pool with capped backoff after the original deadline, preserving
+that deadline and the original outcome. Explicit protection failures and bounded
+attempt exhaustion report CleanupBlocked without dropping resource protection.
+
+The actual MCP/Unix CLI tests assert typed code/cause/retry/automatic_replay for
+saving-refused NotSent and Uncertain outcomes, and proof-before-terminal ordering.
+A public lifetime proof settles resources independently of the command's caller
+result. Eight pending waits use one real listener and shared lanes; status/cancel
+remain available, waits keep their own deadlines, and disconnect frees the
+read-only observation slot. Control response encoding applies bounded backpressure.
+
+`post_exit_final_signed_resolved_deadline_sends_zero_attach` spends the original
+budget at the actual final Resolved/helper-signing return. The final attach is
+refused while the consumed post-exit allowance, original instances, launch list
+and prior outcome remain owned. No SDK patch/hash or resolve-count allowance
+changes. Each Rust integration case still needs its own private case root;
+late-stop uses the documented 120-second shell allowance.
