@@ -1,4 +1,5 @@
 //! N4 tool wiring. The development-only selector is removed in N9.
+mod owner_resources;
 use super::{nexus_bridge::BridgeConfig, RouterState};
 use crate::{error::ToolError, nexus::*, preprocess::Preparation};
 use serde_json::{json, Value};
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Semaphore};
 
 pub const METHODS: &[&str] = &[
+    "wait_owner_exit",
     "get_database_info",
     "get_analysis_status",
     "list_functions",
@@ -116,6 +118,8 @@ struct Database {
 pub struct Tools {
     selected: bool,
     databases: Mutex<HashMap<String, Database>>,
+    owner_resources: Mutex<HashMap<String, owner_resources::OwnerResources>>,
+    owner_diagnostics: Mutex<HashMap<SessionLease, PathBuf>>,
     capacity: Arc<Semaphore>,
     paths: Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     operations: Mutex<Vec<OperationIdentity>>,
@@ -133,6 +137,8 @@ impl Tools {
         Ok(Self {
             selected,
             databases: Mutex::new(HashMap::new()),
+            owner_resources: Mutex::default(),
+            owner_diagnostics: Mutex::default(),
             capacity: Arc::new(Semaphore::new(capacity)),
             paths: Mutex::new(HashMap::new()),
             operations: Mutex::new(Vec::new()),
@@ -278,22 +284,6 @@ impl Tools {
             .map(|db| db.cache_hit)
             .ok_or(ToolError::NoDatabaseOpen)
     }
-    fn consume_released(&self, endpoint: &super::nexus_transport::NexusEndpoint) {
-        let mut released = Vec::new();
-        self.records().retain(|_, db| {
-            let confirmed = endpoint
-                .transition(|s, _| s.status(&db.lease.client_id, &db.lease))
-                .is_ok_and(|state| state.phase == SessionPhase::Released);
-            if confirmed {
-                released.push(db.lease.clone());
-            }
-            !confirmed
-        });
-        self.operations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|op| !released.contains(&op.lease));
-    }
     fn path_gate(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
         let mut paths = self.paths.lock().unwrap_or_else(|e| e.into_inner());
         paths.retain(|_, gate| gate.strong_count() > 0);
@@ -375,7 +365,9 @@ impl Tools {
         preparation: Preparation,
         refresh: bool,
     ) -> Result<(String, String), ToolError> {
-        self.consume_released(&router.nexus_endpoint());
+        if let Some(bridge) = router.nexus_bridge.get() {
+            self.consume_released(bridge);
+        }
         self.uncertain_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -463,31 +455,8 @@ impl Tools {
         let cache_guard =
             super::nexus_bridge::cache_lock::acquire(&crate::idb_store::idb_root(), &preparation)
                 .await?;
+        self.wait_draining(router, &canonical, &preparation).await?;
         let endpoint = router.nexus_endpoint();
-        let retained: Vec<_> = self
-            .records()
-            .values()
-            .filter(|db| db.path == canonical)
-            .map(|db| db.lease.clone())
-            .collect();
-        for lease in retained {
-            let status = endpoint.transition(|s, _| s.status(&lease.client_id, &lease))?;
-            if status.control_delivery.is_some_and(|delivery| {
-                matches!(delivery.attempt.target, DeliveryTarget::Release { .. })
-                    && matches!(
-                        delivery.state,
-                        DeliveryState::Queued
-                            | DeliveryState::Acknowledged
-                            | DeliveryState::Uncertain
-                    )
-            }) {
-                return Err(NexusError::new(
-                    NexusErrorCode::CancelPending,
-                    "owner release unconfirmed; new open blocked and tracking retained",
-                )
-                .into());
-            }
-        }
         let mut prepared = super::nexus_bridge::cache::prepare_n7_open(
             canonical.clone(),
             crate::idb_store::idb_root(),
@@ -637,6 +606,12 @@ impl Tools {
         preparation: Preparation,
     ) -> Result<Value, ToolError> {
         Self::require(method)?;
+        if method == "wait_owner_exit" {
+            let reference = params["owner_observation_ref"]
+                .as_str()
+                .ok_or_else(|| diagnostic("wait_owner_exit requires owner_observation_ref"))?;
+            return self.wait_owner_exit(router, reference, preparation).await;
+        }
         if matches!(
             method,
             "batch_decompile" | "search_pseudocode" | "run_auto_analysis" | "batch_rename"
@@ -910,6 +885,10 @@ impl Tools {
         let Some((handle, database)) = record else {
             return Ok(None);
         };
+        self.owner_diagnostics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(database.lease.clone(), database.path.clone());
         let gate = self.path_gate(&database.path);
         let _path = gate.lock().await;
         let bridge = Self::bridge(router).await?;
@@ -917,12 +896,12 @@ impl Tools {
         // discard responsibility for a successfully published Database.
         let _cleanup = ReleaseCleanup {
             tools: Arc::downgrade(self),
-            endpoint: bridge.endpoint(),
+            bridge: bridge.clone(),
             lease: database.lease.clone(),
         };
         release(&bridge, &database.lease).await?;
-        let mut records = self.records();
-        records.remove(&handle);
+        self.consume_released(&bridge);
+        let records = self.records();
         self.operations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -932,6 +911,25 @@ impl Tools {
             .filter(|db| db.path == database.path)
             .count();
         Ok(Some((handle, remaining)))
+    }
+
+    pub async fn close_token_detailed(
+        self: &Arc<Self>,
+        router: &RouterState,
+        token: &str,
+    ) -> (Result<Option<(String, usize)>, ToolError>, Option<Value>) {
+        let lease = self
+            .records()
+            .values()
+            .find(|db| db.token == token)
+            .map(|db| db.lease.clone());
+        let result = self.close_token(router, token).await;
+        let observation = lease.and_then(|lease| {
+            self.owner_status(router)
+                .into_iter()
+                .find(|value| value["lease"] == json!(lease))
+        });
+        (result, observation)
     }
     pub async fn close_path(
         self: &Arc<Self>,
@@ -1024,26 +1022,17 @@ impl Tools {
 
 struct ReleaseCleanup {
     tools: std::sync::Weak<Tools>,
-    endpoint: super::nexus_transport::NexusEndpoint,
+    bridge: Arc<super::nexus_bridge::NexusBridge>,
     lease: SessionLease,
 }
 impl Drop for ReleaseCleanup {
     fn drop(&mut self) {
-        let endpoint = self.endpoint.clone();
         let lease = self.lease.clone();
-        let tools = self.tools.clone();
-        let confirmed = endpoint
-            .transition(|s, _| s.status(&lease.client_id, &lease))
-            .is_ok_and(|state| state.phase == SessionPhase::Released);
-        if confirmed {
-            if let Some(tools) = tools.upgrade() {
-                tools.consume_released(&endpoint);
-            }
-            return;
-        }
-        let Some(owner) = tools.upgrade() else {
+        let bridge = self.bridge.clone();
+        let Some(owner) = self.tools.upgrade() else {
             return;
         };
+        owner.consume_released(&bridge);
         if !owner
             .close_observers
             .lock()
@@ -1052,29 +1041,44 @@ impl Drop for ReleaseCleanup {
         {
             return;
         }
-        drop(owner);
+        let tools = owner;
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-            while tokio::time::Instant::now() < deadline {
-                let Some(tools) = tools.upgrade() else {
+            let mut retries = 0_u8;
+            let mut next_retry = Instant::now();
+            loop {
+                tools.consume_released(&bridge);
+                let active = tools.records().values().any(|db| db.lease == lease);
+                if !active && !tools.owner_pending(&lease) {
+                    tools
+                        .close_observers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&lease);
                     return;
-                };
-                tools.consume_released(&endpoint);
-                if !tools.records().values().any(|db| db.lease == lease) {
-                    break;
                 }
-                drop(tools);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            if let Some(tools) = tools.upgrade() {
-                tools
-                    .close_observers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&lease);
-                if tools.records().values().any(|db| db.lease == lease) {
-                    tracing::warn!("cache guard retained after close proof observation deadline; next open will recheck exact N1 proof");
+                if active && retries < 16 && Instant::now() >= next_retry {
+                    let not_sent = bridge
+                        .endpoint()
+                        .transition(|s, _| s.status(&lease.client_id, &lease))
+                        .is_ok_and(|s| {
+                            s.control_delivery
+                                .is_some_and(|d| d.state == DeliveryState::NotSent)
+                        });
+                    if not_sent {
+                        // N1 rechecks stop/owner/grant eligibility. A potentially
+                        // sent detach never enters this retry branch.
+                        if let Err(error) = bridge
+                            .endpoint()
+                            .transition(|s, t| s.release(&lease.client_id, &lease, t))
+                        {
+                            tracing::debug!(%error,"Nexus background NotSent cleanup remains blocked");
+                        }
+                        retries += 1;
+                        next_retry = Instant::now()
+                            + Duration::from_millis(50_u64.saturating_mul(1_u64 << retries.min(4)));
+                    }
                 }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         });
     }
@@ -1404,16 +1408,32 @@ async fn release(
             let state = bridge
                 .endpoint()
                 .transition(|s, _| s.status(&lease.client_id, lease))?;
+            if let Some(delivery) = &state.control_delivery {
+                if delivery.state == DeliveryState::Uncertain {
+                    if let Some(error) = &delivery.error {
+                        return Err(diagnostic(format!(
+                            "{error}; lease_detached={}; owner_pending={}; never_replay=true",
+                            state.phase == SessionPhase::Released,
+                            bridge.owner_release_status(lease)["owner_pending"]
+                        )));
+                    }
+                }
+            }
             if state.phase == SessionPhase::Released {
-                return bridge
-                    .take_release_error(lease)
-                    .map_or(Ok(()), |message| Err(diagnostic(message)));
+                return bridge.take_release_error(lease).map_or(Ok(()), |message| {
+                    Err(diagnostic(format!(
+                        "{message}; lease detached; owner_pending={}",
+                        bridge.owner_release_status(lease)["owner_pending"]
+                    )))
+                });
             }
             if let Some(delivery) = state.control_delivery {
-                if delivery.state != DeliveryState::Uncertain {
-                    if let Some(error) = delivery.error {
-                        return Err(ToolError::Nexus(error));
-                    }
+                if let Some(error) = delivery.error {
+                    return Err(diagnostic(format!(
+                        "{}; lease_detached=false; owner_pending=true; never_replay={}",
+                        error,
+                        delivery.state == DeliveryState::Uncertain
+                    )));
                 }
             }
             let event = receive(events.recv().await)?;
@@ -1462,6 +1482,12 @@ impl RetainedOpen {
                 return false;
             };
             if let Some(lease) = lease {
+                if sessions
+                    .resource_retirement(&lease)
+                    .is_ok_and(|e| e.is_some())
+                {
+                    return true;
+                }
                 return sessions
                     .status(&lease.client_id, &lease)
                     .is_ok_and(|status| status.phase == SessionPhase::Released);

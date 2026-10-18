@@ -7,6 +7,50 @@ use serde_json::json;
 #[path = "support/nexus_contract.rs"]
 mod support;
 use support::*;
+
+#[test]
+fn r2_late_notsent_preserves_public_lifetime_release_and_original_failure() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("r2-proof", "r2-owner", 1);
+    rig.sessions
+        .release(&lease.client_id, &lease, &mut rig.backend)
+        .expect("release attempt");
+    let attempt = rig
+        .sessions
+        .status(&lease.client_id, &lease)
+        .expect("snapshot")
+        .control_delivery
+        .expect("delivery")
+        .attempt;
+    rig.sessions
+        .public_owner_lifetime(&lease)
+        .expect("adapter already adopted exact durable proof");
+    let error = NexusError::new(
+        NexusErrorCode::OperationFailed,
+        "fresh protection refused before detach",
+    );
+    rig.sessions
+        .delivery_failed(&attempt, DispatchFailure::NotSent(error.clone()))
+        .expect("late genuine NotSent");
+    let snapshot = rig
+        .sessions
+        .status(&lease.client_id, &lease)
+        .expect("final snapshot");
+    assert_eq!(
+        snapshot.phase,
+        SessionPhase::Released,
+        "public owner proof cannot be undone"
+    );
+    let delivery = snapshot
+        .control_delivery
+        .expect("original delivery history");
+    assert_eq!(
+        delivery.state,
+        DeliveryState::NotSent,
+        "proof is not a detach ACK"
+    );
+    assert_eq!(delivery.error, Some(error), "original caller cause remains");
+}
 #[path = "support/nexus_compatibility.rs"]
 mod compatibility;
 #[path = "support/nexus_lifecycle.rs"]

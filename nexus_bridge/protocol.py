@@ -1,20 +1,20 @@
-"""Exact R3a admission. OS retirement and full transactions remain unavailable."""
+"""Exact adapter versions; boot retirement still requires a qualified native scope."""
 import json
 import os
 
-SDK_FILES = {'handle.py': 'e9d57e725b4c0405faf959422720451215a9f7b2bd8f98bf0ad2377383b399ce', '_resolver.py': 'd06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8', 'options.py': '1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe'}
+SDK_FILES = {'handle.py': 'dd9daf669b6dc55f657dd11b60f9869dcca70cf278cc65bc1d91b4e02b199acd', '_resolver.py': 'd06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8', 'options.py': '1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe'}
 HANDLE_SHA = SDK_FILES['handle.py']
 
 
 def contract():
-    return {'wire': 2, 'schema': 1, 'release': 1, 'open': 1,
-            'owner_observation': 1, 'custody':1, 'helper':1, 'target_gate':1,
-            'same_boot_exit':0, 'boot_retirement':0, 'client_hash': HANDLE_SHA,
-            'sdk_boundary': 1, 'client_modules': dict(SDK_FILES),
+    return {'wire': 2, 'schema': 1, 'release': 2, 'open': 1,
+            'owner_observation': 1, 'custody':2, 'helper':2, 'target_gate':1,
+            'same_boot_exit':0, 'boot_retirement':1, 'client_hash': HANDLE_SHA,
+            'sdk_boundary': 2, 'client_modules': dict(SDK_FILES),
             'capabilities': ['absolute_home_v1', 'ack_cleanup_v1', 'acquisition_outcome_v1',
                              'durable_public_proof_v1', 'final_preparing_v1', 'internal_grant_v1',
                              'launch_observer_v1', 'lifetime_handshake_v1',
-                             'receiver_isolation_v1', 'release_observation_v1', 'target_gate_base_v1']}
+                             'receiver_isolation_v1', 'release_observation_v1', 'single_resolution_outcome_v1', 'target_gate_base_v1', 'two_phase_release_v1']}
 
 
 def validate(value):

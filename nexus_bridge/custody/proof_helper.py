@@ -17,7 +17,7 @@ from custody_process_identity import capture
 from origin import creation_scope
 from target_coordination import Directory, Target, canonical, digest, encoded
 
-PROTOCOL = 1
+PROTOCOL = 2
 MAX_FRAME = 1024 * 1024
 # Exact request families. Reject partial upgrades before any reservation,
 # durable fact or public discovery can occur.
@@ -25,6 +25,7 @@ REQUEST_FIELDS = {
     'finish':(), 'heartbeat':(), 'reserve_parent':('parent',), 'retire_parent':('parent',),
     'lookup':('watch',), 'attach_attempt':('watch','attempt'), 'no_attach':('watch',),
     'adopt_public_proof':('watch','proof'), 'startup_transfer':('watch','successor'),
+    'resource_retired':('watch','evidence'),
     'retire':('watch','sha256'), 'proof_custody_ack':('watch','sha256','path'),
     'subscribe':('watch','target','coord_key','acquisition','owner','subscription_epoch'),
     'launch_intent':('watch','target','coord_key','acquisition','launch','subscription_epoch'),
@@ -274,7 +275,8 @@ class Observer:
         if not isinstance(kind, str) or kind not in REQUEST_FIELDS:
             raise ValueError('ProtocolMismatch: unknown helper request family')
         required = {'kind', 'protocol', 'helper', *REQUEST_FIELDS[kind]}
-        allowed = required | ({'summary_only'} if kind == 'heartbeat' else set())
+        allowed = required | ({'summary_only'} if kind == 'heartbeat' else
+                              {'proof'} if kind == 'subscribe' else set())
         if not required <= value.keys() or value.keys() - allowed:
             raise ValueError('ProtocolMismatch: helper request fields')
         if 'summary_only' in value and type(value['summary_only']) is not bool:
@@ -361,6 +363,31 @@ class Observer:
                     item['consumer'] = self.publish(item, 'NoAttachClosed',
                         attempts=attempts, previous_facts=[item['receipt'], *item.get('attach_facts', [])])
                 return {'consumer':item['consumer']}
+            if kind == 'resource_retired':
+                item = self.items.get(value['watch'])
+                if item is None:
+                    return {}  # Exact durable target evidence is checked by the caller too.
+                evidence = value['evidence']
+                with Target(item['target']) as target:
+                    journal, _, _ = target.directory.read('custody.json')
+                    bound = journal['entries'].get(str(item['subscription_epoch']), {})
+                    if (journal['coord_key'] != target.key or bound.get('watch') != item['watch']
+                            or bound.get('resource_retirement') != evidence
+                            or evidence.get('acquisition') != item['acquisition']
+                            or evidence.get('owner') != item.get('owner')
+                            or evidence.get('scope') != 'host_boot_change'
+                            or evidence.get('evidence_type') != 'verified_boot_change_resource_retirement'):
+                        raise ValueError('ProtocolMismatch: resource retirement lacks exact durable authority')
+                self.items.pop(item['watch'])
+                self.persist()
+                key = digest(item.get('owner'))
+                entry = self.owners.get(key)
+                if entry:
+                    entry['watches'].discard(item['watch'])
+                    if not entry['watches']:
+                        entry['stop'].set()
+                        self.owners.pop(key)
+                return {}
             if kind == 'adopt_public_proof':
                 from target_journal import fact
                 item = self.items[value['watch']]
@@ -373,9 +400,20 @@ class Observer:
                     raise ValueError('ProtocolMismatch: backup public proof identity')
                 with Target(item['target']) as target:
                     fact(receipt, target, kind='PublicOwnerLifetime')
+                    if item.get('proof') and item['proof'] != receipt:
+                        journal, _, _ = target.directory.read('custody.json')
+                        bound = journal['entries'].get(str(item['subscription_epoch']), {})
+                        selected = bound.get('proof', {})
+                        if (bound.get('watch') != item['watch'] or bound.get('owner') != item['owner']
+                                or selected.get('path') != receipt['path']
+                                or selected.get('sha256') != receipt['sha256']
+                                or item.get('consumer')):
+                            raise ValueError('ProtocolMismatch: proof differs from durable target selection')
+                        item['custody_proof'] = receipt
+                        self.persist()
                 if not item.get('proof'):
                     item['proof'] = receipt
-                return {'proof':item['proof']}
+                return {'proof':item.get('custody_proof', item['proof'])}
             if kind == 'startup_transfer':
                 item = self.items[value['watch']]
                 successor = self.items[value['successor']]
@@ -412,14 +450,15 @@ class Observer:
                 return {}
             if kind == 'proof_custody_ack':
                 item = self.items[value['watch']]
-                proof = item.get('proof')
+                proof = item.get('custody_proof', item.get('proof'))
                 if not proof or proof['sha256'] != value['sha256'] or proof['path'] != value['path']:
                     raise ValueError('ProtocolMismatch: proof custody receipt')
                 if not item.get('consumer'):
                     # A receipt is a producer-closed event; it is not permission
                     # to unlink a proof or erase this item's durable references.
                     item['consumer'] = self.publish(item, 'ProducerClosed', proof=proof,
-                        previous_facts=item.get('attach_facts', []))
+                        previous_facts=item.get('attach_facts', []) +
+                            ([item['proof']] if item.get('proof') != proof else []))
                     item.pop('instance', None)
                 return {'consumer':item['consumer']}
             if kind in ('subscribe', 'launch_intent'):
@@ -449,12 +488,26 @@ class Observer:
                 item['created'] = self.clock()
                 if kind == 'subscribe':
                     owner = validate_owner(value['owner'])
-                    from ida_nexus import discover_databases
-                    matches = [x.instance for x in discover_databases(timeout=.2)
-                               if owner_key(x.instance, self.state) == owner]
-                    if len(matches) != 1:
-                        raise RuntimeError('ObservationFailed: exact public instance unavailable')
-                    instance = matches[0]
+                    if 'proof' in value:
+                        from target_journal import fact
+                        proof = value['proof']
+                        record = proof['record']
+                        if (record.get('owner') != owner or record.get('watch') != watch
+                                or record.get('acquisition') != item['acquisition']
+                                or record.get('subscription_epoch') != item['subscription_epoch']
+                                or record.get('evidence_type') != 'public_owner_lifetime'):
+                            raise ValueError('ProtocolMismatch: reaped subscription proof identity')
+                        with Target(item['target']) as target:
+                            fact(proof, target, kind='PublicOwnerLifetime')
+                        item['proof'] = proof
+                        instance = None
+                    else:
+                        from ida_nexus import discover_databases
+                        matches = [x.instance for x in discover_databases(timeout=.2)
+                                   if owner_key(x.instance, self.state) == owner]
+                        if len(matches) != 1:
+                            raise RuntimeError('ObservationFailed: exact public instance unavailable')
+                        instance = matches[0]
                     try:
                         item['os_identity'] = capture(owner['pid'])
                     except (OSError, RuntimeError):
@@ -462,7 +515,7 @@ class Observer:
                 self.items[watch] = item
                 self.persist()
                 item['receipt'] = self.publish(item, 'Subscribed' if kind == 'subscribe' else 'SpawnIntent')
-                if kind == 'subscribe':
+                if kind == 'subscribe' and instance is not None:
                     self.watch_owner(item, instance)
                 return {'receipt':item['receipt']}
             if kind == 'spawned':

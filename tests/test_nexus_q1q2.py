@@ -1,5 +1,6 @@
 """Diagnostic failures preserve business results; full hashes require opt-in."""
 import hashlib
+from contextlib import nullcontext
 import importlib.util
 import os
 from pathlib import Path
@@ -100,6 +101,34 @@ class Diagnostics(unittest.TestCase):
             self.assertNotIn('sha256', evidence['disk_now'])
 
 
+class FingerprintCustodian:
+    """Only the diagnostic wrapper boundary is modeled here, not custody/proof."""
+    def __init__(self, owner, attempt, command, deadline, track):
+        self.owner, self.attempt, self.track = owner, attempt, track
+        self.acquisition = {'parent':command['identity']}
+        self.target = None
+        self.handle = None
+
+    def gate(self, _path):
+        return nullcontext()
+
+    def obtain(self, Handle, Options, path, options, context):
+        self.handle = Handle.open(path, options=Options(**options))
+        self.track(self.handle, context)
+        self.lease = next(lease for lease,handle in self.owner.handles.values() if handle is self.handle)
+        return self.handle
+
+    def execute(self, _purpose, code, **_options):
+        return self.handle.execute_python(code)
+
+    def ready(self, caps, _analysis, recovery):
+        self.owner.business.send({'event':'opened','attempt':self.attempt,'lease':self.lease,
+            'capabilities':caps,'recovery':recovery})
+
+    def fail(self, error):
+        raise AssertionError('diagnostic boundary unexpectedly failed') from error
+
+
 class OpenFingerprints(unittest.TestCase):
     def check_open(self, enabled):
         with tempfile.TemporaryDirectory() as directory, patch.object(
@@ -120,8 +149,9 @@ class OpenFingerprints(unittest.TestCase):
             owner.Handle = types.SimpleNamespace(open=lambda *_, **__: handle)
             owner.Options = lambda **kwargs: kwargs
             owner.lock = threading.Lock()
-            owner.generations, owner.handles, owner.metadata_contexts = {}, {}, {}
+            owner.generations, owner.handles, owner.metadata_contexts, owner.acquisitions = {}, {}, {}, {}
             events, reads = [], []
+            owner.business = types.SimpleNamespace(send=events.append)
             original = Path.open
 
             def track(target, *args, **kwargs):
@@ -134,11 +164,12 @@ class OpenFingerprints(unittest.TestCase):
             if enabled:
                 env['IDA_CLI_NEXUS_FORENSIC_HASH'] = '1'
             with patch.dict(os.environ, env, clear=True), patch.object(Path, 'open', track), \
-                    patch.object(bridge, 'readiness', return_value={'capabilities': {'runtime': {}}}):
+                    patch.object(bridge, 'readiness', return_value={'capabilities': {'runtime': {}}}), \
+                    patch.object(bridge, 'Custodian', FingerprintCustodian):
                 for _ in range(2):
                     owner.invoke(types.SimpleNamespace(send=events.append), {},
                         {'command': 'open', 'path': str(path),
-                         'identity': {'client_id': 'client'}, 'options': {}},
+                         'identity': {'client_id': 'client','operation_id':'diagnostic-open'}, 'options': {}},
                         time.monotonic()+5, [False])
             self.assertEqual([e['event'] for e in events], ['opened', 'opened'])
             self.assertEqual(len(reads), 2 if enabled else 0)

@@ -8,7 +8,7 @@ if os is None or os.__spec__.origin != 'frozen' or os.path.__spec__.origin != 'f
     raise RuntimeError('trusted frozen os and path required')
 
 # A closed installation, including the complete current bridge module closure.
-REQUIRED = frozenset(('acquisition.py', 'analysis_tools.py', 'bootstrap.py', 'bridge.py', 'bridge_observer.py', 'cache_store.py', 'config.py', 'edit_tools.py', 'lifecycle.py', 'lifetime.py', 'metadata.py', 'open_recovery.py', 'origin.py', 'owner_identity.py', 'custody_process_identity.py', 'proof_helper.py', 'protocol.py', 'query_tools.py', 'save_guard.py', 'search_tools.py', 'slices.py', 'struct_tools.py', 'target_coordination.py', 'target_journal.py', 'tools.py', 'type_tools.py'))
+REQUIRED = frozenset(('acquisition.py', 'analysis_tools.py', 'bootstrap.py', 'bridge.py', 'bridge_observer.py', 'cache_store.py', 'config.py', 'edit_tools.py', 'lifecycle.py', 'lifetime.py', 'metadata.py', 'open_recovery.py', 'owner_modules.py', 'owner_release.py', 'origin.py', 'owner_identity.py', 'custody_process_identity.py', 'proof_helper.py', 'protocol.py', 'query_tools.py', 'save_guard.py', 'search_tools.py', 'slices.py', 'struct_tools.py', 'target_coordination.py', 'target_journal.py', 'tools.py', 'type_tools.py'))
 
 
 def load_entry():

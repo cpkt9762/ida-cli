@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -19,8 +20,10 @@ import ida_nexus.handle as client
 
 def scenario(*, sibling=False, both_lost=False, unsafe=False):
     live, names, calls, queries, messages, checks = set(), {}, [], [], [], []
+    path = Path(tempfile.mkdtemp(dir=os.environ['R3A_CASE_ROOT'], prefix='group-'))/'mock.i64'
+    path.write_bytes(b'private group input')
     instance = types.SimpleNamespace(record_id='group-owner', backend='idalib',
-        managed=True, pid=os.getpid(), port=1, idb_path='/private/mock.i64',
+        managed=True, pid=os.getpid(), started_at=time.time(), port=1, idb_path=str(path),
         exe_path='', _token=os.urandom(16).hex())
     deadline = time.monotonic() + 1
 
@@ -78,6 +81,7 @@ def scenario(*, sibling=False, both_lost=False, unsafe=False):
         owner.lock = threading.Lock()
         owner.identity, owner.lifetime_path = 'group-bridge', '/private/lifetime'
         owner.handles = {'logical': (lease, primary)}
+        owner.custodians = {}  # This fixture exercises only the legacy auxiliary coordinator.
         owner.cleanup_handles, owner.metadata_contexts = {}, {}
         owner.Handle = types.SimpleNamespace(attach=lambda entry: auxiliary)
         owner.drop_lifetime = lambda key: None

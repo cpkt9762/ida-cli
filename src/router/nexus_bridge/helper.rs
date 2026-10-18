@@ -87,9 +87,9 @@ impl Helper {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(config.directory.join("helper.log"))?;
         let mut command = Command::new(&config.python);
+        command.arg("-I").arg("-B");
+        super::python_ledger(&mut command);
         command
-            .arg("-I")
-            .arg("-B")
             .arg(installation.join("bootstrap.py"))
             .arg("proof_helper")
             .arg(&endpoint)
@@ -116,7 +116,7 @@ impl Helper {
                 Ok(())
             });
         }
-        let child = command.spawn()?;
+        let child = super::spawn_child(&mut command)?;
         let mut helper = Self {
             endpoint,
             incarnation,
@@ -181,7 +181,7 @@ impl Helper {
         // SAFETY: geteuid has no arguments or memory safety preconditions.
         let uid = unsafe { libc::geteuid() };
         value["helper"] = json!(self.incarnation);
-        value["protocol"] = json!(1);
+        value["protocol"] = json!(2);
         let data = serde_json::to_vec(&value)?;
         anyhow::ensure!(data.len() < 65536, "helper request capacity exceeded");
         let exchange = async {
@@ -236,7 +236,7 @@ impl Helper {
                 .ok_or_else(|| anyhow::anyhow!("helper EOF"))?;
             let response: Value = serde_json::from_slice(&line)?;
             anyhow::ensure!(
-                response["protocol"] == 1 && response["helper"] == self.incarnation,
+                response["protocol"] == 2 && response["helper"] == self.incarnation,
                 "ProtocolMismatch: helper reply"
             );
             anyhow::ensure!(response["ok"] == true, "helper: {}", response["error"]);
@@ -346,9 +346,9 @@ impl Helper {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(self.endpoint.with_file_name("helper.log"))?;
         let mut command = Command::new(&self.python);
+        command.arg("-I").arg("-B");
+        super::python_ledger(&mut command);
         command
-            .arg("-I")
-            .arg("-B")
             .arg(self.installation.join("bootstrap.py"))
             .arg("proof_helper")
             .arg(&self.endpoint)
@@ -373,7 +373,7 @@ impl Helper {
                 Ok(())
             });
         }
-        *child = command.spawn()?;
+        *child = super::spawn_child(&mut command)?;
         self.restarts
             .store(count + 1, std::sync::atomic::Ordering::Release);
         // Readiness is retried by the bounded proof pump. No absence, process
@@ -384,18 +384,25 @@ impl Helper {
     /// A separate target writer takes root SH then target EX. Neither helper
     /// observers nor the N1 short lock wait on that writer's IPC/filesystem I/O.
     pub async fn journal(&self, value: Value) -> anyhow::Result<Value> {
-        let mut child = Command::new(&self.python)
-            .arg("-I")
-            .arg("-B")
-            .arg(self.installation.join("bootstrap.py"))
-            .arg("target_journal")
-            .env_clear()
-            .envs(&self.environment)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+        let mut command = Command::new(&self.python);
+        command.arg("-I").arg("-B");
+        super::python_ledger(&mut command);
+        #[cfg(feature = "nexus-test-support")]
+        if self.environment.contains_key("R2_BOOT_SOURCE_INPUT") {
+            command
+                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/r2_boot_writer.py"));
+        }
+        let mut child = super::spawn_child(
+            command
+                .arg(self.installation.join("bootstrap.py"))
+                .arg("target_journal")
+                .env_clear()
+                .envs(&self.environment)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true),
+        )?;
         let mut input = child
             .stdin
             .take()
@@ -620,27 +627,27 @@ mod tests {
             "accepted helper has not exited"
         );
         // A restarted observer independently honors the same durable tombstone.
-        let status = tokio::time::timeout(
-            Duration::from_secs(2),
-            Command::new(&config.python)
-                .arg("-I")
-                .arg("-B")
-                .arg(installation.join("bootstrap.py"))
-                .arg("proof_helper")
-                .arg(root.as_path().join("h"))
-                .arg(&helper.incarnation)
-                .arg("256")
-                .env_clear()
-                .envs(&config.environment)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .expect("bounded restart")
-        .expect("restart exact finished observer");
+        let mut restart = Command::new(&config.python);
+        restart.arg("-I").arg("-B");
+        crate::router::nexus_bridge::python_ledger(&mut restart);
+        restart
+            .arg(installation.join("bootstrap.py"))
+            .arg("proof_helper")
+            .arg(root.as_path().join("h"))
+            .arg(&helper.incarnation)
+            .arg("256")
+            .env_clear()
+            .envs(&config.environment)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = crate::router::nexus_bridge::spawn_child(&mut restart)
+            .expect("register and spawn exact finished observer");
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+            .await
+            .expect("bounded restart")
+            .expect("restart exact finished observer");
         assert!(
             status.status.success(),
             "{}",

@@ -265,11 +265,14 @@ outcome=handle.close_outcome(wait_for_database=True,timeout=10)
 assert outcome['owner_released'] is True,outcome
 print(json.dumps({'owner_released':outcome['owner_released'],'lease_released':outcome['lease_released']}))
 "#;
-            let output=tokio::time::timeout(Duration::from_secs(15),tokio::process::Command::new(envroot.join("venv/bin/python"))
-                .args(["-I","-B","-c",code,item["launch"]["target"].as_str().ok_or_else(||anyhow::anyhow!("launch target missing"))?,
+            let mut command=tokio::process::Command::new(envroot.join("venv/bin/python"));
+            command.args(["-I","-B","-c",code,item["launch"]["target"].as_str().ok_or_else(||anyhow::anyhow!("launch target missing"))?,
                     item["launch"]["suffix"].as_str().ok_or_else(||anyhow::anyhow!("launch suffix missing"))?])
                 .env("IDA_NEXUS_STATE_DIR",envroot.join("state"))
-                .kill_on_drop(true).output()).await??;
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            let child=ida_mcp::router::nexus_bridge::test_spawn_child(&mut command)?;
+            let output=tokio::time::timeout(Duration::from_secs(15),child.wait_with_output()).await??;
             std::fs::write(root.join("external-close.json"),&output.stdout)?;
             anyhow::ensure!(output.status.success(),"private late worker close failed: {}",String::from_utf8_lossy(&output.stderr));
             tokio::time::timeout(Duration::from_secs(8),async {

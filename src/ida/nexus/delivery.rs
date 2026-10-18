@@ -331,7 +331,10 @@ impl<C: Clock> NexusSessions<C> {
                     if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
                         // A subsequent real disconnect cannot be undone by a
                         // request-local NotSent callback.
-                        if session.phase != SessionPhase::Disconnected {
+                        if !matches!(
+                            session.phase,
+                            SessionPhase::Disconnected | SessionPhase::Released
+                        ) {
                             session.phase = previous.unwrap_or(SessionPhase::ReleaseRequired);
                         }
                         if matches!(attempt.target, DeliveryTarget::Shutdown { .. }) {

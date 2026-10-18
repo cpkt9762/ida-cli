@@ -30,33 +30,45 @@ from analysis_tools import ANALYSIS_METHODS
 from struct_tools import STRUCT_METHODS
 from query_tools import QUERY_METHODS
 from search_tools import SEARCH_METHODS
-from lifecycle import database_diagnostics, release_handle, release_errors, release_group
+from lifecycle import database_diagnostics, release_handle, release_errors, release_group, release_state
 from metadata import idb_context
 from open_recovery import open_checked
 from config import ida_cli_home, startup_paths
 from protocol import SDK_FILES, admission
 from lifetime import LifetimeListener
 from acquisition import Custodian
+from owner_release import FairReleases, ordinary_release
 from bridge_observer import BackupSources, INCARNATION as OBSERVER_INCARNATION
 
 GUARD_SOURCE = module_source('save_guard.py')
+OWNER_MODULES_SOURCE = module_source('owner_modules.py')
+OWNER_SOURCES = dict(zip(('_ida_cli_save_guard_v1', '_ida_cli_release_protocol_v1',
+    '_ida_cli_nexus_slices_v1'), (module_source(name) for name in
+    ('save_guard.py', 'lifecycle.py', 'slices.py'))))
 
 
 def guarded_source(code, context, refuse=True):
     """Install once per owner, then sample within the same native operation."""
     setup = ("import sys as _r9_sys, types as _r9_types\n"
+             "_r9_policy = {}\n"
+             f"exec({OWNER_MODULES_SOURCE!r}, _r9_policy)\n"
+             f"_r9_module_kind = _r9_policy['classify']({OWNER_SOURCES!r}, cleanup={not refuse!r})\n"
              "if '_ida_cli_save_guard_v1' not in _r9_sys.modules:\n"
              "    _r9_module = _r9_types.ModuleType('_ida_cli_save_guard_v1')\n"
              f"    exec({GUARD_SOURCE!r}, _r9_module.__dict__)\n"
              "    _r9_sys.modules['_ida_cli_save_guard_v1'] = _r9_module\n"
              "_r9_guard = _r9_sys.modules['_ida_cli_save_guard_v1']\n"
-             f"_r9_guard.begin({context!r}, refuse={refuse!r})\n")
+             "if _r9_module_kind == 'current':\n"
+             f"    _r9_guard.begin({context!r}, refuse={refuse!r})\n")
     finish = f"_r9_guard.finish({context!r}, refuse={refuse!r})"
     if refuse:
         # A separate compilation preserves module-level future imports in raw
         # execute_python code; a try-indented source would reject them.
         return setup + f"try:\n    exec(compile({code!r}, '<ida-cli owner>', 'exec'), globals())\nfinally:\n    " + finish
-    return setup + code + '\nresult = {"save_guard_error": ' + finish + '}\n'
+    current = code + '\nresult = {"save_guard_error": ' + finish + '}\n'
+    return (setup + "if _r9_module_kind == 'known_v1_cleanup_only':\n"
+            "    result = _r9_guard.close_status()\nelse:\n"
+            + '\n'.join('    '+line for line in current.splitlines()) + '\n')
 
 TOOL_METHODS = (*TOOL_METHODS, *TYPE_METHODS, *EDIT_METHODS, *ANALYSIS_METHODS, *STRUCT_METHODS, *QUERY_METHODS, *SEARCH_METHODS, "batch_rename")
 
@@ -215,9 +227,14 @@ class Bridge(LifetimeListener):
         self.initialized = threading.Event()
         self.stopped = threading.Event()
         self.business_pool = concurrent.futures.ThreadPoolExecutor(4, thread_name_prefix="nexus-business")
-        self.cancel_pool = concurrent.futures.ThreadPoolExecutor(4, thread_name_prefix="nexus-cancel")
+        self.cancel_pool = concurrent.futures.ThreadPoolExecutor(2, thread_name_prefix="nexus-cancel")
         self.release_pool = concurrent.futures.ThreadPoolExecutor(2, thread_name_prefix="nexus-release")
         self.proof_pool = concurrent.futures.ThreadPoolExecutor(2, thread_name_prefix="nexus-proof")
+        self.preflight_pool = concurrent.futures.ThreadPoolExecutor(2, thread_name_prefix="nexus-preflight")
+        self.detach_pool = concurrent.futures.ThreadPoolExecutor(2, thread_name_prefix="nexus-detach")
+        self.release_scheduler = FairReleases(self.preflight_pool)
+        self.cancel_scheduler = FairReleases(self.cancel_pool)
+        self.release_gate = threading.BoundedSemaphore(8)
         self.proof_gate = threading.BoundedSemaphore(2)
         self.business_gate = threading.BoundedSemaphore(capacity)
         self.control_gate = threading.BoundedSemaphore(8)
@@ -248,6 +265,42 @@ class Bridge(LifetimeListener):
 
     def receive(self, channel, message):
         self.initialized.wait()
+        if 'resource_retired' in message:
+            receipt = message['resource_retired']
+            evidence = receipt['evidence']
+            if (evidence.get('scope') != 'host_boot_change'
+                    or evidence.get('evidence_type') != 'verified_boot_change_resource_retirement'
+                    or evidence.get('lease') != receipt.get('lease')
+                    or evidence.get('watch') != receipt['watch']
+                    or evidence.get('acquisition') != receipt['acquisition']):
+                raise ValueError('ProtocolMismatch: boot resource projection')
+            lease = receipt.get('lease')
+            with self.lock:
+                if lease:
+                    custody = self.custodians.get(lease['lease_id'])
+                    if custody is not None:
+                        if custody.lease != lease or custody.acquisition != receipt['acquisition']:
+                            raise ValueError('ProtocolMismatch: retired physical resource')
+                        self.custodians.pop(lease['lease_id'])
+                    self.handles.pop(lease['lease_id'], None)
+                    self.metadata_contexts.pop(lease['lease_id'], None)
+            if lease:
+                self.drop_lifetime(lease['lease_id'])
+            self.backup_sources.retire(receipt['watch'])
+            with self.lock:
+                parent = receipt['acquisition']['parent']['operation_id']
+                custody = self.acquisitions.get(parent)
+                if custody is not None and custody.acquisition == receipt['acquisition']:
+                    from target_coordination import digest
+                    if evidence.get('owner'):
+                        custody.originals.pop(digest(evidence['owner']), None)
+                    custody.observations.pop(receipt['watch'], None)
+                    for suffix, launch in list(custody.launches.items()):
+                        if launch['watch'] == receipt['watch']:
+                            custody.launches.pop(suffix)
+                    if not custody.running and not custody.originals and not custody.launches:
+                        self.acquisitions.pop(parent)
+            return
         if 'owner_backup_query' in message:
             self.backup_sources.query(message['owner_backup_query'])
             return
@@ -258,11 +311,21 @@ class Bridge(LifetimeListener):
             if proof['owner'] != owner or proof['evidence_type'] != 'public_owner_lifetime':
                 raise ValueError('ProtocolMismatch: owner proof custody')
             closed = self.backup_sources.close(receipt)
+            with self.lock:
+                for custody in self.acquisitions.values():
+                    observation = custody.observations.get(receipt['watch'])
+                    if observation is not None:
+                        if (observation['owner'] != owner
+                                or proof['acquisition'] != custody.acquisition):
+                            raise ValueError('ProtocolMismatch: closed acquisition observation')
+                        observation['proof'] = receipt['proof']
             self.control.send({'event':'owner_proof_ack', 'owner':owner, 'watch':receipt['watch'],
                                'sha256':receipt['proof']['sha256'], 'consumer':closed})
             return
         if 'custody_retired' in message:
             receipt = message['custody_retired']
+            if receipt.get('resource_retirement'):
+                self.receive(channel, {'resource_retired':dict(receipt, evidence=receipt['resource_retirement'])})
             with self.lock:
                 lease = receipt.get('lease')
                 custody = self.custodians.get(lease['lease_id']) if lease else None
@@ -327,13 +390,22 @@ class Bridge(LifetimeListener):
         control = command in {"cancel", "release", "shutdown"}
         if (channel is self.control) != control:
             raise ValueError("wrong physical lane")
-        gate = self.control_gate if control else self.business_gate
+        gate = self.release_gate if command == "release" else self.control_gate if control else self.business_gate
         if not gate.acquire(blocking=False):
             channel.send({"event": "not_sent", "attempt": frame["attempt"],
                           "error": error("busy", "bridge lane capacity exhausted")})
             return
         pool = self.cancel_pool if command == "cancel" else self.release_pool if control else self.business_pool
-        pool.submit(self.run, channel, frame, gate)
+        if command == 'release':
+            lease = frame['payload']['lease']
+            self.release_scheduler.submit((lease['instance_id'], lease['generation']),
+                lambda:self.run(channel, frame, gate))
+        elif command == 'cancel':
+            lease = frame['payload']['identity']['lease']
+            self.cancel_scheduler.submit((lease['instance_id'], lease['generation']),
+                lambda:self.run(channel, frame, gate))
+        else:
+            pool.submit(self.run, channel, frame, gate)
 
     def run(self, channel, frame, gate):
         attempt = frame["attempt"]
@@ -392,6 +464,10 @@ class Bridge(LifetimeListener):
                 participants = ([primary[1]] if primary else []) + ([auxiliary] if auxiliary else [])
                 messages = dict.fromkeys(message for member in participants for message in release_errors(member))
                 details['save_guard_error'] = '; '.join(messages) or None
+                if participants and not any(release_state(member)['requested'] for member in participants):
+                    channel.send({'event':'not_sent', 'attempt':attempt,
+                        'error':error('operation_failed', f'{type(exc).__name__}: {exc}'), **details})
+                    return
             if isinstance(exc, RemoteError):
                 channel.send({"event": "remote_error", "attempt": attempt, "remote_code": exc.code,
                               "error": error("operation_failed", str(exc)), **details})
@@ -649,6 +725,15 @@ class Bridge(LifetimeListener):
                 dict(self.metadata_contexts.get(lease['lease_id'], {}), method='close',
                      operation_id=command.get('identity', {}).get('operation_id',
                          'release:' + str(attempt['sequence'])), lease=lease), refuse=False)
+            if release_custodian is not None:
+                # Use the existing versioned owner code, then a fresh close_status
+                # in this same exact N1 operation. No owner-exit wait is involved.
+                cleanup_code += ("\nresult = _r9_guard.close_status()\n")
+                ordinary_release(self, channel, attempt, lease, handle, release_custodian,
+                                 deadline, cleanup_code)
+                return
+            # Legacy auxiliary/verification compatibility remains independently
+            # tracked until R3b migrates those physical members.
             cleanup_handle = self.cleanup_handles.get(lease['lease_id'])
             def check_primary():
                 nonlocal cleanup_handle
@@ -870,7 +955,7 @@ class Bridge(LifetimeListener):
                 print(f"verification cleanup unconfirmed; staging retained: {path}: {type(exc).__name__}", file=sys.stderr)
         for channel in (self.business, self.control):
             channel.socket.close()
-        for pool in (self.business_pool, self.cancel_pool, self.release_pool, self.proof_pool):
+        for pool in (self.business_pool, self.cancel_pool, self.release_pool, self.proof_pool, self.preflight_pool, self.detach_pool):
             pool.shutdown(wait=False, cancel_futures=True)
 
 

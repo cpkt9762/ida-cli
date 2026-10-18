@@ -52,10 +52,32 @@ pub(super) struct Custody {
 }
 
 impl<C: Clock> NexusSessions<C> {
+    /// The adapter has durably verified every prior owner proof and typed
+    /// absence of a lease. Consume the separate allowance before calling SDK.
+    pub fn consume_post_exit_resolve(&mut self, parent: &OpenIdentity) -> Result<(), NexusError> {
+        self.open_send_eligible(parent)?;
+        let opening = self.openings.get_mut(&parent.operation_id).ok_or_else(|| {
+            NexusError::new(NexusErrorCode::InvalidIdentity, "post-exit parent missing")
+        })?;
+        if opening.post_exit_resolve_used {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "post-exit resolver allowance already consumed; never replay",
+            ));
+        }
+        opening.post_exit_resolve_used = true;
+        Ok(())
+    }
     /// Called only after the adapter validates and durably adopts a matching
     /// public owner lifetime proof. ACK/delivery and original results stay intact.
     pub fn public_owner_lifetime(&mut self, lease: &SessionLease) -> Result<(), NexusError> {
         self.authorize(&lease.client_id, lease)?;
+        if self.resource_retirements.contains_key(&lease.lease_id) {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "old boot resource retired; historical lifetime result cannot change",
+            ));
+        }
         let operations: Vec<_> = self
             .operations
             .values()

@@ -49,6 +49,14 @@ impl Drop for Temporary {
 
 const SOURCES: &[(&str, &[u8])] = &[
     (
+        "owner_modules.py",
+        include_bytes!("../../../nexus_bridge/owner_modules.py"),
+    ),
+    (
+        "owner_release.py",
+        include_bytes!("../../../nexus_bridge/owner_release.py"),
+    ),
+    (
         "acquisition.py",
         include_bytes!("../../../nexus_bridge/custody/acquisition.py"),
     ),

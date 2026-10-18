@@ -113,6 +113,9 @@ impl<C: Clock> NexusSessions<C> {
             op.snapshot.identity.lease.instance_id == lease.instance_id
                 && op.snapshot.identity.lease.generation == lease.generation
                 && !op.snapshot.execution_stopped
+                && !self
+                    .resource_retirements
+                    .contains_key(&op.snapshot.identity.lease.lease_id)
         })
     }
 

@@ -385,7 +385,9 @@ finally:
                 command.args(["-I", "-B", "-c", script]).arg(&root)
                     .env("IDA_NEXUS_STATE_DIR", root.join("state"))
                     .env("HOME", root.join("home")).kill_on_drop(true);
-                let output = tokio::time::timeout(Duration::from_secs(5), command.output()).await??;
+                command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+                let child=ida_mcp::router::nexus_bridge::test_spawn_child(&mut command)?;
+                let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await??;
                 std::fs::write(root.join("second-opener.json"), &output.stdout)?;
                 anyhow::ensure!(output.status.success(), "second opener failed: {}", String::from_utf8_lossy(&output.stderr));
                 let fault = bridge.test_helper_fault(false).await?;

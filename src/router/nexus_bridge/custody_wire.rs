@@ -14,6 +14,7 @@ pub(super) struct Resource {
     pub consumer: Option<Value>,
     pub bridge_proof_ack: bool,
     pub backup: Option<Value>,
+    pub origin_binding: Value,
 }
 
 pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result<Value> {
@@ -33,6 +34,126 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
         .ok_or_else(|| anyhow::anyhow!("mandatory proof helper unavailable"))?;
     let mut response = json!({"custody_reply":nonce,"ok":true});
     match action {
+        "post_exit_resolve" => {
+            let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
+            let watches = event["watches"]
+                .as_array()
+                .filter(|w| !w.is_empty() && w.len() <= 2)
+                .ok_or_else(|| anyhow::anyhow!("post-exit watches missing"))?;
+            let attempts = event["attempts"]
+                .as_array()
+                .filter(|a| !a.is_empty() && a.len() <= 2)
+                .ok_or_else(|| anyhow::anyhow!("post-exit attach attempts missing"))?;
+            let mut owners = Vec::new();
+            for watch in watches {
+                let status = helper.call(json!({"kind":"lookup", "watch":watch})).await?;
+                anyhow::ensure!(
+                    status["state_root"] == helper.state_root,
+                    "post-exit root mismatch"
+                );
+                let cached = state
+                    .startup_proofs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(
+                        watch
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("post-exit watch type"))?,
+                    )
+                    .cloned();
+                let item = if status["item"].is_null() {
+                    cached.unwrap_or(Value::Null)
+                } else {
+                    status["item"].clone()
+                };
+                if item["proof"].is_null() {
+                    response["ready"] = json!(false);
+                    return Ok(response);
+                }
+                anyhow::ensure!(
+                    status["state_root"] == helper.state_root
+                        && item["acquisition"] == event["acquisition"]
+                        && item["proof"]["record"]["evidence_type"] == "public_owner_lifetime",
+                    "post-exit exact durable public proof missing"
+                );
+                anyhow::ensure!(
+                    item["attach_attempts"]
+                        .as_object()
+                        .is_some_and(|a| !a.is_empty()
+                            && a.values()
+                                .all(|v| v["state"] == "not_sent" || v["state"] == "lease_absent")),
+                    "post-exit unknown or acquired attach cannot be replayed"
+                );
+                if !status["item"].is_null() {
+                    helper
+                        .journal(json!({"action":"proof", "target":item["target"],
+                        "coord_key":item["coord_key"],"watch":watch,"proof":item["proof"]}))
+                        .await?;
+                }
+                owners.push(item["owner"].clone());
+            }
+            anyhow::ensure!(
+                attempts.iter().all(|a| owners.contains(&a["owner"])
+                    && (a["failure_kind"] == "not_sent" || a["failure_kind"] == "lease_absent")),
+                "post-exit attempt owner mismatch"
+            );
+            state
+                .endpoint
+                .transition(|s, _| s.consume_post_exit_resolve(&acquisition.parent))?;
+            response["ready"] = json!(true);
+        }
+        "release_observation" => {
+            let lease: SessionLease = decode(event["lease"].clone())?;
+            let attempt: DeliveryAttempt = decode(event["attempt"].clone())?;
+            anyhow::ensure!(
+                attempt.target
+                    == DeliveryTarget::Release {
+                        lease: lease.clone()
+                    },
+                "release observation target mismatch"
+            );
+            state
+                .endpoint
+                .transition(|s, _| s.delivery_status(&lease.client_id, &attempt))?;
+            let resource = state
+                .custody_resources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&lease.lease_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("release observation has no custody"))?;
+            anyhow::ensure!(
+                resource.lease == lease
+                    && resource.owner == event["owner"]
+                    && resource.watch == event["watch"]
+                    && serde_json::to_value(&resource.acquisition)? == event["acquisition"],
+                "release observation physical identity mismatch"
+            );
+            helper
+                .journal(json!({"action":action, "target":resource.target,
+                "coord_key":resource.coord_key,"lease":lease,"watch":resource.watch,
+                "epoch":resource.receipt["record"]["subscription_epoch"],"owner":resource.owner,
+                "attempt":attempt,"observation_id":nonce,"outcome":event["outcome"]}))
+                .await?;
+            if let Some(message) = event["outcome"]["save_guard_error"].as_str() {
+                state
+                    .release_errors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(lease.lease_id.clone(), (lease.clone(), message.into()));
+            }
+            let mut facts = state
+                .release_facts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = facts.entry(lease.lease_id.clone()).or_insert_with(|| {
+                (
+                    lease,
+                    json!({"owner":resource.owner,"watch":resource.watch}),
+                )
+            });
+            entry.1["preflight"] = event["outcome"].clone();
+        }
         "no_attach" => {
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
             let watch = event["watch"]
@@ -56,7 +177,8 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                     "no-attach helper closure missing"
                 );
                 helper.journal(json!({"action":"no_attach","watch":watch,"target":event["target"],
-                    "coord_key":event["coord_key"],"consumer":event["consumer"],"bridge_consumer":event["bridge_consumer"]})).await?;
+                    "coord_key":event["coord_key"],"consumer":event["consumer"],"bridge_consumer":event["bridge_consumer"],
+                    "custody_accepted":true})).await?;
                 helper
                     .call(
                         json!({"kind":"retire","watch":watch,"sha256":event["consumer"]["sha256"]}),
@@ -129,7 +251,7 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                 *expected == event["receipt"],
                 "startup durable receipt mismatch"
             );
-            helper.journal(json!({"action":if action == "observe" {"verify_observe"} else {"verify_launch"}, "target":event["target"],
+            let verified = helper.journal(json!({"action":if action == "observe" {"verify_observe"} else {"verify_launch"}, "target":event["target"],
                 "coord_key":event["coord_key"], "watch":watch,"receipt":event["receipt"],
                 "launch":event["launch"],"owner":event["owner"],"acquisition":event["acquisition"]})).await?;
             let mut startups = state.startups.lock().unwrap_or_else(|e| e.into_inner());
@@ -146,7 +268,13 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                     "startup/observation capacity full or unreserved spawn"
                 );
             }
-            startups.insert(watch.into(), event.clone());
+            let mut retained = event.clone();
+            retained["origin_binding"] = verified["origin_binding"].clone();
+            let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
+            state.endpoint.transition(|s, _| {
+                s.bind_startup_origin(&acquisition, watch, verified["origin_binding"].clone())
+            })?;
+            startups.insert(watch.into(), retained);
         }
         "acquired" => {
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
@@ -176,7 +304,7 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
             );
             let mut verify = event.clone();
             verify["action"] = json!("verify_adopt");
-            helper.journal(verify).await?;
+            let verified = helper.journal(verify).await?;
             {
                 let _ordered = state.callbacks.lock().unwrap_or_else(|e| e.into_inner());
                 let mut resources = state
@@ -191,6 +319,9 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                 let decision = state
                     .endpoint
                     .transition(|s, _| s.acquired(&acquisition, lease.clone(), true))?;
+                state.endpoint.transition(|s, _| {
+                    s.bind_resource_origin(&lease, verified["origin_binding"].clone())
+                })?;
                 let resource = Resource {
                     acquisition,
                     lease: lease.clone(),
@@ -203,6 +334,7 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                     consumer: None,
                     bridge_proof_ack: false,
                     backup: None,
+                    origin_binding: verified["origin_binding"].clone(),
                 };
                 if let Some(old) = resources.get(&lease.lease_id) {
                     anyhow::ensure!(
@@ -389,13 +521,53 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
     Ok(response)
 }
 
+/// Record the parsed ACK without an additional bridge round trip. Persistence
+/// failure is a separate local cleanup error, never a reversal of this ACK.
+pub(super) async fn detach_fact(event: &Value, state: &Arc<State>) -> anyhow::Result<()> {
+    let attempt: DeliveryAttempt = decode(event["attempt"].clone())?;
+    let DeliveryTarget::Release { lease } = &attempt.target else {
+        anyhow::bail!("detach target mismatch");
+    };
+    state
+        .endpoint
+        .transition(|s, _| s.delivery_status(&lease.client_id, &attempt))?;
+    let resource = state
+        .custody_resources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&lease.lease_id)
+        .cloned();
+    let Some(resource) = resource else {
+        // Public proof can durably settle and compact before the original ACK.
+        // N1 still validates that ACK's exact delivery; do not recreate a watch.
+        return Ok(());
+    };
+    let ordinary = state
+        .release_facts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&lease.lease_id)
+        .is_some_and(|(exact, v)| *exact == *lease && !v["preflight"].is_null());
+    if !ordinary {
+        return Ok(());
+    } // Existing auxiliary/R3b compatibility.
+    let helper = state
+        .helper
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("mandatory helper missing"))?;
+    helper.journal(json!({"action":"detach_outcome","target":resource.target,"coord_key":resource.coord_key,
+        "watch":resource.watch,"epoch":resource.receipt["record"]["subscription_epoch"],
+        "lease":lease,"owner":resource.owner,"attempt":attempt,"outcome":event["outcome"]})).await?;
+    Ok(())
+}
+
 /// Independent of command pending and bridge health. A public proof is first
 /// committed by the target writer, then consumed by N1, then acknowledged.
 pub(super) async fn proofs(state: &Arc<State>, writer: &Writer) -> anyhow::Result<()> {
     let Some(helper) = &state.helper else {
         return Ok(());
     };
-    helper
+    let heartbeat = helper
         .call(json!({"kind":"heartbeat", "summary_only":true}))
         .await?;
     let resources: Vec<_> = state
@@ -417,12 +589,29 @@ pub(super) async fn proofs(state: &Arc<State>, writer: &Writer) -> anyhow::Resul
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("observation watch missing"))?
             .to_owned();
-        let result = observe_launch(state, writer, helper, &resources, launch).await;
+        let has_successor = resources.iter().any(|r| {
+            r.watch == watch
+                || (!launch["launch"].is_null() && json!(r.acquisition) == launch["acquisition"])
+        });
+        let old_boot = &launch["origin_binding"]["creator"]["boot_id"];
+        let result = if !has_successor
+            && !old_boot.is_null()
+            && *old_boot != heartbeat["identity"]["boot_id"]
+        {
+            retire_startup(state, writer, helper, launch).await
+        } else {
+            observe_launch(state, writer, helper, &resources, launch).await
+        };
         observation_result(state, &watch, result);
     }
     for resource in resources {
         let watch = resource.watch.clone();
-        let result = observe_resource(state, writer, helper, resource).await;
+        let old_boot = &resource.origin_binding["creator"]["boot_id"];
+        let result = if !old_boot.is_null() && *old_boot != heartbeat["identity"]["boot_id"] {
+            retire_resource(state, writer, helper, resource).await
+        } else {
+            observe_resource(state, writer, helper, resource).await
+        };
         observation_result(state, &watch, result);
     }
     let retirements: Vec<_> = state
@@ -435,6 +624,200 @@ pub(super) async fn proofs(state: &Arc<State>, writer: &Writer) -> anyhow::Resul
     if !state.failed.load(std::sync::atomic::Ordering::Acquire) {
         for receipt in retirements {
             send(writer, &json!({"custody_retired":receipt})).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn retire_resource(
+    state: &Arc<State>,
+    writer: &Writer,
+    helper: &helper::Helper,
+    resource: Resource,
+) -> anyhow::Result<()> {
+    let result = helper
+        .journal(json!({"action":"retire_old_boot","target":resource.target,
+        "coord_key":resource.coord_key}))
+        .await?;
+    let evidence = result["retirements"]
+        .as_array()
+        .and_then(|a| {
+            a.iter().find(|v| {
+                v["watch"] == resource.watch
+                    && v["owner"] == resource.owner
+                    && v["lease"] == json!(resource.lease)
+                    && v["acquisition"] == json!(resource.acquisition)
+                    && v["binding"] == resource.origin_binding
+                    && v["coord_key"] == resource.coord_key
+            })
+        })
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("exact durable boot resource retirement missing"))?;
+    state
+        .endpoint
+        .transition(|s, _| s.retire_boot_resource(&resource.lease, evidence.clone()))?;
+    helper
+        .call(json!({"kind":"resource_retired","watch":resource.watch,"evidence":evidence}))
+        .await?;
+    {
+        let mut facts = state
+            .release_facts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = facts
+            .entry(resource.lease.lease_id.clone())
+            .or_insert_with(|| {
+                (
+                    resource.lease.clone(),
+                    json!({"owner":resource.owner,"watch":resource.watch}),
+                )
+            });
+        anyhow::ensure!(
+            entry.0 == resource.lease,
+            "resource retirement lease changed"
+        );
+        entry.1["resource_retirement"] = evidence.clone();
+    }
+    state
+        .custody_resources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&resource.lease.lease_id);
+    state
+        .startups
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&resource.watch);
+    helper
+        .call(json!({"kind":"retire_parent","parent":resource.acquisition.parent}))
+        .await?;
+    state
+        .leases
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&resource.lease.lease_id);
+    state
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, p| match &p.attempt.target {
+            DeliveryTarget::Release { lease } => lease != &resource.lease,
+            DeliveryTarget::Execute { identity }
+            | DeliveryTarget::Cancel { identity, .. }
+            | DeliveryTarget::Shutdown { identity } => identity.lease != resource.lease,
+            DeliveryTarget::Open { .. } => true,
+        });
+    state
+        .custody_retirements
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            resource.watch.clone(),
+            json!({"lease":resource.lease,"watch":resource.watch,"acquisition":resource.acquisition,
+            "resource_retirement":evidence}),
+        );
+    send(
+        writer,
+        &json!({"custody_retired":{"lease":resource.lease,"watch":resource.watch,
+        "acquisition":resource.acquisition,"resource_retirement":evidence}}),
+    )
+    .await?;
+    state.emit(json!({"event":"resource_retired","lease":resource.lease,"evidence":evidence}));
+    Ok(())
+}
+
+async fn retire_startup(
+    state: &Arc<State>,
+    _writer: &Writer,
+    helper: &helper::Helper,
+    launch: Value,
+) -> anyhow::Result<()> {
+    let watch = launch["watch"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("startup watch missing"))?;
+    let acquisition: AcquisitionId = decode(launch["acquisition"].clone())?;
+    let result = helper
+        .journal(json!({"action":"retire_old_boot","target":launch["target"],
+        "coord_key":launch["coord_key"]}))
+        .await?;
+    let evidence = result["retirements"]
+        .as_array()
+        .and_then(|a| {
+            a.iter().find(|v| {
+                v["watch"] == watch
+                    && v["acquisition"] == launch["acquisition"]
+                    && v["lease"].is_null()
+                    && v["owner"] == launch["owner"]
+                    && v["launch"] == launch["launch"]
+                    && v["binding"] == launch["origin_binding"]
+                    && v["coord_key"] == launch["coord_key"]
+            })
+        })
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("exact durable startup retirement missing"))?;
+    state
+        .endpoint
+        .transition(|s, _| s.retire_boot_startup(&acquisition, watch, evidence.clone()))?;
+    helper
+        .call(json!({"kind":"resource_retired","watch":watch,"evidence":evidence}))
+        .await?;
+    state
+        .startups
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(watch);
+    state
+        .retired_open_resources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(acquisition.parent.operation_id.clone());
+    helper
+        .call(json!({"kind":"retire_parent","parent":acquisition.parent}))
+        .await?;
+    state.custody_retirements.lock().unwrap_or_else(|e|e.into_inner()).insert(watch.into(),
+        json!({"lease":null,"watch":watch,"acquisition":acquisition,"resource_retirement":evidence}));
+    state.emit(json!({"event":"startup_resource_retired","acquisition":acquisition,"watch":watch,"evidence":evidence}));
+    Ok(())
+}
+
+#[cfg(feature = "nexus-test-support")]
+pub(super) async fn test_boot_resource_projection(
+    state: &Arc<State>,
+    writer: &Writer,
+) -> anyhow::Result<()> {
+    let helper = state
+        .helper
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("helper missing"))?;
+    let resources: Vec<_> = state
+        .custody_resources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    let startups: Vec<_> = state
+        .startups
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    for resource in &resources {
+        retire_resource(state, writer, helper, resource.clone()).await?;
+    }
+    for startup in startups {
+        if !resources.iter().any(|r| {
+            r.watch == startup["watch"].as_str().unwrap_or("")
+                || (!startup["launch"].is_null() && json!(r.acquisition) == startup["acquisition"])
+        }) {
+            retire_startup(state, writer, helper, startup).await?;
+        } else if let Some(watch) = startup["watch"].as_str() {
+            state
+                .startups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(watch);
         }
     }
     Ok(())
@@ -550,13 +933,27 @@ async fn observe_resource(
                 && item["acquisition"] == serde_json::to_value(&resource.acquisition)?,
             "proof physical owner binding mismatch"
         );
-        helper
+        let selected = helper
             .journal(
                 json!({"action":"proof", "target":resource.target,"coord_key":resource.coord_key,
                 "watch":resource.watch,"proof":proof}),
             )
             .await?;
+        let selected = helper
+            .call(json!({"kind":"adopt_public_proof","watch":resource.watch,
+            "proof":selected["proof"]}))
+            .await?;
+        let proof = &selected["proof"];
+        anyhow::ensure!(proof.is_object(), "canonical public proof missing");
         resource.proof = Some(proof.clone());
+        state
+            .owner_proofs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                resource.lease.lease_id.clone(),
+                (resource.lease.clone(), proof.clone()),
+            );
         state
             .endpoint
             .transition(|s, _| s.public_owner_lifetime(&resource.lease))?;
@@ -684,12 +1081,25 @@ async fn startup_proof(
             helper.journal(json!({"action":"startup_owner","target":launch["target"],"coord_key":launch["coord_key"],
                 "watch":watch,"receipt":item["owner_receipt"]})).await?;
         }
-        helper
+        let selected = helper
             .journal(
                 json!({"action":"proof","target":launch["target"],"coord_key":launch["coord_key"],
             "watch":watch,"proof":proof}),
             )
             .await?;
+        let selected = helper
+            .call(json!({"kind":"adopt_public_proof","watch":watch,
+            "proof":selected["proof"]}))
+            .await?;
+        let proof = selected["proof"].clone();
+        anyhow::ensure!(proof.is_object(), "canonical startup proof missing");
+        let mut durable_item = item.clone();
+        durable_item["proof"] = proof.clone();
+        state
+            .startup_proofs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(watch.clone(), durable_item);
         launch["proof"] = proof.clone();
         launch["owner"] = item["owner"].clone();
         state

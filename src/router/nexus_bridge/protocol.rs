@@ -3,11 +3,11 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const CLIENT_HASH: &str = "e9d57e725b4c0405faf959422720451215a9f7b2bd8f98bf0ad2377383b399ce";
+pub const CLIENT_HASH: &str = "dd9daf669b6dc55f657dd11b60f9869dcca70cf278cc65bc1d91b4e02b199acd";
 pub const CLIENT_MODULES: [(&str, &str); 3] = [
     (
         "handle.py",
-        "e9d57e725b4c0405faf959422720451215a9f7b2bd8f98bf0ad2377383b399ce",
+        "dd9daf669b6dc55f657dd11b60f9869dcca70cf278cc65bc1d91b4e02b199acd",
     ),
     (
         "_resolver.py",
@@ -41,16 +41,16 @@ impl Protocol {
         Self {
             wire: 2,
             schema: 1,
-            release: 1,
+            release: 2,
             open: 1,
             owner_observation: 1,
-            custody: 1,
-            helper: 1,
+            custody: 2,
+            helper: 2,
             target_gate: 1,
             same_boot_exit: 0,
-            boot_retirement: 0,
+            boot_retirement: 1,
             client_hash: CLIENT_HASH.into(),
-            sdk_boundary: 1,
+            sdk_boundary: 2,
             client_modules: CLIENT_MODULES
                 .into_iter()
                 .map(|(name, hash)| (name.into(), hash.into()))
@@ -66,7 +66,9 @@ impl Protocol {
                 "lifetime_handshake_v1",
                 "receiver_isolation_v1",
                 "release_observation_v1",
+                "single_resolution_outcome_v1",
                 "target_gate_base_v1",
+                "two_phase_release_v1",
             ]
             .into_iter()
             .map(String::from)

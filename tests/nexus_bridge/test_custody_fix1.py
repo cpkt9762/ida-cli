@@ -99,14 +99,14 @@ class CustodyFix1(unittest.TestCase):
     def subscribe(self, observer, boundary, watch='watch'):
         acquisition = {'parent':{'operation_id':'parent'}, 'purpose':'final', 'ordinal':1}
         owner = owner_key(boundary.instance)
-        observer.receive(dict(kind='reserve_parent', protocol=1, helper=observer.incarnation,
+        observer.receive(dict(kind='reserve_parent', protocol=2, helper=observer.incarnation,
                               parent=acquisition['parent']))
         with Target(boundary.path) as target:
             with target.locked():
                 epoch = Journal(target).begin(acquisition, watch, owner=owner)
                 value = dict(watch=watch, target=str(boundary.path), coord_key=target.key,
                              acquisition=acquisition, owner=owner, subscription_epoch=epoch)
-                receipt = observer.receive(dict(value, kind='subscribe', protocol=1,
+                receipt = observer.receive(dict(value, kind='subscribe', protocol=2,
                                                 helper=observer.incarnation))['receipt']
                 Journal(target).owner_signed(receipt)
         return value
@@ -200,14 +200,14 @@ class CustodyFix1(unittest.TestCase):
             acquisition = {'parent':'startup', 'purpose':'final', 'ordinal':1}
             launch = {'suffix':boundary.instance.record_id.rsplit('-',1)[1],
                       'source':str(boundary.path), 'target':str(boundary.path), 'backend':'idalib'}
-            observer.receive(dict(kind='reserve_parent', protocol=1, helper=observer.incarnation, parent='startup'))
+            observer.receive(dict(kind='reserve_parent', protocol=2, helper=observer.incarnation, parent='startup'))
             with Target(boundary.path) as target:
                 with target.locked():
                     journal = Journal(target)
                     epoch = journal.begin(acquisition, 'startup', launch=launch)
                     value = dict(watch='startup', subscription_epoch=epoch, target=str(boundary.path),
                                  coord_key=target.key, acquisition=acquisition, launch=launch)
-                    receipt = observer.receive(dict(value, kind='launch_intent', protocol=1,
+                    receipt = observer.receive(dict(value, kind='launch_intent', protocol=2,
                                                     helper=observer.incarnation))['receipt']
                     journal.launch_signed(receipt)
             observer.discover_startups()
@@ -232,6 +232,60 @@ class CustodyFix1(unittest.TestCase):
                     journal.recover_public_proofs()
                     self.assertEqual(journal.value['entries'][str(epoch)]['owner'], item['owner'])
                     self.assertFalse(journal.value['entries'][str(epoch)]['producer_closed'])
+                    # Discovery can win the race with final lease custody.
+                    # Transfer must use the immutable launch, not its cleared
+                    # pending-launch field, and retain the exact successor.
+                    successor_epoch = journal.begin(acquisition, 'final', owner=item['owner'])
+                    successor_value = dict(value, watch='final', subscription_epoch=successor_epoch,
+                                           owner=item['owner'])
+                    successor_value.pop('launch')
+                    successor_receipt = observer.receive(dict(successor_value, kind='subscribe',
+                        protocol=2, helper=observer.incarnation))['receipt']
+                    journal.owner_signed(successor_receipt)
+                    journal.adopt(dict(watch='final', receipt=successor_receipt,
+                        owner=item['owner'], acquisition=acquisition, lease={'lease_id':'exact-final'}))
+                    transferred = observer.receive(dict(kind='startup_transfer', protocol=2,
+                        helper=observer.incarnation, watch='startup', successor='final'))['consumer']
+                    journal.startup_transfer(dict(watch='startup', successor='final', consumer=transferred))
+                    old = journal.value['entries'][str(epoch)]
+                    self.assertEqual(old['launch_identity'], launch)
+                    self.assertEqual(old['transferred_to'], successor_epoch)
+                    self.assertTrue(old['producer_closed'] and old['consumer_closed'])
+
+    def test_two_authorized_public_sources_keep_first_durable_proof_and_both_facts(self):
+        with Boundary(self.root/'two-public-sources', stub_ida=False) as boundary:
+            observer = self.observer('two-source-helper')
+            value = self.subscribe(observer, boundary)
+            bridge = SimpleNamespace(lock=threading.RLock(), acquisitions={},
+                                     control=SimpleNamespace(send=lambda _:None))
+            backup = BackupSources(bridge, 8)
+            backup.subscribe(boundary.instance, value['owner'], value['watch'])
+            binding = backup.bind(value)
+            with Target(boundary.path) as target:
+                with target.locked():
+                    Journal(target).bridge_signed(binding)
+            boundary.release_owner()
+            until(lambda: observer.items['watch'].get('proof'))
+            helper_proof = observer.items['watch']['proof']
+            bridge_proof = until(lambda: backup.query(value))
+            with Target(boundary.path) as target:
+                with target.locked():
+                    journal = Journal(target)
+                    first = journal.proof(dict(watch='watch', proof=bridge_proof))['proof']
+                    second = journal.proof(dict(watch='watch', proof=helper_proof))['proof']
+                    self.assertEqual(first, bridge_proof)
+                    self.assertEqual(second, first)
+                    self.assertTrue(all(any(f['sha256'] == proof['sha256'] for f in
+                        journal.value['entries']['1']['facts']) for proof in (bridge_proof, helper_proof)))
+            selected = observer.receive(dict(kind='adopt_public_proof', protocol=2,
+                helper=observer.incarnation, watch='watch', proof=first))['proof']
+            self.assertEqual(selected, first)
+            self.assertEqual(observer.items['watch']['proof'], helper_proof)
+            closed = observer.receive(dict(kind='proof_custody_ack', protocol=2,
+                helper=observer.incarnation, watch='watch', path=first['path'], sha256=first['sha256']))['consumer']
+            self.assertEqual(closed['record']['proof'], first)
+            self.assertIn(helper_proof, closed['record']['previous_facts'])
+            backup.retire('watch')
 
     def test_refused_admissions_have_no_unwatched_backup_and_healthy_target_still_fits(self):
         observer = self.observer('admission-helper')
@@ -249,9 +303,9 @@ class CustodyFix1(unittest.TestCase):
                 if value['kind'] == 'subscribe' and fault in ('helper-reject', 'helper-ack-loss') and not injected[0]:
                     injected[0] = True
                     if fault == 'helper-ack-loss':
-                        observer.receive(dict(value, protocol=1, helper=observer.incarnation))
+                        observer.receive(dict(value, protocol=2, helper=observer.incarnation))
                     raise RuntimeError('private subscribe boundary fault')
-                return observer.receive(dict(value, protocol=1, helper=observer.incarnation))
+                return observer.receive(dict(value, protocol=2, helper=observer.incarnation))
             def transact(self, action, **fields):
                 messages.append(dict(action=action, **fields))
                 return {}
@@ -284,7 +338,7 @@ class CustodyFix1(unittest.TestCase):
                         for watch in list(custody.observations):
                             item = observer.items[watch]
                             observer.receive(dict(kind='retire', watch=watch, sha256=item['consumer']['sha256'],
-                                                  protocol=1, helper=observer.incarnation))
+                                                  protocol=2, helper=observer.incarnation))
                             bridge.backup_sources.retire(watch)
                         Journal(custody.target).settle() if custody.target.target_fd is not None else None
                 except (RuntimeError, OSError) as exc:

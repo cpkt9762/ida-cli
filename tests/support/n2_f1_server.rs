@@ -1,4 +1,5 @@
 use super::*;
+use crate::preprocess::SpawnRecorded as _;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -21,7 +22,7 @@ async fn isolated_c1(name: &str, work: impl std::future::Future<Output = ()>) {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
+            .spawn_recorded()
             .unwrap();
         crate::preprocess::record_owned_fixture(child.id().unwrap(), false, "f5-isolated-libtest");
         let output = child.wait_with_output().await.unwrap();

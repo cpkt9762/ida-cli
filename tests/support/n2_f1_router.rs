@@ -1,4 +1,5 @@
 use super::*;
+use crate::preprocess::SpawnRecorded as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // Startup includes process scheduling and Python initialization. Response budgets
@@ -260,7 +261,7 @@ async fn sbpf_post_open_queries_and_rename_share_preparation_cancellation() {
         let child = Command::new("/usr/bin/true")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .spawn()
+            .spawn_recorded()
             .unwrap();
         crate::preprocess::record_owned_fixture(child.id().unwrap(), false, "router-sbpf-probe");
         router.inner.lock().await.workers.insert(
@@ -374,12 +375,15 @@ async fn f3_corrupt_index_preserves_successful_open_and_original_bytes() {
             let corrupt = b"{ diagnostic: invalid index JSON }\n";
             std::fs::write(&index, corrupt).unwrap();
             let output = directory.join("output.i64");
+            // This assertion is about ordinary index failure, not a three-second
+            // cold process startup guarantee. Use this fixture's existing I/O
+            // budget; all byte-preservation and live-worker assertions remain.
             let result = router
                 .ensure_worker_prepared(
                     &path,
                     Some(output.to_str().unwrap()),
                     None,
-                    crate::preprocess::Preparation::new(Duration::from_secs(3)),
+                    crate::preprocess::Preparation::new(FIXTURE_OPERATION),
                 )
                 .await;
             let unchanged = std::fs::read(&index).unwrap() == corrupt;
@@ -623,7 +627,7 @@ async fn isolated_f3_case(name: &str, work: impl std::future::Future<Output = ()
             .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
+            .spawn_recorded()
             .unwrap();
         crate::preprocess::record_owned_fixture(child.id().unwrap(), false, "f3-isolated-libtest");
         let output = child.wait_with_output().await.unwrap();

@@ -291,8 +291,8 @@ with Target(sys.argv[1]) as target:
                 coord = target.key
         clock = [10.0]
         observer = Observer(self.identity, 8, clock=lambda:clock[0])
-        observer.receive({'kind':'reserve_parent', 'protocol':1, 'helper':self.identity, 'parent':'startup-parent'})
-        receipt = observer.receive({'kind':'launch_intent', 'protocol':1, 'helper':self.identity,
+        observer.receive({'kind':'reserve_parent', 'protocol':2, 'helper':self.identity, 'parent':'startup-parent'})
+        receipt = observer.receive({'kind':'launch_intent', 'protocol':2, 'helper':self.identity,
             'watch':'startup-only', 'target':str(target_path), 'coord_key':coord, 'subscription_epoch':1,
             'launch':{'suffix':'private-suffix', 'target':str(target_path), 'backend':'idalib'},
             'acquisition':{'parent':'startup-parent', 'purpose':'final', 'ordinal':1}})['receipt']
@@ -309,7 +309,7 @@ with Target(sys.argv[1]) as target:
     def test_parent_budget_is_reserved_before_side_effect_and_returned_only_without_watches(self):
         observer = Observer(self.identity, 8)
         def call(kind, **fields):
-            return observer.receive(dict(kind=kind, protocol=1, helper=self.identity, **fields))
+            return observer.receive(dict(kind=kind, protocol=2, helper=self.identity, **fields))
         call('reserve_parent', parent='a')
         call('reserve_parent', parent='a')
         call('reserve_parent', parent='b')
@@ -359,7 +359,7 @@ with Target(sys.argv[1]) as target:
         clock = [0.0]
         observer = Observer(self.identity, 8, clock=lambda:clock[0])
         def call(kind, **fields):
-            return observer.receive(dict(kind=kind, protocol=1, helper=self.identity, **fields))
+            return observer.receive(dict(kind=kind, protocol=2, helper=self.identity, **fields))
         call('reserve_parent', parent='orphan')
         call('launch_intent', watch='startup', target=str(target_path), coord_key=coord, subscription_epoch=1,
              acquisition={'parent':'orphan','purpose':'final','ordinal':1},
@@ -427,8 +427,8 @@ with Target(sys.argv[1]) as target:
 
     def test_helper_schema_mismatch_has_no_side_effect_or_reserved_capacity(self):
         observer = Observer(self.identity,8)
-        base = {'kind':'reserve_parent','protocol':1,'helper':self.identity,'parent':'malformed'}
-        for message in (dict(base, protocol=True), dict(base, future=True),
+        base = {'kind':'reserve_parent','protocol':2,'helper':self.identity,'parent':'malformed'}
+        for message in (dict(base, protocol=1), dict(base, protocol=True), dict(base, future=True),
                         dict(base, helper='wrong'), {k:v for k,v in base.items() if k != 'parent'},
                         dict(base,kind='future')):
             with self.subTest(message=message), self.assertRaisesRegex(ValueError,'ProtocolMismatch'):

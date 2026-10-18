@@ -7,6 +7,9 @@ import socket
 import subprocess
 import sys
 
+from r2_process_ledger import install
+install()
+
 mode, socket_path, marker = sys.argv[1:4]
 if mode == 'escaped_pipe':
     if os.environ.get('N4_F2_STARTUP_DELAY'):

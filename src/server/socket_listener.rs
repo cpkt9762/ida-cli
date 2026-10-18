@@ -96,7 +96,12 @@ async fn handle_cli_connection(
     let control = parsed.as_ref().is_ok_and(|request| {
         matches!(
             primary_name_for(&request.method),
-            "status" | "list_idbs" | "list_tasks" | "task_status" | "cancel_task"
+            "status"
+                | "list_idbs"
+                | "list_tasks"
+                | "task_status"
+                | "cancel_task"
+                | "wait_owner_exit"
         ) || (router.uses_nexus() && primary_name_for(&request.method) == "get_task_status")
     });
     let shutdown_request = parsed
@@ -225,6 +230,55 @@ async fn dispatch_cli_request(
                 serde_json::json!({"ok": true, "message": "server shutting down"}),
             );
             (resp, None)
+        }
+
+        "wait_owner_exit" => {
+            if !router.uses_nexus() {
+                return (
+                    RpcResponse::err(&req.id, -32601, "owner exit observation requires Nexus"),
+                    None,
+                );
+            }
+            let Some(reference) = req
+                .params
+                .get("owner_observation_ref")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty() && s.len() <= 128)
+            else {
+                return (
+                    RpcResponse::err(
+                        &req.id,
+                        -32602,
+                        "wait_owner_exit requires owner_observation_ref",
+                    ),
+                    None,
+                );
+            };
+            let seconds = match req.params.get("timeout_secs") {
+                None => 120,
+                Some(value) => match value.as_u64() {
+                    Some(seconds) => seconds.min(600),
+                    None => {
+                        return (
+                            RpcResponse::err(
+                                &req.id,
+                                -32602,
+                                "timeout_secs must be an unsigned integer",
+                            ),
+                            None,
+                        )
+                    }
+                },
+            };
+            let preparation =
+                crate::preprocess::Preparation::new(std::time::Duration::from_secs(seconds));
+            let response = match router.nexus_wait_owner_exit(reference, preparation).await {
+                Ok(value) => RpcResponse::ok(&req.id, value),
+                Err(error) => RpcResponse::err(&req.id, -32000, error.to_string()),
+            };
+            // This local observation neither resolves a path nor acquires a
+            // lease. Its caller budget cannot restart the old close attempt.
+            (response, None)
         }
 
         "status" => {
@@ -455,6 +509,46 @@ async fn dispatch_cli_request(
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn test_owner_wait_rpc(
+    router: RouterState,
+    reference: &str,
+    seconds: u64,
+) -> serde_json::Value {
+    use tokio::io::AsyncBufReadExt;
+    let (client, server) = tokio::net::UnixStream::pair().expect("private CLI connection");
+    let input = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let task = tokio::spawn(async move {
+        handle_cli_connection(
+            server,
+            &router,
+            &CancellationToken::new(),
+            input.acquire_owned().await.expect("input permit"),
+            std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+        )
+        .await
+    });
+    let (read, mut write) = client.into_split();
+    let mut data = serde_json::to_vec(
+        &serde_json::json!({"jsonrpc":"2.0", "id":"owner-wait", "method":"wait_owner_exit",
+        "params":{"owner_observation_ref":reference,"timeout_secs":seconds}}),
+    )
+    .expect("request");
+    data.push(b'\n');
+    write.write_all(&data).await.expect("CLI request");
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(seconds + 2),
+        BufReader::new(read).read_line(&mut line),
+    )
+    .await
+    .expect("bounded CLI response")
+    .expect("response frame");
+    task.await.expect("CLI task").expect("CLI connection");
+    serde_json::from_str(&line).expect("CLI JSON response")
 }
 
 #[cfg(test)]

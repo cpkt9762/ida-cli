@@ -6,6 +6,8 @@ Linux ABI: kernel.org filesystems/proc.html, stat field 22 and boot_id.
 Unknown platforms, short reads and permission errors fail closed.
 """
 
+from __future__ import annotations
+
 import ctypes
 import errno
 from pathlib import Path

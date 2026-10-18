@@ -88,6 +88,19 @@ class BackupSources:
                     evidence_type='public_owner_lifetime', source='bridge_original')
                 entry['proofs'][watch] = proof
         self.bridge.control.send({'event':'owner_backup_proof', 'watch':watch, 'proof':proof})
+        return proof
+
+    def released_proof(self, value):
+        """Query the retained original, never rediscover or recreate it."""
+        from ida_nexus import wait_database_released
+        with self.bridge.lock:
+            entry = self.items[digest(value['owner'])]
+            instance = entry['instance']
+        if wait_database_released(instance, timeout=0) is not True:
+            return None
+        with self.bridge.lock:
+            entry['released'] = True
+        return self.query(value)
 
     def close(self, value):
         """Serialize closure against query so no later backup fact can appear."""

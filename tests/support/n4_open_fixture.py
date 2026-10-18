@@ -33,7 +33,8 @@ def serve(path):
                     send(stream,{'event':'opened','attempt':attempt,'lease':lease,'capabilities':caps,'idb_path':command['path'],'pid':os.getpid()})
                 elif kind=='release':
                     if fault in ('release-proof','release-unconfirmed'):
-                        send(stream,{'event':'uncertain','attempt':attempt,'error':{'code':'cancel_pending','message':'injected lost release ACK'}})
+                        if fault=='release-unconfirmed':
+                            send(stream,{'event':'uncertain','attempt':attempt,'error':{'code':'cancel_pending','message':'injected lost release ACK'}})
                         (root/'release-uncertain').touch()
                         if fault=='release-proof':
                             end=time.monotonic()+5
@@ -41,7 +42,6 @@ def serve(path):
                                 assert time.monotonic()<end,'missing release proof barrier'
                                 time.sleep(.005)
                         else:
-                            send(stream,{'event':'release_unconfirmed','attempt':attempt})
                             continue
                     send(stream,{'event':'released','attempt':attempt})
                 elif kind=='execute':

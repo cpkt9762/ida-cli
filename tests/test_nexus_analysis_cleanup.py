@@ -1,5 +1,6 @@
 """Production open/guard flow with public API stubs; no IDA is launched."""
 import importlib.util
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import sys
@@ -15,6 +16,29 @@ sys.path.insert(0, str(REPO / "nexus_bridge"))
 import bridge
 
 
+class AnalysisCustodian:
+    """IDA/guard wrapper fixture; N1 cleanup scheduling is tested in nexus_r3a."""
+    def __init__(self, owner, attempt, command, deadline, track):
+        self.owner, self.track = owner, track
+        self.acquisition = {'parent':command['identity']}
+        self.target = None
+        self.handle = None
+
+    def gate(self, _target):
+        return nullcontext()
+
+    def obtain(self, Handle, Options, path, options, context):
+        self.handle = Handle.open(path, options=Options(**options))
+        self.track(self.handle, context)
+        return self.handle
+
+    def execute(self, _purpose, code, **_kwargs):
+        return self.handle.execute_python(code)
+
+    def rpc(self, _purpose, call):
+        return call('analysis-fixture', 1)
+
+
 def case(branch):
     temporary = tempfile.TemporaryDirectory(prefix='r9-analysis-')
     target_dir = Path(temporary.name)
@@ -24,8 +48,6 @@ def case(branch):
     spec = importlib.util.spec_from_file_location("_ida_cli_save_guard_v1", REPO / "nexus_bridge/save_guard.py")
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
-    guard._log = lambda value: None
-    guard._delayed_probes = lambda value: []
 
     class Hook:
         def hook(self):
@@ -99,7 +121,7 @@ def case(branch):
     owner.Handle = types.SimpleNamespace(open=lambda *args, **kw: handle)
     owner.Options = lambda **kw: kw
     owner.lock = threading.Lock()
-    owner.handles, owner.metadata_contexts, owner.generations = {}, {}, {}
+    owner.handles, owner.metadata_contexts, owner.generations, owner.acquisitions = {}, {}, {}, {}
     events = []
     channel = types.SimpleNamespace(send=events.append)
     command = {"command": "open", "identity": {"client_id": "review", "operation_id": "open-review"},
@@ -108,7 +130,8 @@ def case(branch):
         modules["ida_netnode"].netnode.exist = lambda _: True if context["present"] else (_ for _ in ()).throw(OSError("probe unavailable"))
     with patch.dict(sys.modules, modules), patch.dict(os.environ, {"IDA_CLI_HOME": str(target_dir / "home")}), \
             patch.object(bridge, "idb_context", return_value={}), \
-            patch.object(bridge, "database_diagnostics", return_value={}):
+            patch.object(bridge, "database_diagnostics", return_value={}), \
+            patch.object(bridge, "Custodian", AnalysisCustodian):
         error = None
         started = [False]
         try:
@@ -135,25 +158,27 @@ class AnalysisFailureTests(unittest.TestCase):
                 self.assertEqual(result['events'], ['analysis-failed-after-root-loss'])
                 self.assertTrue(result['exact_handle_retained'])
                 self.assertTrue(result['public_started'], 'run() must report uncertain')
-                self.assertIn('exact lease retained', result['error'])
+                self.assertIn('injected analysis failure', result['error'])
                 self.assertEqual(result['bridge_events'], [])
                 self.assertFalse(result['post_close_safe'])
                 self.assertFalse(result['first_failure']['previous_sample'] is None,
                                  'analysis failure cannot become an initial-open retry')
 
-    def test_analysis_failure_with_current_healthy_root_cleans_normally(self):
+    def test_analysis_failure_with_current_healthy_root_retains_n1_custody(self):
         result = case('healthy')
-        self.assertEqual(result['events'], ['analysis-failed-after-root-loss', 'default-save-close'])
-        self.assertEqual(result['retained_handles'], 0)
-        self.assertEqual(result['bridge_events'][0]['event'], 'failed')
-        self.assertIsNone(result['error'])
+        self.assertEqual(result['events'], ['analysis-failed-after-root-loss'])
+        self.assertEqual(result['retained_handles'], 1, 'N1 owns cleanup after failed analysis')
+        self.assertEqual(result['bridge_events'], [], 'wrapper cannot publish readiness or detach without N1')
+        self.assertIn('injected analysis failure', result['error'])
+        self.assertTrue(result['packed_file_unchanged'])
 
-    def test_analysis_root_loss_with_confirmed_flags_discards(self):
+    def test_analysis_root_loss_with_confirmed_flags_retains_n1_custody(self):
         result = case('confirmed')
-        self.assertEqual(result['events'], ['analysis-failed-after-root-loss', 'discard-close'])
-        self.assertEqual(result['retained_handles'], 0)
-        self.assertEqual(result['bridge_events'][0]['event'], 'failed')
-        self.assertIsNone(result['error'])
+        self.assertEqual(result['events'], ['analysis-failed-after-root-loss'])
+        self.assertEqual(result['retained_handles'], 1, 'N1 owns cleanup after failed analysis')
+        self.assertEqual(result['bridge_events'], [], 'wrapper cannot publish readiness or detach without N1')
+        self.assertIn('injected analysis failure', result['error'])
+        self.assertTrue(result['packed_file_unchanged'])
 
 if __name__ == '__main__':
     unittest.main()

@@ -7,6 +7,45 @@ mod helper;
 pub(crate) mod installation;
 pub mod protocol;
 mod receiver;
+#[cfg(feature = "nexus-test-support")]
+mod test_process_ledger;
+
+fn spawn_child(command: &mut tokio::process::Command) -> anyhow::Result<tokio::process::Child> {
+    #[cfg(feature = "nexus-test-support")]
+    {
+        test_process_ledger::spawn(command)
+    }
+    #[cfg(not(feature = "nexus-test-support"))]
+    {
+        Ok(command.spawn()?)
+    }
+}
+
+#[cfg(feature = "nexus-test-support")]
+pub fn test_spawn_child(
+    command: &mut tokio::process::Command,
+) -> anyhow::Result<tokio::process::Child> {
+    spawn_child(command)
+}
+
+#[cfg(feature = "nexus-test-support")]
+pub(crate) fn test_spawn_std_child(
+    command: &mut std::process::Command,
+) -> anyhow::Result<std::process::Child> {
+    test_process_ledger::spawn_std(command)
+}
+
+fn python_ledger(command: &mut tokio::process::Command) {
+    #[cfg(feature = "nexus-test-support")]
+    if std::env::var_os("R2_LEDGER").is_some() {
+        command.arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/r2_process_ledger.py"),
+        );
+    }
+    #[cfg(not(feature = "nexus-test-support"))]
+    let _ = command;
+}
 use super::nexus_transport::{Delivery, NexusEndpoint, NexusWireFrame};
 use crate::nexus::*;
 use serde_json::{json, Value};
@@ -52,6 +91,9 @@ struct State {
     pending: Mutex<HashMap<u64, Pending>>,
     leases: Mutex<HashMap<LeaseId, SessionLease>>,
     release_errors: Mutex<HashMap<LeaseId, (SessionLease, String)>>,
+    release_facts: Mutex<HashMap<LeaseId, (SessionLease, Value)>>,
+    owner_proofs: Mutex<HashMap<LeaseId, (SessionLease, Value)>>,
+    startup_proofs: Mutex<HashMap<String, Value>>,
     rejected_acquisitions: Mutex<HashSet<SessionLease>>,
     events: broadcast::Sender<Value>,
     open_replies: Mutex<HashMap<OperationId, tokio::sync::oneshot::Sender<Value>>>,
@@ -206,13 +248,105 @@ fn cleanup_startup_sockets(directory: &std::path::Path) {
     }
 }
 impl NexusBridge {
+    pub(crate) fn resource_retirement_pending(&self, lease: &SessionLease) -> bool {
+        self.state
+            .custody_retirements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|receipt| {
+                receipt["lease"] == json!(lease) && !receipt["resource_retirement"].is_null()
+            })
+    }
+    /// Non-secret current obligations, independent of command subscribers.
+    pub fn lifecycle_status(&self) -> Value {
+        let state = &self.state;
+        let resources: Vec<_> = state.custody_resources.lock().unwrap_or_else(|e|e.into_inner())
+            .values().map(|r|json!({"watch":r.watch,"target":r.target,"owner":r.owner,
+                "lease":r.lease,"acquisition":r.acquisition,"public_proof_adopted":r.proof.is_some(),
+                "producer_closed":r.consumer.is_some(),"bridge_closed":r.bridge_proof_ack,
+                "boot_retirement_scope":r.origin_binding["boot_retirement_capability"]})).collect();
+        let startups: Vec<_> = state
+            .startups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|r| {
+                json!({"watch":r["watch"],"target":r["target"],"owner":r["owner"],
+                "acquisition":r["acquisition"],"launch":r["launch"],
+                "public_proof_adopted":r.get("proof").is_some(),
+                "boot_retirement_scope":r["origin_binding"]["boot_retirement_capability"]})
+            })
+            .collect();
+        let blocked = state
+            .observation_faults
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        json!({"resources":resources.len(),"startup_and_pre_attach":startups.len(),
+            "resource_details":resources,"startup_details":startups,"blocked":blocked,
+            "retirement_acks":state.custody_retirements.lock().unwrap_or_else(|e|e.into_inner()).len(),
+            "helper":state.helper.as_ref().map(|h|h.status_snapshot()),
+            "state_root":state.helper.as_ref().map(|h|&h.state_root),
+            "live_limit":state.open_reply_capacity,"same_boot_eligibility":false,
+            "boot_retirement":"requires_verified_native_creation_and_consumption_scope",
+            "next_action":if blocked.is_empty() {"wait_public_owner_lifetime"} else {"inspect_observation_failure"}})
+    }
+    pub(crate) fn owner_release_status(&self, lease: &SessionLease) -> Value {
+        let resource = self
+            .state
+            .custody_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&lease.lease_id)
+            .filter(|r| r.lease == *lease)
+            .cloned();
+        let mut value = self
+            .state
+            .release_facts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&lease.lease_id)
+            .filter(|(exact, _)| exact == lease)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| json!({}));
+        if let Some(resource) = resource {
+            value["owner"] = resource.owner;
+            value["watch"] = json!(resource.watch);
+        }
+        let proof = self
+            .state
+            .owner_proofs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&lease.lease_id)
+            .filter(|(exact, _)| exact == lease)
+            .map(|(_, proof)| proof.clone());
+        value["owner_released"] =
+            json!(proof.is_some() || value["outcome"]["owner_released"] == true);
+        value["owner_pending"] = json!(value["owner_released"] != true);
+        if let Some(proof) = proof {
+            value["evidence_scope"] = json!("public_owner_lifetime");
+            value["proof"] = proof;
+        }
+        if let Ok(Some(evidence)) = self
+            .state
+            .endpoint
+            .transition(|s, _| s.resource_retirement(lease))
+        {
+            value["resource_retirement"] = evidence;
+            value["owner_pending"] = json!(false);
+            value["evidence_scope"] = json!("verified_boot_change_resource_retirement");
+        }
+        value
+    }
     pub(crate) fn take_release_error(&self, lease: &SessionLease) -> Option<String> {
         self.state
             .release_errors
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&lease.lease_id)
-            .and_then(|(exact, message)| (exact == *lease).then_some(message))
+            .get(&lease.lease_id)
+            .and_then(|(exact, message)| (exact == lease).then(|| message.clone()))
     }
     pub async fn start(
         router: &super::RouterState,
@@ -273,15 +407,15 @@ impl NexusBridge {
             .is_some_and(|name| name == "bridge.py");
         let mut process = Command::new(&config.python);
         if production {
+            process.arg("-I").arg("-B");
+            python_ledger(&mut process);
             process
-                .arg("-I")
-                .arg("-B")
                 .arg(installation_path.join("bootstrap.py"))
                 .arg("bridge");
         } else {
             process.arg(&config.script);
         }
-        owner.child = Some(
+        owner.child = Some(spawn_child(
             process
                 .current_dir(&startup_cwd)
                 .arg(&business_path)
@@ -292,9 +426,8 @@ impl NexusBridge {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::from(log))
-                .kill_on_drop(true)
-                .spawn()?,
-        );
+                .kill_on_drop(true),
+        )?);
         let child = owner
             .child
             .as_mut()
@@ -386,6 +519,9 @@ impl NexusBridge {
             pending: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
             release_errors: Mutex::new(HashMap::new()),
+            release_facts: Mutex::new(HashMap::new()),
+            owner_proofs: Mutex::new(HashMap::new()),
+            startup_proofs: Mutex::new(HashMap::new()),
             rejected_acquisitions: Mutex::new(HashSet::new()),
             events,
             open_replies: Mutex::new(HashMap::new()),
@@ -455,6 +591,7 @@ impl NexusBridge {
                     .collect();
                 ticking.endpoint.transition(|s, t| {
                     for lease in leases {
+                        if s.resource_retirement(&lease).is_ok_and(|r|r.is_some()) { continue; }
                         if let Err(error) = s.poll_preparation(&lease, t) {
                             tracing::debug!(%error, "Nexus preparing cancellation pending");
                         }
@@ -508,6 +645,11 @@ impl NexusBridge {
     }
     pub fn endpoint(&self) -> NexusEndpoint {
         self.state.endpoint.clone()
+    }
+    /// Consume injected OS-source observations through the production U6 path.
+    #[cfg(feature = "nexus-test-support")]
+    pub async fn test_boot_resource_projection(&self) -> anyhow::Result<()> {
+        custody_wire::test_boot_resource_projection(&self.state, &self.control).await
     }
     #[cfg(feature = "nexus-test-support")]
     pub async fn test_helper_pause(&self) -> anyhow::Result<Value> {
@@ -599,6 +741,10 @@ impl NexusBridge {
             // Never force-stop an observer with outstanding responsibility.
             helper.finish().await?;
         }
+        // Accepted finish proves the helper has no remaining observation
+        // responsibility. Stop the local poller only after that acceptance;
+        // a refused finish must keep recovery/observation running.
+        self.state.observer_stop.cancel();
         Ok(())
     }
     /// Test supervisor may terminate this exact child; no process-name scans.
@@ -960,7 +1106,16 @@ async fn event_received(
             .remove(nonce);
         return Ok(());
     }
-    if event["event"] == "custody_request" {
+    if event["event"] == "released" && event["outcome"]["lease_released"] == true {
+        if let Err(error) = custody_wire::detach_fact(&event, state).await {
+            event["local_cleanup_error"] = json!(format!(
+                "detach ACK parsed; target observation persistence failed: {error}"
+            ));
+        }
+    }
+    if event["event"] == "custody_request"
+        || (event["event"] == "release_observation" && event.get("nonce").is_some())
+    {
         anyhow::ensure!(control, "custody request must use independent control lane");
         let nonce = event["nonce"]
             .as_str()
@@ -1197,7 +1352,8 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
             "retirement_acks":state.custody_retirements.lock().unwrap_or_else(|e| e.into_inner()).len(),
             "limit":state.open_reply_capacity,
             "blocked":*state.observation_faults.lock().unwrap_or_else(|e| e.into_inner()),
-            "same_boot_eligibility":false,"boot_retirement":"NotEnabled"});
+            "same_boot_eligibility":false,
+            "boot_retirement":"requires_verified_native_creation_and_consumption_scope"});
         state.emit(event);
         return Ok(());
     }
@@ -1235,7 +1391,34 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
     };
     let _ordered = state.callbacks.lock().unwrap_or_else(|e| e.into_inner());
     let attempt: DeliveryAttempt = serde_json::from_value(event["attempt"].clone())?;
+    let retired = state.endpoint.transition(|s, _| match &attempt.target {
+        DeliveryTarget::Release { lease } => s.resource_retirement(lease),
+        DeliveryTarget::Execute { identity }
+        | DeliveryTarget::Cancel { identity, .. }
+        | DeliveryTarget::Shutdown { identity } => s.resource_retirement(&identity.lease),
+        DeliveryTarget::Open { .. } => Ok(None),
+    })?;
+    anyhow::ensure!(retired.is_none(), "late event for retired boot resource");
     let sequence = attempt.sequence.get();
+    if let DeliveryTarget::Release { lease } = &attempt.target {
+        if matches!(
+            name,
+            "released" | "uncertain" | "not_sent" | "failed" | "remote_error"
+        ) {
+            let facts = state
+                .release_facts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            anyhow::ensure!(
+                !facts
+                    .get(&lease.lease_id)
+                    .is_some_and(|(exact, value)| exact == lease
+                        && value["attempt"] == json!(attempt)
+                        && value["terminal"].is_string()),
+                "duplicate release terminal"
+            );
+        }
+    }
     let target_matches = match name {
         "opened" => matches!(attempt.target, DeliveryTarget::Open { .. }),
         "completed" | "yielded" | "stopped" | "stop_unconfirmed" => {
@@ -1415,7 +1598,14 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
                 }
             }
             "released" => {
-                s.released(&attempt)?;
+                if event.get("outcome").is_some() && event["outcome"]["lease_released"] != true {
+                    return Err(invalid(
+                        "released without a parsed lease ACK or public proof",
+                    ));
+                }
+                if !s.released(&attempt)? {
+                    return Err(invalid("duplicate release terminal"));
+                }
                 if let DeliveryTarget::Release { lease } = &attempt.target {
                     if let Some(message) = event["save_guard_error"].as_str() {
                         state
@@ -1423,6 +1613,51 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(lease.lease_id.clone(), (lease.clone(), message.into()));
+                    }
+                    if let Some(message) = event["local_cleanup_error"].as_str() {
+                        let mut errors = state
+                            .release_errors
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let entry = errors
+                            .entry(lease.lease_id.clone())
+                            .or_insert_with(|| (lease.clone(), String::new()));
+                        if !entry.1.is_empty() {
+                            entry.1.push_str("; ");
+                        }
+                        entry.1.push_str(message);
+                    }
+                    // Preserve the SDK's legacy benign stream-close races as
+                    // diagnostics in the outcome. They do not constitute a
+                    // failed lease detach or a rejected save. Unexpected local
+                    // cleanup failures still reach the close caller.
+                    let failures: Vec<_> = event["outcome"]["cleanup_failures"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|failure| {
+                            !matches!(
+                                (failure["phase"].as_str(), failure["type"].as_str()),
+                                (Some("stream_shutdown" | "stream_raw"), Some("OSError"))
+                                    | (Some("stream_response"), Some("OSError" | "ValueError"))
+                            )
+                        })
+                        .collect();
+                    if !failures.is_empty() {
+                        let mut errors = state
+                            .release_errors
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let entry = errors
+                            .entry(lease.lease_id.clone())
+                            .or_insert_with(|| (lease.clone(), String::new()));
+                        if !entry.1.is_empty() {
+                            entry.1.push_str("; ");
+                        }
+                        entry.1.push_str(&format!(
+                            "ACK parsed; local cleanup failures: {}",
+                            json!(failures)
+                        ));
                     }
                     state
                         .leases
@@ -1455,7 +1690,11 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
             }
             "stop_unconfirmed" | "release_unconfirmed" => {}
             "uncertain" => {
-                s.delivery_failed(&attempt, DispatchFailure::Uncertain(take_error()?))?;
+                let accepted =
+                    s.delivery_failed(&attempt, DispatchFailure::Uncertain(take_error()?))?;
+                if !accepted && matches!(attempt.target, DeliveryTarget::Release { .. }) {
+                    return Err(invalid("duplicate release terminal"));
+                }
                 if let DeliveryTarget::Execute { identity } = &attempt.target {
                     let mut pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(item) = pending.get_mut(&sequence) {
@@ -1470,12 +1709,41 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
                 s.shutdown_rejected(&attempt)?;
             }
             "failed" | "not_sent" | "remote_error" => {
-                s.delivery_failed(&attempt, DispatchFailure::NotSent(take_error()?))?;
+                let accepted =
+                    s.delivery_failed(&attempt, DispatchFailure::NotSent(take_error()?))?;
+                if !accepted && matches!(attempt.target, DeliveryTarget::Release { .. }) {
+                    return Err(invalid("duplicate release terminal"));
+                }
                 if let DeliveryTarget::Open { identity } = &attempt.target {
                     s.open_failed(identity)?;
                 }
             }
             _ => return Err(invalid("unknown bridge event")),
+        }
+        // Store the accepted command's raw result before publishing its terminal.
+        // Retirement and public proof only project current liveness; they must
+        // not have to reconstruct a missing lost-ACK or NotSent outcome later.
+        if matches!(
+            name,
+            "released" | "uncertain" | "not_sent" | "failed" | "remote_error"
+        ) {
+            if let DeliveryTarget::Release { lease } = &attempt.target {
+                let mut facts = state
+                    .release_facts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let entry = facts
+                    .entry(lease.lease_id.clone())
+                    .or_insert_with(|| (lease.clone(), json!({})));
+                entry.1["attempt"] = json!(attempt);
+                entry.1["terminal"] = json!(name);
+                if let Some(outcome) = event.get("outcome") {
+                    entry.1["outcome"] = outcome.clone();
+                }
+                if let Some(error) = event.get("error") {
+                    entry.1["command_error"] = error.clone();
+                }
+            }
         }
         Ok(())
     });

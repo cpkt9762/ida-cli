@@ -513,7 +513,12 @@ class FoundationTests(unittest.TestCase):
         self.assertNotIn('custody_v1', contract()['capabilities'])
         self.assertEqual(contract()['owner_observation'], 1)
         self.assertEqual(contract()['same_boot_exit'], 0)
-        self.assertEqual(contract()['boot_retirement'], 0)
+        self.assertEqual(contract()['boot_retirement'], 1)
+        # This is the message schema, never unconditional OS eligibility.
+        bad = contract()
+        bad['boot_retirement'] = 0
+        with self.assertRaises(ValueError):
+            validate(bad)
 
     def test_f9_barriers_preserve_old_connection_and_b(self):
         records = []

@@ -73,6 +73,9 @@ impl Rig {
             pending: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
             release_errors: Mutex::new(HashMap::new()),
+            release_facts: Mutex::new(HashMap::new()),
+            owner_proofs: Mutex::new(HashMap::new()),
+            startup_proofs: Mutex::new(HashMap::new()),
             rejected_acquisitions: Mutex::new(Default::default()),
             events,
             open_replies: Mutex::new(HashMap::new()),
@@ -633,5 +636,53 @@ async fn r5_actual_grant_write_failure_remains_io_error() {
     assert!(
         result.is_err(),
         "a physical write error must never become a logical drop: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn r2_duplicate_release_failure_cannot_replace_original_diagnostics() {
+    let mut rig = Rig::new();
+    let (lease, _) = rig.open("release-history").await;
+    let attempt = rig.release(&lease).await;
+    let original = json!({"event":"uncertain", "attempt":attempt,
+        "outcome":{"lease_released":false,"ack_kind":null,"cause":"original lost ACK"},
+        "error":{"code":"unknown_outcome","message":"original cause"}});
+    rig.control.send(original.clone()).await;
+    rig.event("uncertain").await;
+    let before = rig.state.release_facts.lock().expect("facts").clone();
+    let mut duplicate = original;
+    duplicate["outcome"]["cause"] = json!("replacement");
+    duplicate["error"]["message"] = json!("replacement");
+    rig.control.send(duplicate).await;
+    rig.event("event_rejected").await;
+    assert_eq!(
+        *rig.state.release_facts.lock().expect("facts"),
+        before,
+        "duplicate terminal replaced immutable original diagnosis"
+    );
+    rig.control
+        .send(json!({"event":"released","attempt":attempt}))
+        .await;
+    rig.event("event_rejected").await;
+    assert_eq!(
+        *rig.state.release_facts.lock().expect("facts"),
+        before,
+        "a second terminal replaced the original unknown detach outcome"
+    );
+    let history = rig
+        .state
+        .endpoint
+        .transition(|s, _| s.status(&lease.client_id, &lease))
+        .expect("original delivery");
+    assert_eq!(
+        history
+            .control_delivery
+            .expect("delivery")
+            .error
+            .expect("cause")
+            .cause
+            .expect("original cause")
+            .message,
+        "original cause"
     );
 }

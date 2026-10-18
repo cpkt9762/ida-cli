@@ -1,4 +1,5 @@
 use super::*;
+use crate::preprocess::SpawnRecorded as _;
 use std::os::unix::process::CommandExt;
 #[test]
 fn owner_lock_is_released_even_while_a_forked_child_waits_for_exec() {
@@ -35,7 +36,7 @@ fn owner_lock_is_released_even_while_a_forked_child_waits_for_exec() {
     }
     let spawned = std::thread::spawn(move || {
         let _child = child;
-        let mut child = command.spawn().unwrap();
+        let mut child = command.spawn_recorded().unwrap();
         crate::preprocess::record_owned_fixture(child.id(), false, "n4-f2-exec-lock-probe");
         child.wait().unwrap()
     });

@@ -293,6 +293,8 @@ pub struct WorkerStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RouterStatus {
+    pub owner_observations: Vec<serde_json::Value>,
+    pub nexus_lifecycle: Option<serde_json::Value>,
     pub metadata: DaemonMetadata,
     pub worker_count: usize,
     pub active_handle: Option<String>,
@@ -516,6 +518,24 @@ impl RouterState {
         token: &str,
     ) -> Result<Option<(String, usize)>, crate::error::ToolError> {
         self.nexus_tools.close_token(self, token).await
+    }
+    pub async fn nexus_wait_owner_exit(
+        &self,
+        reference: &str,
+        preparation: crate::preprocess::Preparation,
+    ) -> Result<serde_json::Value, crate::error::ToolError> {
+        self.nexus_tools
+            .wait_owner_exit(self, reference, preparation)
+            .await
+    }
+    pub(crate) async fn nexus_close_token_detailed(
+        &self,
+        token: &str,
+    ) -> (
+        Result<Option<(String, usize)>, crate::error::ToolError>,
+        Option<serde_json::Value>,
+    ) {
+        self.nexus_tools.close_token_detailed(self, token).await
     }
     pub async fn nexus_open_details(
         &self,
@@ -886,9 +906,12 @@ impl RouterState {
             .kill_on_drop(true);
         Self::apply_worker_env(&mut cmd);
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn worker process: {e}"))?;
+        #[cfg(feature = "nexus-test-support")]
+        let spawned = nexus_bridge::test_spawn_child(&mut cmd);
+        #[cfg(not(feature = "nexus-test-support"))]
+        let spawned = cmd.spawn().map_err(anyhow::Error::from);
+        let mut child =
+            spawned.map_err(|e| anyhow::anyhow!("Failed to spawn worker process: {e}"))?;
 
         let stdin = child
             .stdin
@@ -1366,7 +1389,8 @@ impl RouterState {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
-        let mut child = cmd.spawn().expect("spawn stand-in worker");
+        let mut child = crate::preprocess::SpawnRecorded::spawn_recorded(&mut cmd)
+            .expect("spawn stand-in worker");
         let stdin = child.stdin.take().expect("stand-in worker stdin");
         let stdout = child.stdout.take().expect("stand-in worker stdout");
 
@@ -1558,6 +1582,8 @@ impl RouterState {
             .collect();
 
         let mut status = RouterStatus {
+            owner_observations: self.nexus_tools.owner_status(self),
+            nexus_lifecycle: self.nexus_bridge.get().map(|b| b.lifecycle_status()),
             metadata,
             worker_count,
             active_handle,
@@ -3194,6 +3220,7 @@ pub(crate) async fn resolve_open_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preprocess::SpawnRecorded as _;
 
     #[tokio::test(flavor = "current_thread")]
     async fn queued_dedupe_cancel_removes_all_work_without_overwriting_original() {
@@ -3354,7 +3381,7 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
+            .spawn_recorded()
             .expect("fixture child");
         crate::preprocess::record_owned_fixture(
             child.id().expect("owned spawned PID"),

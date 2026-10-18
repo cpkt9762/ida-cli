@@ -7,6 +7,8 @@ import sys
 import threading
 import secrets
 import socket
+from r2_process_ledger import install
+install()
 from urllib.parse import parse_qs, urlsplit
 from ida_nexus._registry import InstanceIdentity, InstanceRegistration, REGISTRY_DIR
 
@@ -35,6 +37,7 @@ with Boundary(owner_root, os.environ.get('R3A_SCENARIO', 'healthy')) as boundary
     original_get = handler.do_GET
     original_post = handler.do_POST
     scenario = os.environ.get('R3A_SCENARIO', 'healthy')
+    attach_count = [0]
     r9 = scenario.startswith('r9-')
     if r9:
         import ida_netnode
@@ -42,6 +45,22 @@ with Boundary(owner_root, os.environ.get('R3A_SCENARIO', 'healthy')) as boundary
     def get_input(request):
         query = parse_qs(urlsplit(request.path).query)
         if 'sse' in query:
+            if scenario.startswith('post-exit-'):
+                attach_count[0] += 1
+                boundary.requests.append({'endpoint':'attach_attempt', 'ordinal':attach_count[0]})
+                if attach_count[0] <= 2 or scenario == 'post-exit-final503':
+                    request.reply({'error':'controlled closing owner'}, 503)
+                    if attach_count[0] == 2:
+                        # Only external registry/lifetime inputs change. The
+                        # production SDK must consume the real old public True
+                        # before its third resolver/attach can reach this owner.
+                        boundary.release_owner()
+                        boundary.registration = InstanceRegistration(REGISTRY_DIR,
+                            InstanceIdentity(str(boundary.path), str(boundary.path), 'idalib', True),
+                            token=secrets.token_hex(24))
+                        boundary.instance = boundary.registration.publish(boundary.server.server_port)
+                        boundary.released = False
+                    return
             if scenario == 'attach-rejected':
                 boundary.requests.append({'endpoint':'lease_rejected', 'http_status':400})
                 request.reply({'error':'controlled rejected attach'}, 400)
@@ -59,6 +78,14 @@ with Boundary(owner_root, os.environ.get('R3A_SCENARIO', 'healthy')) as boundary
         return original_get(request)
     first_preparation = [True]
     def post_input(request):
+        if request.path == '/execute_python' and (root/'poison-root').exists():
+            import ida_netnode
+            ida_netnode.netnode.exist = staticmethod(lambda _:False)
+            if scenario == 'r2-protection-failed':
+                import ida_loader
+                def deny_flags(_flag):
+                    raise OSError('private IDA close protection flag failure')
+                ida_loader.set_database_flag = deny_flags
         if request.path == '/execute_python' and scenario == 'tools-barrier' and first_preparation[0]:
             first_preparation[0] = False
             from r0_transport import barrier
@@ -148,6 +175,19 @@ with Boundary(owner_root, os.environ.get('R3A_SCENARIO', 'healthy')) as boundary
     sys.argv = [str(installation / 'bootstrap.py'), 'bridge', *sys.argv[1:]]
     try:
         runtime = vars(runpy.run_path(sys.argv[0], run_name='verified_fixture')['load_entry']())
+        if scenario.startswith('post-exit-') or scenario == 'attach-eof':
+            from acquisition import Custodian
+            original_stage = Custodian.stage
+            stage_lock = threading.Lock()
+            def public_stage(self, stage, value):
+                # Public observer telemetry only; never substitutes a resolver,
+                # result, proof, SDK object or production admission decision.
+                result = original_stage(self, stage, value)
+                with stage_lock, (root/'public-stages.jsonl').open('a') as log:
+                    log.write(json.dumps({'stage':stage, 'owner':getattr(value,'instance_id',None)})+'\n')
+                    log.flush()
+                return result
+            Custodian.stage = public_stage
         if r9:
             from acquisition import Custodian
             original_receive = runtime['Bridge'].receive

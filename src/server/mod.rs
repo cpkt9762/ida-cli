@@ -951,12 +951,19 @@ impl IdaMcpServer {
                 )
                 .to_tool_result());
             };
-            return match router.nexus_close_token(token).await {
-                Ok(None) => Ok(CallToolResult::success(vec![Content::text("close_idb ignored: invalid close_token")])),
-                Ok(Some((_,remaining))) if remaining > 0 => Ok(CallToolResult::success(vec![Content::text(format!("Reference released ({remaining} client(s) still active, database remains open)"))])),
-                Ok(Some(_)) => Ok(CallToolResult::success(vec![Content::text("Database closed")])),
-                Err(error) => Ok(error.to_tool_result()),
+            let (result, lifecycle) = router.nexus_close_token_detailed(token).await;
+            let mut result = match result {
+                Ok(None) => CallToolResult::success(vec![Content::text("close_idb ignored: invalid close_token")]),
+                Ok(Some((_,remaining))) if remaining > 0 => CallToolResult::success(vec![Content::text(format!("Reference released ({remaining} client(s) still active, database remains open)"))]),
+                Ok(Some(_)) => CallToolResult::success(vec![Content::text("Database closed")]),
+                Err(error) => error.to_tool_result(),
             };
+            if let Some(lifecycle) = lifecycle {
+                result
+                    .content
+                    .push(Content::text(json!({"lifecycle":lifecycle}).to_string()));
+            }
+            return Ok(result);
         }
         let token = match req.token.as_deref() {
             Some(t) => t,
@@ -6079,6 +6086,10 @@ mod tests {
 #[cfg(test)]
 #[path = "../../tests/support/n2_f1_server.rs"]
 mod n2_f1_regressions;
+
+#[cfg(all(test, feature = "nexus-test-support"))]
+#[path = "../../tests/support/r2_server.rs"]
+mod r2_lifecycle;
 
 fn read_script_file(source: String) -> std::io::Result<String> {
     #[cfg(test)]

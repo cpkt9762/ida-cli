@@ -271,7 +271,7 @@ def test_unknown_result_requires_causal_control_stop_proof(harness):
 def test_release_only_closes_held_exact_lease(harness):
     harness.open()
     harness.dispatch(1, {"command": "release", "lease": {**harness.lease, "client_id": "foreign"}})
-    assert harness.receive(1)["event"] == "failed"
+    assert harness.receive(1)["event"] == "not_sent"
     assert not harness.handle.closed
     harness.dispatch(1, {"command": "release", "lease": harness.lease})
     assert harness.receive(1)["event"] == "released"

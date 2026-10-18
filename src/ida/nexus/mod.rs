@@ -11,6 +11,7 @@ mod delivery;
 mod error;
 mod model;
 mod operation;
+mod resource;
 mod session;
 
 pub use custody::{

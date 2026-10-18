@@ -17,6 +17,7 @@ pub(super) struct Opening {
     pub(super) failure: Option<NexusError>,
     pub(super) acquired: Option<SessionLease>,
     pub(super) acquisition_ordinal: u64,
+    pub(super) post_exit_resolve_used: bool,
     pub(super) wait_analysis: bool,
 }
 
@@ -31,6 +32,10 @@ pub struct NexusSessions<C> {
     capabilities: Result<NexusCapabilities, NexusError>,
     capacity: usize,
     pub(super) sessions: HashMap<LeaseId, SessionSnapshot>,
+    pub(super) resource_origins: HashMap<LeaseId, serde_json::Value>,
+    pub(super) resource_retirements: HashMap<LeaseId, serde_json::Value>,
+    pub(super) startup_origins: HashMap<String, (AcquisitionId, serde_json::Value)>,
+    pub(super) startup_retirements: HashMap<String, serde_json::Value>,
     pub(super) deliveries: HashMap<super::delivery::DeliveryKey, super::delivery::DeliveryRecord>,
     pub(super) send_sequence: u64,
     pub(super) queue_sequence: u64,
@@ -57,6 +62,10 @@ impl<C: Clock> NexusSessions<C> {
             capabilities,
             capacity,
             sessions: HashMap::new(),
+            resource_origins: HashMap::new(),
+            resource_retirements: HashMap::new(),
+            startup_origins: HashMap::new(),
+            startup_retirements: HashMap::new(),
             deliveries: HashMap::new(),
             send_sequence: 0,
             queue_sequence: 0,
@@ -86,11 +95,34 @@ impl<C: Clock> NexusSessions<C> {
                 "request/operation identity cannot be reused",
             ));
         }
-        if self
-            .used_operations
-            .len()
-            .saturating_sub(self.internal_ids.len())
-            >= self.capacity
+        let retired_ids = self
+            .operations
+            .iter()
+            .filter(|(_, op)| {
+                self.resource_retirements
+                    .contains_key(&op.snapshot.identity.lease.lease_id)
+            })
+            .map(|(id, _)| id)
+            .chain(
+                self.openings
+                    .iter()
+                    .filter(|(_, o)| {
+                        o.acquired
+                            .as_ref()
+                            .is_some_and(|l| self.resource_retirements.contains_key(&l.lease_id))
+                            || (o.acquired.is_none() && self.startup_resources_retired(&o.identity))
+                    })
+                    .map(|(id, _)| id),
+            )
+            .filter(|id| !self.internal_ids.contains(*id))
+            .count();
+        if self.used_operations.len() >= self.capacity.saturating_mul(64)
+            || self
+                .used_operations
+                .len()
+                .saturating_sub(self.internal_ids.len())
+                .saturating_sub(retired_ids)
+                >= self.capacity
         {
             return Err(NexusError::new(
                 NexusErrorCode::Busy,
@@ -172,6 +204,7 @@ impl<C: Clock> NexusSessions<C> {
                 failure: None,
                 acquired: None,
                 acquisition_ordinal: 1,
+                post_exit_resolve_used: false,
                 wait_analysis: command_wait_analysis,
             },
         );
@@ -427,7 +460,16 @@ impl<C: Clock> NexusSessions<C> {
                 "zero generation or reused lease id",
             ));
         }
-        if self.sessions.len() >= self.capacity {
+        if self
+            .sessions
+            .values()
+            .filter(|s| {
+                s.phase != SessionPhase::Released
+                    && !self.resource_retirements.contains_key(&s.lease.lease_id)
+            })
+            .count()
+            >= self.capacity
+        {
             return Err(NexusError::new(
                 NexusErrorCode::Busy,
                 "session capacity reached",
@@ -496,6 +538,12 @@ impl<C: Clock> NexusSessions<C> {
 
     pub(super) fn active(&self, client: &ClientId, lease: &SessionLease) -> Result<(), NexusError> {
         self.current_owner(client, lease)?;
+        if self.resource_retirements.contains_key(&lease.lease_id) {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidLease,
+                "old boot resource retired; historical token cannot be revived",
+            ));
+        }
         let session = self.authorize(client, lease)?;
         if session.phase != SessionPhase::Active {
             return Err(NexusError::new(
@@ -612,6 +660,9 @@ impl<C: Clock> NexusSessions<C> {
     }
 
     fn lease_busy(&self, lease: &SessionLease) -> bool {
+        if self.resource_retirements.contains_key(&lease.lease_id) {
+            return false;
+        }
         self.operations.values().any(|op| {
             &op.snapshot.identity.lease == lease
                 && (!op.snapshot.status.is_terminal() || !op.snapshot.execution_stopped)

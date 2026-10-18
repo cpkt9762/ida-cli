@@ -1,4 +1,5 @@
 use super::*;
+use crate::preprocess::SpawnRecorded as _;
 static FIXTURE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 async fn run_case(fault: &str) {
     let name = format!("router::nexus_tools::n4_f2_regressions::open_{fault}").replace('-', "_");
@@ -30,7 +31,7 @@ async fn run_case(fault: &str) {
             .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
+            .spawn_recorded()
             .unwrap();
         crate::preprocess::record_owned_fixture(
             child.id().unwrap(),
@@ -125,10 +126,10 @@ async fn run_case(fault: &str) {
             .open(&router, &path.display().to_string(), preparation)
             .await
             .unwrap();
-        let token = opened.1;
+        let token = opened.1.clone();
         let owner_tools = tools.clone();
         let owner_router = router.clone();
-        let mut closing =
+        let closing =
             tokio::spawn(async move { owner_tools.close_token(&owner_router, &token).await });
         let marker = path.parent().unwrap().join("release-uncertain");
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -139,36 +140,43 @@ async fn run_case(fault: &str) {
         .await
         .unwrap();
         if fault == "release-proof" {
-            assert!(
-                !closing.is_finished(),
-                "uncertainty must not complete close"
-            );
+            // A delayed ACK is the command's only terminal. An independent
+            // public lifetime is exercised by the production R2 suite.
+            assert!(!closing.is_finished(), "pending ACK completed close early");
             std::fs::write(path.parent().unwrap().join("release-proof"), b"").unwrap();
-            tokio::time::timeout(Duration::from_secs(3), &mut closing)
+            tokio::time::timeout(Duration::from_secs(3), closing)
                 .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            assert!(tools.records().is_empty());
+                .expect("bounded delayed ACK")
+                .expect("close task")
+                .expect("valid original ACK");
+            assert!(tools.records().is_empty(), "ACK leaves no active lease");
         } else {
-            let error = tokio::time::timeout(Duration::from_secs(3), &mut closing)
+            let error = tokio::time::timeout(Duration::from_secs(3), closing)
                 .await
-                .unwrap()
-                .unwrap()
-                .unwrap_err();
-            assert!(error.to_string().contains("owner retained"), "{error}");
-            assert_eq!(tools.records().len(), 1);
-            let error = tools
+                .expect("bounded original close result")
+                .expect("close task")
+                .expect_err("lost ACK must remain a caller error");
+            assert!(error.to_string().contains("UnknownOutcome"), "{error}");
+            assert_eq!(tools.records().len(), 1, "unknown retains its own record");
+            // An unknown old detach may coexist with a new lease on the same
+            // healthy owner. Each new open still goes through normal admission.
+            let (_, fresh_token) = tools
                 .open(
                     &router,
                     &path.display().to_string(),
                     Preparation::new(Duration::from_secs(3)),
                 )
                 .await
-                .unwrap_err();
-            assert!(error.to_string().contains("new open blocked"), "{error}");
-            assert_eq!(tools.records().len(), 1);
-            // A retained uncertain owner must not block another IDB.
+                .expect("same healthy owner attach remains available");
+            assert_eq!(
+                tools.records().len(),
+                2,
+                "old unknown obligation was dropped"
+            );
+            assert_ne!(
+                fresh_token, opened.1,
+                "old token must not authorize the new lease"
+            );
             let other = path.with_file_name("other.i64");
             std::fs::write(&other, b"independent IDB").unwrap();
             tools
@@ -178,8 +186,8 @@ async fn run_case(fault: &str) {
                     Preparation::new(Duration::from_secs(3)),
                 )
                 .await
-                .unwrap();
-            assert_eq!(tools.records().len(), 2);
+                .expect("unrelated IDB admission remains available");
+            assert_eq!(tools.records().len(), 3);
         }
         bridge.shutdown().await.unwrap();
         return;

@@ -10,7 +10,15 @@ import sys
 import time
 
 from target_coordination import LIMIT, RESERVE, SUMMARY_BYTES, SUMMARY_LIMIT, Target, digest, encoded
-from origin import creation_scope
+from origin import creation_scope, boot_change
+
+
+class OwnerDraining(RuntimeError):
+    """A confirmed last ACK retains its physical owner until public proof."""
+
+
+class ObservationPending(RuntimeError):
+    """An immutable producer has not finished publishing its reserved fact."""
 
 
 def fact(receipt, target, *, kind=None):
@@ -60,7 +68,7 @@ class Journal:
         if (v.get('schema') != 1 or v.get('coord_key') != target.key or type(v.get('revision')) is not int
                 or type(v.get('next_epoch')) is not int or type(v.get('closed_through')) is not int
                 or v['next_epoch'] <= v['closed_through'] or not isinstance(v.get('entries'), dict)
-                or len(v['entries']) > LIMIT or not isinstance(v.get('summary'), list)
+                or len(v['entries']) > LIMIT*8 or not isinstance(v.get('summary'), list)
                 or len(v['summary']) > SUMMARY_LIMIT or len(encoded(v['summary'])) > SUMMARY_BYTES
                 or not isinstance(v.get('closed_after_holes'), list)):
             raise RuntimeError('CoordinationBlocked: unknown/corrupt custody journal')
@@ -119,8 +127,11 @@ class Journal:
             raise RuntimeError('CoordinationBlocked: immutable reference outside target namespace')
 
     def accounting(self):
-        totals = {'live_refs':len(self.value['entries']), 'routine_bytes':len(encoded(self.value['summary'])),
-                  'retained_evidence_bytes':0, 'namespace_bytes':0, 'routine_files':0}
+        totals = {'live_refs':sum(not i.get('resource_retirement') for i in self.value['entries'].values()),
+                  'routine_bytes':len(encoded(self.value['summary'])),
+                  'retained_evidence_bytes':sum(len(encoded(i)) for i in self.value['entries'].values()
+                                               if i.get('resource_retirement')),
+                  'namespace_bytes':0, 'routine_files':0}
         scanned = [0]
         def scan(directory, namespace, depth=0):
             if depth > 2:
@@ -174,7 +185,7 @@ class Journal:
         self.target.directory.durable('custody.json', self.value)
         _, self.info, self.raw = self.target.directory.read('custody.json')
 
-    def gate(self, state_root=None):
+    def gate(self, state_root=None, acquisition=None):
         # Unknown .new and unrecognized recovery files are never ignored.
         for name in os.listdir(self.target.directory.fd):
             if name.endswith('.new'):
@@ -182,8 +193,13 @@ class Journal:
             if name not in ('lock', 'target.json', 'custody.json', 'proofs', 'observations', 'retained'):
                 raise RuntimeError('RecoveryBlocked: unsupported target coordination entry: ' + name)
         self.recover_public_proofs()
+        self.retire_old_boot()
         for item in self.value['entries'].values():
-            if item.get('launch') and not item.get('transferred'):
+            if item.get('resource_retirement'):
+                continue
+            if item.get('detach_outcome', {}).get('ack_kind') == 'last' and not item.get('proof'):
+                raise OwnerDraining('OwnerDraining: last ACK recorded; public owner proof pending')
+            if item.get('launch') and not item.get('transferred') and item['acquisition'] != acquisition:
                 raise RuntimeError('StartupUnconfirmed: exact launch responsibility pending')
             if item.get('owner') and not item.get('proof'):
                 if state_root is None or item['owner']['state_root'] != state_root:
@@ -234,8 +250,11 @@ class Journal:
                 result = []
                 for name in names:
                     if name.endswith('.new'):
-                        raise RuntimeError('ObservationRecoveryBlocked: pending immutable fact retained')
-                    record, _, data = directory.read(name)
+                        raise ObservationPending('ObservationRecoveryBlocked: pending immutable fact retained')
+                    try:
+                        record, _, data = directory.read(name)
+                    except FileNotFoundError as exc:
+                        raise ObservationPending('ObservationRecoveryBlocked: fact publication changed during scan') from exc
                     result.append({'path':str(directory.path/name), 'sha256':digest(data), 'record':record})
                 return result
             finally:
@@ -302,8 +321,33 @@ class Journal:
 
     def check_owner(self, owner):
         for item in self.value['entries'].values():
-            if item.get('owner') and not item.get('proof') and item['owner'] != owner:
+            if (item.get('owner') and not item.get('proof') and not item.get('resource_retirement')
+                    and not item.get('transferred_to')
+                    and item['owner'] != owner):
                 raise RuntimeError('ObservationRecoveryBlocked: different owner without exact lifetime proof')
+
+    def retire_old_boot(self):
+        current = creation_scope(self.target.directory.path, 'resource-consumer')
+        changed = False
+        for item in self.value['entries'].values():
+            if item.get('resource_retirement'):
+                continue
+            binding = item['origin_binding']
+            if binding.get('creator', {}).get('boot_id') == current['creator']['boot_id']:
+                continue
+            # Missing historical bindings cannot be assigned to an old boot.
+            evidence = boot_change(binding, current)
+            evidence.update(watch=item['watch'], epoch=item['epoch'], acquisition=item['acquisition'],
+                owner=item.get('owner'), lease=item.get('lease'), launch=item.get('launch'),
+                coord_key=self.target.key, target_binding=self.target.binding)
+            evidence['sha256'] = digest(evidence)
+            item['resource_retirement'] = evidence
+            item['failure'] = item.get('failure') or 'historical outcome retained after boot resource retirement'
+            changed = True
+        if changed:
+            self.save()  # Durable before returning any permission to drop guards.
+        return {'retirements':[i['resource_retirement'] for i in self.value['entries'].values()
+                               if i.get('resource_retirement')]}
 
     def begin(self, acquisition, watch, *, owner=None, launch=None):
         self.settle()
@@ -314,7 +358,7 @@ class Journal:
                 return item['epoch']
         if owner is not None:
             self.check_owner(owner)
-        if len(self.value['entries']) >= LIMIT-RESERVE:
+        if len(self.value['entries']) >= LIMIT*8 or self.accounting()['live_refs'] >= LIMIT-RESERVE:
             raise RuntimeError('Busy: live_refs; healthy history already compacted')
         stats = self.accounting()
         if stats['retained_evidence_bytes'] + 65536 > stats['retained_evidence_limit_bytes']:
@@ -354,6 +398,42 @@ class Journal:
         self.save()
         return {'epoch':item['epoch'], 'revision':self.value['revision']}
 
+    def release_observation(self, value):
+        item = self.item(value['watch'], value['epoch'])
+        if (item['lease'] != value['lease'] or item['owner'] != value['owner']
+                or value['attempt']['target'] != {'kind':'release', 'lease':item['lease']}
+                or value['outcome'].get('detach_called') is not False):
+            raise RuntimeError('CoordinationBlocked: release observation identity/stage mismatch')
+        observation = {k:value[k] for k in ('observation_id', 'attempt', 'outcome')}
+        old = item.get('release_observation')
+        if old is not None:
+            if old['observation_id'] == observation['observation_id']:
+                if old != observation:
+                    raise RuntimeError('CoordinationBlocked: conflicting release observation')
+                return {}
+            if old['attempt']['sequence'] >= observation['attempt']['sequence']:
+                raise RuntimeError('CoordinationBlocked: stale release observation')
+        item['release_observation'] = observation
+        if value['outcome'].get('save_guard_error'):
+            item['failure'] = value['outcome']['save_guard_error']
+        self.save()
+        return {'epoch':item['epoch'], 'revision':self.value['revision']}
+
+    def detach_outcome(self, value):
+        item = self.item(value['watch'], value['epoch'])
+        observation = item.get('release_observation')
+        outcome = value['outcome']
+        if (not observation or observation['attempt'] != value['attempt']
+                or item['lease'] != value['lease'] or item['owner'] != value['owner']
+                or type(outcome.get('lease_released')) is not bool
+                or (outcome['lease_released'] and outcome.get('ack_kind') not in ('last', 'nonlast'))):
+            raise RuntimeError('CoordinationBlocked: detach outcome identity/ACK mismatch')
+        if item.get('detach_outcome') is not None and item['detach_outcome'] != outcome:
+            raise RuntimeError('CoordinationBlocked: conflicting detach outcome')
+        item['detach_outcome'] = outcome
+        self.save()
+        return {'epoch':item['epoch'], 'revision':self.value['revision']}
+
     def launch_signed(self, receipt):
         record = receipt['record']
         item = self.item(record['watch'], record['subscription_epoch'])
@@ -389,9 +469,10 @@ class Journal:
                 or record['acquisition'] != item['acquisition']):
             raise RuntimeError('CoordinationBlocked: proof owner/acquisition mismatch')
         verified = fact(receipt, self.target, kind='PublicOwnerLifetime')
-        if item.get('proof') and item['proof'] != verified:
-            raise RuntimeError('CoordinationBlocked: conflicting proof identity')
-        item['proof'] = verified
+        # Independent authorized public sources can observe the same lifetime.
+        # The first durable target receipt remains canonical; retain every
+        # valid producer fact until its own closure, without replacing it.
+        item.setdefault('proof', verified)
         item['consumer_closed'] = True
         # Public lifetime, unlike absence/EOF, also proves this exact lease is gone.
         item['detached'] = True
@@ -399,7 +480,10 @@ class Journal:
         if verified not in item['facts']:
             item['facts'].append(verified)
         self.save()
-        return {'epoch':item['epoch'], 'revision':self.value['revision']}
+        selected = item['proof']
+        return {'epoch':item['epoch'], 'revision':self.value['revision'],
+                'proof':{'path':selected['path'], 'sha256':selected['sha256'],
+                         'record':self.referenced_record(selected)}}
 
     def producer_closed(self, value):
         record = value['consumer']['record']
@@ -423,7 +507,10 @@ class Journal:
                     or record['acquisition'] != item['acquisition'] or record['subscription_epoch'] != item['epoch']):
                 raise RuntimeError('CoordinationBlocked: attach fact binding mismatch')
             verified = fact(receipt, self.target)
-            if verified['kind'] not in ('Subscribed', 'AttachAttempt'):
+            if (verified['kind'] not in ('Subscribed', 'AttachAttempt', 'PublicOwnerLifetime')
+                    or (verified['kind'] == 'PublicOwnerLifetime' and
+                        record['helper'] not in self.authorized_producers(item,
+                            ('Subscribed', 'StartupOwnerSubscribed', 'BridgeSubscribed')))):
                 raise RuntimeError('CoordinationBlocked: unexpected attach fact kind')
             if verified not in item['facts']:
                 item['facts'].append(verified)
@@ -447,7 +534,10 @@ class Journal:
                 item['facts'].append(reference)
         item['producer_closed'] = item['consumer_closed'] = item['detached'] = item['bridge_closed'] = True
         item['no_attach'] = True
-        item['unacked_events'] = False
+        # Publishing a terminal before the IPC receipt is not permission to
+        # compact it. Rust independently verifies both producers and signs
+        # acceptance before this final reference can be removed.
+        item['unacked_events'] = value.get('custody_accepted') is not True
         self.save()
         return {}
 
@@ -516,8 +606,12 @@ class Journal:
         item = self.item(value['watch'], record['subscription_epoch'])
         successor_record = record['successor_receipt']['record']
         successor = self.item(value['successor'], successor_record['subscription_epoch'])
-        if (record['kind'] != 'StartupTransferred' or record['launch'] != item['launch']
+        # Discovery may have bound the spawned owner before final acquisition.
+        # The immutable launch identity survives that transition.
+        launch = item.get('launch') or item.get('launch_identity')
+        if (record['kind'] != 'StartupTransferred' or record['launch'] != launch
                 or record['acquisition'] != item['acquisition'] or successor['lease'] is None
+                or (item.get('owner') is not None and item['owner'] != successor['owner'])
                 or record['successor'] != successor['watch'] or successor['acquisition'] != item['acquisition']):
             raise RuntimeError('StartupUnconfirmed: owner custody transfer mismatch')
         verified = fact(value['consumer'], self.target, kind='StartupTransferred')
@@ -677,13 +771,20 @@ def main():
                 if item['launch'] != value['launch'] or record['kind'] not in ('SpawnIntent', 'Spawned'):
                     raise RuntimeError('StartupUnconfirmed: durable launch binding mismatch')
                 fact(value['receipt'], target)
-            print(json.dumps({'ok':True, 'epoch':item['epoch'], 'revision':journal['revision']}))
+            print(json.dumps({'ok':True, 'epoch':item['epoch'], 'revision':journal['revision'],
+                              'origin_binding':item['origin_binding']}))
             return
         with target.locked(deadline=time.monotonic()+1.5):
             journal = Journal(target)
             action = value['action']
             if action == 'adopt':
                 result = journal.adopt(value)
+            elif action == 'release_observation':
+                result = journal.release_observation(value)
+            elif action == 'detach_outcome':
+                result = journal.detach_outcome(value)
+            elif action == 'retire_old_boot':
+                result = journal.retire_old_boot()
             elif action == 'proof':
                 result = journal.proof(value)
             elif action == 'producer_closed':

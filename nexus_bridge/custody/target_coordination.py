@@ -304,7 +304,8 @@ class Target:
                             raise RuntimeError('CoordinationBlocked: invalid generation manifest identity')
                         raw = os.read(fd, MAX_RECORD + 1)
                         manifest = json.loads(raw)
-                        if (manifest.get('version') != 1 or not isinstance(manifest.get('key'), str)
+                        if (not isinstance(manifest, dict) or type(manifest.get('version')) is not int
+                                or manifest['version'] != 1 or not isinstance(manifest.get('key'), str)
                                 or not manifest['key'] or len(raw) != info.st_size):
                             raise RuntimeError('CoordinationBlocked: invalid generation manifest')
                         self.binding = {'group':parent.identity, 'manifest':[info.st_dev, info.st_ino],

@@ -127,9 +127,12 @@ pub async fn run(
         .kill_on_drop(false);
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command
-        .spawn()
-        .map_err(|e| ToolError::IdaError(format!("offline process spawn: {e}")))?;
+    #[cfg(feature = "nexus-test-support")]
+    let spawned = command.spawn_recorded();
+    #[cfg(not(feature = "nexus-test-support"))]
+    let spawned = command.spawn();
+    let mut child =
+        spawned.map_err(|e| ToolError::IdaError(format!("offline process spawn: {e}")))?;
     let pid = child
         .id()
         .ok_or_else(|| ToolError::IdaError("offline child PID missing".into()))?;
@@ -566,6 +569,41 @@ pub(crate) fn record_owned_fixture(pid: u32, group_owned: bool, kind: &str) {
         .expect("isolated owned fixture audit")
         .write_all(format!("{record}\n").as_bytes())
         .expect("complete audit append");
+}
+
+#[cfg(any(test, feature = "nexus-test-support"))]
+pub(crate) trait SpawnRecorded {
+    type Child;
+    fn spawn_recorded(&mut self) -> std::io::Result<Self::Child>;
+}
+#[cfg(any(test, feature = "nexus-test-support"))]
+impl SpawnRecorded for tokio::process::Command {
+    type Child = tokio::process::Child;
+    fn spawn_recorded(&mut self) -> std::io::Result<tokio::process::Child> {
+        #[cfg(feature = "nexus-test-support")]
+        {
+            crate::router::nexus_bridge::test_spawn_child(self).map_err(std::io::Error::other)
+        }
+        #[cfg(not(feature = "nexus-test-support"))]
+        {
+            self.spawn()
+        }
+    }
+}
+
+#[cfg(any(test, feature = "nexus-test-support"))]
+impl SpawnRecorded for std::process::Command {
+    type Child = std::process::Child;
+    fn spawn_recorded(&mut self) -> std::io::Result<Self::Child> {
+        #[cfg(feature = "nexus-test-support")]
+        {
+            crate::router::nexus_bridge::test_spawn_std_child(self).map_err(std::io::Error::other)
+        }
+        #[cfg(not(feature = "nexus-test-support"))]
+        {
+            self.spawn()
+        }
+    }
 }
 
 #[cfg(test)]

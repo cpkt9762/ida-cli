@@ -428,7 +428,14 @@ impl NexusTransport {
         };
         let deadline = Some(
             Instant::now()
-                + std::time::Duration::from_millis(budget.map_or(2000, |b| b.milliseconds())),
+                + std::time::Duration::from_millis(budget.map_or(
+                    if matches!(command, SessionCommand::Release { .. }) {
+                        15000
+                    } else {
+                        2000
+                    },
+                    |b| b.milliseconds(),
+                )),
         );
         queue.send(Delivery {
             command,

@@ -34,10 +34,9 @@ def case(version='current', lost_ack=False, root_loss=False, slice_cleanup=False
     spec = importlib.util.spec_from_file_location("_ida_cli_save_guard_v1", REPO / "nexus_bridge/save_guard.py")
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
-    guard._delayed_probes = lambda context: []
-    guard._log = lambda value: None
     directory = Path(tempfile.mkdtemp(prefix='release-', dir=ROOT))
     path = str(directory / "mock.i64")
+    Path(path).write_bytes(b"private release input")
     instance = types.SimpleNamespace(record_id="review-owner", backend="idalib",
         managed=True, pid=os.getpid(), started_at=time.time(), port=1, idb_path=path, exe_path="",
         _token=os.urandom(16).hex())
@@ -120,7 +119,10 @@ def case(version='current', lost_ack=False, root_loss=False, slice_cleanup=False
         owner.identity, owner.lifetime_path = "review-bridge", str(ROOT / "lifetime")
         owner.handles = {"logical": (lease, primary)}
         owner.custodians = {}
-        owner.cleanup_handles, owner.metadata_contexts = {}, {}
+        owner.cleanup_handles = {}
+        # Bound optional poison diagnostics with the supplied context deadline;
+        # the inspected guard's executable functions remain unmodified.
+        owner.metadata_contexts = {"logical":{"deadline":time.monotonic()}}
         owner.Handle = types.SimpleNamespace(attach=lambda entry: auxiliary)
         owner.drop_lifetime = lambda key: None
         messages = []

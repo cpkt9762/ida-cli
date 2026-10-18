@@ -66,8 +66,11 @@ def exercise(row, directory, *, alien=False):
     count = len(guards)
     messages, calls, checks, queries, drops = [], [], [], [], []
     live = set(range(count + (group == 'sibling')))
+    target = directory / 'matrix.i64'
+    if not target.exists():
+        target.write_bytes(b'private release compatibility input')
     instance = types.SimpleNamespace(record_id='matrix-owner', pid=os.getpid(),
-        started_at=1, idb_path='/private/matrix.i64', backend='idalib')
+        started_at=1, idb_path=str(target), backend='idalib')
     lock_fd = os.open(directory / 'matrix-owner.lock', os.O_CREAT | os.O_RDWR, 0o600)
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     real_wait = instances.wait_database_released
@@ -137,6 +140,7 @@ def exercise(row, directory, *, alien=False):
     owner.identity, owner.lifetime_path = 'matrix-bridge', '/private/matrix-lifetime'
     owner.handles, owner.metadata_contexts = {'logical': (lease, handles[0])}, {'logical': {}}
     owner.cleanup_handles, owner.grants = {}, {}
+    owner.custodians = {}  # This matrix exercises the retained auxiliary path.
     owner.Handle = types.SimpleNamespace(attach=lambda _: handles[1])
     owner.drop_lifetime = drops.append
 
@@ -179,16 +183,23 @@ def exercise(row, directory, *, alien=False):
             released and not owner.handles and not owner.cleanup_handles
             and not owner.metadata_contexts and drops == ['logical']))
         must_retain = unsafe or (group == 'sibling' and not ack_proofs) or alien
+        expected_not_sent = guards[0] not in GUARDS[:2]
+        invariant('NotSent_boundary', not expected_not_sent or (
+            calls == [] and live == set(range(count + (group == 'sibling')))
+            and all(not release_state(h)['requested'] for h in handles)
+            and final['event'] == 'not_sent' and final.get('save_guard_error') == observed_errors[0]))
         invariant('I6', not must_retain or (not released and owner.handles.get('logical') ==
             (lease, handles[0]) and owner.metadata_contexts == {'logical': {}}
             and (count == 1 or owner.cleanup_handles.get('logical') is handles[1])
-            and not drops and final['event'] in ('uncertain', 'release_unconfirmed')))
+            and not drops and final['event'] in (('not_sent',) if expected_not_sent
+                else ('uncertain', 'release_unconfirmed'))))
         # Raw ACK provenance is never rewritten by a shared owner proof.
         invariant('raw_ACK', all(not release_state(h).get('requested') or
             release_state(h)['outcome'].get('lease_released') is (acks[i] in ACKS[:2])
             for i, h in enumerate(handles)))
         return failures, {'case': row, 'failures': failures, 'calls': calls,
-                          'queries': queries, 'events': [m['event'] for m in messages]}
+                          'queries': queries, 'events': [m['event'] for m in messages],
+                          'messages':messages}
     finally:
         os.close(lock_fd)
 
@@ -203,7 +214,7 @@ class MatrixTests(unittest.TestCase):
                 if bad:
                     failures.append(detail)
         result = {'raw_combinations': 3280, 'reachable': len(rows),
-                  'excluded': dict(excluded), 'assertions_per_case': list(('I1', 'I2', 'I3', 'I4', 'I5', 'I6', 'raw_ACK')),
+                  'excluded': dict(excluded), 'assertions_per_case': list(('I1', 'I2', 'I3', 'I4', 'I5', 'I6', 'raw_ACK', 'NotSent_boundary')),
                   'failed': failures}
         if os.environ.get('F11_MATRIX_RESULT'):
             Path(os.environ['F11_MATRIX_RESULT']).write_text(json.dumps(result, indent=2) + '\n')

@@ -1,5 +1,7 @@
 """Owner guard state, fail-closed probes and first-transition attribution."""
 import importlib.util
+import os
+import tempfile
 from pathlib import Path
 import sys
 import types
@@ -10,12 +12,13 @@ from unittest.mock import patch
 class GuardTests(unittest.TestCase):
     def setUp(self):
         path = Path(__file__).resolve().parents[1] / 'nexus_bridge/save_guard.py'
-        spec = importlib.util.spec_from_file_location('test_save_guard', path)
+        spec = importlib.util.spec_from_file_location('_ida_cli_save_guard_v1', path)
         self.guard = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.guard)
         self.present = True
         self.flags = set()
         self.logs = []
+        self.original_log = self.guard._log
         self.guard._log = self.logs.append
         self.delayed_probes = self.guard._delayed_probes
         self.guard._delayed_probes = lambda context: []
@@ -35,6 +38,12 @@ class GuardTests(unittest.TestCase):
         self.modules = patch.dict(sys.modules, modules)
         self.modules.start()
         self.addCleanup(self.modules.stop)
+
+    def checked_guard(self):
+        # Compatibility inspection must see the actual source functions. Direct
+        # sampler tests above/below may still capture logs at their own boundary.
+        self.guard._log = self.original_log
+        self.guard._delayed_probes = self.delayed_probes
 
     def test_first_loss_has_operation_and_previous_sample_and_stays_poisoned(self):
         self.guard.begin({'method': 'open', 'operation_id': 'open-1'})
@@ -90,6 +99,7 @@ class GuardTests(unittest.TestCase):
                     self.assertEqual(self.flags, {1, 8})
 
     def test_hook_failure_shared_owner_protocol_reopen_and_final_close(self):
+        self.checked_guard()
         import tempfile
         import time
         directory = Path(__file__).resolve().parents[1] / 'nexus_bridge'
@@ -122,7 +132,7 @@ class GuardTests(unittest.TestCase):
             def fail_hook(_hook):
                 hook_calls.append('hook')
                 return False
-            api = types.SimpleNamespace(probe_database_state=lambda *a, **kw: {
+            api = types.SimpleNamespace(get_state_dir=lambda: Path(os.environ['IDA_NEXUS_STATE_DIR']), probe_database_state=lambda *a, **kw: {
                 'idb_path': str(target), 'state': 'packed'},
                 wait_database_released=lambda *a, **kw: False)
             with patch.dict(sys.modules, {'ida_nexus': api, '_ida_cli_save_guard_v1': guard}), \
@@ -168,6 +178,7 @@ class GuardTests(unittest.TestCase):
                         self.guard.finish({'method': 'close'}, refuse=False)
 
     def test_unconfirmed_flags_never_request_default_close(self):
+        self.checked_guard()
         import tempfile
         import time
         directory = Path(__file__).resolve().parents[1] / 'nexus_bridge'
@@ -201,7 +212,7 @@ class GuardTests(unittest.TestCase):
                     if branch == 'read-error':
                         raise OSError('cannot query flag')
                     return False
-                api = types.SimpleNamespace(probe_database_state=lambda *a, **kw: {
+                api = types.SimpleNamespace(get_state_dir=lambda: Path(os.environ['IDA_NEXUS_STATE_DIR']), probe_database_state=lambda *a, **kw: {
                     'idb_path': str(target), 'state': 'packed'}, wait_database_released=lambda *a, **kw: False)
                 with patch.dict(sys.modules, {'ida_nexus': api, '_ida_cli_save_guard_v1': guard}), \
                         patch.dict(__import__('os').environ, {'IDA_CLI_HOME': str(Path(temp)/'home')}), \
@@ -231,12 +242,15 @@ class GuardTests(unittest.TestCase):
                 owner.handles = {'lease': ({'lease_id': 'lease'}, handle)}
                 owner.verification_probes, owner.cleanup_handles = {}, {}
                 owner.executing, owner.metadata_contexts = {}, {}
+                owner.lifetime_endpoint = None
                 owner.lifetime_socket = Mock()
+                owner.custodians = {}
                 owner.lifetime_path = '/nonexistent/f7-lifetime'
                 owner.drop_lifetime = Mock()
                 owner.business, owner.control = Mock(), Mock()
                 owner.business_pool, owner.cancel_pool = Mock(), Mock()
                 owner.release_pool, owner.proof_pool = Mock(), Mock()
+                owner.preflight_pool, owner.detach_pool = Mock(), Mock()
                 owner.close()
                 handle.close.assert_not_called()
                 handle.close_outcome.assert_not_called()
@@ -322,6 +336,7 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(self.flags, {1, 8})
 
     def test_disconnected_release_rechecks_before_last_auxiliary_close(self):
+        self.checked_guard()
         import threading
         import time
         from unittest.mock import Mock
@@ -329,7 +344,10 @@ class GuardTests(unittest.TestCase):
         with patch.object(sys, 'path', [str(directory), *sys.path]):
             import bridge
         lease = {'lease_id': 'exact', 'instance_id': 'owner', 'generation': 1}
-        instance = types.SimpleNamespace(record_id='owner')
+        private = Path(tempfile.mkdtemp(dir=os.environ['R3A_CASE_ROOT'], prefix='r9-release-'))
+        target = private/'input.i64'
+        target.write_bytes(b'private owner input')
+        instance = types.SimpleNamespace(record_id='owner',backend='idalib',pid=os.getpid(),started_at=time.time(),idb_path=str(target))
         for loss in (False, True):
             with self.subTest(root_loss_after_primary_release=loss):
                 self.guard._state = None
@@ -353,10 +371,11 @@ class GuardTests(unittest.TestCase):
                 owner.identity, owner.lifetime_path = 'bridge', '/lifetime'
                 owner.lock = threading.Lock()
                 owner.handles = {'exact': (lease, primary)}
-                owner.cleanup_handles, owner.metadata_contexts = {}, {}
+                owner.cleanup_handles, owner.metadata_contexts, owner.custodians = {}, {}, {}
                 owner.Handle = types.SimpleNamespace(attach=lambda _: auxiliary)
                 owner.drop_lifetime = Mock()
                 api = types.SimpleNamespace(
+                    get_state_dir=lambda: Path(os.environ['IDA_NEXUS_STATE_DIR']),
                     discover_databases=lambda: [types.SimpleNamespace(instance=instance)],
                     wait_database_released=Mock(side_effect=AssertionError('unexpected lifetime wait')))
                 loader = sys.modules['ida_loader']
@@ -455,20 +474,21 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(self.logs[0]['stage'], 'automatic-close')
 
     def test_raw_python_preserves_future_imports_and_result_globals(self):
+        self.checked_guard()
         directory = Path(__file__).resolve().parents[1] / 'nexus_bridge'
         spec = importlib.util.spec_from_file_location('guard_bridge', directory/'bridge.py')
         bridge = importlib.util.module_from_spec(spec)
         with patch.object(sys, 'path', [str(directory), *sys.path]):
             spec.loader.exec_module(bridge)
-        calls = []
-        guard = types.SimpleNamespace(begin=lambda *a, **k: calls.append('before'),
-                                      finish=lambda *a, **k: calls.append('after'))
         code = bridge.guarded_source('from __future__ import annotations\nresult = 42', {'method': 'execute_python'})
         namespace = {}
-        with patch.dict(sys.modules, {'_ida_cli_save_guard_v1': guard}):
+        with patch.dict(sys.modules, {'_ida_cli_save_guard_v1': self.guard}):
             exec(code, namespace)
         self.assertEqual(namespace['result'], 42)
-        self.assertEqual(calls, ['before', 'after'])
+        self.assertEqual(self.guard._state['operation']['method'], 'execute_python')
+        self.assertEqual(self.guard._state['last_sample']['stage'], 'after',
+            'actual guard begin/finish must surround the future-import source')
+
 
 
 if __name__ == '__main__':
