@@ -157,6 +157,8 @@ class Channel:
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.connect(address)
         self.output = queue.Queue(capacity)
+        self.custody_acks = set()
+        self.ack_condition = threading.Condition()
         self.handler = handler
         self.stopped = stopped
         self.writer = threading.Thread(target=self.write, daemon=True)
@@ -165,7 +167,25 @@ class Channel:
         self.reader.start()
 
     def send(self, message):
+        # A retained receipt can be retransmitted while Rust waits on target
+        # EX. Keep one identical ACK queued/in flight so duplicate ACKs cannot
+        # block this channel's reader from accepting the custody RPC reply.
+        # Tracking is bounded by the output queue plus its current write.
+        key = self.custody_ack_key(message)
+        if key is not None:
+            with self.ack_condition:
+                while key not in self.custody_acks and len(self.custody_acks) >= self.output.maxsize + 1:
+                    self.ack_condition.wait()
+                if key in self.custody_acks:
+                    return
+                self.custody_acks.add(key)
         self.output.put(message)
+
+    @staticmethod
+    def custody_ack_key(message):
+        if message.get('event') in ('custody_retired_ack', 'owner_proof_ack'):
+            return json.dumps(message, sort_keys=True, allow_nan=False)
+        return None
 
     def write(self):
         try:
@@ -183,7 +203,14 @@ class Channel:
                                "error": error("operation_failed",
                                    f"response encoding failed: {type(exc).__name__}")}
                     encoded = json.dumps(failure, ensure_ascii=True, allow_nan=False).encode("ascii")
-                self.socket.sendall(encoded + b"\n")
+                try:
+                    self.socket.sendall(encoded + b"\n")
+                finally:
+                    key = self.custody_ack_key(message)
+                    if key is not None:
+                        with self.ack_condition:
+                            self.custody_acks.discard(key)
+                            self.ack_condition.notify_all()
         except OSError:
             self.stopped.set()
 

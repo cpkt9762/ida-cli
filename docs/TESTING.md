@@ -1311,3 +1311,15 @@ refused while the consumed post-exit allowance, original instances, launch list
 and prior outcome remain owned. No SDK patch/hash or resolve-count allowance
 changes. Each Rust integration case still needs its own private case root;
 late-stop uses the documented 120-second shell allowance.
+
+R2 RR1-F1 adds
+`post_exit_attach_attempt_ack_deadline_sends_zero_attach_and_settles_notsent`.
+Its actual helper signs the final may_send fact while the original budget is
+positive; a barrier delays that ACK return past the deadline. The callback then
+refuses before HTTP, retains the signed fact and original instance, and consumes
+the fixed SDK's real NotSent outcome before durable NoAttachClosed settlement.
+This differs from the earlier final-Resolved barrier, which remains required.
+Exact-clock models cover healthy, expired entry, exact deadline and late ACK.
+Identical custody-retirement/public-proof ACKs coalesce only while queued/in flight, with
+tracking bounded by the output queue plus its current write. The original ACK
+still completes; duplicates cannot block the control reader's custody RPC reply.

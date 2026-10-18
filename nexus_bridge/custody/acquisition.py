@@ -191,6 +191,11 @@ class Custodian:
             self.admit_target(self.acquisition)
         elif stage == 'AttachMayBeSent':
             self.attach_fact(value, self.attach_ordinal, 'may_send')
+            # Durable pre-send registration is not an HTTP send. The helper
+            # round trip can consume the original budget; keep its signed fact
+            # and let the SDK report NotSent when this final callback refuses.
+            if self.deadline <= time.monotonic():
+                raise TimeoutError('original open budget exhausted after attach attempt signing; no attach')
         elif stage == 'AttachFailed':
             self.attach_failures.append(value)
             state = 'exact_handle' if value['handle'] is not None else value['failure_kind']

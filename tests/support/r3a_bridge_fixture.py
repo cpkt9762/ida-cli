@@ -133,6 +133,10 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
         generation = 0
         gc_serial = 0
         while not stopped.wait(.005):
+            if scenario == 'post-exit-attach-ack' and (root/'dump-stacks').exists() and not (root/'stacks.log').exists():
+                import faulthandler
+                with (root/'stacks.log').open('w') as output:
+                    faulthandler.dump_traceback(file=output)
             if (root / 'owner-release').exists() and not boundary.released:
                 boundary.release_owner()
                 (root / 'owner-released').touch()
@@ -182,6 +186,14 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
             def public_stage(self, stage, value):
                 # Public observer telemetry only; never substitutes a resolver,
                 # result, proof, SDK object or production admission decision.
+                if scenario == 'post-exit-attach-ack' and self.post_exit_resolve_used and stage == 'AttachMayBeSent':
+                    import time
+                    # Enter the production stage with a small positive budget;
+                    # the actual failure barrier is the later helper ACK.
+                    while self.deadline-time.monotonic() > .4:
+                        threading.Event().wait(min(.01, self.deadline-time.monotonic()-.4))
+                    self._r2_attach_entry = time.monotonic()
+                    self._r2_attach_instance = value
                 result = original_stage(self, stage, value)
                 if scenario == 'post-exit-deadline' and self.post_exit_resolve_used and stage == 'Resolved':
                     import time
@@ -196,6 +208,49 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
                     log.flush()
                 return result
             Custodian.stage = public_stage
+        if scenario == 'post-exit-attach-ack':
+            from acquisition import Custodian
+            from r0_transport import barrier
+            import time
+            actual_helper_request = Custodian.helper_request
+            def final_attach_ack(self, value):
+                reply = actual_helper_request(self, value)
+                if self.post_exit_resolve_used and value['kind'] in ('attach_attempt', 'no_attach'):
+                    with (root/'attach-facts.jsonl').open('a') as log:
+                        log.write(json.dumps({'kind':value['kind'], 'watch':value['watch'],
+                            'reply':reply})+'\n')
+                if (self.post_exit_resolve_used and value['kind'] == 'attach_attempt'
+                        and value['attempt']['state'] == 'may_send'):
+                    self._r2_attach_watch = value['watch']
+                    (root/'attach-ack-stage.json').write_text(json.dumps({
+                        'deadline':self.deadline, 'entry_at':self._r2_attach_entry,
+                        'signed_at':time.monotonic(), 'remaining':self.deadline-time.monotonic(),
+                        'consumed':self.post_exit_resolve_used, 'watch':value['watch'],
+                        'signed':reply['receipt']['record']['attempt'],
+                        'strong_instances':len(self.originals), 'launches':list(self.launches)}))
+                    barrier(root, 'attach-ack', seconds=3)
+                    (root/'attach-ack-return.json').write_text(json.dumps({
+                        'returned_at':time.monotonic(), 'deadline':self.deadline}))
+                return reply
+            Custodian.helper_request = final_attach_ack
+            actual_obtain = Custodian.obtain
+            def record_attach_outcome(self, *args, **kwargs):
+                try:
+                    return actual_obtain(self, *args, **kwargs)
+                finally:
+                    if self.outcome is not None:
+                        value = self.outcome
+                        (root/'attach-outcome.json').write_text(json.dumps({
+                            'failure_kind':value['failure_kind'], 'handle':value['handle'] is not None,
+                            'cause':None if value['cause'] is None else type(value['cause']).__name__,
+                            'consumed':self.post_exit_resolve_used,
+                            'instance_preserved':value['instance'] is getattr(self,'_r2_attach_instance',None),
+                            'prior_attempts':[{'attempt':a['attempt'],'failure_kind':a['failure_kind']}
+                                for a in value.get('prior_outcome',{}).get('attempts',[])],
+                            'attempts':[{'attempt':a['attempt'],'failure_kind':a['failure_kind'],
+                                'handle':a['handle'] is not None} for a in value['attempts']],
+                            'launches':[stage for stage,_ in value['launches']]}))
+            Custodian.obtain = record_attach_outcome
         if os.environ.get('R2_BOOT_SOURCE_INPUT'):
             import target_journal
             observed_scope = runpy.run_path(str(Path(__file__).with_name('r2_boot_writer.py')))['observed_scope']

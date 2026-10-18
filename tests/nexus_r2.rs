@@ -1385,3 +1385,110 @@ async fn late_real_ack_after_boot_retirement_never_rewrites_target() {
     shutdown.expect("natural shutdown");
     result.expect("retired target bytes immutable");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn post_exit_attach_attempt_ack_deadline_sends_zero_attach_and_settles_notsent() {
+    let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root"));
+    let router = RouterState::new().expect("router");
+    let mut environment: BTreeMap<String, String> = std::env::vars().collect();
+    environment.insert("R3A_SCENARIO".into(), "post-exit-attach-ack".into());
+    let bridge = router
+        .connect_nexus(BridgeConfig {
+            python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("fixed SDK")),
+            script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/r3a_bridge_fixture.py"),
+            directory: root.join("i"),
+            environment,
+        })
+        .await
+        .expect("production bridge/helper");
+    let caller_router = router.clone();
+    let path = root.join("tiny.i64");
+    let caller = tokio::spawn(async move {
+        caller_router
+            .ensure_worker_prepared(
+                path.to_str().expect("path"),
+                None,
+                None,
+                Preparation::new(Duration::from_secs(5)),
+            )
+            .await
+    });
+    let result: anyhow::Result<Value> = async {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while !root.join("attach-ack.arrived").exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await?;
+        let signed: Value = serde_json::from_slice(&std::fs::read(root.join("attach-ack-stage.json"))?)?;
+        anyhow::ensure!(signed["entry_at"].as_f64() < signed["deadline"].as_f64()
+            && signed["remaining"].as_f64().is_some_and(|v|v>0.0 && v<0.5)
+            && signed["consumed"]==true && signed["signed"]["attempt"]==3
+            && signed["signed"]["state"]=="may_send" && signed["strong_instances"].as_u64().is_some_and(|n|n>0),
+            "barrier must follow real final helper signing with positive original budget: {signed}");
+        tokio::time::sleep(Duration::from_secs_f64(signed["remaining"].as_f64().expect("remaining")+0.1)).await;
+        std::fs::write(root.join("attach-ack.release"),b"")?;
+        let opened = caller.await?;
+        anyhow::ensure!(opened.is_err(),"expired original request returned an active token");
+        let outcome_ready = tokio::time::timeout(Duration::from_secs(3),async {
+            while !root.join("attach-outcome.json").exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await;
+        if outcome_ready.is_err() {
+            std::fs::write(root.join("dump-stacks"),b"")?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        outcome_ready?;
+        let outcome:Value = serde_json::from_slice(&std::fs::read(root.join("attach-outcome.json"))?)?;
+        let returned:Value = serde_json::from_slice(&std::fs::read(root.join("attach-ack-return.json"))?)?;
+        anyhow::ensure!(returned["returned_at"].as_f64() >= returned["deadline"].as_f64(),"ACK did not cross deadline");
+        std::fs::write(root.join("snapshot-request"),b"")?;
+        tokio::time::timeout(Duration::from_secs(2),async {
+            while !root.join("snapshot.json").exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await?;
+        let snapshot:Value = serde_json::from_slice(&std::fs::read(root.join("snapshot.json"))?)?;
+        let requests=snapshot["requests"].as_array().expect("HTTP requests");
+        anyhow::ensure!(requests.iter().filter(|v|v["endpoint"]=="attach_attempt").count()==2
+            && requests.iter().all(|v|v["endpoint"]!="lease") && snapshot["physical_leases"]==0,
+            "helper ACK after deadline still sent third attach or acquired lease: {snapshot}");
+        anyhow::ensure!(outcome["failure_kind"]=="not_sent" && outcome["handle"]==false
+            && outcome["cause"]=="TimeoutError" && outcome["consumed"]==true && outcome["instance_preserved"]==true
+            && outcome["prior_attempts"]==json!([{"attempt":1,"failure_kind":"lease_absent"},{"attempt":2,"failure_kind":"lease_absent"}])
+            && outcome["attempts"][2]["attempt"]==3 && outcome["attempts"][2]["failure_kind"]=="not_sent",
+            "signed custody/prior history/SDK NotSent lost: {outcome}");
+        let stages=std::fs::read_to_string(root.join("public-stages.jsonl"))?;
+        let resolves=stages.lines().map(serde_json::from_str::<Value>).collect::<Result<Vec<_>,_>>()?
+            .iter().filter(|v|v["stage"]=="BeforeResolve").count();
+        anyhow::ensure!(resolves==3,"original two plus exactly one post-exit resolver: {resolves}");
+        let facts=std::fs::read_to_string(root.join("attach-facts.jsonl"))?;
+        let facts=facts.lines().map(serde_json::from_str::<Value>).collect::<Result<Vec<_>,_>>()?;
+        anyhow::ensure!(facts.iter().any(|v|v["kind"]=="no_attach" && v["watch"]==signed["watch"]
+            && v["reply"]["consumer"]["record"]["attempts"]["3"]["state"]=="not_sent"),
+            "real NotSent must durably supersede may_send before watch closure: {facts:?}");
+        tokio::time::timeout(Duration::from_secs(3),async {
+            while bridge.lifecycle_status()["resources"]!=0 || bridge.lifecycle_status()["startup_and_pre_attach"]!=0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await?;
+        anyhow::ensure!(!root.join("owner-release").exists(),"owner proof substituted for typed NotSent closure");
+        Ok(json!({"signed":signed,"returned":returned,"outcome":outcome,"snapshot":snapshot,"resolves":resolves,"facts":facts}))
+    }.await;
+    std::fs::write(root.join("attach-ack.release"), b"").expect("finally release exact ACK");
+    std::fs::write(root.join("owner-release"), b"").expect("finally release owned lifetime");
+    let settled = tokio::time::timeout(Duration::from_secs(8), async {
+        while bridge.lifecycle_status()["resources"] != 0
+            || bridge.lifecycle_status()["startup_and_pre_attach"] != 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let shutdown = bridge.shutdown().await;
+    std::fs::write(
+        root.join("attach-ack-result.json"),
+        serde_json::to_vec_pretty(&json!({"result":format!("{result:?}"),
+        "settled":settled.is_ok(),"shutdown":format!("{shutdown:?}")}))
+        .expect("encode"),
+    )
+    .expect("evidence");
+    settled.expect("all custody naturally settled");
+    shutdown.expect("natural helper/bridge shutdown");
+    result.expect("final helper acknowledgment deadline/NotSent contract");
+}
