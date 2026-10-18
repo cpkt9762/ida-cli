@@ -31,7 +31,7 @@ class VerificationScope(unittest.TestCase):
         shutil.copyfile(os.environ['R3F1_SAMPLE'],self.probe)
         self.probe.chmod(0o600)
         (self.root/'input').write_bytes(b'private immutable input')
-        self.addCleanup(shutil.rmtree,self.root)
+        # Keep private input/journal scenes for independent verification, including failures.
 
     def initialize(self,target):
         return verification_scope(target,copy.deepcopy(PARENT))
