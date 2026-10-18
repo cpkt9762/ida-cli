@@ -11,6 +11,7 @@ import time
 
 from target_coordination import LIMIT, RESERVE, SUMMARY_BYTES, SUMMARY_LIMIT, Target, digest, encoded
 from origin import creation_scope, boot_change
+from custody_process_identity import capture
 
 
 class OwnerDraining(RuntimeError):
@@ -195,7 +196,6 @@ class Journal:
             if name not in ('lock', 'target.json', 'custody.json', 'proofs', 'observations', 'retained'):
                 raise RuntimeError('RecoveryBlocked: unsupported target coordination entry: ' + name)
         self.recover_public_proofs()
-        self.retire_old_boot()
         for item in self.value['entries'].values():
             if self.retirement(item):
                 continue
@@ -351,9 +351,15 @@ class Journal:
         return evidence
 
     def require_live(self, item):
-        self.retire_old_boot()
         if self.retirement(item):
             raise RuntimeError('ObservationClosed: retired boot epoch cannot change historical facts')
+        # Ordinary same-boot callbacks need only a native boot recheck. Full
+        # machine/volume qualification is required when that boot differs;
+        # repeatedly probing disks on every proof/closure delays live cleanup.
+        if item['origin_binding'].get('creator', {}).get('boot_id') != capture(os.getpid())['boot_id']:
+            self.retire_old_boot()
+            if self.retirement(item):
+                raise RuntimeError('ObservationClosed: retired boot epoch cannot change historical facts')
 
     def retire_old_boot(self):
         current = creation_scope(self.target.directory.path, 'resource-consumer')
@@ -431,7 +437,6 @@ class Journal:
 
     def release_observation(self, value):
         item = self.item(value['watch'], value['epoch'])
-        self.require_live(item)
         if (item['lease'] != value['lease'] or item['owner'] != value['owner']
                 or value['attempt']['target'] != {'kind':'release', 'lease':item['lease']}
                 or value['outcome'].get('detach_called') is not False):
@@ -453,7 +458,6 @@ class Journal:
 
     def detach_outcome(self, value):
         item = self.item(value['watch'], value['epoch'])
-        self.require_live(item)
         observation = item.get('release_observation')
         outcome = value['outcome']
         if (not observation or observation['attempt'] != value['attempt']
@@ -495,7 +499,6 @@ class Journal:
         receipt = value['proof']
         record = receipt['record']
         item = self.item(value['watch'], record['subscription_epoch'])
-        self.require_live(item)
         if (record.get('helper') not in self.authorized_producers(item, ('Subscribed', 'StartupOwnerSubscribed', 'BridgeSubscribed'))
                 or record['watch'] != item['watch']
                 or record['state_root'] != item['owner']['state_root']
