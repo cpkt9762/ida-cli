@@ -1,18 +1,19 @@
 {
   "schema": 1,
-  "sdk_boundary": 1,
+  "sdk_boundary": 2,
   "nexus_version": "0.13.4",
   "nexus_sha": "d60ff582fde90c59726336c0dbdf3e8286e9df7a",
   "domain_version": "0.5.1",
   "files": {
-    "handle.py": "e9d57e725b4c0405faf959422720451215a9f7b2bd8f98bf0ad2377383b399ce",
+    "handle.py": "dd9daf669b6dc55f657dd11b60f9869dcca70cf278cc65bc1d91b4e02b199acd",
     "_resolver.py": "d06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8",
     "options.py": "1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe"
   },
   "capabilities": [
     "acquisition_outcome_v1",
     "ack_cleanup_v1",
-    "launch_observer_v1"
+    "launch_observer_v1",
+    "single_resolution_outcome_v1"
   ],
   "unavailable": [
     "durable_custody",
@@ -20,5 +21,12 @@
     "preparing_operations",
     "post_exit_resolve",
     "two_phase_release"
-  ]
+  ],
+  "resolution_contract": {
+    "max_resolver_calls": 1,
+    "attach_calls": 0,
+    "internal_retries": 0,
+    "recovery": "same_as_legacy_open",
+    "custody_or_exit_proof": false
+  }
 }

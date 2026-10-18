@@ -1078,6 +1078,20 @@ Python/R5/N1/transport/bridge targets. The matrix preserves all twelve R0 SDK
 behaviors and adds type/signature, original-instance, callback, thread, reentry,
 claim/close concurrency and failed-second-resolve assertions. Real HTTP/SSE
 faults are test boundaries, not production private-protocol replacement.
+
+R2 adds public `DatabaseHandle.resolve_outcome(path, *, options=None,
+observer=None)` in the same fourth patch and three-module SDK closure. It calls
+the resolver at most once and never attaches or retries. `ResolutionOutcome`
+retains the exact cause, original instance, launch events and legacy `recovery`;
+it asserts neither custody nor owner exit. The initial legacy open remains at
+most two attempts. After exact durable exit proof and original-budget admission,
+the adapter may consume one separate post-exit allowance and explicitly attach
+once using the returned recovery. Unknown attach and business calls never replay.
+`tests/support/r2_sdk.py` checks this boundary in a new private case root. The
+existing real SDK probe additionally verifies actual Spawned/Ready for normal
+resolve and Ready rejection, followed by explicit cleanup and natural child exit.
+Current installed hashes come from `scripts/nexus/client-sdk-contract.json`;
+the earlier R1/R0 hashes above remain historical inputs.
 The new probe requires a fresh prepared root and its own interpreter:
 
 ```sh

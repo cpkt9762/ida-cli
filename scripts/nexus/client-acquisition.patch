@@ -1,9 +1,10 @@
-Nexus 0.13.4 R1 additive client acquisition/ACK boundary.
+Nexus 0.13.4 R2 additive client acquisition/ACK boundary.
 Apply after loopback-bind, client-cancel-unknown and client-close-proof.
 Upstream d60ff582fde90c59726336c0dbdf3e8286e9df7a; no server/wire changes.
 R0 candidate is historical; this static patch is the reproducible product input.
 Public types live in ida_nexus.handle/options and LaunchEvent in _resolver.
-No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
+Single resolve_outcome is an acquisition stage only; no custody or owner-exit proof.
+The adapter owns the separate one-use post-exit allowance and total deadline.
 
 --- a/ida_nexus/handle.py
 +++ b/ida_nexus/handle.py
@@ -36,7 +37,7 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
  
  # Closing an IDB may include a final save. Allow the same five-minute budget as
  # explicit saving plus a small margin for worker and registry teardown.
-@@ -239,6 +242,179 @@
+@@ -239,6 +242,238 @@
          self.close()
  
  
@@ -87,6 +88,15 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 +    sdk_reconnect_used: bool
 +    attempts: list[AttachAttempt]
 +    unresolved_attempts: list[AttachAttempt]
++
++
++class ResolutionOutcome(AcquisitionOutcome):
++    """One resolver phase without an attach or lease.
++
++    The exact instance and launch facts remain obligations for the caller.
++    recovery is None only when probing failed before its value was known.
++    """
++    recovery: DatabaseRecovery | None
 +
 +
 +# Lock never spans a callback, a handle lock or any I/O. A callback may claim,
@@ -162,6 +172,10 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 +        if stage in ("Resolved", "ReconnectResolved"):
 +            self.instances.append(value)
 +            self.reconnect |= stage == "ReconnectResolved"
++        elif stage == "Ready":
++            # Ready already holds a real public instance, even if its observer
++            # rejects before the final Resolved notification. Retain it first.
++            self.instances.append(value["instance"])
 +        elif stage == "BeforeAttach":
 +            self.attempts.append({"attempt": len(self.attempts) + 1,
 +                "instance": value, "stage": stage, "failure_kind": "not_sent",
@@ -213,10 +227,56 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 +            "unresolved_attempts": unknown, "sdk_reconnect_used": self.reconnect}
 +
 +
++def _resolve_open_instance(path: str, options: DatabaseOpenOptions) -> DatabaseInstance:
++    """Shared option forwarding for legacy open and single-phase resolution."""
++    return resolve_instance(
++        path,
++        spawn=options.spawn,
++        timeout=options.startup_timeout,
++        output_database=options.output_database,
++        worker_env=options.worker_env,
++        worker_cwd=options.worker_cwd,
++        auto_analysis=options.auto_analysis,
++        image_base=options.image_base,
++        new_database=options.new_database,
++        compiler=options.compiler,
++        first_pass_directives=options.first_pass_directives,
++        second_pass_directives=options.second_pass_directives,
++        disable_fpp=options.disable_fpp,
++        entry_point=options.entry_point,
++        jit_debugger=options.jit_debugger,
++        log_file=options.log_file,
++        disable_mouse=options.disable_mouse,
++        plugin_options=options.plugin_options,
++        processor=options.processor,
++        db_compression=options.db_compression,
++        run_debugger=options.run_debugger,
++        load_resources=options.load_resources,
++        script_file=options.script_file,
++        script_args=options.script_args,
++        file_type=options.file_type,
++        file_member=options.file_member,
++        empty_database=options.empty_database,
++        windows_dir=options.windows_dir,
++        no_segmentation=options.no_segmentation,
++        debug_flags=options.debug_flags,
++        acquisition_observer=options.acquisition_observer,
++    )
++
++
++def _open_recovery(path: str, options: DatabaseOpenOptions) -> DatabaseRecovery:
++    file_state = probe_database_state(
++        path, output_database=options.output_database,
++    )
++    if file_state["state"] == "crashed" and not options.new_database:
++        return "restored" if file_state["packed_database_exists"] else "repaired"
++    return "none"
++
++
  class DatabaseHandle:
      """A shared Nexus instance plus one lifetime SSE client lease."""
  
-@@ -251,6 +427,8 @@
+@@ -251,6 +486,8 @@
          idle_timeout: float | None = None,
          recovery: DatabaseRecovery = "none",
          on_disconnect: Callable[["DatabaseHandle", str], None] | None = None,
@@ -225,7 +285,7 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
      ) -> None:
          if not math.isfinite(keepalive) or not 0 <= keepalive <= MAX_KEEPALIVE_SECONDS:
              raise ValueError(
-@@ -280,9 +458,12 @@
+@@ -280,9 +517,12 @@
          self._lease_id = uuid.uuid4().hex
          self._event_origin_id = _event_origin_id(self._lease_id)
          self._on_disconnect = on_disconnect
@@ -238,7 +298,7 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
          self._close_outcome: dict[str, Any] | None = None
          self._closed = threading.Event()
          self._disconnected = threading.Event()
-@@ -306,13 +487,27 @@
+@@ -306,13 +546,27 @@
              self._lease_response,
              self._lease_socket,
          ) = self._open_lease(instance)
@@ -273,7 +333,7 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
  
      @classmethod
      def attach(
-@@ -324,20 +519,52 @@
+@@ -324,20 +578,52 @@
          idle_timeout: float | None = None,
          recovery: DatabaseRecovery = "none",
          on_disconnect: Callable[["DatabaseHandle", str], None] | None = None,
@@ -327,7 +387,7 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
  
      @classmethod
      def open(
-@@ -346,6 +573,7 @@
+@@ -346,72 +632,137 @@
          *,
          options: DatabaseOpenOptions | None = None,
          on_disconnect: Callable[["DatabaseHandle", str], None] | None = None,
@@ -335,13 +395,54 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
      ) -> Self:
          """Attach to a shared instance, spawning a configured worker if needed."""
  
-@@ -392,26 +620,100 @@
-                 windows_dir=options.windows_dir,
-                 no_segmentation=options.no_segmentation,
-                 debug_flags=options.debug_flags,
-+                acquisition_observer=options.acquisition_observer,
-             )
+         options = options or DatabaseOpenOptions()
+-        file_state = probe_database_state(
+-            path,
+-            output_database=options.output_database,
+-        )
+-        recovery: DatabaseRecovery = "none"
+-        if file_state["state"] == "crashed" and not options.new_database:
+-            recovery = (
+-                "restored" if file_state["packed_database_exists"] else "repaired"
+-            )
++        recovery = _open_recovery(path, options)
  
+         def resolve() -> DatabaseInstance:
+-            return resolve_instance(
+-                path,
+-                spawn=options.spawn,
+-                timeout=options.startup_timeout,
+-                output_database=options.output_database,
+-                worker_env=options.worker_env,
+-                worker_cwd=options.worker_cwd,
+-                auto_analysis=options.auto_analysis,
+-                image_base=options.image_base,
+-                new_database=options.new_database,
+-                compiler=options.compiler,
+-                first_pass_directives=options.first_pass_directives,
+-                second_pass_directives=options.second_pass_directives,
+-                disable_fpp=options.disable_fpp,
+-                entry_point=options.entry_point,
+-                jit_debugger=options.jit_debugger,
+-                log_file=options.log_file,
+-                disable_mouse=options.disable_mouse,
+-                plugin_options=options.plugin_options,
+-                processor=options.processor,
+-                db_compression=options.db_compression,
+-                run_debugger=options.run_debugger,
+-                load_resources=options.load_resources,
+-                script_file=options.script_file,
+-                script_args=options.script_args,
+-                file_type=options.file_type,
+-                file_member=options.file_member,
+-                empty_database=options.empty_database,
+-                windows_dir=options.windows_dir,
+-                no_segmentation=options.no_segmentation,
+-                debug_flags=options.debug_flags,
+-            )
+-
++            return _resolve_open_instance(path, options)
++
 +        _notify_stage(options.acquisition_observer, "BeforeResolve", {"path": path, "reconnect": False})
          instance = resolve()
 +        _notify_stage(options.acquisition_observer, "Resolved", instance)
@@ -428,6 +529,36 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 +            return ledger.outcome(None, error)
 +        return ledger.outcome(handle, None)
 +
++    @classmethod
++    def resolve_outcome(
++        cls, path: str, *, options: DatabaseOpenOptions | None = None,
++        observer: AcquisitionObserver | None = None,
++    ) -> ResolutionOutcome:
++        """Resolve at most once, preserving facts without attaching or retrying.
++
++        Both observers run inline, options first. A callback failure is an
++        error and retains the exact resolved instance and launch facts.
++        Successful resolution is not durable custody or owner-exit proof.
++        The caller owns the deadline and must retain startup/owner obligations.
++        """
++        from dataclasses import replace
++        options = options or DatabaseOpenOptions()
++        def observe(stage: AcquisitionStage, value: Any) -> None:
++            _notify_stage(options.acquisition_observer, stage, value)
++            _notify_stage(observer, stage, value)
++        ledger = _Acquisition(observe)
++        recovery: DatabaseRecovery | None = None
++        try:
++            recovery = _open_recovery(path, options)
++            ledger.observe("BeforeResolve", {"path": path, "reconnect": False})
++            instance = _resolve_open_instance(
++                path, replace(options, acquisition_observer=ledger.observe),
++            )
++            ledger.observe("Resolved", instance)
++        except Exception as error:
++            return ResolutionOutcome(**ledger.outcome(None, error), recovery=recovery)
++        return ResolutionOutcome(**ledger.outcome(None, None), recovery=recovery)
++
 +    def claim_acquired(self) -> Self:
 +        """Idempotently transfer SDK retention to caller; concurrent close is legal."""
 +        with _ACQUIRED_PENDING_LOCK:
@@ -437,15 +568,16 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
  
      @property
      def instance(self) -> DatabaseInstance:
-@@ -465,48 +767,40 @@
+@@ -465,48 +816,40 @@
          self, entry: DatabaseInstance
      ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse, socket.socket]:
          connection = http.client.HTTPConnection(HOST, entry.port, timeout=10.0)
-+        response = None
-         try:
+-        try:
 -            lease_path = (
 -                f"/health?sse=1&lease_id={self._lease_id}&keepalive={self.keepalive:g}"
 -            )
++        response = None
++        try:
 +            lease_path = f"/health?sse=1&lease_id={self._lease_id}&keepalive={self.keepalive:g}"
              if self.idle_timeout is not None:
                  lease_path += f"&idle_timeout={self.idle_timeout:g}"
@@ -516,7 +648,7 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
  
      @staticmethod
      def _crashed_database_state(entry: DatabaseInstance) -> DatabaseFileState | None:
-@@ -934,214 +1228,214 @@
+@@ -934,214 +1277,214 @@
          return result
  
      def _release_remote_lease(self) -> bool:
@@ -574,10 +706,11 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
              outcome["failure"] = "deadline"
              return outcome
 -        connection = http.client.HTTPConnection(HOST, self.instance.port, timeout=timeout)
+-        try:
 +        connection = response = None
 +        legacy_error = None
 +        legacy_caught = (OSError, http.client.HTTPException, UnicodeDecodeError, json.JSONDecodeError)
-         try:
++        try:
 +            entry = self.instance
 +            connection = http.client.HTTPConnection(HOST, entry.port, timeout=timeout)
              connection.request("POST", "/release_lease",
@@ -683,11 +816,7 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
          if not self._close_lock.acquire(timeout=float(timeout)):
 -            return {"status": "uncertain", "owner_released": False,
 -                    "lease_released": False, "failure": "close_in_progress"}
-+            outcome = self._close_snapshot()
-+            outcome.update(close_in_progress=True, wait_failure="deadline")
-+            return outcome
-+        self._close_owner = threading.get_ident()
-         try:
+-        try:
 -            return self._close(wait_for_database=wait_for_database, timeout=max(0.0, deadline - time.monotonic()), structured=True)
 -        except Exception as exc:
 -            outcome = {"status": "uncertain", "owner_released": False,
@@ -695,6 +824,11 @@ No helper/custody, owner-exit policy or post-exit re-resolve is advertised.
 -                       "failure_type": type(exc).__name__}
 -            self._close_outcome = outcome
 -            return dict(outcome)
++            outcome = self._close_snapshot()
++            outcome.update(close_in_progress=True, wait_failure="deadline")
++            return outcome
++        self._close_owner = threading.get_ident()
++        try:
 +            return self._close(wait_for_database=wait_for_database,
 +                timeout=max(0.0, deadline - time.monotonic()), structured=True)
          finally:

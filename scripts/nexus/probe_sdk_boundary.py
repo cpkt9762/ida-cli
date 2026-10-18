@@ -41,7 +41,7 @@ def main():
         assert path.is_relative_to(env.root / 'venv')
         modules[name] = {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
     supported = (all(modules[n]['sha256'] == h for n, h in contract['files'].items())
-                 and all(hasattr(DatabaseHandle, n) for n in ('open_outcome', 'attach_outcome', 'claim_acquired')))
+                 and all(hasattr(DatabaseHandle, n) for n in ('open_outcome', 'attach_outcome', 'resolve_outcome', 'claim_acquired')))
     assert supported is not args.expect_unpatched
     result = {'status': 'RED' if args.expect_unpatched else 'FAIL', 'sdk_modules': modules,
               'versions': {n: importlib.metadata.version(n) for n in ('ida-nexus', 'ida-domain')},
@@ -113,6 +113,36 @@ def main():
             assert handle.close_outcome(timeout=1) == last
             result['outcome'] = {'callback_failure_retains_real_handle': True, 'claim': True,
                 'attempts': len(outcome['attempts']), 'nonlast': nonlast, 'last': last}
+            # R2's normal single-resolution API must expose real Spawned/Ready
+            # without attaching. A Ready rejection keeps the original instance
+            # and cause so an explicit cleanup can assume that responsibility.
+            single = []
+            for rejected in (False, True):
+                cause = NexusConnectionError('probe exact real Ready refusal')
+                before = len(stages)
+                def single_observer(stage, value):
+                    if rejected and stage == 'Ready':
+                        raise cause
+                resolved = DatabaseHandle.resolve_outcome(str(env.root / 'fixtures/mini'),
+                    options=options('single-rejected' if rejected else 'single'),
+                    observer=single_observer)
+                assert (resolved['cause'] is cause) if rejected else resolved['cause'] is None
+                assert resolved['handle'] is None and not resolved['attempts'] and not resolved['unresolved_attempts']
+                assert not resolved['sdk_reconnect_used'] and resolved['recovery'] == 'none'
+                launches = dict(resolved['launches'])
+                assert {'LaunchIntent','Spawned','LogReady','Ready'} <= launches.keys()
+                assert resolved['instance'] is launches['Ready']['instance']
+                assert resolved['first_instance'] is resolved['instance']
+                assert stages[before:].count('BeforeResolve') == 1 and 'BeforeAttach' not in stages[before:]
+                attached = DatabaseHandle.attach_outcome(resolved['instance'], recovery=resolved['recovery'])
+                handle = attached['handle']
+                assert attached['cause'] is None and handle is not None
+                handles.append(handle)
+                closed = handle.close_outcome(wait_for_database=True, timeout=20)
+                assert closed['lease_released'] and closed['owner_released']
+                single.append({'ready_rejected':rejected,'stage':resolved['stage'],
+                    'stages':stages[before:],'explicit_cleanup':closed})
+            result['single_resolution'] = single
             assert {'r1-legacy-execute', 'r1-owner-version', 'r1-outcome-execute', 'r1-outcome-wait'} <= set(operation_ids)
             result.update(status='PASS', stages=stages, operation_ids=operation_ids)
     except BaseException as exc:
