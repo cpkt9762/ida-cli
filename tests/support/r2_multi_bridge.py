@@ -208,7 +208,9 @@ else:
                 self.unlock_target()
                 marker = root/'custody-dropped.json'
                 if not marker.exists():
-                    marker.write_text(json.dumps([self.lease]))
+                    temporary=marker.with_suffix('.json.new')
+                    temporary.write_text(json.dumps([self.lease]))
+                    temporary.replace(marker)
                     until = time.monotonic()+8
                     while not (root/'acquired-resume').exists():
                         if time.monotonic() >= until:
@@ -225,7 +227,9 @@ else:
                         leases = [lease for lease, _ in self.handles.values()]
                     marker = root/'custody-dropped.json'
                     if not marker.exists():
-                        marker.write_text(json.dumps(leases))
+                        temporary=marker.with_suffix('.json.new')
+                        temporary.write_text(json.dumps(leases))
+                        temporary.replace(marker)
                     return
                 return original_receive(self, channel, message)
             runtime.Bridge.receive = lose_acquired_ack
