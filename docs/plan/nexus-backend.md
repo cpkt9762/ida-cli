@@ -989,3 +989,10 @@ R3b实现边界（待独立复验/评审）：r9、verification、adapter可托�
 续跑；写失败保现场，不重放v1文件步骤。当前严格协议release3/open2/custody4/helper2，
 SDK四patch/三模块与sameboot Unsupported不改。详细边界见保护释放协议§12.6及
 TESTING的R3b入口；R4完整durable事务/移交/维护继续后续，不由本记录验收或启动。
+
+R3b fix2定向实现（待独立复验/评审）：verification scope仅在获取前无既有持久历史时
+一次初始化，cleanup只验既有完整强类型授权；SDK完成与最后watch闭合在同一startups→N1
+同步仲裁中汇合。verification义务由既有N1 reservation/publish_parent继承至Root重试，
+不依赖旧ordinal退休ACK继续存在；普通final重试无副本删除权。实际独立正常caller已证实
+原closure检查/发布间隙可进入新目标责任，现将检查、input发布及精确清理置于同一目标EX。
+固定SDK、custody4及sameboot Unsupported保持；不由这些定向修复验收R3b或推进R4。

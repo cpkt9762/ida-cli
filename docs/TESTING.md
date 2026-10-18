@@ -1382,6 +1382,27 @@ environment. Public proof plus all producer closures completes late cleanup;
 unproven LaunchIntent retains copy and capacity even after ObservationAbandoned.
 These are actual private IDA startup cases, distinct from controlled HTTP inputs.
 
+The fix2 `nexus_r3b_fix2` cases run individually with `--exact` and fresh
+HOME/state/tmp/IPC per case, like the R2 matrix. Its test-only scheduling points
+pause SDK completion after pending observation, last-watch retirement, and the
+validated publication window; they do not change production predicates.
+`test_verification_scope.py` separately exercises strict existing authority;
+its foreign-epoch terminal flags are a declared journal boundary, not N1 proof.
+Initialization is allowed once before persisted history; cleanup never recreates
+missing/null scope or accepts boolean/float identities or incomplete parents.
+
+The two completion inputs join under startups then N1, without await under a
+synchronous lock. Other watches, an existing lease, or a still-running SDK actor
+retain capacity. Verification provenance comes from the original N1 reservation
+and inherited publish_parent flag across Root retries, independently of an old
+retirement ACK; ordinary final retries never gain copy deletion authority.
+
+The publication case uses real private IDA and a second independent normal
+bridge/helper caller with public output_database. Content/open guards alone do
+not exclude that target. Validation, input publication and exact input cleanup
+therefore retain one target EX throughout; the later caller enters after commit.
+This is the narrow verification publication fix, not a full R4 file transaction.
+
 Run each integration target in a fresh private HOME/state/tmp/IPC and case root,
 recording before/after uptime. Use `timeout 120s cargo test --locked --features
 nexus-test-support --test nexus_r3b -- --test-threads=1`; allow 180s for the private
