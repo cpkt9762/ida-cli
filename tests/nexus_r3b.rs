@@ -97,7 +97,7 @@ async fn verification_owner_proof_precedes_copy_cleanup_and_final_acquisition() 
         AcceptedRequest::new(&SystemClock, RequestId::new("verify-open")?, None, "open", json!({"timeout_secs":20}))?,
         OpenSpec { operation_id: OperationId::new("verify-open")?, path:root.join("b/tiny.i64").display().to_string(),
             options:json!({"spawn":false,"wait_analysis":false,
-                "verification_idb":root.join("a/tiny.i64"), "verify_input_snapshot":root.join("input")}) }, t))
+                "verification_idb":root.join("vcopy/probe.i64"), "verify_input_snapshot":root.join("input")}) }, t))
         .expect("parent reserves verification first");
     let result: anyhow::Result<Value> = async {
         tokio::time::timeout(Duration::from_secs(8), async {
@@ -119,7 +119,7 @@ async fn verification_owner_proof_precedes_copy_cleanup_and_final_acquisition() 
         })
         .await??;
         anyhow::ensure!(
-            !root.join("a/closed").exists(),
+            !root.join("vcopy/closed").exists(),
             "last ACK is not owner proof or copy cleanup authority"
         );
         anyhow::ensure!(
@@ -151,7 +151,7 @@ async fn verification_owner_proof_precedes_copy_cleanup_and_final_acquisition() 
         .await??;
         anyhow::ensure!(ready["event"] == "opened", "{ready}");
         anyhow::ensure!(
-            root.join("a/closed").is_file(),
+            root.join("vcopy/closed").is_file(),
             "verified copy must have a proved closure before final open"
         );
         let lease: SessionLease = serde_json::from_value(ready["lease"].clone())?;
@@ -708,7 +708,7 @@ async fn verification_failure_cancel_and_acquired_initialization_failure_keep_co
         let parent=bridge.endpoint().transition(|s,t|s.open(&client,
             AcceptedRequest::new(&SystemClock,RequestId::new("verify-open")?,None,"open",json!({"timeout_secs":20}))?,
             OpenSpec{operation_id:OperationId::new("verify-open")?,path:root.join("b/tiny.i64").display().to_string(),
-                options:json!({"spawn":false,"verification_idb":root.join("a/tiny.i64"),"verify_input_snapshot":root.join("input")})},t))
+                options:json!({"spawn":false,"verification_idb":root.join("vcopy/probe.i64"),"verify_input_snapshot":root.join("input")})},t))
             .expect("original parent");
         let result: anyhow::Result<Value> = async {
             tokio::time::timeout(Duration::from_secs(8), async {
@@ -717,7 +717,7 @@ async fn verification_failure_cancel_and_acquired_initialization_failure_keep_co
                 }
             })
             .await?;
-            anyhow::ensure!(!root.join("a/closed").exists(), "unproved copy removed");
+            anyhow::ensure!(!root.join("vcopy/closed").exists(), "unproved copy removed");
             if scenario == "verification-cancel" {
                 bridge
                     .endpoint()
@@ -734,7 +734,7 @@ async fn verification_failure_cancel_and_acquired_initialization_failure_keep_co
                 })
                 .await??;
                 anyhow::ensure!(
-                    !root.join("a/closed").exists(),
+                    !root.join("vcopy/closed").exists(),
                     "caller ending cannot delete the unproved copy"
                 );
             }
@@ -758,7 +758,7 @@ async fn verification_failure_cancel_and_acquired_initialization_failure_keep_co
                     let (_, failure) = bridge
                         .endpoint()
                         .transition(|s, _| s.open_progress(&client, &parent))?;
-                    if failure.is_some() && root.join("a/closed").is_file() {
+                    if failure.is_some() && root.join("vcopy/closed").is_file() {
                         break Ok::<_, anyhow::Error>(());
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;

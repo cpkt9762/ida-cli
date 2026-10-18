@@ -8,7 +8,6 @@ from pathlib import Path
 import plistlib
 import queue
 import socket
-import stat
 import sys
 import threading
 import time
@@ -383,6 +382,10 @@ class Bridge(LifetimeListener):
                                         for c in self.custodians.values())):
                         self.acquisitions.pop(parent)
                 elif lease is None:
+                    if receipt.get('acquisition_closed') is True:
+                        for primary, child in list(self.cleanup_handles.items()):
+                            if child.acquisition == receipt['acquisition'] and child.handle is None:
+                                self.cleanup_handles.pop(primary)
                     parent = receipt['acquisition']['parent']['operation_id']
                     custody = self.acquisitions.get(parent)
                     if (custody is not None and custody.acquisition == receipt['acquisition']
@@ -508,6 +511,7 @@ class Bridge(LifetimeListener):
                     no_acquisition = custody.known_no_acquisition()
                     try:
                         custody.fail(exc)
+                        no_acquisition = custody.known_no_acquisition()
                     except Exception as failure:
                         channel.send({'event':'uncertain', 'attempt':attempt,
                             'error':error('unknown_outcome', f'{type(exc).__name__}: {exc}; observation cleanup: {failure}')})
@@ -516,6 +520,10 @@ class Bridge(LifetimeListener):
                 command = frame["payload"]
                 details['diagnostics'] = database_diagnostics(
                     command.get('options', {}).get('output_database') or command['path'])
+                if custody is None and not public_started[0]:
+                    channel.send({'event':'not_sent','attempt':attempt,
+                        'error':failure_details(exc), **details})
+                    return
             if frame["payload"]["command"] == "release":
                 key = frame['payload']['lease']['lease_id']
                 with self.lock:
@@ -622,40 +630,30 @@ class Bridge(LifetimeListener):
     def close_verification(self, path, custody, deadline):
         custody.cleanup()
         outcome = custody.release_for_retry(require_ack=False)
-        self.finish_verification_copy(path)
+        from target_journal import ObservationPending
+        while True:
+            try:
+                self.finish_verification_copy(path)
+                break
+            except ObservationPending:
+                if time.monotonic() >= deadline or self.stopped.wait(.02):
+                    raise TimeoutError('verification producer closure pending; copy retained')
         if outcome and outcome.get('save_guard_error'):
             raise RuntimeError(outcome['save_guard_error'])
 
     def finish_verification_copy(self, path):
-        # Independent owner proof alone does not authorize deleting a copy that
-        # a new owner or external file holder has acquired in the meantime.
-        from cache_store import public_owner_probe
-        from ida_nexus import probe_database_state
         from owner_identity import state_identity
         from target_coordination import Target
-        from target_journal import Journal
+        from target_journal import verification_probe_cleanup
+        with self.lock:
+            custody = self.verification_probes.get(path)
+        acquisition = getattr(custody,'acquisition',None)
+        if acquisition is None or not isinstance(acquisition.get('parent'),dict):
+            raise RuntimeError('VerificationCleanupBlocked: exact copy custodian missing')
+        parent = acquisition['parent']
         with Target(path) as target, target.locked(deadline=time.monotonic()+15):
-            Journal(target).gate(state_identity())
-            reason = public_owner_probe(Path(path))
-            state = probe_database_state(path)
-            if reason or state['state'] in ('in_use', 'unknown') or state.get('error'):
-                raise RuntimeError('verification copy still occupied; staging retained: ' + str(reason or state))
-            marker = Path(path).with_name('closed')
-            try:
-                descriptor = os.open(marker,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-            except FileExistsError:
-                info = marker.lstat()
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
-                        or info.st_size != 0 or stat.S_IMODE(info.st_mode) != 0o600):
-                    raise RuntimeError('verification cleanup marker identity conflict; copy retained')
-            else:
-                try:
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-                from cache_store import sync_directory
-                sync_directory(marker.parent)
+            verification_probe_cleanup(target,state_identity(),parent)
+
         with self.lock:
             self.verification_probes.pop(path, None)
 
@@ -718,13 +716,17 @@ class Bridge(LifetimeListener):
             with self.lock:
                 self.acquisitions[command['identity']['operation_id']] = custodian
             if verification is not None:
+                with self.lock:
+                    self.verification_probes[verification] = custodian
+                from target_coordination import Target
+                from target_journal import verification_scope
+                with Target(verification) as copy_target, copy_target.locked(deadline=deadline):
+                    verification_scope(copy_target,custodian.acquisition['parent'])
                 original = Path(command["path"])
                 copy_hash = hashlib.sha256(Path(verification).read_bytes()).digest()
                 if hashlib.sha256(original.read_bytes()).digest() != copy_hash:
                     raise ValueError("legacy cache changed during verification copy; refusing reuse")
                 expected = hashlib.sha256(Path(snapshot).read_bytes()).hexdigest()
-                with self.lock:
-                    self.verification_probes[verification] = custodian
                 public_started[0] = True
                 probe, _, _ = open_checked(self.Handle, self.Options, str(verification),
                     {'auto_analysis': False, 'worker_env': dict(os.environ),

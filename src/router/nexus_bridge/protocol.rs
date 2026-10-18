@@ -44,7 +44,7 @@ impl Protocol {
             release: 3,
             open: 2,
             owner_observation: 1,
-            custody: 3,
+            custody: 4,
             helper: 2,
             target_gate: 1,
             same_boot_exit: 0,
@@ -70,6 +70,8 @@ impl Protocol {
                 "single_resolution_outcome_v1",
                 "target_gate_base_v1",
                 "two_phase_release_v1",
+                "unstarted_absence_v1",
+                "verification_removal_v1",
             ]
             .into_iter()
             .map(String::from)
@@ -106,6 +108,28 @@ mod tests {
             assert!(
                 Protocol::validate(bad).is_err(),
                 "accepts mismatched {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn custody_v4_rejects_old_schema_and_partial_cleanup_upgrade() {
+        let current = serde_json::to_value(Protocol::current()).expect("protocol JSON");
+        let mut old = current.clone();
+        old["custody"] = serde_json::json!(3);
+        assert!(
+            Protocol::validate(old).is_err(),
+            "old absence semantics must be refused"
+        );
+        for capability in ["unstarted_absence_v1", "verification_removal_v1"] {
+            let mut partial = current.clone();
+            partial["capabilities"]
+                .as_array_mut()
+                .expect("capabilities")
+                .retain(|v| v != capability);
+            assert!(
+                Protocol::validate(partial).is_err(),
+                "partial cleanup upgrade accepted"
             );
         }
     }

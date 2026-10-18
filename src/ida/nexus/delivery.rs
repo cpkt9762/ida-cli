@@ -321,6 +321,29 @@ impl<C: Clock> NexusSessions<C> {
                         error.clone()
                     });
                 }
+                if !uncertain {
+                    // Exact NotSent means the adapter did not start this send.
+                    // Registered watches/leases must retain their own custody.
+                    let acquisition = self
+                        .openings
+                        .get(&identity.operation_id)
+                        .and_then(|o| {
+                            o.acquisitions.iter().rev().find(|a| {
+                                a.identity.purpose != AcquisitionPurpose::Auxiliary && !a.closed
+                            })
+                        })
+                        .map(|a| a.identity.clone());
+                    if let Some(acquisition) = acquisition {
+                        if self.acquisition_lease(&acquisition)?.is_none()
+                            && !self
+                                .startup_origins
+                                .values()
+                                .any(|(bound, _)| bound == &acquisition)
+                        {
+                            self.acquisition_unstarted(&acquisition)?;
+                        }
+                    }
+                }
             }
             DeliveryTarget::Cancel { .. } => {} // The original outcome/cause is immutable.
             DeliveryTarget::Release { lease }

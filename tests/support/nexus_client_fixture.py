@@ -33,7 +33,9 @@ def owned_popen(command, **options):
         raise
     env.children.append(child)
     if os.environ.get('R3A_STARTUP_PHASE') == 'PopenReturn':
-        startup_barrier(Path(os.environ['R5_ROOT']),'startup')
+        startup_barrier(Path(os.environ['R5_ROOT']),'startup',seconds=8)
+        if os.environ.get('R3F1_STARTUP_FAULT')=='failure':
+            raise RuntimeError('controlled verification startup failure after Popen')
     return child
 proxy.Popen = owned_popen
 # Record even a dependency-failure bridge before importing Nexus.
@@ -123,7 +125,9 @@ else:
         def startup_stage(self, stage, value):
             original_stage(self,stage,value)
             if stage == os.environ['R3A_STARTUP_PHASE']:
-                startup_barrier(Path(os.environ['R5_ROOT']),'startup')
+                startup_barrier(Path(os.environ['R5_ROOT']),'startup',seconds=8)
+                if os.environ.get('R3F1_STARTUP_FAULT')=='failure':
+                    raise RuntimeError('controlled verification startup failure after LaunchIntent')
         Custodian.stage = startup_stage
     bridge_init = runtime["Bridge"].__init__
     def registered_init(self, business, control, capacity):

@@ -1,32 +1,139 @@
-//! Dispose only proved verification payload; stable coordination is never removed.
+//! Consume exact verification removal facts; only the locked Python authority deletes DB payload.
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     io::Read,
     os::fd::AsRawFd,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileBinding {
+    identity: [u64; 3],
+    size: u64,
+    sha256: String,
+}
+fn binding(path: &Path) -> anyhow::Result<FileBinding> {
+    let before = fs::symlink_metadata(path)?;
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    let uid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        before.is_file() && before.uid() == uid && before.mode() & 0o022 == 0,
+        "verification foreign/symlink payload retained"
+    );
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let opened = file.metadata()?;
+    anyhow::ensure!(
+        (before.dev(), before.ino()) == (opened.dev(), opened.ino()),
+        "verification file replaced before read"
+    );
+    let mut hash = Sha256::new();
+    let mut chunk = [0_u8; 65536];
+    loop {
+        let count = file.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&chunk[..count]);
+    }
+    let after = file.metadata()?;
+    let current = fs::symlink_metadata(path)?;
+    let signature = |v: &fs::Metadata| {
+        (
+            v.dev(),
+            v.ino(),
+            v.len(),
+            v.mtime(),
+            v.mtime_nsec(),
+            v.ctime(),
+            v.ctime_nsec(),
+        )
+    };
+    anyhow::ensure!(
+        signature(&before) == signature(&after) && signature(&before) == signature(&current),
+        "verification payload changed during read"
+    );
+    Ok(FileBinding {
+        identity: [before.dev(), before.ino(), u64::from(before.uid())],
+        size: before.len(),
+        sha256: format!("{:x}", hash.finalize()),
+    })
+}
+fn file_hash(path: &Path) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        fs::symlink_metadata(path)?.nlink() == 1,
+        "verification authority hardlink refused"
+    );
+    Ok(binding(path)?.sha256)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Removed {
+    name: String,
+    file: FileBinding,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Receipt {
+    schema: u8,
+    kind: String,
+    directory: [u64; 3],
+    target: PathBuf,
+    coord_key: serde_json::Value,
+    target_sha256: String,
+    journal_sha256: String,
+    input: Option<FileBinding>,
+    removed: Vec<Removed>,
+}
+
 pub(crate) struct Cleanup {
-    path: std::path::PathBuf,
+    path: PathBuf,
     identity: (u64, u64),
-    published_input: Option<std::path::PathBuf>,
+    published_input: Option<PathBuf>,
+    created: std::sync::Mutex<BTreeMap<String, FileBinding>>,
     done: std::sync::atomic::AtomicBool,
     error: std::sync::Mutex<Option<String>>,
 }
 impl Cleanup {
     pub(super) fn new(
-        path: std::path::PathBuf,
+        path: PathBuf,
         identity: (u64, u64),
-        published_input: Option<std::path::PathBuf>,
+        published_input: Option<PathBuf>,
     ) -> Self {
-        Self {
+        let cleanup = Self {
             path,
             identity,
             published_input,
+            created: std::sync::Mutex::new(BTreeMap::new()),
             done: std::sync::atomic::AtomicBool::new(false),
             error: std::sync::Mutex::new(None),
+        };
+        if let Err(error) = cleanup.bind_created() {
+            *cleanup.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
         }
+        cleanup
+    }
+    /// Called after our copy/rename succeeds and before any SDK handoff.
+    pub(super) fn bind_created(&self) -> anyhow::Result<()> {
+        let mut created = BTreeMap::new();
+        for name in ["probe.i64", "input"] {
+            match fs::symlink_metadata(self.path.join(name)) {
+                Ok(_) => {
+                    created.insert(name.into(), binding(&self.path.join(name))?);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        *self.created.lock().unwrap_or_else(|e| e.into_inner()) = created;
+        Ok(())
     }
     pub(crate) fn complete(&self, handed_off: bool) -> anyhow::Result<bool> {
         if self.done.load(std::sync::atomic::Ordering::Acquire) {
@@ -38,157 +145,321 @@ impl Cleanup {
         }
         if handed_off {
             match fs::symlink_metadata(self.path.join("closed")) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(failure) => {
-                    *error = Some(failure.to_string());
-                    return Err(failure.into());
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => {
+                    *error = Some(e.to_string());
+                    return Err(e.into());
                 }
                 Ok(_) => {}
             }
         }
-        match cleanup(
-            &self.path,
-            self.identity,
-            handed_off,
-            self.published_input.as_deref(),
-        ) {
+        let result = self.consume(handed_off, true);
+        match result {
             Ok(()) => {
                 self.done.store(true, std::sync::atomic::Ordering::Release);
+                *error = None;
                 Ok(true)
             }
-            Err(failure) => {
-                *error = Some(format!("{failure:#}"));
-                Err(failure)
+            Err(e) => {
+                *error = Some(format!("{e:#}"));
+                Err(e)
             }
         }
+    }
+    pub(super) fn validate_closure(&self) -> anyhow::Result<()> {
+        self.consume(true, false)
+    }
+    fn consume(&self, handed_off: bool, remove: bool) -> anyhow::Result<()> {
+        let parent = fs::symlink_metadata(&self.path)?;
+        anyhow::ensure!(
+            parent.is_dir() && (parent.dev(), parent.ino()) == self.identity,
+            "verification directory identity changed; retained"
+        );
+        let entries = fs::read_dir(&self.path)?
+            .take(33)
+            .collect::<Result<Vec<_>, _>>()?;
+        anyhow::ensure!(
+            entries.len() <= 32,
+            "verification namespace exceeds manifest bound"
+        );
+        let mut coordinate = None;
+        let mut payload = Vec::new();
+        for entry in entries {
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("unknown verification name"))?;
+            let meta = fs::symlink_metadata(entry.path())?;
+            if name.starts_with(".ida-cli-txn-") && meta.is_dir() {
+                anyhow::ensure!(coordinate.is_none(), "ambiguous verification coordination");
+                coordinate = Some(entry.path());
+            } else {
+                anyhow::ensure!(
+                    matches!(name.as_str(), "probe.i64" | "input" | "closed")
+                        && meta.is_file()
+                        && meta.uid() == parent.uid(),
+                    "unknown/foreign verification component retained"
+                );
+                if handed_off {
+                    anyhow::ensure!(
+                        name != "probe.i64",
+                        "verification probe appeared after completed removal; retained"
+                    );
+                }
+                payload.push((name, entry.path(), meta.nlink()));
+            }
+        }
+        let mut target_binding = None;
+        let _lock = if let Some(coord) = coordinate.as_ref() {
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(coord.join("lock"))?;
+            let meta = lock.metadata()?;
+            anyhow::ensure!(
+                meta.is_file() && meta.nlink() == 1 && meta.uid() == parent.uid(),
+                "verification lock identity refused"
+            );
+            // SAFETY: a live owned descriptor; independent nonblocking flock.
+            anyhow::ensure!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+                "verification target writer active; retained"
+            );
+            let bytes = read_small(&coord.join("target.json"), parent.uid())?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                value["schema"] == 1
+                    && value["lock_identity"]
+                        == serde_json::json!([meta.dev(), meta.ino(), meta.uid()])
+                    && value["target"]
+                        == serde_json::json!(self.path.canonicalize()?.join("probe.i64")),
+                "verification target binding changed"
+            );
+            target_binding = Some((value, format!("{:x}", Sha256::digest(bytes))));
+            Some(lock)
+        } else {
+            None
+        };
+        // Recheck the complete namespace after acquiring stable target EX.
+        // A producer may have admitted a new component while we waited.
+        let current = fs::read_dir(&self.path)?
+            .map(|entry| entry.map(|e| e.path()))
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        let expected = payload
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .chain(coordinate.iter().cloned())
+            .collect();
+        anyhow::ensure!(
+            current == expected,
+            "verification namespace changed before target lock; retained"
+        );
+        let closure_binding = if handed_off {
+            Some(binding(&self.path.join("closed"))?)
+        } else {
+            None
+        };
+        let created = self.created.lock().unwrap_or_else(|e| e.into_inner());
+        if handed_off {
+            let coord = coordinate
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("verification coordination missing"))?;
+            let (target, target_hash) = target_binding
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("verification target missing"))?;
+            let marker = read_small(&self.path.join("closed"), parent.uid())?;
+            let receipt: Receipt = serde_json::from_slice(&marker)?;
+            anyhow::ensure!(
+                receipt.schema == 1
+                    && receipt.kind == "verification_probe_cleanup"
+                    && receipt.directory == [parent.dev(), parent.ino(), u64::from(parent.uid())]
+                    && receipt.target == self.path.canonicalize()?.join("probe.i64")
+                    && receipt.coord_key == target["coord_key"]
+                    && receipt.target_sha256 == *target_hash,
+                "verification closure scope/target changed; retained"
+            );
+            anyhow::ensure!(
+                file_hash(&coord.join("custody.json"))? == receipt.journal_sha256,
+                "verification journal changed after issuer; newer responsibility retained"
+            );
+            anyhow::ensure!(
+                receipt.input.as_ref() == created.get("input"),
+                "verification input ownership receipt changed"
+            );
+            for removed in receipt.removed {
+                anyhow::ensure!(
+                    [
+                        "probe.i64",
+                        "probe.id0",
+                        "probe.id1",
+                        "probe.id2",
+                        "probe.nam",
+                        "probe.til"
+                    ]
+                    .contains(&removed.name.as_str())
+                        && removed.file.identity[2] == u64::from(parent.uid())
+                        && removed.file.sha256.len() == 64,
+                    "verification removed-payload receipt malformed"
+                );
+                anyhow::ensure!(
+                    !self.path.join(removed.name).exists(),
+                    "verification removed payload reappeared; retained"
+                );
+            }
+        } else if let Some(coord) = coordinate.as_ref() {
+            if coord.join("custody.json").exists() {
+                let journal: serde_json::Value = serde_json::from_slice(&read_small(
+                    &coord.join("custody.json"),
+                    parent.uid(),
+                )?)?;
+                anyhow::ensure!(
+                    journal["entries"].as_object().is_some_and(|m| m.is_empty())
+                        && journal["file_intents"]
+                            .as_object()
+                            .is_none_or(|m| m.is_empty()),
+                    "unpublished copy has another responsibility; retained"
+                );
+            }
+        }
+        // Only an immutable input snapshot is removed after handoff. Database
+        // files were already deleted by the current Python authority under EX.
+        for (name, path, _) in &payload {
+            let links = fs::symlink_metadata(path)?.nlink();
+            if name == "closed" {
+                anyhow::ensure!(handed_off && links == 1, "unowned closure receipt retained");
+                continue;
+            }
+            let expected = created
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("unowned verification payload retained"))?;
+            anyhow::ensure!(
+                binding(path)? == *expected,
+                "verification payload identity/content changed; retained"
+            );
+            let published = name == "input"
+                && links == 2
+                && self.published_input.as_ref().is_some_and(|p| {
+                    fs::symlink_metadata(p).is_ok_and(|m| {
+                        m.is_file() && [m.dev(), m.ino(), u64::from(m.uid())] == expected.identity
+                    })
+                });
+            anyhow::ensure!(
+                links == 1 || published,
+                "verification payload has foreign hardlink; retained"
+            );
+        }
+        if !remove {
+            return Ok(());
+        }
+        payload.sort_by_key(|(name, _, _)| name == "closed");
+        for (name, path, _) in payload {
+            if name == "closed" {
+                anyhow::ensure!(
+                    closure_binding.as_ref() == Some(&binding(&path)?),
+                    "verification closure replaced at unlink; retained"
+                );
+            } else {
+                anyhow::ensure!(
+                    created.get(&name) == Some(&binding(&path)?),
+                    "verification payload replaced at unlink; retained"
+                );
+            }
+            let links = fs::symlink_metadata(&path)?.nlink();
+            let published = name == "input"
+                && links == 2
+                && self.published_input.as_ref().is_some_and(|published| {
+                    fs::symlink_metadata(published).is_ok_and(|v| {
+                        v.is_file()
+                            && created.get("input").is_some_and(|b| {
+                                b.identity == [v.dev(), v.ino(), u64::from(v.uid())]
+                            })
+                    })
+                });
+            anyhow::ensure!(
+                links == 1 || published,
+                "verification hardlink appeared at unlink; retained"
+            );
+            fs::remove_file(path)?;
+        }
+        if fs::read_dir(&self.path)?.next().is_none() {
+            fs::remove_dir(&self.path)?;
+        }
+        Ok(())
     }
     pub(crate) fn status(&self) -> serde_json::Value {
         serde_json::json!({"path":self.path,"cleanup_complete":self.done.load(std::sync::atomic::Ordering::Acquire),
-            "cleanup_error":*self.error.lock().unwrap_or_else(|e|e.into_inner()),"next_action":"wait_exact_proof_and_verify_copy_gate"})
+            "cleanup_error":*self.error.lock().unwrap_or_else(|e|e.into_inner()),"next_action":"wait_exact_probe_removal_and_unchanged_target_journal"})
     }
 }
-
-pub(super) fn cleanup(
-    directory: &Path,
-    expected: (u64, u64),
-    handed_off: bool,
-    published_input: Option<&Path>,
-) -> anyhow::Result<()> {
-    let parent = fs::symlink_metadata(directory)?;
+fn read_small(path: &Path, uid: u32) -> anyhow::Result<Vec<u8>> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = file.metadata()?;
     anyhow::ensure!(
-        parent.is_dir() && (parent.dev(), parent.ino()) == expected,
-        "verification directory identity changed; copy retained"
+        meta.is_file()
+            && meta.uid() == uid
+            && meta.nlink() == 1
+            && meta.mode() & 0o022 == 0
+            && meta.len() <= 65536,
+        "verification receipt identity/size refused"
     );
-    let entries = fs::read_dir(directory)?
-        .take(33)
-        .collect::<Result<Vec<_>, _>>()?;
-    anyhow::ensure!(
-        entries.len() <= 32,
-        "verification namespace exceeds cleanup manifest bound"
-    );
-    let mut payload = Vec::new();
-    let mut coordination = None;
-    for entry in &entries {
-        let name = entry.file_name();
-        let name = name
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("unknown verification name"))?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if name.starts_with(".ida-cli-txn-") && metadata.is_dir() {
-            anyhow::ensure!(
-                coordination.is_none(),
-                "ambiguous verification coordination"
-            );
-            coordination = Some(entry.path());
-        } else {
-            anyhow::ensure!(
-                matches!(name, "probe.i64" | "input" | "closed")
-                    && metadata.is_file()
-                    && metadata.uid() == parent.uid(),
-                "unknown verification component; all payload retained"
-            );
-            let published = name == "input"
-                && metadata.nlink() == 2
-                && published_input
-                    .and_then(|p| fs::symlink_metadata(p).ok())
-                    .is_some_and(|m| {
-                        m.is_file() && (m.dev(), m.ino()) == (metadata.dev(), metadata.ino())
-                    });
-            anyhow::ensure!(
-                metadata.nlink() == 1 || published,
-                "verification payload has an unknown hard link; retained"
-            );
-            payload.push((entry.path(), metadata.dev(), metadata.ino()));
-        }
-    }
-    let _lock = if let Some(coordination) = coordination {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(coordination.join("lock"))?;
-        let metadata = file.metadata()?;
-        let mut source = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(coordination.join("target.json"))?;
-        let binding_metadata = source.metadata()?;
-        anyhow::ensure!(
-            binding_metadata.is_file()
-                && binding_metadata.nlink() == 1
-                && binding_metadata.uid() == parent.uid()
-                && binding_metadata.len() <= 16384,
-            "verification binding file identity refused"
-        );
-        let mut bytes = Vec::new();
-        source.by_ref().take(16385).read_to_end(&mut bytes)?;
-        let binding: serde_json::Value = serde_json::from_slice(&bytes)?;
-        anyhow::ensure!(
-            binding["schema"] == 1
-                && binding["lock_identity"]
-                    == serde_json::json!([metadata.dev(), metadata.ino(), metadata.uid()])
-                && binding["target"]
-                    == serde_json::json!(directory.canonicalize()?.join("probe.i64")),
-            "verification target lock binding changed"
-        );
-        // SAFETY: the owned file remains open; this is an independent, nonblocking OFD.
-        anyhow::ensure!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "verification target writer still active; payload retained"
-        );
-        Some(file)
-    } else {
-        None
+    let mut bytes = Vec::new();
+    file.by_ref().take(65537).read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    let current = fs::symlink_metadata(path)?;
+    let signature = |v: &fs::Metadata| {
+        (
+            v.dev(),
+            v.ino(),
+            v.len(),
+            v.mtime(),
+            v.mtime_nsec(),
+            v.ctime(),
+            v.ctime_nsec(),
+        )
     };
-    if handed_off {
-        let marker = fs::symlink_metadata(directory.join("closed"))?;
-        anyhow::ensure!(
-            marker.is_file()
-                && marker.uid() == parent.uid()
-                && marker.nlink() == 1
-                && marker.len() == 0,
-            "verification closure is not confirmed; payload retained"
-        );
-    }
-    for (path, device, inode) in &payload {
-        let current = fs::symlink_metadata(path)?;
-        anyhow::ensure!(
-            current.is_file() && (current.dev(), current.ino()) == (*device, *inode),
-            "verification component changed before cleanup; payload retained"
-        );
-    }
-    // Remove the receipt last. An I/O error retains the authorization needed
-    // to diagnose/continue removal of the still present exact payload.
-    payload.sort_by_key(|(path, _, _)| path.file_name().is_some_and(|n| n == "closed"));
-    for (path, _, _) in payload {
-        fs::remove_file(path)?;
-    }
-    // A verification CoordKey has the same permanent lock/identity rules as
-    // other targets. Empty directories without coordination can be removed.
-    if fs::read_dir(directory)?.next().is_none() {
-        fs::remove_dir(directory)?;
-    }
-    Ok(())
+    anyhow::ensure!(
+        bytes.len() as u64 == meta.len()
+            && signature(&meta) == signature(&after)
+            && signature(&meta) == signature(&current),
+        "verification receipt changed during read"
+    );
+    Ok(bytes)
+}
+
+/// File-consumer fixture only. It does not issue or model an owner proof.
+#[cfg(test)]
+pub(super) fn issue_unit_receipt(root: &Path) {
+    let coord = root.join(".ida-cli-txn-unit");
+    fs::create_dir(&coord).expect("private coordinate");
+    fs::write(coord.join("lock"), b"").expect("stable lock");
+    fs::write(coord.join("custody.json"), b"{}").expect("closed fixture journal");
+    fs::write(coord.join("proof"), b"retained exact proof").expect("proof bytes");
+    let lock = fs::metadata(coord.join("lock")).expect("lock identity");
+    let parent = fs::metadata(root).expect("copy identity");
+    let key = serde_json::json!({"kind":"unit-file-consumer"});
+    let target = serde_json::json!({"schema":1,"target":root.canonicalize().expect("canonical").join("probe.i64"),
+        "lock_identity":[lock.dev(),lock.ino(),lock.uid()],"coord_key":key});
+    fs::write(
+        coord.join("target.json"),
+        serde_json::to_vec(&target).expect("target JSON"),
+    )
+    .expect("target");
+    let removed = binding(&root.join("probe.i64")).expect("fixture probe binding");
+    fs::remove_file(root.join("probe.i64")).expect("fixture issuer removes its probe");
+    let marker = serde_json::json!({"schema":1,"kind":"verification_probe_cleanup",
+        "directory":[parent.dev(),parent.ino(),parent.uid()],"target":root.canonicalize().expect("canonical").join("probe.i64"),
+        "coord_key":key,"target_sha256":file_hash(&coord.join("target.json")).expect("target hash"),
+        "journal_sha256":file_hash(&coord.join("custody.json")).expect("journal hash"),
+        "input":binding(&root.join("input")).expect("fixture input"),"removed":[{"name":"probe.i64","file":removed}]});
+    fs::write(
+        root.join("closed"),
+        serde_json::to_vec(&marker).expect("marker JSON"),
+    )
+    .expect("fixture completed-removal record");
 }
 
 #[cfg(test)]
@@ -229,23 +500,40 @@ mod tests {
         fs::remove_dir_all(root).expect("own unit fixture");
     }
     #[test]
+    fn completed_removal_rejects_new_journal_even_without_a_reappeared_probe() {
+        let root = directory();
+        let info = fs::metadata(&root).expect("directory");
+        let cleanup = Cleanup::new(root.clone(), (info.dev(), info.ino()), None);
+        issue_unit_receipt(&root);
+        fs::write(
+            root.join(".ida-cli-txn-unit/custody.json"),
+            b"{\"revision\":2,\"entries\":{}}",
+        )
+        .expect("new journal bytes");
+        assert!(
+            cleanup.validate_closure().is_err(),
+            "new responsibility must block publication"
+        );
+        assert!(
+            cleanup.complete(true).is_err(),
+            "changed journal cannot authorize input deletion"
+        );
+        assert_eq!(
+            fs::read(root.join("input")).expect("input retained"),
+            b"owned input"
+        );
+        assert_eq!(cleanup.status()["cleanup_complete"], false);
+        fs::remove_dir_all(root).expect("own unit fixture");
+    }
+
+    #[test]
     fn copy_payload_cleanup_preserves_stable_lock_and_proof_bytes() {
         let root = directory();
         let info = fs::metadata(&root).expect("directory");
-        let coord = root.join(".ida-cli-txn-unit");
-        fs::create_dir(&coord).expect("coordination");
-        fs::write(coord.join("lock"), b"").expect("stable lock");
-        let lock_info = fs::metadata(coord.join("lock")).expect("lock identity");
-        let binding = serde_json::json!({"schema":1,"target":root.canonicalize().expect("target parent").join("probe.i64"),
-            "lock_identity":[lock_info.dev(),lock_info.ino(),lock_info.uid()]});
-        fs::write(
-            coord.join("target.json"),
-            serde_json::to_vec(&binding).expect("binding"),
-        )
-        .expect("target identity");
-        fs::write(coord.join("proof"), b"retained exact proof").expect("proof evidence");
-        fs::write(root.join("closed"), b"").expect("unit closure input");
         let receipt = Cleanup::new(root.clone(), (info.dev(), info.ino()), None);
+        issue_unit_receipt(&root);
+        let coord = root.join(".ida-cli-txn-unit");
+        let lock_info = fs::metadata(coord.join("lock")).expect("lock identity");
         assert!(receipt.complete(true).expect("proved file cleanup"));
         assert!(receipt.complete(true).expect("idempotent completion"));
         assert!(!root.join("input").exists() && !root.join("probe.i64").exists());

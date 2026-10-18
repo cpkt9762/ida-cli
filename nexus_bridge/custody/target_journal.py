@@ -4,6 +4,8 @@ Only callers holding root SH then this target's stable EX may mutate authority.
 Immutable helper facts are verified from their exact descriptor before adoption.
 """
 import json
+import hashlib
+import stat
 import os
 from pathlib import Path
 import sys
@@ -81,6 +83,13 @@ class Journal:
         maximum = (1 << 64)-1
         if not (0 <= v['revision'] <= maximum and 0 <= v['closed_through'] < v['next_epoch'] <= maximum):
             raise RuntimeError('CoordinationBlocked: invalid epoch/revision range')
+        scope = v.get('verification_scope')
+        if scope is not None and (not isinstance(scope, dict) or set(scope) != {'schema','parent','directory'}
+                or scope.get('schema') != 1 or scope.get('directory') != self.target.key.get('parent')
+                or (scope.get('parent') is not None and not isinstance(scope['parent'],dict))):
+            raise RuntimeError('VerificationCleanupBlocked: invalid copy scope')
+        if type(v.get('verification_cleanup_conflict',False)) is not bool:
+            raise RuntimeError('VerificationCleanupBlocked: invalid copy conflict')
         ranges = v['closed_after_holes']
         previous = v['closed_through']
         if len(ranges) > LIMIT:
@@ -410,6 +419,9 @@ class Journal:
             raise RuntimeError('Busy: observation epoch namespace exhausted')
         epoch = self.value['next_epoch']
         self.value['next_epoch'] += 1
+        scope = self.value.get('verification_scope')
+        if scope is not None and acquisition['parent'] != scope['parent']:
+            self.value['verification_cleanup_conflict'] = True
         self.value['entries'][str(epoch)] = {'epoch':epoch, 'watch':watch, 'acquisition':acquisition,
             'owner':owner, 'launch':launch, 'facts':[], 'producer_closed':False,
             'consumer_closed':False, 'unacked_events':True, 'lease':None, 'detached':False,
@@ -792,6 +804,109 @@ class Journal:
         self.save()
 
 
+
+def verification_file(path):
+    """Bind a private regular payload through the exact descriptor read."""
+    before = path.lstat()
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+            or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) & 0o022):
+        raise RuntimeError('VerificationCleanupBlocked: foreign/link payload retained: ' + str(path))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    digest = hashlib.sha256()
+    with os.fdopen(fd, 'rb') as stream:
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise RuntimeError('VerificationCleanupBlocked: payload replaced before read')
+        for chunk in iter(lambda:stream.read(1024*1024), b''):
+            digest.update(chunk)
+        after = os.fstat(stream.fileno())
+    current = path.lstat()
+    signature = lambda v:(v.st_dev,v.st_ino,v.st_size,v.st_mtime_ns,v.st_ctime_ns)
+    if signature(before) != signature(after) or signature(before) != signature(current):
+        raise RuntimeError('VerificationCleanupBlocked: payload changed during read')
+    return {'identity':[before.st_dev,before.st_ino,before.st_uid],
+            'size':before.st_size,'sha256':digest.hexdigest()}
+
+
+def verification_scope(target, parent):
+    """One permanent copy owner; a later journal actor revokes old cleanup."""
+    if not isinstance(parent,dict):
+        raise RuntimeError('VerificationCleanupBlocked: exact parent missing')
+    journal = Journal(target)
+    scope = journal.value.get('verification_scope')
+    expected = {'schema':1,'parent':parent,'directory':list(target.key['parent'])}
+    if scope is not None and scope != expected:
+        raise RuntimeError('VerificationCleanupBlocked: copy ownership changed')
+    if scope is None:
+        if any(i['acquisition']['parent'] != parent for i in journal.value['entries'].values()):
+            raise RuntimeError('VerificationCleanupBlocked: foreign acquisition already owns copy')
+        journal.value['verification_scope'] = expected
+        journal.save()
+    return journal
+
+
+def verification_probe_cleanup(target, state_root, parent):
+    """Delete database payload only here, while current authority holds EX.
+
+    The immutable input remains for Rust publication. The consumer receives
+    exact completed-removal facts; it never gains permission to delete a probe.
+    """
+    from cache_store import public_owner_probe, sync_directory
+    from ida_nexus import probe_database_state
+    journal = verification_scope(target, parent)
+    journal.gate(state_root)
+    if journal.value.get('verification_cleanup_conflict'):
+        raise RuntimeError('VerificationCleanupBlocked: newer journal responsibility retained')
+    for item in journal.value['entries'].values():
+        if not (item.get('proof') or journal.retirement(item) or item.get('no_attach') or item.get('no_launch')):
+            raise ObservationPending('verification exact resource proof still pending')
+        if not journal.retirement(item) and not (item['producer_closed'] and item['consumer_closed'] and not item['unacked_events']):
+            raise ObservationPending('verification producer/consumer closure still pending')
+    journal.settle()
+    reason = public_owner_probe(target.target)
+    state = probe_database_state(target.target)
+    if reason or state['state'] in ('in_use','unknown') or state.get('error'):
+        raise RuntimeError('VerificationCleanupBlocked: current owner/file occupancy: ' + str(reason or state))
+    directory = target.target.parent
+    marker = directory/'closed'
+    stem = target.target.stem
+    database_names = {target.target.name, *(stem+ext for ext in ('.id0','.id1','.id2','.nam','.til'))}
+    names = set(os.listdir(directory))
+    allowed = database_names | {'input','closed',target.directory.path.name}
+    if names-allowed:
+        raise RuntimeError('VerificationCleanupBlocked: unknown namespace retained: ' + ','.join(sorted(names-allowed)))
+    binding = {'schema':1,'kind':'verification_probe_cleanup',
+        'directory':list(target.key['parent']),'target':str(target.target),'coord_key':target.key,
+        'target_sha256':digest((target.directory.path/'target.json').read_bytes()),
+        'journal_sha256':digest((target.directory.path/'custody.json').read_bytes())}
+    if marker.exists() or marker.is_symlink():
+        info = marker.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
+            raise RuntimeError('VerificationCleanupBlocked: untrusted closure receipt')
+        previous = json.loads(marker.read_bytes())
+        if any(previous.get(k) != v for k,v in binding.items()) or names & database_names:
+            raise RuntimeError('VerificationCleanupBlocked: stale closure cannot authorize later payload')
+        return previous
+    if 'input' not in names and not names & database_names:
+        return {'payload_absent':True}  # Exact consumer already removed its input/receipt.
+    inputs = verification_file(directory/'input') if 'input' in names else None
+    payload = [(directory/name,verification_file(directory/name)) for name in sorted(names & database_names)]
+    for path, expected in payload:
+        if verification_file(path) != expected:
+            raise RuntimeError('VerificationCleanupBlocked: payload changed before unlink')
+    for path, expected in payload:
+        if verification_file(path) != expected:
+            raise RuntimeError('VerificationCleanupBlocked: payload replaced at unlink')
+        path.unlink()
+    sync_directory(directory)
+    receipt = dict(binding,input=inputs,removed=[{'name':path.name,'file':value} for path,value in payload])
+    descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,0o600)
+    with os.fdopen(descriptor,'wb') as stream:
+        stream.write(encoded(receipt));stream.flush();os.fsync(stream.fileno())
+    sync_directory(directory)
+    return receipt
+
+
 def main():
     value = json.loads(sys.stdin.buffer.readline(1024*1024+1))
     with Target(value['target']) as target:
@@ -846,6 +961,8 @@ def main():
             elif action == 'settle':
                 journal.settle()
                 result = {}
+            elif action == 'verification_probe_cleanup':
+                result = verification_probe_cleanup(target,value['state_root'],value['parent'])
             elif action == 'accounting':
                 result = journal.accounting()
             else:

@@ -85,7 +85,13 @@ async fn real_ida95_legacy_verification_preserves_saved_bytes_and_immediate_reop
     let bridge = router
         .connect_nexus(BridgeConfig {
             python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("SDK")),
-            script: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("nexus_bridge/bridge.py"),
+            script: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+                if std::env::var("R3F1_CASE").as_deref() == Ok("real-probe-trace") {
+                    "tests/support/r3b_fix1_bridge.py"
+                } else {
+                    "nexus_bridge/bridge.py"
+                },
+            ),
             directory: root.join("i"),
             environment: std::env::vars().collect(),
         })

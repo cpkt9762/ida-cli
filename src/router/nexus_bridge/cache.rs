@@ -83,6 +83,9 @@ impl PreparedOpen {
                     directory.join("closed").is_file(),
                     "legacy verification close unconfirmed"
                 );
+                if let Some(cleanup) = &cleanup {
+                    cleanup.validate_closure()?;
+                }
                 let snapshot = directory.join("input");
                 let source = std::fs::OpenOptions::new()
                     .read(true)
@@ -427,6 +430,11 @@ fn prepare_impl_inner(
             };
             std::fs::copy(&idb, directory.join("probe.i64"))?;
             std::fs::rename(&staging, directory.join("input"))?;
+            prepared
+                .verification_cleanup
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("verification cleanup binding missing"))?
+                .bind_created()?;
             drop(remove);
             preparation.check()?;
             return Ok(prepared);
@@ -542,10 +550,10 @@ mod f1_regressions {
                 prepared.handed_off();
             }
             if closed {
-                std::fs::write(directory.join("closed"), b"").unwrap();
+                super::super::verification::issue_unit_receipt(&directory);
             }
             drop(prepared);
-            assert_eq!(directory.exists(), handed_off && !closed);
+            assert_eq!(directory.join("input").exists(), handed_off && !closed);
             assert_eq!(std::fs::read(&idb).unwrap(), b"synthetic packed IDB");
             if directory.exists() {
                 std::fs::remove_dir_all(directory).expect("remove synthetic retained probe");
@@ -565,7 +573,7 @@ mod f1_regressions {
         let p = Preparation::new(Duration::from_secs(10));
         let mut first = prepare_impl(input.clone(), cache.clone(), &p, true).unwrap();
         first.handed_off();
-        std::fs::write(first.verification.as_ref().unwrap().join("closed"), b"").unwrap();
+        super::super::verification::issue_unit_receipt(first.verification.as_ref().unwrap());
         // Caller has received opened only after the bridge verifies IDB SHA256.
         first.publish_verified_input(&p).await.unwrap();
         drop(first);
@@ -600,7 +608,7 @@ mod f1_regressions {
         let destination = idb.with_extension("");
         assert!(prepared.publish_verified_input(&p).await.is_err());
         assert!(!destination.exists(), "unclosed proof cannot publish");
-        std::fs::write(prepared.verification.as_ref().unwrap().join("closed"), b"").unwrap();
+        super::super::verification::issue_unit_receipt(prepared.verification.as_ref().unwrap());
         let cancelled = Preparation::new(Duration::from_secs(10));
         cancelled.cancel.cancel();
         assert!(prepared.publish_verified_input(&cancelled).await.is_err());

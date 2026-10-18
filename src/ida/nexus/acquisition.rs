@@ -14,6 +14,21 @@ pub(super) struct AcquisitionReservation {
 }
 
 impl<C: Clock> NexusSessions<C> {
+    /// A transport NotSent or adapter's verified pre-SDK absence owns no
+    /// physical slot. Keep the exact parent and acquisition tombstones.
+    pub fn acquisition_unstarted(&mut self, id: &AcquisitionId) -> Result<(), NexusError> {
+        self.open_progress(&id.parent.client_id, &id.parent)?;
+        if self.acquisition_lease(id)?.is_some()
+            || self.startup_origins.values().any(|(bound, _)| bound == id)
+        {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "unstarted absence conflicts with physical/observation custody",
+            ));
+        }
+        self.finish_acquisition(id)?;
+        self.acquisition_absent(id)
+    }
     pub fn acquisition_watch_bound(&self, id: &AcquisitionId, watch: &str) -> bool {
         self.startup_origins
             .get(watch)

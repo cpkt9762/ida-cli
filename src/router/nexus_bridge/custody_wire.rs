@@ -94,6 +94,10 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
         "unstarted_acquisition" => {
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
             anyhow::ensure!(
+                event["sdk_entered"] == false && event["file_obligation"] == false,
+                "unstarted acquisition requires explicit no-SDK and no-file-obligation evidence"
+            );
+            anyhow::ensure!(
                 state
                     .startups
                     .lock()
@@ -110,7 +114,7 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
             );
             state
                 .endpoint
-                .transition(|s, _| s.acquisition_absent(&acquisition))?;
+                .transition(|s, _| s.acquisition_unstarted(&acquisition))?;
             helper
                 .call(json!({"kind":"retire_parent","parent":acquisition.parent}))
                 .await?;
@@ -913,8 +917,55 @@ pub(super) async fn proofs(state: &Arc<State>, writer: &Writer) -> anyhow::Resul
         .cloned()
         .collect();
     if !state.failed.load(std::sync::atomic::Ordering::Acquire) {
-        for receipt in retirements {
+        for receipt in &retirements {
             send(writer, &json!({"custody_retired":receipt})).await?;
+        }
+    }
+    // After exact bridge exit the existing target writer can finish a
+    // verification copy whose SDK actor can no longer publish its receipt.
+    // Source loss alone never substitutes for owner or launch proof.
+    if state
+        .bridge_exit
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
+        for receipt in retirements {
+            if receipt["acquisition"]["purpose"] != "verification"
+                || receipt["verification_removed"] == true
+                || receipt["target"].is_null()
+            {
+                continue;
+            }
+            let acquisition: AcquisitionId = decode(receipt["acquisition"].clone())?;
+            let ready = state.endpoint.transition(|s, _| {
+                Ok::<_, NexusError>(
+                    s.open_wait_ended(&acquisition.parent)?
+                        && s.acquisition_closed(&acquisition)?,
+                )
+            })?;
+            if !ready {
+                continue;
+            }
+            let watch = receipt["watch"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("verification retirement watch missing"))?;
+            let result = helper
+                .journal(json!({"action":"verification_probe_cleanup",
+                "target":receipt["target"],"coord_key":receipt["coord_key"],
+                "parent":acquisition.parent,"state_root":helper.state_root}))
+                .await;
+            let result = result.map(|_| {
+                if let Some(exact) = state
+                    .custody_retirements
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(watch)
+                {
+                    exact["verification_removed"] = json!(true);
+                }
+            });
+            observation_result(state, watch, result);
         }
     }
     Ok(())
@@ -1324,16 +1375,24 @@ async fn observe_resource(
     helper
         .call(json!({"kind":"retire_parent","parent":resource.acquisition.parent}))
         .await?;
-    state
-        .endpoint
-        .transition(|s, _| s.settle_internal_custody(&resource.lease))?;
+    state.endpoint.transition(|s, _| {
+        s.settle_internal_custody(&resource.lease)?;
+        s.acquisition_settled(&resource.acquisition, &resource.lease)
+    })?;
     state
         .custody_resources
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource.lease.lease_id);
-    state.custody_retirements.lock().unwrap_or_else(|e| e.into_inner()).insert(resource.watch.clone(),
-            json!({"acquisition":resource.acquisition,"lease":resource.lease,"watch":resource.watch}));
+    state
+        .custody_retirements
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            resource.watch.clone(),
+            json!({"acquisition":resource.acquisition,"lease":resource.lease,"watch":resource.watch,
+                "target":resource.target,"coord_key":resource.coord_key}),
+        );
     Ok(())
 }
 
@@ -1474,7 +1533,17 @@ async fn startup_proof(
         // Every exact startup watch has consumed public proof/producer closure.
         // Release only the physical reservation; keep the original Unknown
         // command history and allow a late disposed callback to bind its key.
+        let exited = state
+            .bridge_exit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
         state.endpoint.transition(|s, _| {
+            // Exact waitpid ends this SDK actor only. Public proof and all
+            // producer/consumer closures above remain independently required.
+            if exited {
+                s.finish_acquisition(&acquisition)?;
+            }
             if s.acquisition_sdk_finished(&acquisition)?
                 && s.acquisition_lease(&acquisition)?.is_none()
             {
@@ -1483,18 +1552,22 @@ async fn startup_proof(
             Ok::<_, NexusError>(())
         })?;
     }
+    let acquisition_closed = state
+        .endpoint
+        .transition(|s, _| s.acquisition_closed(&acquisition))?;
     state
         .retired_open_resources
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(acquisition.parent.operation_id);
+        .insert(acquisition.parent.operation_id.clone());
     state
         .custody_retirements
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(
             watch.clone(),
-            json!({"acquisition":launch["acquisition"],"lease":null,"watch":watch}),
+            json!({"acquisition":launch["acquisition"],"lease":null,"watch":watch,
+                "acquisition_closed":acquisition_closed,"target":launch["target"],"coord_key":launch["coord_key"]}),
         );
     state
         .emit(json!({"event":"startup_settled","acquisition":launch["acquisition"],"watch":watch}));

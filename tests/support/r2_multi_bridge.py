@@ -16,6 +16,21 @@ install()
 def owner_input(root):
     from r0_transport import Boundary, barrier
     with Boundary(root, 'slow-owner') as boundary:
+        if root.name=='a' and (os.environ.get('R3F1_CASE')=='f3-owner' or os.environ.get('R3B_CASE','').startswith('verification')):
+            from ida_nexus._registry import InstanceIdentity, InstanceRegistration, REGISTRY_DIR
+            from r0_transport import install_ida_inputs
+            import secrets
+            import shutil
+            boundary.release_owner()
+            boundary.path=root.parent/('copy/probe.i64' if os.environ.get('R3F1_CASE')=='f3-owner' else 'vcopy/probe.i64')
+            boundary.path.parent.mkdir(mode=0o700,exist_ok=True)
+            if not boundary.path.exists():
+                shutil.copyfile(root.parent/'source.i64' if os.environ.get('R3F1_CASE')=='f3-owner' else root/'tiny.i64',boundary.path)
+            boundary.registration=InstanceRegistration(REGISTRY_DIR,
+                InstanceIdentity(str(boundary.path),str(boundary.path),'idalib',True),token=secrets.token_hex(24))
+            boundary.instance=boundary.registration.publish(boundary.server.server_port)
+            boundary.released=False
+            install_ida_inputs(boundary.path)
         if os.environ.get('R3B_CASE', '').startswith('verification'):
             import hashlib
             import ida_nalt

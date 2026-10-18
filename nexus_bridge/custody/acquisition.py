@@ -56,6 +56,9 @@ class Custodian:
         self.last_auxiliary = None
         self.adopted = False
         self.retired = False
+        self.sdk_entered = False
+        self.file_gate_admitted = False
+        self.absence_confirmed = False
         self.recovery_snapshot = None
         self.recovery_error = None
         self.recovery_active = False
@@ -101,6 +104,7 @@ class Custodian:
         try:
             self.target_path, self.coord_key = str(self.target.target), self.target.key
             self.admit_target()
+            self.file_gate_admitted = True
             yield self.target
         finally:
             self.unlock_target()
@@ -316,8 +320,8 @@ class Custodian:
             if result is None:
                 continue
             closed, bridge = result
-            with self.file_gate(recovery=True):
-                Journal(self.target).no_attach({'watch':watch, 'consumer':closed, 'bridge_consumer':bridge})
+            with self.file_gate(recovery=True) as target:
+                Journal(target).no_attach({'watch':watch, 'consumer':closed, 'bridge_consumer':bridge})
             # Authority already wrote the terminal before releasing EX. Rust's
             # next proof tick can now finish it without waiting on this writer.
             self.unlock_target()
@@ -381,8 +385,10 @@ class Custodian:
                     self.bridge.custodians.pop(self.lease['lease_id'])
 
     def obtain(self, Handle, Options, path, options, context):
-        outcome = Handle.open_outcome(path, options=Options(**dict(options,
-            acquisition_observer=self.stage)), on_acquired=lambda h:self.obtained(h, context))
+        configured = Options(**dict(options, acquisition_observer=self.stage))
+        self.sdk_entered = True
+        outcome = Handle.open_outcome(path, options=configured,
+            on_acquired=lambda h:self.obtained(h, context))
         if (outcome['cause'] is not None and outcome['handle'] is None
                 and outcome.get('http_status') == 503
                 and outcome['attempts'] and not outcome['unresolved_attempts']
@@ -398,8 +404,7 @@ class Custodian:
         try:
             self.reconcile_outcome(outcome)
             if handle is None:
-                self.transact('acquisition_finished', acquisition=self.acquisition,
-                    watches=list(self.observations)+[v['watch'] for v in self.launches.values()])
+                self.finish_without_handle()
         except Exception as cleanup_error:
             if outcome.get('cause') is not None:
                 raise RuntimeError('acquisition cleanup unconfirmed: ' + str(cleanup_error)) from outcome['cause']
@@ -468,6 +473,7 @@ class Custodian:
 
     def obtain_attach(self, Handle, instance, options, context, *, cleanup=False):
         self.stage('Resolved', instance)
+        self.sdk_entered = True
         outcome = Handle.attach_outcome(instance, idle_timeout=options.get('idle_timeout'),
             on_acquired=lambda h:self.obtained(h, context), on_stage=self.stage)
         self.outcome = outcome
@@ -479,8 +485,7 @@ class Custodian:
         try:
             self.reconcile_outcome(outcome)
             if handle is None:
-                self.transact('acquisition_finished', acquisition=self.acquisition,
-                    watches=list(self.observations)+[v['watch'] for v in self.launches.values()])
+                self.finish_without_handle()
         except Exception as cleanup_error:
             if outcome.get('cause') is not None:
                 raise RuntimeError('attach cleanup unconfirmed: ' + str(cleanup_error)) from outcome['cause']
@@ -498,7 +503,7 @@ class Custodian:
             child = self.bridge.cleanup_handles.get(self.lease['lease_id'])
         if child is not None:
             from lifecycle import release_state
-            settled_absence = child.handle is None and child.known_no_acquisition() and self.transact(
+            settled_absence = child.handle is None and self.transact(
                 'acquisition_status', acquisition=child.acquisition)['settled']
             closed_handle = child.handle is not None and release_state(child.handle)['requested']
             if settled_absence or closed_handle:
@@ -535,19 +540,30 @@ class Custodian:
                 # use the existing signed NoAttach path, never a fake outcome.
                 try:
                     child.reconcile_outcome({'attempts':[]})
-                    if child.transact('acquisition_status', acquisition=identity)['settled']:
-                        with self.bridge.lock:
-                            if self.bridge.cleanup_handles.get(self.lease['lease_id']) is child:
-                                self.bridge.cleanup_handles.pop(self.lease['lease_id'], None)
+                    child.finish_without_handle()
                 except Exception as cleanup_error:
                     raise RuntimeError('auxiliary observation cleanup unconfirmed: ' + str(cleanup_error)) from original
             if child is None or (child.handle is None and not child.observations and not child.launches):
-                self.transact('unstarted_acquisition', acquisition=identity)
+                self.transact('unstarted_acquisition', acquisition=identity,
+                    sdk_entered=False, file_obligation=False)
                 with self.bridge.lock:
                     if self.bridge.cleanup_handles.get(self.lease['lease_id']) is child:
                         self.bridge.cleanup_handles.pop(self.lease['lease_id'], None)
             raise
         return child
+
+    def finish_without_handle(self):
+        if self.handle is not None:
+            raise RuntimeError('ProtocolMismatch: handle must keep physical custody')
+        self.transact('acquisition_finished', acquisition=self.acquisition,
+            watches=list(self.observations)+[v['watch'] for v in self.launches.values()])
+        if self.transact('acquisition_status', acquisition=self.acquisition)['settled']:
+            if self.verification_path:
+                self.verification_retired = True
+            with self.bridge.lock:
+                for parent, child in list(self.bridge.cleanup_handles.items()):
+                    if child is self:
+                        self.bridge.cleanup_handles.pop(parent)
 
     def rpc(self, purpose, call, *, cleanup=False, deadline=None):
         if not self.lease or not self.decision:
@@ -613,10 +629,29 @@ class Custodian:
             # keep their reservation until exact settlement by Rust.
             result = self.helper_request({'kind':'retire_parent', 'parent':self.acquisition['parent']})
             if result['retired'] and not self.observations and not self.launches:
-                with self.bridge.lock:
-                    self.bridge.acquisitions.pop(self.acquisition['parent']['operation_id'], None)
+                if self.sdk_entered or self.recovery_snapshot is not None:
+                    return
+                if self.file_gate_admitted:
+                    with self.file_gate(recovery=True) as target:
+                        if Journal(target).value.get('file_intents'):
+                            raise RuntimeError('file recovery obligation retained; no unstarted absence') from exc
+                self.transact('unstarted_acquisition', acquisition=self.acquisition,
+                    sdk_entered=False, file_obligation=False)
+                self.absence_confirmed = True
+                if self.verification_path:
+                    self.verification_retired = True
+                else:
+                    with self.bridge.lock:
+                        parent=self.acquisition['parent']['operation_id']
+                        if self.bridge.acquisitions.get(parent) is self:
+                            self.bridge.acquisitions.pop(parent)
 
     def known_no_acquisition(self):
+        if self.absence_confirmed:
+            return True
+        if (self.handle is None and not self.sdk_entered and not self.observations
+                and not self.launches and not self.file_gate_admitted and self.recovery_snapshot is None):
+            return True
         return (self.handle is None and self.outcome is not None
                 and self.outcome['failure_kind'] in ('not_sent', 'lease_absent')
                 and not self.outcome['unresolved_attempts'] and not self.launches)
@@ -748,6 +783,9 @@ class Custodian:
         self.verification_retired = False
         self.adopted = False
         self.retired = False
+        self.sdk_entered = False
+        self.file_gate_admitted = False
+        self.absence_confirmed = False
         if purpose == 'final' and action != 'root_retry':
             self.verification_path = None
         if self.target is not None:
