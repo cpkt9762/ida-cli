@@ -101,6 +101,7 @@ class Journal:
                     or item['origin_binding'].get('same_boot_eligibility') is not False):
                 raise RuntimeError('CoordinationBlocked: malformed active observation')
             watches.add(item['watch'])
+            self.retirement(item)
             for reference in item['facts']:
                 self.validate_reference(reference)
             closed = item['epoch'] <= v['closed_through'] or any(a <= item['epoch'] <= b for a,b in ranges)
@@ -127,6 +128,7 @@ class Journal:
             raise RuntimeError('CoordinationBlocked: immutable reference outside target namespace')
 
     def accounting(self):
+        self.validate()
         totals = {'live_refs':sum(not i.get('resource_retirement') for i in self.value['entries'].values()),
                   'routine_bytes':len(encoded(self.value['summary'])),
                   'retained_evidence_bytes':sum(len(encoded(i)) for i in self.value['entries'].values()
@@ -195,7 +197,7 @@ class Journal:
         self.recover_public_proofs()
         self.retire_old_boot()
         for item in self.value['entries'].values():
-            if item.get('resource_retirement'):
+            if self.retirement(item):
                 continue
             if item.get('detach_outcome', {}).get('ack_kind') == 'last' and not item.get('proof'):
                 raise OwnerDraining('OwnerDraining: last ACK recorded; public owner proof pending')
@@ -264,7 +266,10 @@ class Journal:
 
     def recover_public_proofs(self):
         """Adopt authorized durable facts without closing any old producer."""
+        self.retire_old_boot()
         for item in list(self.value['entries'].values()):
+            if self.retirement(item):
+                continue
             if item.get('launch') and not item.get('owner'):
                 authorized = self.authorized_producers(item, ('SpawnIntent', 'Spawned'))
                 for receipt in self.scan_facts('observations', digest(item['watch'].encode())):
@@ -321,23 +326,47 @@ class Journal:
 
     def check_owner(self, owner):
         for item in self.value['entries'].values():
-            if (item.get('owner') and not item.get('proof') and not item.get('resource_retirement')
+            if (item.get('owner') and not item.get('proof') and not self.retirement(item)
                     and not item.get('transferred_to')
                     and item['owner'] != owner):
                 raise RuntimeError('ObservationRecoveryBlocked: different owner without exact lifetime proof')
+
+    def retirement(self, item):
+        """Validate persisted authority before consuming any retirement permission."""
+        if 'resource_retirement' not in item:
+            return None
+        evidence = item['resource_retirement']
+        if not isinstance(evidence, dict) or type(evidence.get('schema')) is not int or evidence['schema'] != 1:
+            raise RuntimeError('CoordinationBlocked: malformed resource retirement schema')
+        current = evidence.get('current')
+        expected = boot_change(item['origin_binding'], current)
+        expected.update(schema=1, watch=item['watch'], epoch=item['epoch'], acquisition=item['acquisition'],
+            owner=item.get('owner'), lease=item.get('lease'), launch=item.get('launch'),
+            coord_key=self.target.key, target_binding=self.target.binding)
+        expected['sha256'] = digest(expected)
+        # Canonical bytes distinguish bool from int as well as extra/missing fields.
+        if encoded(evidence) != encoded(expected):
+            raise RuntimeError('CoordinationBlocked: resource retirement digest/identity binding mismatch')
+        boot_change(item['origin_binding'], creation_scope(self.target.directory.path, 'resource-consumer'))
+        return evidence
+
+    def require_live(self, item):
+        self.retire_old_boot()
+        if self.retirement(item):
+            raise RuntimeError('ObservationClosed: retired boot epoch cannot change historical facts')
 
     def retire_old_boot(self):
         current = creation_scope(self.target.directory.path, 'resource-consumer')
         changed = False
         for item in self.value['entries'].values():
-            if item.get('resource_retirement'):
+            if self.retirement(item):
                 continue
             binding = item['origin_binding']
             if binding.get('creator', {}).get('boot_id') == current['creator']['boot_id']:
                 continue
             # Missing historical bindings cannot be assigned to an old boot.
             evidence = boot_change(binding, current)
-            evidence.update(watch=item['watch'], epoch=item['epoch'], acquisition=item['acquisition'],
+            evidence.update(schema=1, watch=item['watch'], epoch=item['epoch'], acquisition=item['acquisition'],
                 owner=item.get('owner'), lease=item.get('lease'), launch=item.get('launch'),
                 coord_key=self.target.key, target_binding=self.target.binding)
             evidence['sha256'] = digest(evidence)
@@ -353,6 +382,7 @@ class Journal:
         self.settle()
         for item in self.value['entries'].values():
             if item['watch'] == watch:
+                self.require_live(item)
                 if item['acquisition'] != acquisition or item.get('owner') != owner or item.get('launch') != launch:
                     raise RuntimeError('CoordinationBlocked: conflicting observation identity')
                 return item['epoch']
@@ -380,6 +410,7 @@ class Journal:
         item = self.value['entries'].get(str(epoch))
         if not item or item['watch'] != watch:
             raise RuntimeError('ObservationClosed: old/unknown epoch cannot revive references')
+        self.require_live(item)
         return item
 
     def adopt(self, value):
@@ -400,6 +431,7 @@ class Journal:
 
     def release_observation(self, value):
         item = self.item(value['watch'], value['epoch'])
+        self.require_live(item)
         if (item['lease'] != value['lease'] or item['owner'] != value['owner']
                 or value['attempt']['target'] != {'kind':'release', 'lease':item['lease']}
                 or value['outcome'].get('detach_called') is not False):
@@ -421,6 +453,7 @@ class Journal:
 
     def detach_outcome(self, value):
         item = self.item(value['watch'], value['epoch'])
+        self.require_live(item)
         observation = item.get('release_observation')
         outcome = value['outcome']
         if (not observation or observation['attempt'] != value['attempt']
@@ -462,6 +495,7 @@ class Journal:
         receipt = value['proof']
         record = receipt['record']
         item = self.item(value['watch'], record['subscription_epoch'])
+        self.require_live(item)
         if (record.get('helper') not in self.authorized_producers(item, ('Subscribed', 'StartupOwnerSubscribed', 'BridgeSubscribed'))
                 or record['watch'] != item['watch']
                 or record['state_root'] != item['owner']['state_root']
@@ -762,6 +796,8 @@ def main():
             if (journal.get('schema') != 1 or journal['coord_key'] != target.key or not item
                     or item['watch'] != value['watch'] or item['acquisition'] != value['acquisition']):
                 raise RuntimeError('CoordinationBlocked: durable custody binding missing')
+            if 'resource_retirement' in item:
+                raise RuntimeError('ObservationClosed: retired epoch cannot authorize new custody')
             if value['action'] in ('verify_adopt', 'verify_observe'):
                 if (item['owner'] != value['owner']
                         or (value['action'] == 'verify_adopt' and item['lease'] != value['lease'])):

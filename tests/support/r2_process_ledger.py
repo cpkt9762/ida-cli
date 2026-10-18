@@ -12,13 +12,14 @@ from process_identity import identity
 
 
 def install():
-    if not os.environ.get('R2_LEDGER') or getattr(subprocess.Popen, '_r2_ledger', False):
+    ledger_path = os.environ.get('R2_LEDGER')
+    if not ledger_path or getattr(subprocess.Popen, '_r2_ledger', False):
         return
     original = subprocess.Popen
 
     def record(value):
         data = (json.dumps(dict(value, parent=os.getpid()))+'\n').encode()
-        descriptor = os.open(os.environ['R2_LEDGER'], os.O_WRONLY | os.O_APPEND)
+        descriptor = os.open(ledger_path, os.O_WRONLY | os.O_APPEND)
         try:
             if os.write(descriptor, data) != len(data):
                 raise OSError('partial process ledger write')

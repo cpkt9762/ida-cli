@@ -89,6 +89,11 @@ impl Helper {
         let mut command = Command::new(&config.python);
         command.arg("-I").arg("-B");
         super::python_ledger(&mut command);
+        #[cfg(feature = "nexus-test-support")]
+        if config.environment.contains_key("R2_BOOT_SOURCE_INPUT") {
+            command
+                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/r2_boot_writer.py"));
+        }
         command
             .arg(installation.join("bootstrap.py"))
             .arg("proof_helper")
@@ -348,6 +353,11 @@ impl Helper {
         let mut command = Command::new(&self.python);
         command.arg("-I").arg("-B");
         super::python_ledger(&mut command);
+        #[cfg(feature = "nexus-test-support")]
+        if self.environment.contains_key("R2_BOOT_SOURCE_INPUT") {
+            command
+                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/r2_boot_writer.py"));
+        }
         command
             .arg(self.installation.join("bootstrap.py"))
             .arg("proof_helper")

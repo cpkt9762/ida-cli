@@ -24,6 +24,7 @@ async fn n4_fix_busy_shutdown_does_not_exit() {
             input.acquire_owned().await.unwrap(),
             std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
             std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         )
         .await
         .unwrap();

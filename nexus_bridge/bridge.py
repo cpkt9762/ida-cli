@@ -844,9 +844,9 @@ class Bridge(LifetimeListener):
                     if record.get("stop_proof"):
                         record["proving"] = True
                         proven.append((operation_id, record, record["stop_proof"]))
-                    elif record["expired"]:
+                    elif record["expired"] and not record.get('cleanup_stop_observation'):
                         continue
-                    elif time.monotonic() >= record["deadline"]:
+                    elif not record["expired"] and time.monotonic() >= record["deadline"]:
                         record["expired"] = True
                         expired.append(record["attempt"])
                     elif time.monotonic() >= record["next"] and self.proof_gate.acquire(blocking=False):
@@ -893,7 +893,11 @@ class Bridge(LifetimeListener):
         finally:
             with self.lock:
                 record["proving"] = False
-                record["next"] = time.monotonic() + 0.02
+                # Accepted cleanup still owns this exact stop obligation after
+                # the caller's deadline. Bounded public observation continues;
+                # the original deadline/outcome and execution are never reset.
+                delay = .8 if record.get('cleanup_stop_observation') and record['expired'] else .02
+                record["next"] = time.monotonic() + delay
                 # Rotate retryable records so a failed proof cannot monopolize
                 # the two reserved slots while other unknowns wait.
                 if self.executing.get(operation_id) is record:

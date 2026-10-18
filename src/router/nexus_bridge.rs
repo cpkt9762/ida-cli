@@ -348,6 +348,22 @@ impl NexusBridge {
             .get(&lease.lease_id)
             .and_then(|(exact, message)| (exact == lease).then(|| message.clone()))
     }
+    pub(crate) fn cleanup_blocked(&self, lease: &SessionLease, error: NexusError) {
+        let mut facts = self
+            .state
+            .release_facts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (exact, value) = facts
+            .entry(lease.lease_id.clone())
+            .or_insert_with(|| (lease.clone(), json!({})));
+        if exact == lease {
+            value["cleanup_state"] = json!("CleanupBlocked");
+            if value["cleanup_error"].is_null() {
+                value["cleanup_error"] = error.details();
+            }
+        }
+    }
     pub async fn start(
         router: &super::RouterState,
         mut config: BridgeConfig,

@@ -118,6 +118,8 @@ class Custodian:
                 yield
 
     def stage(self, stage, value):
+        if stage in ('BeforeAttach', 'AttachMayBeSent') and self.deadline <= time.monotonic():
+            raise TimeoutError('original open budget exhausted before attach; signed custody retained')
         if stage == 'BeforeResolve' and value['reconnect']:
             unknown = next((a for a in self.attach_failures
                             if a['failure_kind'] not in ('not_sent', 'lease_absent')), None)
@@ -359,8 +361,13 @@ class Custodian:
             return previous
         resolved = Handle.resolve_outcome(path, options=Options(**dict(options,
             startup_timeout=remaining, acquisition_observer=self.stage)))
+        if resolved['cause'] is None and self.deadline <= time.monotonic():
+            resolved['cause'] = TimeoutError('original open budget exhausted after signed resolve; no attach')
+            resolved['failure_kind'] = 'not_sent'
         if resolved['cause'] is not None:
             resolved['prior_outcome'] = previous
+            resolved['attempts'] = previous['attempts'] + resolved['attempts']
+            resolved['launches'] = previous['launches'] + resolved['launches']
             return resolved
         outcome = Handle.attach_outcome(resolved['instance'], path=path,
             keepalive=options.get('keepalive', 0), idle_timeout=options.get('idle_timeout'),
@@ -405,7 +412,8 @@ class Custodian:
         with self.bridge.lock:
             self.bridge.executing[operation_id] = {'attempt':attempt, 'handle':self.handle,
                 'native_id':operation_id, 'deadline':deadline, 'unknown':False,
-                'cancel_requested':False, 'proving':False, 'next':0, 'expired':False}
+                'cancel_requested':False, 'proving':False, 'next':0, 'expired':False,
+                'cleanup_stop_observation':cleanup}
         try:
             # The public client adds its fixed HTTP allowance; do not hide it
             # inside a caller deadline shorter than that allowance.

@@ -83,6 +83,8 @@ class Environment:
         self.ledger = self.root / "processes.jsonl"
         self.intents = self.root / "process-intents"
         self.children = []
+        self.test_telemetry = {name: os.environ[name] for name in ('R2_LEDGER', 'R2_TELEMETRY_SOURCE')
+                               if name in os.environ}
 
     def client_patch_status(self):
         """Check installed code against the prepared manifest, without loading IDA."""
@@ -132,6 +134,7 @@ class Environment:
                     "TMPDIR": str(self.root / "tmp"), "PYTHONNOUSERSITE": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYTHONUNBUFFERED": "1", "LANG": "C.UTF-8"})
+        env.update(self.test_telemetry)
         return env
 
     def _begin_creation(self, command):

@@ -75,7 +75,7 @@ def boot_change(binding, current):
             if not isinstance(text, str) or len(text) != 64 or any(c not in '0123456789abcdef' for c in text):
                 raise RuntimeError('UnsupportedBootScope: missing native machine/volume identity')
         creator = value.get('creator', {})
-        if creator.get('kind') != 'macos-libproc-v1':
+        if not isinstance(creator, dict) or creator.get('kind') != 'macos-libproc-v1':
             raise RuntimeError('UnsupportedBootScope: unvalidated host boot source')
         try:
             if str(uuid.UUID(creator['boot_id'])) != creator['boot_id']:

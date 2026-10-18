@@ -528,9 +528,22 @@ pub(super) async fn detach_fact(event: &Value, state: &Arc<State>) -> anyhow::Re
     let DeliveryTarget::Release { lease } = &attempt.target else {
         anyhow::bail!("detach target mismatch");
     };
-    state
-        .endpoint
-        .transition(|s, _| s.delivery_status(&lease.client_id, &attempt))?;
+    let retired = state.endpoint.transition(|s, _| {
+        s.delivery_status(&lease.client_id, &attempt)?;
+        s.resource_retirement(lease)
+    })?;
+    anyhow::ensure!(retired.is_none(), "late ACK for retired boot resource");
+    anyhow::ensure!(
+        !state
+            .release_facts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&lease.lease_id)
+            .is_some_and(|(exact, value)| exact == lease
+                && value["attempt"] == json!(attempt)
+                && value["terminal"].is_string()),
+        "duplicate release terminal before persistence"
+    );
     let resource = state
         .custody_resources
         .lock()

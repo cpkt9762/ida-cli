@@ -20,7 +20,7 @@ owner_root = root/'cache/generations/g-fixed' if managed else root
 owner_root.mkdir(parents=True, exist_ok=True)
 if managed:
     (owner_root/'generation.json').write_text(json.dumps({'version':1,'key':'r3a-fixed'}))
-with Boundary(owner_root, os.environ.get('R3A_SCENARIO', 'healthy')) as boundary:
+with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-uncertain' else os.environ.get('R3A_SCENARIO', 'healthy'))) as boundary:
     if managed:
         from r0_transport import install_ida_inputs
         boundary.release_owner()
@@ -81,7 +81,7 @@ with Boundary(owner_root, os.environ.get('R3A_SCENARIO', 'healthy')) as boundary
         if request.path == '/execute_python' and (root/'poison-root').exists():
             import ida_netnode
             ida_netnode.netnode.exist = staticmethod(lambda _:False)
-            if scenario == 'r2-protection-failed':
+            if scenario in ('r2-protection-failed', 'rf4-notsent'):
                 import ida_loader
                 def deny_flags(_flag):
                     raise OSError('private IDA close protection flag failure')
@@ -183,11 +183,42 @@ with Boundary(owner_root, os.environ.get('R3A_SCENARIO', 'healthy')) as boundary
                 # Public observer telemetry only; never substitutes a resolver,
                 # result, proof, SDK object or production admission decision.
                 result = original_stage(self, stage, value)
+                if scenario == 'post-exit-deadline' and self.post_exit_resolve_used and stage == 'Resolved':
+                    import time
+                    from r0_transport import barrier
+                    (root/'deadline-stage.json').write_text(json.dumps({
+                        'remaining':self.deadline-time.monotonic(), 'consumed':self.post_exit_resolve_used,
+                        'owner':self.owner, 'watches':list(self.observations), 'launches':list(self.launches),
+                        'strong_instances':len(self.originals), 'signed':self.subscription is not None}))
+                    barrier(root, 'deadline', seconds=15)
                 with stage_lock, (root/'public-stages.jsonl').open('a') as log:
                     log.write(json.dumps({'stage':stage, 'owner':getattr(value,'instance_id',None)})+'\n')
                     log.flush()
                 return result
             Custodian.stage = public_stage
+        if os.environ.get('R2_BOOT_SOURCE_INPUT'):
+            import target_journal
+            observed_scope = runpy.run_path(str(Path(__file__).with_name('r2_boot_writer.py')))['observed_scope']
+            native_scope = target_journal.creation_scope
+            target_journal.creation_scope = lambda path, incarnation: observed_scope(native_scope, path, incarnation)
+        if scenario == 'r2-save-refused-notsent':
+            from acquisition import Custodian
+            real_transaction = Custodian.transact
+            def receipt_failure(self, action, **fields):
+                result = real_transaction(self, action, **fields)
+                if action == 'release_observation':
+                    raise RuntimeError('controlled local failure after durable saving-refused receipt; detach not called')
+                return result
+            Custodian.transact = receipt_failure
+        if scenario.startswith('rf4-') or scenario == 'u6-late-ack':
+            from r0_transport import barrier
+            send_terminal = runtime['Channel'].send
+            def terminal_barrier(self, message):
+                if (message.get('event') in ('not_sent', 'uncertain', 'released', 'failed')
+                        and message.get('attempt', {}).get('target', {}).get('kind') == 'release'):
+                    barrier(root, 'terminal', seconds=8)
+                return send_terminal(self, message)
+            runtime['Channel'].send = terminal_barrier
         if r9:
             from acquisition import Custodian
             original_receive = runtime['Bridge'].receive

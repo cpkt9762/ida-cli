@@ -1,5 +1,6 @@
 """Independent native IDA/HTTP inputs for release scheduling assertions."""
 import json
+import io
 import os
 from pathlib import Path
 import runpy
@@ -17,10 +18,34 @@ def owner_input(root):
     with Boundary(root, 'slow-owner') as boundary:
         original = boundary.server.RequestHandlerClass.do_POST
         guard_calls = []
+        pending = set()
         def post(request):
+            late = os.environ.get('R2_LATE_STOP') == '1'
+            if request.path == '/cancel_operation' and late:
+                payload = json.loads(request.rfile.read(int(request.headers['Content-Length'])))
+                with boundary.lock:
+                    boundary.requests.append({'endpoint':request.path, **payload})
+                    running = payload['operation_id'] in pending
+                request.reply({'ok':True, 'result':{'cancelled':running}})
+                return
             if request.path == '/execute_python' and (root/'guard-block').exists():
                 guard_calls.append(time.monotonic())
                 (root/'guard-calls.json').write_text(json.dumps(guard_calls))
+                if late:
+                    raw = request.rfile.read(int(request.headers['Content-Length']))
+                    operation = json.loads(raw)['operation_id']
+                    with boundary.lock:
+                        pending.add(operation)
+                    stream = request.rfile
+                    request.rfile = io.BytesIO(raw)
+                    try:
+                        barrier(root, 'guard', seconds=45)
+                        return original(request)
+                    finally:
+                        request.rfile = stream
+                        with boundary.lock:
+                            pending.remove(operation)
+                        (root/'guard.stopped').touch()
                 barrier(root, 'guard', seconds=20)
             if request.path == '/cancel_operation' and (root/'guard-block').exists():
                 # This input remains executing until its actual HTTP response;

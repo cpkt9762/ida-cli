@@ -969,9 +969,10 @@ async fn boot_source_injection_retires_only_current_resources_and_preserves_unkn
         }
         anyhow::ensure!(cache_lock::try_exclusive(&ida_mcp::idb_store::idb_root()).is_ok(),"old resource still blocks physical root EX");
         anyhow::ensure!(matches!(router.nexus_close_token(&token).await,Ok(None)),"retired token revived");
+        std::fs::write(source.with_extension("json.boot"), b"00000000-0000-4000-8000-000000000001")?;
         // A new physical owner must not inherit old proof or retirement. The
-        // injected OS input is removed before creating this native obligation.
-        std::fs::remove_file(&source)?;
+        // injected current boot stays consistent in every writer. New
+        // obligations bind that new boot and cannot inherit old retirement.
         std::fs::write(root.join("owner-release"),b"")?;
         tokio::time::timeout(Duration::from_secs(2),async {
             while !root.join("owner-released").exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
@@ -1124,4 +1125,263 @@ async fn real_ida95_saved_modification_immediate_reopen_and_shared_lease() {
     ash.expect("first natural shutdown");
     bs.expect("second natural shutdown");
     result.expect("production IDA9.5 shared close and immediate saved readback");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_close_detaches_once_after_late_native_stop_with_owner_held() {
+    use ida_mcp::nexus::{DeliveryState, SessionLease};
+    let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root"));
+    let router = RouterState::new().expect("router");
+    let mut environment: BTreeMap<String, String> = std::env::vars().collect();
+    environment.insert("R2_LATE_STOP".into(), "1".into());
+    let bridge = router
+        .connect_nexus(BridgeConfig {
+            python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("SDK")),
+            script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/r2_multi_bridge.py"),
+            directory: root.join("i"),
+            environment,
+        })
+        .await
+        .expect("production bridge/helper");
+    let mut events = bridge.subscribe();
+    let result: anyhow::Result<Value> = async {
+        let (_, token) = router
+            .ensure_worker_prepared(
+                root.join("a/tiny.i64").to_str().expect("path"),
+                None,
+                None,
+                Preparation::new(Duration::from_secs(10)),
+            )
+            .await?;
+        let lease: SessionLease = loop {
+            let event = events.recv().await?;
+            if event["event"] == "opened" {
+                break serde_json::from_value(event["lease"].clone())?;
+            }
+        };
+        std::fs::write(root.join("a/guard-block"), b"")?;
+        let caller_router = router.clone();
+        let caller = tokio::spawn(async move { caller_router.nexus_close_token(&token).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !root.join("a/guard.arrived").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        caller.abort();
+        let _cancelled = caller.await;
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let state = bridge
+                    .endpoint()
+                    .transition(|s, _| s.status(&lease.client_id, &lease))?;
+                if state
+                    .control_delivery
+                    .is_some_and(|d| d.state == DeliveryState::NotSent)
+                {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        // More than the old sixteen CancelPending backoffs, with the owner
+        // still holding the public lifetime and native HTTP still executing.
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        anyhow::ensure!(
+            !root.join("a/release-requested").exists(),
+            "detach before actual stop"
+        );
+        std::fs::remove_file(root.join("a/guard-block"))?;
+        std::fs::write(root.join("a/guard.release"), b"")?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !root.join("a/release-requested").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        anyhow::ensure!(
+            !root.join("a/owner-released").exists(),
+            "proof substituted for detach"
+        );
+        std::fs::write(root.join("a/snapshot-request"), b"")?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !root.join("a/requests.json").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        let calls: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(root.join("a/requests.json"))?)?;
+        anyhow::ensure!(
+            calls
+                .iter()
+                .filter(|v| v["endpoint"] == "/release_lease")
+                .count()
+                == 1,
+            "detach count: {calls:?}"
+        );
+        Ok(json!({"calls":calls,"status":router.status_snapshot().await.owner_observations}))
+    }
+    .await;
+    for name in ["a", "b"] {
+        std::fs::write(root.join(name).join("guard.release"), b"").expect("finally guard");
+        std::fs::write(root.join(name).join("owner-release"), b"").expect("finally owner");
+    }
+    let settled = tokio::time::timeout(Duration::from_secs(8), async {
+        while bridge.lifecycle_status()["resources"] != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let shutdown = bridge.shutdown().await;
+    std::fs::write(
+        root.join("late-stop.json"),
+        serde_json::to_vec_pretty(&json!({"result":format!("{result:?}"),
+        "settled":settled.is_ok(),"shutdown":format!("{shutdown:?}")}))
+        .expect("encode"),
+    )
+    .expect("evidence");
+    settled.expect("public proof settles cleanup");
+    shutdown.expect("natural input shutdown");
+    result.expect("late native stop automatically detaches exactly once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn post_exit_final_signed_resolved_deadline_sends_zero_attach() {
+    let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root"));
+    let router = RouterState::new().expect("router");
+    let mut environment: BTreeMap<String, String> = std::env::vars().collect();
+    environment.insert("R3A_SCENARIO".into(), "post-exit-deadline".into());
+    let bridge = router
+        .connect_nexus(BridgeConfig {
+            python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("SDK")),
+            script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/r3a_bridge_fixture.py"),
+            directory: root.join("i"),
+            environment,
+        })
+        .await
+        .expect("bridge/helper");
+    let caller_router = router.clone();
+    let path = root.join("tiny.i64");
+    let caller = tokio::spawn(async move {
+        caller_router
+            .ensure_worker_prepared(
+                path.to_str().expect("path"),
+                None,
+                None,
+                Preparation::new(Duration::from_secs(5)),
+            )
+            .await
+    });
+    let result:anyhow::Result<Value>=async {
+        tokio::time::timeout(Duration::from_secs(4),async {
+            while !root.join("deadline.arrived").exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await?;
+        let signed:Value=serde_json::from_slice(&std::fs::read(root.join("deadline-stage.json"))?)?;
+        anyhow::ensure!(signed["signed"]==true && signed["consumed"]==true
+            && signed["strong_instances"].as_u64().is_some_and(|n|n>=1) && signed["watches"].as_array().is_some_and(|v|v.len()==2),"missing real instance/helper custody: {signed}");
+        let remaining=signed["remaining"].as_f64().ok_or_else(||anyhow::anyhow!("deadline"))?;
+        tokio::time::sleep(Duration::from_secs_f64(remaining.max(0.0)+0.1)).await;
+        std::fs::write(root.join("deadline.release"),b"")?;
+        let opened=caller.await?;
+        anyhow::ensure!(opened.is_err(),"expired open delivered active token");
+        // Let the actual SDK/bridge finish the held observer, then query HTTP inputs.
+        std::fs::write(root.join("snapshot-request"),b"")?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let snapshot:Value=serde_json::from_slice(&std::fs::read(root.join("snapshot.json"))?)?;
+        let stages=std::fs::read_to_string(root.join("public-stages.jsonl"))?;
+        let requests=snapshot["requests"].as_array().ok_or_else(||anyhow::anyhow!("requests"))?;
+        anyhow::ensure!(requests.iter().filter(|v|v["endpoint"]=="attach_attempt").count()==2,
+            "expired post-exit stage reached final attach: {snapshot}");
+        anyhow::ensure!(requests.iter().all(|v|v["endpoint"]!="lease"),"lease after deadline: {snapshot}");
+        Ok(json!({"signed":signed,"snapshot":snapshot,"stages":stages,"caller":format!("{opened:?}")}))
+    }.await;
+    std::fs::write(root.join("deadline.release"), b"").expect("finally observer");
+    std::fs::write(root.join("owner-release"), b"").expect("finally owner");
+    let settled = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let status = bridge.lifecycle_status();
+            if status["resources"] == 0 && status["startup_and_pre_attach"] == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let shutdown = bridge.shutdown().await;
+    std::fs::write(
+        root.join("deadline-result.json"),
+        serde_json::to_vec_pretty(&json!({"result":format!("{result:?}"),
+        "settled":settled.is_ok(),"shutdown":format!("{shutdown:?}")}))
+        .expect("encode"),
+    )
+    .expect("evidence");
+    settled.expect("all signed observations settle");
+    shutdown.expect("natural shutdown");
+    result.expect("deadline before final attach");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_real_ack_after_boot_retirement_never_rewrites_target() {
+    use ida_mcp::nexus::SessionLease;
+    let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root"));
+    let source = root.join("os-source.json");
+    let router = RouterState::new().expect("router");
+    let mut environment: BTreeMap<String, String> = std::env::vars().collect();
+    environment.insert("R3A_SCENARIO".into(), "u6-late-ack".into());
+    environment.insert("R2_BOOT_SOURCE_INPUT".into(), source.display().to_string());
+    let bridge = router
+        .connect_nexus(BridgeConfig {
+            python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("SDK")),
+            script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/r3a_bridge_fixture.py"),
+            directory: root.join("i"),
+            environment,
+        })
+        .await
+        .expect("bridge/helper");
+    let mut events = bridge.subscribe();
+    let result:anyhow::Result<Value>=async {
+        let (_,token)=router.ensure_worker_prepared(root.join("tiny.i64").to_str().expect("path"),None,None,Preparation::new(Duration::from_secs(10))).await?;
+        let lease:SessionLease=loop {let event=events.recv().await?;if event["event"]=="opened" {break serde_json::from_value(event["lease"].clone())?;}};
+        let caller_router=router.clone();
+        let caller=tokio::spawn(async move{caller_router.nexus_close_token(&token).await});
+        tokio::time::timeout(Duration::from_secs(3),async{while !root.join("terminal.arrived").exists(){tokio::time::sleep(Duration::from_millis(5)).await;}}).await?;
+        caller.abort();let _cancelled=caller.await;
+        let before=router.nexus_endpoint().transition(|s,_|s.status(&lease.client_id,&lease))?;
+        std::fs::write(&source,serde_json::to_vec(&json!({"creator":{"boot_id":"00000000-0000-4000-8000-000000000001"}}))?)?;
+        bridge.test_boot_resource_projection().await?;
+        let directory=std::fs::read_dir(&root)?.filter_map(Result::ok).find(|entry|entry.file_name().to_string_lossy().starts_with(".ida-cli-txn-")).ok_or_else(||anyhow::anyhow!("actual target journal"))?.path();
+        let journal=directory.join("custody.json");let retired=std::fs::read(&journal)?;
+        std::fs::write(root.join("terminal.release"),b"")?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        anyhow::ensure!(std::fs::read(&journal)?==retired,"late real SDK ACK rewrote retired target history");
+        let after=router.nexus_endpoint().transition(|s,_|s.status(&lease.client_id,&lease))?;
+        anyhow::ensure!(serde_json::to_value(&before)?==serde_json::to_value(&after)?,"late ACK rewrote N1 history");
+        std::fs::write(root.join("retired-journal.json"),&retired)?;
+        Ok(json!({"before":before,"after":after,"journal":journal,"scope":"actual SDK ACK, injected OS boot source"}))
+    }.await;
+    std::fs::write(root.join("terminal.release"), b"").expect("finally terminal");
+    std::fs::write(root.join("owner-release"), b"").expect("finally lifetime");
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while bridge.lifecycle_status()["retirement_acks"] != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retirement ACK");
+    let shutdown = bridge.shutdown().await;
+    std::fs::write(
+        root.join("late-ack.json"),
+        serde_json::to_vec_pretty(
+            &json!({"result":format!("{result:?}"),"shutdown":format!("{shutdown:?}")}),
+        )
+        .expect("encode"),
+    )
+    .expect("evidence");
+    shutdown.expect("natural shutdown");
+    result.expect("retired target bytes immutable");
 }

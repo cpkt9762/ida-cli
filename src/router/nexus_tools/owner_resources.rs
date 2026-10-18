@@ -119,7 +119,9 @@ impl Tools {
                 } else {
                     "RetiredByBootChange"
                 });
-                facts["next_action"] = json!(if facts["owner_pending"] == true {
+                facts["next_action"] = json!(if facts["cleanup_state"] == "CleanupBlocked" {
+                    "inspect_cleanup_blocked"
+                } else if facts["owner_pending"] == true {
                     "wait_owner_exit"
                 } else {
                     "none"
@@ -145,12 +147,15 @@ impl Tools {
             if status["owner_released"] == true || !status["resource_retirement"].is_null() {
                 return Ok(status);
             }
-            preparation
-                .wait(async {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    Ok(())
-                })
-                .await?;
+            // This is a read-only observation with no outstanding input job.
+            // Report its own deadline, never an unproven native execution.
+            tokio::time::sleep_until(
+                preparation
+                    .deadline
+                    .min(Instant::now() + Duration::from_millis(10))
+                    .into(),
+            )
+            .await;
         }
     }
 

@@ -3,7 +3,7 @@ use crate::router::protocol::{RpcRequest, RpcResponse};
 use crate::router::RouterState;
 use crate::tool_registry::primary_name_for;
 use std::path::PathBuf;
-use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -28,6 +28,7 @@ pub async fn run_socket_listener(
     let input_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
     let business_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
     let control_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+    let observation_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
 
     loop {
         tokio::select! {
@@ -49,8 +50,9 @@ pub async fn run_socket_listener(
                 let shutdown = shutdown.clone();
                 let business_gate=business_gate.clone();
                 let control_gate=control_gate.clone();
+                let observation_gate=observation_gate.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_cli_connection(stream, &router, &shutdown, input_permit, business_gate, control_gate).await {
+                    if let Err(e) = handle_cli_connection(stream, &router, &shutdown, input_permit, business_gate, control_gate, observation_gate).await {
                         debug!("CLI connection ended: {}", e);
                     }
                 });
@@ -73,6 +75,7 @@ async fn handle_cli_connection(
     input_permit: tokio::sync::OwnedSemaphorePermit,
     business_gate: std::sync::Arc<tokio::sync::Semaphore>,
     control_gate: std::sync::Arc<tokio::sync::Semaphore>,
+    observation_gate: std::sync::Arc<tokio::sync::Semaphore>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -107,7 +110,16 @@ async fn handle_cli_connection(
     let shutdown_request = parsed
         .as_ref()
         .is_ok_and(|req| primary_name_for(&req.method) == "shutdown");
-    let gate = if control { control_gate } else { business_gate };
+    let observation = parsed
+        .as_ref()
+        .is_ok_and(|request| primary_name_for(&request.method) == "wait_owner_exit");
+    let gate = if observation {
+        observation_gate
+    } else if control {
+        control_gate
+    } else {
+        business_gate
+    };
     let execution_permit = gate.try_acquire_owned();
     let resp = match parsed {
         Ok(req) if execution_permit.is_err() => {
@@ -115,7 +127,19 @@ async fn handle_cli_connection(
         }
         Ok(req) => {
             drop(input_permit); // Classified work now owns its independent lane capacity.
-            let (mut response, ref_guard) = dispatch_cli_request(&req, router, shutdown).await;
+            let dispatched = dispatch_cli_request(&req, router, shutdown);
+            let (mut response, ref_guard) = if observation {
+                // This read-only observer owns no lease/cleanup side effect.
+                // A disconnected client releases its observation slot promptly.
+                let mut extra = [0_u8; 1];
+                tokio::select! {
+                    result = dispatched => result,
+                    _ = reader.read(&mut extra) => return Ok(()),
+                    _ = shutdown.cancelled() => return Ok(()),
+                }
+            } else {
+                dispatched.await
+            };
             if !control && !always_inline(&req.method) {
                 if let Some(result) = response.result.take() {
                     response.result =
@@ -130,10 +154,7 @@ async fn handle_cli_connection(
 
     let shutdown_accepted = shutdown_request && resp.error.is_none();
     let json = if control {
-        crate::blocking::run(crate::blocking::WorkClass::Control, move || {
-            serde_json::to_vec(&resp)
-        })
-        .await??
+        crate::blocking::control_response(move || serde_json::to_vec(&resp)).await??
     } else {
         crate::blocking::response(move || serde_json::to_vec(&resp)).await??
     };
@@ -208,6 +229,9 @@ async fn dispatch_cli_request(
                 let canonical = std::fs::canonicalize(&expanded).unwrap_or(expanded);
                 match router.close_by_path(&canonical, tenant_id.as_deref()).await {
                     Ok(()) => RpcResponse::ok(&req.id, serde_json::json!({"ok": true})),
+                    Err(crate::error::ToolError::Nexus(error)) => {
+                        RpcResponse::nexus_error(&req.id, &error)
+                    }
                     Err(e) => RpcResponse::err(&req.id, -32000, e.to_string()),
                 }
             } else {
@@ -549,6 +573,7 @@ async fn test_cli_rpc(
             input.acquire_owned().await.expect("input permit"),
             std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         )
         .await
     });
@@ -591,6 +616,7 @@ mod n2_tests {
                 input.acquire_owned().await.unwrap(),
                 business,
                 control,
+                std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             )
             .await
         });
@@ -642,6 +668,7 @@ mod tests {
                     .acquire_owned()
                     .await
                     .expect("input permit"),
+                std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
                 std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
                 std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             )

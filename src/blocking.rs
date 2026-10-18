@@ -60,6 +60,14 @@ pub async fn response<T: Send + 'static>(
     static GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
     independent(GATE.clone(), "ida-response-encode", job).await
 }
+/// Control replies have independent backpressure, including simultaneous
+/// observation deadlines. A full encoder must not silently close a socket.
+pub async fn control_response<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, crate::error::ToolError> {
+    static GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
+    independent(GATE.clone(), "ida-control-encode", job).await
+}
 pub async fn request_decode<T: Send + 'static>(
     job: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, crate::error::ToolError> {

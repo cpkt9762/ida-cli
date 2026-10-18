@@ -1044,6 +1044,7 @@ impl Drop for ReleaseCleanup {
         let tools = owner;
         tokio::spawn(async move {
             let mut retries = 0_u8;
+            let mut backoffs = 0_u8;
             let mut next_retry = Instant::now();
             loop {
                 tools.consume_released(&bridge);
@@ -1064,18 +1065,55 @@ impl Drop for ReleaseCleanup {
                             s.control_delivery
                                 .is_some_and(|d| d.state == DeliveryState::NotSent)
                         });
-                    if not_sent {
+                    if not_sent
+                        && bridge.owner_release_status(&lease)["preflight"]["protection"]
+                            ["close_safe"]
+                            == false
+                    {
+                        bridge.cleanup_blocked(&lease, NexusError::new(NexusErrorCode::OperationFailed,
+                            "CleanupBlocked: fresh protection unavailable; exact resource retained"));
+                        retries = 16;
+                    } else if not_sent {
                         // N1 rechecks stop/owner/grant eligibility. A potentially
                         // sent detach never enters this retry branch.
-                        if let Err(error) = bridge
-                            .endpoint()
-                            .transition(|s, t| s.release(&lease.client_id, &lease, t))
-                        {
-                            tracing::debug!(%error,"Nexus background NotSent cleanup remains blocked");
+                        let issued: Result<_, NexusError> = bridge.endpoint().transition(|s, t| {
+                            let before = s.status(&lease.client_id, &lease)?.control_delivery;
+                            let result = s.release(&lease.client_id, &lease, t);
+                            let after = s.status(&lease.client_id, &lease)?.control_delivery;
+                            Ok((
+                                before.map(|d| d.attempt) != after.map(|d| d.attempt),
+                                result,
+                            ))
+                        });
+                        let error = match issued {
+                            Ok((created, result)) => {
+                                if created {
+                                    retries += 1;
+                                }
+                                result.err()
+                            }
+                            Err(error) => Some(error),
+                        };
+                        if let Some(error) = error {
+                            if matches!(
+                                error.code,
+                                NexusErrorCode::CancelPending | NexusErrorCode::Busy
+                            ) {
+                                tracing::debug!(%error,"Nexus background cleanup awaits eligibility");
+                            } else {
+                                bridge.cleanup_blocked(&lease, error);
+                                retries = 16;
+                            }
                         }
-                        retries += 1;
+                        backoffs = backoffs.saturating_add(1);
                         next_retry = Instant::now()
-                            + Duration::from_millis(50_u64.saturating_mul(1_u64 << retries.min(4)));
+                            + Duration::from_millis(
+                                50_u64.saturating_mul(1_u64 << backoffs.min(4)),
+                            );
+                        if retries == 16 {
+                            bridge.cleanup_blocked(&lease, NexusError::new(NexusErrorCode::OperationFailed,
+                                "CleanupBlocked: bounded release attempts exhausted; exact resource retained"));
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1420,35 +1458,35 @@ async fn release(
             let state = bridge
                 .endpoint()
                 .transition(|s, _| s.status(&lease.client_id, lease))?;
+            // Public lifetime settles resources independently of this command.
+            // Deliver the original terminal before interpreting resource phase.
             if let Some(delivery) = &state.control_delivery {
-                if delivery.state == DeliveryState::Uncertain {
-                    if let Some(error) = &delivery.error {
-                        return Err(diagnostic(format!(
-                            "{error}{}; lease_detached={}; owner_pending={}; never_replay=true",
-                            guard_diagnostic(),
-                            state.phase == SessionPhase::Released,
-                            bridge.owner_release_status(lease)["owner_pending"]
-                        )));
-                    }
+                if let Some(error) = &delivery.error {
+                    let mut error = error.clone();
+                    error.message.push_str(&format!(
+                        "{}; lease_detached={}; owner_pending={}; never_replay={}",
+                        guard_diagnostic(),
+                        state.phase == SessionPhase::Released,
+                        bridge.owner_release_status(lease)["owner_pending"],
+                        delivery.state == DeliveryState::Uncertain
+                    ));
+                    return Err(ToolError::Nexus(error));
                 }
             }
-            if state.phase == SessionPhase::Released {
+            let terminal = state
+                .control_delivery
+                .as_ref()
+                .is_none_or(|delivery| delivery.state == DeliveryState::Confirmed);
+            if state.phase == SessionPhase::Released && terminal {
                 return bridge.take_release_error(lease).map_or(Ok(()), |message| {
-                    Err(diagnostic(format!(
-                        "{message}; lease detached; owner_pending={}",
-                        bridge.owner_release_status(lease)["owner_pending"]
+                    Err(ToolError::Nexus(NexusError::new(
+                        NexusErrorCode::OperationFailed,
+                        format!(
+                            "{message}; lease detached; owner_pending={}",
+                            bridge.owner_release_status(lease)["owner_pending"]
+                        ),
                     )))
                 });
-            }
-            if let Some(delivery) = state.control_delivery {
-                if let Some(error) = delivery.error {
-                    return Err(diagnostic(format!(
-                        "{}{}; lease_detached=false; owner_pending=true; never_replay={}",
-                        error,
-                        guard_diagnostic(),
-                        delivery.state == DeliveryState::Uncertain
-                    )));
-                }
             }
             let event = receive(events.recv().await)?;
             if event["event"] == "release_unconfirmed"
