@@ -6,6 +6,8 @@
 
 2026-10-17 增量验收：N7a-R 的 r4 设计 `8eb0d88` 已获 Astra/Claude 双复审认可，编排者直接核验补齐测试证据 scope、持久 boot 绑定粒度与既有 owner 不追认资格三处文字澄清，允许按依赖进入 R0 原型。此项仅为设计输入验收，N7a 产品及 N7b/N7c、N8、N9 均未完成。
 
+2026-10-18 增量验收：R3a及fix1最终对象`ef4fc3b`已完成编排者独立执行验证并由用户人工复审通过，验收为R2输入。后续按R2→R3b→R4→R6→R7→N7b/N7c→N8→N9推进；完整验收来源与边界见本计划末尾。
+
 执行约束（2026-10-17用户后续指定覆盖历史配置）：实现用 `dev / codex-worker / gpt-6.1-sol / full-access / high`；常规只读审查用 `review / gpt-6-astra / xhigh`，provider/modeId以每次实际profile核验为准。本阶段保留已批准的Claude/xhigh独立交叉复审。继续使用既有独立worktree与分支；不为每一阶段重建工作区，不修改全局配置。
 
 ## 1. 目标与验收范围
@@ -919,9 +921,9 @@ R1最终验收对象为`f2718b357a6760ef4f9d72d505eaea0cf932210e`，包含初版
 之后再审计，无forced cleanup，不能用后续通过覆盖旧失败。
 本次仅验收R1 SDK边界；R3a的Preparing、内部operation、startup/helper和目标gate，
 R2两阶段、R3b恢复编排、R4文件事务及GUI/Linux/大库/真实跨boot均保持后续责任。
-下一步按既定顺序委托R3a，F1/F4仍不宣称已修复。
+当时下一步为R3a；R3a最终范围见下文，F1完整两阶段仍归R2。
 
-R3a实现交付（2026-10-18，待编排者独立复验/review，不作阶段验收）：普通final路径已用正式SDK早期on_acquired接N1 Preparing；
+R3a实现交付（2026-10-18，含fix1已验收为R2输入）：普通final路径已用正式SDK早期on_acquired接N1 Preparing；
 父终态、grant_epoch与逐RPC内部operation由N1唯一仲裁，ACK只托管不授执行权；Tools可靠登记后发布索引并释放analysis不应持的open/content/path锁。
 生产职责入口为`src/ida/nexus/custody.rs`、`src/router/nexus_bridge/{custody_wire,helper,installation}.rs`与`nexus_bridge/custody/`。
 每固定state根独立helper、Popen前durable launch intent/Popen后出生身份、公共wait immutable proof、目标journal先接管后ACK及原instance备用来源均已接线；
@@ -932,10 +934,22 @@ F4的analysis主错、服务端lease与失败cleanup事实保持，N1不再丢le
 R2完整两阶段/立即重开F1、R3b恢复/verification/auxiliary编排、R4全事务/维护/完整durable故障矩阵、R7及跨boot产品实验未由本轮验收。
 本轮仅交付R3a，后续仍按既定顺序由编排者派单；默认后端和native功能保留。
 
-R3a fix1定向返修（待44ad及原reviewer复审，不作验收）：独立review的五P1/六反例
+R3a fix1定向返修（已完成编排者独立执行验证和用户人工复审）：独立review的五P1/六反例
 分别补公共True后的固定proof身份重试、新writer先恢复startup签收及已授权bridge备用proof、
 失败准入provisional source精确撤回、quarantine/retired业务拒绝、旧verification及辅助attach的实际target gate。
 反向producer/身份/hash仍拒绝，不伪闭合旧producer或删除未结责任。Q1真实r9跨ordinal时序及Q2真实IPC丢finish回复
 均证实为当前缺陷；最小修复保旧ordinal对象/事件与durable proof归并、持久finish接受后永久fence。
 回归入口见TESTING，红绿来源/最终字节/全部失败和精确资源审计见外部`r3a-fix1/`。
 固定SDK四patch、U1–U6及sameboot Unsupported不变；R2/R3b/R4及跨boot责任保持后续。
+
+R3a最终验收（2026-10-18）：对象`ef4fc3bc9949f0aa55ba09f3f3133ef74359d01c`，
+包含初版实现、helper finish修复及上述fix1。用户针对`3acfefd → ef4fc3b`的20文件、
+五P1与Q1/Q2明确回复“我人工复审通过”，据此记为用户人工复审通过；自动reviewer两次平台拒绝仍为历史事实，不冒充自动复审通过。
+编排者独立新环境36条命令全部exit0：六安全反例、Q1三时序、Q2真实IPC丢回复、N1/transport/bridge、
+Rust库565项（2既有ignored）、Python155项/102子测试、SDK12、readiness31、receiver189/56、
+真实SDK/Tools IDA9.5及五startup、direct/managed各128轮与静态检查通过，详见
+`/tmp/n7r3af1v.YtFYrx/report/verification.md`及同目录机器证据。
+审计183条进程身份记录与167个锁，无存活/身份不明进程、占用锁、未完intent或forced cleanup；
+3个故障socket路径无holder并保留。验收时当前源码、36条日志、27项证据及6个二进制hash均重新核对一致，未重复计算历史运行。
+本次验收只覆盖R3a基础及返修，未验收整个N7a、R2/R3b/R4或GUI/Linux/大库/跨boot。
+后续委托R2普通lease两阶段释放、owner保留表、立即重开及相应证据scope投影；保持既定保护、不重放与文件门禁。

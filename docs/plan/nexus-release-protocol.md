@@ -1,9 +1,9 @@
 # Nexus 释放与打开协议：N7a-R 设计
 
-状态：第一阶段 r4 已经 Astra 与 Claude 聚焦双复审，编排者核验并补齐 R4-F1/T1/T2 文字澄清后验收。第二阶段 R0 及两轮返修已验收，范围见 §11.4；R5及局部返修、R1及关闭边界返修均已验收，证据见主计划对应最终验收记录。R1仅作为R3a输入，不代表 N7 产品验收通过。
+状态：第一阶段 r4 已经 Astra 与 Claude 聚焦双复审，编排者核验并补齐 R4-F1/T1/T2 文字澄清后验收。第二阶段 R0、R5、R1及各自返修已验收；R3a及fix1经编排者独立执行验证、用户人工复审通过后，已验收为R2输入，依据见§12.3。不代表 N7 产品验收通过。
 日期：2026-10-17。设计基线：`feat/nexus-backend`，`f47dd2301b096f1c4b6643906f6e8976e8663469`。
 设计输入提交：`460f0966cc6db174d49342a5536a1a54e046ebd8`（r3；前序设计为 ff81992、36ed13c）；当时产品与测试为上述 f47dd23。
-第一阶段只提交本文件及主计划 N7 中的引用。第二阶段按 §11.2 逐步委托；R1最终对象`f2718b357a6760ef4f9d72d505eaea0cf932210e`于2026-10-18通过编排者独立执行与聚焦复审，下一步为R3a基础custody。
+第一阶段只提交本文件及主计划 N7 中的引用。第二阶段按 §11.2 逐步委托；R3a最终对象`ef4fc3bc9949f0aa55ba09f3f3133ef74359d01c`于2026-10-18通过独立执行验证与用户人工复审，下一步为R2两阶段释放。
 设计验收对象为 `8eb0d88e21dffed38fc5208b0cf473ec2adba11c`；双评审见 `/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/rereview4-{astra,claude}/report.md`。两位均确认无新增 P0/P1，并允许编排者直接核验下述三处文字同步；完整运行能力按 §11.2 从 R0 实证，不重复将文档回应计为产品测试。
 
 ## 1. 依据、目标与保留边界
@@ -1043,7 +1043,7 @@ R0 后重估以下为**工程人日区间**，含各项定向实现与故障验�
 没有运行真实IDA/新协议harness/产品测试或重跑VM，没有修改产品/测试/补丁；历史实验仅设计依据，不计本轮运行通过。静态检查不能证明协议正确，尚未验收N7a，聚焦双复审通过后才另派R0。
 F1 自然关闭耗时、准备 RPC 停止身份、startup 后台写入、hook 写盘前保护和 journal 故障恢复均是第二阶段必须实证的验收项。
 
-### 12.1 R3a实现记录（2026-10-18，待独立验收）
+### 12.1 R3a实现记录（2026-10-18，含fix1已验收为R2输入）
 
 §11.2的R3a已接普通final生产路径：正式SDK早期取得保同一handle，经Rust custody/N1原子登记Preparing，
 取消/父失败仅cleanup-only，逐准备RPC登记精确operation_id并再取grant；传输不确定保停止义务，迟到ACK/公共proof不改变原调用错误。
@@ -1065,7 +1065,7 @@ F1 自然关闭耗时、准备 RPC 停止身份、startup 后台写入、hook �
 最终direct与managed各128轮、五startup断桥barrier和新真实IDA9.5 Rust Tools链已实跑；F4保持原analysis失败/残留lease/cleanup失败事实后公共proof结算。
 这不是N7a验收；R2两阶段和F1、R3b完整恢复编排、R4事务/维护、R7及跨boot产品实证仍保留后续责任。
 
-### 12.2 R3a fix1返修边界（待独立复审）
+### 12.2 R3a fix1返修边界（已通过用户人工复审）
 
 五P1/六安全反例的修补仍限R3a基础：真实公共True后的proof发布保原instance、固定pending身份及有界退避；
 精确已提交事实可重用，未知内容/身份冲突继续保场阻断。新writer先按原launch/watch/epoch/acquisition/CoordKey
@@ -1078,4 +1078,14 @@ Q1以实际N1/SDK/生产bridge barrier确认旧ordinal迟到retirement及公共p
 以旧ordinal对象/事件隔离和期限内归并原durable proof修补。Q2以真实IPC在helper接受finish后丢完整回复确认重连缺陷，
 以精确durable finish tombstone恢复接受事实并阻重启；仍有parent/watch时拒finish不fence。
 复现/回归命令及精确来源见TESTING和外部`r3a-fix1/`。U1–U6、固定SDK及sameboot Unsupported不变，
-R2完整两阶段、R3b/R4和跨boot仍按原顺序另行委托，返修本身不宣告R3a验收。
+R2完整两阶段、R3b/R4和跨boot仍按原顺序另行委托；R3a验收依据如下，不扩展为这些后续阶段的验收。
+
+### 12.3 R3a最终验收（2026-10-18）
+
+对象为`ef4fc3bc9949f0aa55ba09f3f3133ef74359d01c`。编排者已在新隔离环境执行36条命令，
+六条安全反例及Q1/Q2、当前生产跨层链、真实IDA9.5和两组128轮结算全部通过；完整边界见主计划与
+`/tmp/n7r3af1v.YtFYrx/report/verification.md`。验收前重新核对当前源码、36条日志、27项证据和6个二进制hash一致。
+用户对明确的`3acfefd → ef4fc3b`返修范围回复“我人工复审通过”，作为本次五P1及Q1/Q2的人工复审结论。
+原自动复审两次被平台拒绝的历史保留，不记为自动复审通过；本次审查来源为用户人工确认。
+R3a基础托管/helper/gate/routine及返修验收为R2输入；同boot OS资格仍Unsupported，
+R2完整释放/立即重开、R3b完整编排、R4事务/维护和跨boot产品实证仍由后续阶段完成。
