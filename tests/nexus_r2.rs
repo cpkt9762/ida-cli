@@ -414,6 +414,12 @@ async fn actual_guard_errors_reach_close_caller_and_remain_after_proof() {
                     closed.is_err(),
                     "real guard failure must reach caller: {closed:?}"
                 );
+                if scenario != "r2-protection-failed" {
+                    anyhow::ensure!(
+                        format!("{closed:?}").contains("saving refused"),
+                        "guard refusal missing from actual close error text: {closed:?}"
+                    );
+                }
                 let before = router.status_snapshot().await.owner_observations;
                 anyhow::ensure!(before.len() == 1, "error observation missing: {before:?}");
                 let detached = scenario == "r2-save-refused";

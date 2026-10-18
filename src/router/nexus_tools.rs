@@ -1399,10 +1399,22 @@ async fn release(
     bridge: &super::nexus_bridge::NexusBridge,
     lease: &SessionLease,
 ) -> Result<(), ToolError> {
+    let guard_diagnostic = || {
+        bridge
+            .take_release_error(lease)
+            .map_or_else(String::new, |message| {
+                format!("; save_guard_error={message}")
+            })
+    };
     let mut events = bridge.subscribe();
     bridge
         .endpoint()
-        .transition(|s, t| s.release(&lease.client_id, lease, t))?;
+        .transition(|s, t| s.release(&lease.client_id, lease, t))
+        .map_err(|mut error| {
+            // Annotate only this caller's owned error; N1 history stays intact.
+            error.message.push_str(&guard_diagnostic());
+            error
+        })?;
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let state = bridge
@@ -1412,7 +1424,8 @@ async fn release(
                 if delivery.state == DeliveryState::Uncertain {
                     if let Some(error) = &delivery.error {
                         return Err(diagnostic(format!(
-                            "{error}; lease_detached={}; owner_pending={}; never_replay=true",
+                            "{error}{}; lease_detached={}; owner_pending={}; never_replay=true",
+                            guard_diagnostic(),
                             state.phase == SessionPhase::Released,
                             bridge.owner_release_status(lease)["owner_pending"]
                         )));
@@ -1430,8 +1443,9 @@ async fn release(
             if let Some(delivery) = state.control_delivery {
                 if let Some(error) = delivery.error {
                     return Err(diagnostic(format!(
-                        "{}; lease_detached=false; owner_pending=true; never_replay={}",
+                        "{}{}; lease_detached=false; owner_pending=true; never_replay={}",
                         error,
+                        guard_diagnostic(),
                         delivery.state == DeliveryState::Uncertain
                     )));
                 }
@@ -1440,14 +1454,20 @@ async fn release(
             if event["event"] == "release_unconfirmed"
                 && event["attempt"]["target"]["lease"]["lease_id"] == lease.lease_id.as_str()
             {
-                return Err(diagnostic(
-                    "lease release proof deadline expired; owner retained; new open blocked",
-                ));
+                return Err(diagnostic(format!(
+                    "lease release proof deadline expired; owner retained; new open blocked{}",
+                    guard_diagnostic()
+                )));
             }
         }
     })
     .await
-    .map_err(|_| diagnostic("lease release unconfirmed; lease tracking retained"))?
+    .map_err(|_| {
+        diagnostic(format!(
+            "lease release unconfirmed; lease tracking retained{}",
+            guard_diagnostic()
+        ))
+    })?
 }
 
 // Installed before awaiting an opening outcome. Every error/deadline/drop

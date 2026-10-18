@@ -41,7 +41,7 @@ async fn close_preserves_text_error_and_lifecycle() {
         );
         return;
     }
-    for scenario in ["slow-owner", "r2-save-refused"] {
+    for scenario in ["slow-owner", "r2-save-refused", "lost-ack"] {
         let root = base.join(scenario);
         std::fs::create_dir_all(&root).expect("private case");
         let router = crate::router::RouterState::new().expect("router");
@@ -77,14 +77,14 @@ async fn close_preserves_text_error_and_lifecycle() {
                     Preparation::new(Duration::from_secs(10)),
                 )
                 .await?;
-            if scenario == "r2-save-refused" {
+            if scenario != "slow-owner" {
                 std::fs::write(root.join("poison-root"), b"")?;
             }
             let response = server
                 .close_idb_routed(&router, &CloseIdbRequest { token: Some(token) })
                 .await?;
             anyhow::ensure!(
-                response.is_error.unwrap_or(false) == (scenario == "r2-save-refused"),
+                response.is_error.unwrap_or(false) == (scenario != "slow-owner"),
                 "MCP caller error flag changed: {response:?}"
             );
             let text = &response.content[0]
@@ -109,11 +109,42 @@ async fn close_preserves_text_error_and_lifecycle() {
                     .text,
             )?;
             anyhow::ensure!(
-                body["lifecycle"]["lease_detached"] == true
+                body["lifecycle"]["lease_detached"] == (scenario != "lost-ack")
                     && body["lifecycle"]["owner_pending"] == true
                     && body["lifecycle"]["root_shared_guard"] == true,
                 "MCP lifecycle must distinguish ACK from owner: {body}"
             );
+            if scenario == "lost-ack" {
+                let repeated = super::socket_listener::test_close_rpc(
+                    router.clone(),
+                    root.join("tiny.i64").to_str().expect("utf8"),
+                )
+                .await;
+                anyhow::ensure!(
+                    repeated["error"]["message"].as_str().is_some_and(|s| s
+                        .contains("saving refused")
+                        && s.contains("UnknownOutcome")),
+                    "actual CLI close lost guard refusal or original uncertainty: {repeated}"
+                );
+                std::fs::write(root.join("snapshot-request"), b"")?;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !root.join("snapshot.json").exists() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await?;
+                let snapshot: Value =
+                    serde_json::from_slice(&std::fs::read(root.join("snapshot.json"))?)?;
+                anyhow::ensure!(
+                    snapshot["requests"].as_array().is_some_and(|r| r
+                        .iter()
+                        .filter(|v| v["endpoint"] == "/release_lease")
+                        .count()
+                        == 1),
+                    "CLI/MCP repeated close replayed unknown detach: {snapshot}"
+                );
+            }
+            let active_before_wait = router.worker_count().await;
             let reference = body["lifecycle"]["owner_observation_ref"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("owner reference missing from MCP response"))?;
@@ -129,7 +160,7 @@ async fn close_preserves_text_error_and_lifecycle() {
                 "CLI wait must use its own budget without requiring a path: {pending}"
             );
             anyhow::ensure!(
-                router.worker_count().await == 0
+                router.worker_count().await == active_before_wait
                     && bridge.lifecycle_status()["resources"] == resources,
                 "CLI owner wait created a new lease or changed retained owner resources"
             );

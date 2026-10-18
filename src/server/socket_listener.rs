@@ -517,6 +517,27 @@ pub(crate) async fn test_owner_wait_rpc(
     reference: &str,
     seconds: u64,
 ) -> serde_json::Value {
+    test_cli_rpc(
+        router,
+        "wait_owner_exit",
+        serde_json::json!({"owner_observation_ref":reference,"timeout_secs":seconds}),
+        seconds + 2,
+    )
+    .await
+}
+
+#[cfg(all(test, feature = "nexus-test-support"))]
+pub(crate) async fn test_close_rpc(router: RouterState, path: &str) -> serde_json::Value {
+    test_cli_rpc(router, "close", serde_json::json!({"path":path}), 5).await
+}
+
+#[cfg(all(test, feature = "nexus-test-support"))]
+async fn test_cli_rpc(
+    router: RouterState,
+    method: &str,
+    params: serde_json::Value,
+    seconds: u64,
+) -> serde_json::Value {
     use tokio::io::AsyncBufReadExt;
     let (client, server) = tokio::net::UnixStream::pair().expect("private CLI connection");
     let input = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
@@ -533,15 +554,14 @@ pub(crate) async fn test_owner_wait_rpc(
     });
     let (read, mut write) = client.into_split();
     let mut data = serde_json::to_vec(
-        &serde_json::json!({"jsonrpc":"2.0", "id":"owner-wait", "method":"wait_owner_exit",
-        "params":{"owner_observation_ref":reference,"timeout_secs":seconds}}),
+        &serde_json::json!({"jsonrpc":"2.0", "id":"lifecycle", "method":method,"params":params}),
     )
     .expect("request");
     data.push(b'\n');
     write.write_all(&data).await.expect("CLI request");
     let mut line = String::new();
     tokio::time::timeout(
-        std::time::Duration::from_secs(seconds + 2),
+        std::time::Duration::from_secs(seconds),
         BufReader::new(read).read_line(&mut line),
     )
     .await
