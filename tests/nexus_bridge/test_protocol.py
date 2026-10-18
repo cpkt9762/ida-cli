@@ -31,7 +31,7 @@ class Handle:
         self.disconnect = False
 
     def execute_python(self, code, **options):
-        if '_g.close_status()' in code:
+        if '_g.close_status()' in code or '_r9_guard.close_status()' in code:
             return {'result': {'close_safe': True, 'save_guard_error': None}}
         if code == 'r9-fixture-release':
             return {'result': {'save_guard_error': None}}
@@ -87,6 +87,8 @@ class TransportCustodian:
         self.originals, self.launches = {}, {}
         self.running = True
         self.target = None  # Transport-only double has no native target snapshot.
+        self.release_event = threading.Event()
+        self.watch, self.owner = 'transport-watch', {'record_id':'owner-1'}
 
     def gate(self, _target):
         return nullcontext()
@@ -95,7 +97,15 @@ class TransportCustodian:
         self.handle = Handle.open(path, options=Options(**options))
         self.track(self.handle, context)
         self.lease = next(lease for lease,handle in self.bridge.handles.values() if handle is self.handle)
+        self.bridge.custodians[self.lease['lease_id']] = self
         return self.handle
+
+    def cleanup(self):
+        pass
+
+    def transact(self, action, **_fields):
+        assert action == 'release_observation', 'transport double only signs wrapper preflight'
+        return {'ok':True}
 
     def execute(self, _purpose, code, **_options):
         return self.handle.execute_python(code, timeout=1, operation_id='fixture-internal-' + uuid.uuid4().hex)
@@ -160,7 +170,8 @@ class Harness:
         self.send(lane, frame)
         ready = self.receive(lane)
         assert ready == {"event": "dispatch_ready", "frame": frame}
-        self.send(lane, {"grant": allow, "sequence": self.sequence, "remaining_ms": 1000})
+        budget = 15000 if payload['command'] == 'release' else 1000
+        self.send(lane, {"grant": allow, "sequence": self.sequence, "remaining_ms": budget})
         return frame
 
     def open(self):
@@ -279,7 +290,7 @@ def test_release_only_closes_held_exact_lease(harness):
 
 
 @pytest.mark.parametrize("proven", [True, False])
-def test_release_uncertainty_retains_handle_until_public_proof(harness, monkeypatch, proven):
+def test_release_uncertainty_retains_handle_without_inline_owner_proof(harness, monkeypatch, proven):
     harness.open()
     handle = harness.handle
     monkeypatch.setattr(handle, "close_outcome", lambda **_kw: {"status": "uncertain"})
@@ -290,20 +301,11 @@ def test_release_uncertainty_retains_handle_until_public_proof(harness, monkeypa
         return proven
     monkeypatch.setattr("ida_nexus.wait_database_released", wait)
     harness.dispatch(1, {"command": "release", "lease": harness.lease})
-    observation = harness.receive(1)
-    assert observation["event"] == "release_observation"
-    assert observation["schema"] == 1 and observation["release_protocol"] == 1
-    assert observation["observation"] == "uncertain"
-    if proven:
-        assert harness.receive(1)["event"] == "released"
-    else:
-        observation = harness.receive(1)
-        assert observation["event"] == "release_observation"
-        assert observation["observation"] == "release_unconfirmed"
-        assert harness.receive(1)["event"] == "uncertain"
-        assert harness.receive(1)["event"] == "release_unconfirmed"
-    assert len(waits) == 1 and 0 <= waits[0] <= 2
-    assert (harness.lease["lease_id"] in harness.bridge.handles) is not proven
+    terminal = harness.receive(1)
+    assert terminal['event'] == 'uncertain'
+    assert terminal['error']['code'] == 'unknown_outcome'
+    assert waits == [], 'ordinary detach must not synthesize a second inline owner observer'
+    assert harness.lease['lease_id'] in harness.bridge.handles
 
 
 def test_proof_failure_retries_without_losing_unknown_or_claiming_stop(harness, monkeypatch):

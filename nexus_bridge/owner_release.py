@@ -44,13 +44,16 @@ def ordinary_release(bridge, channel, attempt, lease, handle, custody, deadline,
         preflight_deadline = deadline - 6  # detach, observation ACK, target ACK persistence <=2s each
         proof = None
         failure = None
+        auxiliary = None
         try:
-            if not handle.connected:
-                raise RuntimeError('CleanupBlocked: disconnected handle cannot provide fresh protection; exact owner observation retained')
             if preflight_deadline - time.monotonic() <= 5:
                 raise TimeoutError('preflight NotSent: insufficient public HTTP allowance')
             custody.cleanup()
-            checked = custody.execute('cleanup', cleanup_code, cleanup=True,
+            checker = custody
+            if not handle.connected:
+                auxiliary = custody.auxiliary(deadline)
+                checker = auxiliary
+            checked = checker.execute('cleanup', cleanup_code, cleanup=True,
                                       deadline=preflight_deadline)
             proof = checked['result']
             if not isinstance(proof, dict) or type(proof.get('close_safe')) is not bool:
@@ -61,16 +64,22 @@ def ordinary_release(bridge, channel, attempt, lease, handle, custody, deadline,
                 raise RuntimeError('CleanupBlocked: fresh save protection unavailable; no detach')
         except Exception as exc:
             failure = exc
+        from ida_nexus import RemoteError
+        blocked = ((isinstance(proof, dict) and proof.get('close_safe') is False)
+                   or (isinstance(failure, RemoteError) and failure.code != 'operation_timeout'))
         observation = {'stage':'preflight', 'protection':proof,
             'save_guard_error':'; '.join(state['errors']) or None,
-            'cause':None if failure is None else {'type':type(failure).__name__, 'message':str(failure)},
-            'detach_called':False, 'owner_pending':True}
+            'cause':None if failure is None else {'type':type(failure).__name__, 'message':str(failure),
+                'remote_code':getattr(failure, 'code', None)},
+            'detach_called':False, 'owner_pending':True, 'cleanup_blocked':blocked}
         # This must precede detach even for a healthy guard. ACK loss reuses the
         # exact transaction nonce; target authority and Rust retain the facts.
         custody.transact('release_observation', _deadline=deadline-2,
             acquisition=custody.acquisition, lease=lease, watch=custody.watch,
             owner=custody.owner, attempt=attempt, outcome=observation)
         if failure is not None:
+            # This child is already cleanup-only in N1; its own fair release
+            # lane continues even when primary's preflight is NotSent.
             channel.send({'event':'not_sent', 'attempt':attempt, 'outcome':observation,
                 'save_guard_error':observation['save_guard_error'],
                 'error':{'code':'operation_failed', 'message':str(failure)}})

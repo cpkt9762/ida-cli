@@ -7,12 +7,12 @@ HANDLE_SHA = SDK_FILES['handle.py']
 
 
 def contract():
-    return {'wire': 2, 'schema': 1, 'release': 2, 'open': 1,
-            'owner_observation': 1, 'custody':2, 'helper':2, 'target_gate':1,
+    return {'wire': 2, 'schema': 1, 'release': 3, 'open': 2,
+            'owner_observation': 1, 'custody':3, 'helper':2, 'target_gate':1,
             'same_boot_exit':0, 'boot_retirement':1, 'client_hash': HANDLE_SHA,
             'sdk_boundary': 2, 'client_modules': dict(SDK_FILES),
             'capabilities': ['absolute_home_v1', 'ack_cleanup_v1', 'acquisition_outcome_v1',
-                             'durable_public_proof_v1', 'final_preparing_v1', 'internal_grant_v1',
+                             'durable_public_proof_v1', 'final_preparing_v1', 'internal_grant_v1', 'k2_acquisitions_v1',
                              'launch_observer_v1', 'lifetime_handshake_v1',
                              'receiver_isolation_v1', 'release_observation_v1', 'single_resolution_outcome_v1', 'target_gate_base_v1', 'two_phase_release_v1']}
 

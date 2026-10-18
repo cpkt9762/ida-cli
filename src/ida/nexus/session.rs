@@ -10,13 +10,15 @@ pub(super) struct Operation {
 }
 
 pub(super) struct Opening {
-    identity: OpenIdentity,
+    pub(super) identity: OpenIdentity,
     pub(super) request: AcceptedRequest,
     pub(super) uncertain: bool,
     pub(super) cancel_requested: bool,
     pub(super) failure: Option<NexusError>,
     pub(super) acquired: Option<SessionLease>,
     pub(super) acquisition_ordinal: u64,
+    pub(super) acquisitions: Vec<super::acquisition::AcquisitionReservation>,
+    pub(super) root_attempts: u8,
     pub(super) post_exit_resolve_used: bool,
     pub(super) wait_analysis: bool,
 }
@@ -30,7 +32,7 @@ pub struct NexusSessions<C> {
     pub(super) internal_operations: HashMap<OperationId, (AcquisitionId, InternalPurpose, u64)>,
     pub(super) clock: C,
     capabilities: Result<NexusCapabilities, NexusError>,
-    capacity: usize,
+    pub(super) capacity: usize,
     pub(super) sessions: HashMap<LeaseId, SessionSnapshot>,
     pub(super) resource_origins: HashMap<LeaseId, serde_json::Value>,
     pub(super) resource_retirements: HashMap<LeaseId, serde_json::Value>,
@@ -175,6 +177,7 @@ impl<C: Clock> NexusSessions<C> {
             ));
         }
         let remaining_ms = request.remaining(&self.clock)?;
+        self.reserve_physical_slot(None)?;
         self.reserve(&request.request_id, &spec.operation_id)?;
         let identity = OpenIdentity {
             client_id: client.clone(),
@@ -187,6 +190,15 @@ impl<C: Clock> NexusSessions<C> {
             .get("wait_analysis")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let purpose = if spec
+            .options
+            .get("verification_idb")
+            .is_some_and(|v| !v.is_null())
+        {
+            AcquisitionPurpose::Verification
+        } else {
+            AcquisitionPurpose::Final
+        };
         let command = SessionCommand::Open {
             identity: identity.clone(),
             path: spec.path,
@@ -204,6 +216,19 @@ impl<C: Clock> NexusSessions<C> {
                 failure: None,
                 acquired: None,
                 acquisition_ordinal: 1,
+                acquisitions: vec![super::acquisition::AcquisitionReservation {
+                    identity: AcquisitionId {
+                        parent: identity.clone(),
+                        purpose,
+                        ordinal: 1,
+                    },
+                    lease: None,
+                    closed: false,
+                    primary: None,
+                    publish_parent: purpose == AcquisitionPurpose::Final,
+                    owner_proof: false,
+                }],
+                root_attempts: 1,
                 post_exit_resolve_used: false,
                 wait_analysis: command_wait_analysis,
             },
@@ -322,6 +347,13 @@ impl<C: Clock> NexusSessions<C> {
         self.register(lease.clone(), capabilities)?;
         if let Some(opening) = self.openings.get_mut(&identity.operation_id) {
             opening.acquired = Some(lease.clone());
+            if let Some(reservation) = opening
+                .acquisitions
+                .iter_mut()
+                .find(|a| a.identity.ordinal == opening.acquisition_ordinal)
+            {
+                reservation.lease = Some(lease.clone());
+            }
         }
         if complete {
             self.confirm_delivery(DeliveryTarget::Open {
@@ -420,13 +452,12 @@ impl<C: Clock> NexusSessions<C> {
             ));
         }
         if opening.acquired.is_some()
-            && !opening.acquired.as_ref().is_some_and(|lease| {
-                self.custodies.contains_key(&lease.lease_id)
-                    && self
-                        .sessions
-                        .get(&lease.lease_id)
-                        .is_some_and(|s| s.phase == SessionPhase::Preparing)
-            })
+            && self
+                .deliveries
+                .get(&super::delivery::DeliveryKey::Open(
+                    identity.operation_id.clone(),
+                ))
+                .is_none_or(|delivery| delivery.snapshot.state == DeliveryState::Confirmed)
         {
             return Err(NexusError::new(
                 NexusErrorCode::InvalidTransition,
@@ -449,7 +480,7 @@ impl<C: Clock> NexusSessions<C> {
 
     /// Register only a confirmed public Nexus handle, never a discovered owner
     /// alone. Each logical close_token and warm reference gets its own lease.
-    fn register(
+    pub(super) fn register(
         &mut self,
         lease: SessionLease,
         capabilities: NexusCapabilities,
@@ -708,6 +739,15 @@ impl<C: Clock> NexusSessions<C> {
                 NexusErrorCode::CancelPending,
                 "lease retained until queued work and stop confirmation resolve",
             ));
+        }
+        if self
+            .custodies
+            .get(&lease.lease_id)
+            .is_some_and(|c| c.acquisition.purpose == AcquisitionPurpose::Auxiliary)
+            && self.occupied(lease)
+        {
+            return Err(NexusError::new(NexusErrorCode::CancelPending,
+                "auxiliary cleanup waits for exact owner operations to stop before a release attempt"));
         }
         let command = SessionCommand::Release {
             lease: lease.clone(),

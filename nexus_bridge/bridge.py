@@ -8,6 +8,7 @@ from pathlib import Path
 import plistlib
 import queue
 import socket
+import stat
 import sys
 import threading
 import time
@@ -30,13 +31,13 @@ from analysis_tools import ANALYSIS_METHODS
 from struct_tools import STRUCT_METHODS
 from query_tools import QUERY_METHODS
 from search_tools import SEARCH_METHODS
-from lifecycle import database_diagnostics, release_handle, release_errors, release_group, release_state
+from lifecycle import database_diagnostics, release_handle, release_errors, release_state
 from metadata import idb_context
 from open_recovery import open_checked
 from config import ida_cli_home, startup_paths
 from protocol import SDK_FILES, admission
 from lifetime import LifetimeListener
-from acquisition import Custodian
+from acquisition import Custodian, failure_details
 from owner_release import FairReleases, ordinary_release
 from bridge_observer import BackupSources, INCARNATION as OBSERVER_INCARNATION
 
@@ -239,7 +240,9 @@ class Bridge(LifetimeListener):
         self.metadata_contexts = {}
         self.identity = uuid.uuid4().hex
         self.verification_probes = {}
+        self.verification_cleanup_pending = set()
         self.cleanup_handles = {}
+        self.cleanup_requests = set()
         self.grants = {}
         self.custody_requests = {}
         self.custodians = {}
@@ -302,6 +305,7 @@ class Bridge(LifetimeListener):
                     or evidence.get('acquisition') != receipt['acquisition']):
                 raise ValueError('ProtocolMismatch: boot resource projection')
             lease = receipt.get('lease')
+            retired_verification = None
             with self.lock:
                 if lease:
                     custody = self.custodians.get(lease['lease_id'])
@@ -309,6 +313,10 @@ class Bridge(LifetimeListener):
                         if custody.lease != lease or custody.acquisition != receipt['acquisition']:
                             raise ValueError('ProtocolMismatch: retired physical resource')
                         self.custodians.pop(lease['lease_id'])
+                        custody.retired = True
+                        if getattr(custody, 'verification_path', None):
+                            custody.verification_retired = True
+                            retired_verification = custody
                     self.handles.pop(lease['lease_id'], None)
                     self.metadata_contexts.pop(lease['lease_id'], None)
             if lease:
@@ -325,8 +333,10 @@ class Bridge(LifetimeListener):
                     for suffix, launch in list(custody.launches.items()):
                         if launch['watch'] == receipt['watch']:
                             custody.launches.pop(suffix)
-                    if not custody.running and not custody.originals and not custody.launches:
+                    if not custody.running and not custody.originals and not custody.launches and custody.recovery_snapshot is None:
                         self.acquisitions.pop(parent)
+            if retired_verification is not None and not retired_verification.running:
+                self.schedule_verification_cleanup(retired_verification)
             return
         if 'owner_backup_query' in message:
             self.backup_sources.query(message['owner_backup_query'])
@@ -339,7 +349,7 @@ class Bridge(LifetimeListener):
                 raise ValueError('ProtocolMismatch: owner proof custody')
             closed = self.backup_sources.close(receipt)
             with self.lock:
-                for custody in self.acquisitions.values():
+                for custody in dict.fromkeys([*self.acquisitions.values(), *self.custodians.values()]):
                     observation = custody.observations.get(receipt['watch'])
                     if observation is not None:
                         if (observation['owner'] != owner
@@ -361,21 +371,30 @@ class Bridge(LifetimeListener):
                             or custody.acquisition != receipt['acquisition']):
                         raise ValueError('ProtocolMismatch: retired custody identity')
                     self.custodians.pop(receipt['lease']['lease_id'])
+                    custody.retired = True
                     held = self.handles.get(receipt['lease']['lease_id'])
                     if held is not None and held[0] == receipt['lease']:
                         self.handles.pop(receipt['lease']['lease_id'])
                         self.metadata_contexts.pop(receipt['lease']['lease_id'], None)
                     parent = custody.acquisition['parent']['operation_id']
                     if (self.acquisitions.get(parent) is custody and custody.acquisition == receipt['acquisition']
-                            and not custody.originals):
+                            and not custody.originals and not custody.running and custody.recovery_snapshot is None
+                            and not any(c.acquisition['parent'] == custody.acquisition['parent']
+                                        for c in self.custodians.values())):
                         self.acquisitions.pop(parent)
                 elif lease is None:
                     parent = receipt['acquisition']['parent']['operation_id']
                     custody = self.acquisitions.get(parent)
-                    if custody is not None and not custody.originals and custody.handle is None and not custody.running:
+                    if (custody is not None and custody.acquisition == receipt['acquisition']
+                            and not custody.originals and (custody.handle is None or custody.retired) and not custody.running
+                            and custody.recovery_snapshot is None):
                         self.acquisitions.pop(parent)
             self.control.send({'event':'custody_retired_ack', 'receipt':receipt})
             self.backup_sources.retire(receipt['watch'])
+            if custody is not None and getattr(custody, 'verification_path', None):
+                custody.verification_retired = True
+                if not custody.running:
+                    self.schedule_verification_cleanup(custody)
             return
         if 'helper_configuration' in message:
             if self.helper_configuration is not None and self.helper_configuration != message['helper_configuration']:
@@ -401,12 +420,26 @@ class Bridge(LifetimeListener):
         if "local_status" in message:
             with self.lock:
                 held = [{"lease": item[0], "connected": item[1].connected,
-                         "pid": item[1].instance.pid, "idb_path": item[1].instance.idb_path}
+                         "pid": item[1].instance.pid, "idb_path": item[1].instance.idb_path,
+                         "acquisition":self.custodians[item[0]['lease_id']].acquisition if item[0]['lease_id'] in self.custodians else None,
+                         "responsibility":"InFlight" if release_state(item[1])['requested']
+                            and not (release_state(item[1]).get('outcome') or {}).get('lease_released') else 'Owned'}
                         for item in self.handles.values()]
                 owners = list(self.owners)
                 verifications = list(self.verification_probes)
+                verification_cleanup = [{'path':path, 'cause':getattr(c, 'verification_cleanup_error', None),
+                    'owner_proof_consumed':getattr(c, 'verification_retired', False),
+                    'next_action':'inspect_copy_occupancy_and_file_gate' if getattr(c, 'verification_cleanup_error', None)
+                                  else 'wait_exact_owner_proof'} for path,c in self.verification_probes.items()]
+                recoveries = [{'acquisition':c.acquisition, 'path':str(c.recovery_snapshot[0].path),
+                    'status':c.recovery_snapshot[0].data['status'], 'cause':c.recovery_error,
+                    'blocked':c.recovery_blocked, 'next_action':'inspect_retained_scene' if c.recovery_blocked
+                        else 'wait_exact_cleanup_then_restore'} for c in self.acquisitions.values()
+                    if c.recovery_snapshot is not None]
             channel.send({"event": "local_status", "id": message["local_status"],
                           "held": held, "owners": owners, "verification_probes": verifications,
+                          "verification_cleanup":verification_cleanup,
+                          "recovery_cleanup":recoveries,
                           "acquisitions":len(self.acquisitions), "custodians":len(self.custodians),
                           "original_instances":len(self.backup_sources.items),
                           "backup_closures":len(getattr(self.backup_sources, 'closed', {})),
@@ -488,7 +521,7 @@ class Bridge(LifetimeListener):
                 with self.lock:
                     primary = self.handles.get(key)
                     auxiliary = self.cleanup_handles.get(key)
-                participants = ([primary[1]] if primary else []) + ([auxiliary] if auxiliary else [])
+                participants = ([primary[1]] if primary else []) + ([auxiliary.handle] if auxiliary and auxiliary.handle else [])
                 messages = dict.fromkeys(message for member in participants for message in release_errors(member))
                 details['save_guard_error'] = '; '.join(messages) or None
                 if participants and not any(release_state(member)['requested'] for member in participants):
@@ -510,6 +543,7 @@ class Bridge(LifetimeListener):
                 channel.send({"event": "uncertain" if uncertain else "failed", "attempt": attempt,
                               "error": error("operation_failed", f"{type(exc).__name__}: {exc}"), **details})
         finally:
+            finished_verification = None
             with self.lock:
                 self.grants.pop(key, None)
                 if frame['payload']['command'] == 'open' and frame['payload']['identity'].get('operation_id') is not None:
@@ -517,14 +551,21 @@ class Bridge(LifetimeListener):
                     custody = self.acquisitions.get(parent)
                     if custody is not None:
                         custody.running = False
-                        if custody.handle is None and not custody.originals and not custody.launches:
+                        if getattr(custody, 'verification_path', None) and custody.verification_retired:
+                            finished_verification = custody
+                        if ((custody.handle is None or getattr(custody, 'retired', False)) and not custody.originals
+                                and not custody.launches and custody.recovery_snapshot is None):
                             self.acquisitions.pop(parent)
                 if frame["payload"]["command"] == "execute":
                     operation_id = frame["payload"]["identity"]["operation_id"]
                     if (operation_id not in self.unknown
                             and self.executing.get(operation_id, {}).get("attempt") == attempt):
                         self.executing.pop(operation_id, None)
-            gate.release()
+            try:
+                if finished_verification is not None:
+                    self.schedule_verification_cleanup(finished_verification)
+            finally:
+                gate.release()
 
     def disconnected(self, lease, reason, attempt):
         # The callback may be replayed synchronously by set_disconnect_callback,
@@ -533,15 +574,106 @@ class Bridge(LifetimeListener):
         self.control.send({"event": "disconnected", "lease": lease, "reason": reason,
                            "attempt": attempt})
 
-    def close_verification(self, path, probe, deadline):
-        outcome = release_handle(probe, deadline, owner_required=True)
-        if outcome is None:
-            raise TimeoutError("verification owner release unconfirmed; staging retained")
-        if outcome['save_guard_error']:
+    def accept_cleanup(self, bridge_id, lease_id, *, reply=None):
+        with self.lock:
+            custody = self.custodians.get(lease_id)
+            if bridge_id != self.identity or custody is None or self.stopped.is_set():
+                raise ValueError('cleanup parent unavailable')
+            duplicate = lease_id in self.cleanup_requests
+            if not duplicate:
+                if not self.release_gate.acquire(blocking=False):
+                    raise RuntimeError('Busy: bounded auxiliary cleanup queue full')
+                self.cleanup_requests.add(lease_id)
+        if duplicate:
+            if reply is not None:
+                reply(True)
+            return
+        deadline = time.monotonic()+15
+        def acquire_auxiliary():
+            accepted = False
+            try:
+                # The second slot is reserved by N1 before the public attach;
+                # no SDK/helper wait occupies the lifetime accept loop.
+                custody.auxiliary(deadline)
+                accepted = True
+            except Exception as exc:
+                try:
+                    custody.transact('auxiliary_failed', acquisition=custody.acquisition,
+                        lease=custody.lease, error=failure_details(exc))
+                except Exception as delivery:
+                    print(f'auxiliary cleanup result unconfirmed: {type(delivery).__name__}: {delivery}',file=sys.stderr)
+            finally:
+                if reply is not None:
+                    try:
+                        reply(accepted)
+                    except Exception as exc:
+                        print(f'auxiliary custody acknowledgement lost: {type(exc).__name__}',file=sys.stderr)
+                with self.lock:
+                    self.cleanup_requests.discard(lease_id)
+                self.release_gate.release()
+        try:
+            self.release_scheduler.submit((custody.lease['instance_id'],custody.lease['generation']),acquire_auxiliary)
+        except Exception:
+            with self.lock:
+                self.cleanup_requests.discard(lease_id)
+            self.release_gate.release()
+            raise
+
+    def close_verification(self, path, custody, deadline):
+        custody.cleanup()
+        outcome = custody.release_for_retry(require_ack=False)
+        self.finish_verification_copy(path)
+        if outcome and outcome.get('save_guard_error'):
             raise RuntimeError(outcome['save_guard_error'])
-        Path(path).with_name("closed").touch()
+
+    def finish_verification_copy(self, path):
+        # Independent owner proof alone does not authorize deleting a copy that
+        # a new owner or external file holder has acquired in the meantime.
+        from cache_store import public_owner_probe
+        from ida_nexus import probe_database_state
+        from owner_identity import state_identity
+        from target_coordination import Target
+        from target_journal import Journal
+        with Target(path) as target, target.locked(deadline=time.monotonic()+15):
+            Journal(target).gate(state_identity())
+            reason = public_owner_probe(Path(path))
+            state = probe_database_state(path)
+            if reason or state['state'] in ('in_use', 'unknown') or state.get('error'):
+                raise RuntimeError('verification copy still occupied; staging retained: ' + str(reason or state))
+            marker = Path(path).with_name('closed')
+            try:
+                descriptor = os.open(marker,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            except FileExistsError:
+                info = marker.lstat()
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+                        or info.st_size != 0 or stat.S_IMODE(info.st_mode) != 0o600):
+                    raise RuntimeError('verification cleanup marker identity conflict; copy retained')
+            else:
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                from cache_store import sync_directory
+                sync_directory(marker.parent)
         with self.lock:
             self.verification_probes.pop(path, None)
+
+    def schedule_verification_cleanup(self, custody):
+        path = custody.verification_path
+        with self.lock:
+            if path not in self.verification_probes or path in self.verification_cleanup_pending:
+                return
+            self.verification_cleanup_pending.add(path)
+        def complete():
+            try:
+                self.finish_verification_copy(path)
+            except Exception as exc:
+                custody.verification_cleanup_error = type(exc).__name__ + ': ' + str(exc)
+            finally:
+                with self.lock:
+                    self.verification_cleanup_pending.discard(path)
+        self.release_scheduler.submit(('verification-copy', path), complete)
 
     def invoke(self, channel, attempt, command, deadline, public_started):
         from ida_nexus import discover_databases
@@ -560,46 +692,6 @@ class Bridge(LifetimeListener):
             options["startup_timeout"] = max(0.001, deadline - time.monotonic())
             options["worker_env"] = dict(os.environ)
             options["worker_cwd"] = str(ida_cli_home())
-            if verification is not None:
-                original = Path(command["path"])
-                copy_hash = hashlib.sha256(Path(verification).read_bytes()).digest()
-                if hashlib.sha256(original.read_bytes()).digest() != copy_hash:
-                    raise ValueError("legacy cache changed during verification copy; refusing reuse")
-                expected = hashlib.sha256(Path(snapshot).read_bytes()).hexdigest()
-                with self.lock:
-                    self.verification_probes[verification] = None
-                public_started[0] = True
-                def track_probe(probe, _context):
-                    with self.lock:
-                        self.verification_probes[verification] = probe
-
-                def release_probe(_probe):
-                    public_started[0] = False
-                    with self.lock:
-                        self.verification_probes.pop(verification, None)
-
-                probe, _, _ = open_checked(self.Handle, self.Options, str(verification),
-                    {'auto_analysis': False, 'worker_env': dict(os.environ),
-                     'worker_cwd': str(ida_cli_home())}, deadline, guarded_source,
-                    dict(metadata_context, method='verification-open'), track_probe, release_probe,
-                    lambda: public_started.__setitem__(0, True))
-                try:
-                    proof = probe.execute_python(guarded_source(
-                        "import ida_nalt\nsha = ida_nalt.retrieve_input_file_sha256()\nresult = sha.hex() if sha else None",
-                        dict(metadata_context, method='verification-open', record_id=probe.instance.record_id)),
-                        timeout=max(0.001, deadline - time.monotonic()))["result"]
-                finally:
-                    self.close_verification(verification, probe, deadline)
-                # A confirmed closed probe has no lease or operation left.
-                # The following verification rejections are certain failures.
-                public_started[0] = False
-                if not isinstance(proof, str) or len(proof) != 64 or proof == "0" * 64:
-                    raise ValueError("legacy cache input SHA256 is unavailable; refusing reuse without changing original")
-                if proof != expected:
-                    raise ValueError("legacy cache input SHA256 mismatch; refusing reuse without changing original")
-                if hashlib.sha256(original.read_bytes()).digest() != copy_hash:
-                    raise ValueError("legacy cache changed during Nexus verification; refusing reuse")
-                options["startup_timeout"] = max(0.001, deadline - time.monotonic())
             lease_box = []
 
             def track_open(handle, context):
@@ -625,6 +717,48 @@ class Bridge(LifetimeListener):
             custodian = Custodian(self, attempt, command, deadline, track_open)
             with self.lock:
                 self.acquisitions[command['identity']['operation_id']] = custodian
+            if verification is not None:
+                original = Path(command["path"])
+                copy_hash = hashlib.sha256(Path(verification).read_bytes()).digest()
+                if hashlib.sha256(original.read_bytes()).digest() != copy_hash:
+                    raise ValueError("legacy cache changed during verification copy; refusing reuse")
+                expected = hashlib.sha256(Path(snapshot).read_bytes()).hexdigest()
+                with self.lock:
+                    self.verification_probes[verification] = custodian
+                public_started[0] = True
+                probe, _, _ = open_checked(self.Handle, self.Options, str(verification),
+                    {'auto_analysis': False, 'worker_env': dict(os.environ),
+                     'worker_cwd': str(ida_cli_home())}, deadline, guarded_source,
+                    dict(metadata_context, method='verification-open'), track_open, release_open,
+                    lambda: public_started.__setitem__(0, True), custodian=custodian)
+                with self.lock:
+                    self.verification_probes[verification] = custodian
+                verification_error = None
+                try:
+                    proof = custodian.execute('root', guarded_source(
+                        "import ida_nalt\nsha = ida_nalt.retrieve_input_file_sha256()\nresult = sha.hex() if sha else None",
+                        dict(metadata_context, method='verification-open', record_id=probe.instance.record_id)))["result"]
+                except Exception as exc:
+                    verification_error = exc
+                    raise
+                finally:
+                    try:
+                        self.close_verification(verification, custodian, deadline)
+                    except Exception as cleanup_error:
+                        if verification_error is not None:
+                            raise RuntimeError('verification cleanup pending: ' + str(cleanup_error)) from verification_error
+                        raise
+                # A confirmed closed probe has no lease or operation left.
+                # The following verification rejections are certain failures.
+                public_started[0] = False
+                if not isinstance(proof, str) or len(proof) != 64 or proof == "0" * 64:
+                    raise ValueError("legacy cache input SHA256 is unavailable; refusing reuse without changing original")
+                if proof != expected:
+                    raise ValueError("legacy cache input SHA256 mismatch; refusing reuse without changing original")
+                if hashlib.sha256(original.read_bytes()).digest() != copy_hash:
+                    raise ValueError("legacy cache changed during Nexus verification; refusing reuse")
+                custodian.next_acquisition()
+                options["startup_timeout"] = max(0.001, deadline - time.monotonic())
             if attach:
                 instances = [x.instance for x in discover_databases() if x.instance.record_id == attach]
                 if len(instances) != 1:
@@ -745,7 +879,8 @@ class Bridge(LifetimeListener):
             with self.lock:
                 release_custodian = self.custodians.get(lease['lease_id'])
             public_started[0] = True
-            context = [self.identity, lease["lease_id"], lease["instance_id"], lease["generation"], self.lifetime_path]
+            context = getattr(release_custodian, 'cleanup_context',
+                [self.identity, lease["lease_id"], lease["instance_id"], lease["generation"], self.lifetime_path])
             cleanup_code = ("import sys\nmodule = sys.modules.get('_ida_cli_nexus_slices_v1')\n"
                             f"result = module.release_lease({context!r}) if module else None")
             cleanup_code = guarded_source(cleanup_code,
@@ -759,82 +894,7 @@ class Bridge(LifetimeListener):
                 ordinary_release(self, channel, attempt, lease, handle, release_custodian,
                                  deadline, cleanup_code)
                 return
-            # Legacy auxiliary/verification compatibility remains independently
-            # tracked until R3b migrates those physical members.
-            cleanup_handle = self.cleanup_handles.get(lease['lease_id'])
-            def check_primary():
-                nonlocal cleanup_handle
-                if handle.connected:
-                    custodian = self.custodians.get(lease['lease_id'])
-                    if custodian is not None:
-                        custodian.cleanup()
-                        checked = custodian.execute('cleanup', cleanup_code, cleanup=True)
-                    else:
-                        checked = handle.execute_python(cleanup_code,
-                            timeout=max(.001, deadline-time.monotonic()))
-                else:
-                    if cleanup_handle is None:
-                        instances = [item.instance for item in discover_databases()
-                                     if item.instance.record_id == lease['instance_id']]
-                        if not instances:
-                            from ida_nexus import wait_database_released
-                            if wait_database_released(handle.instance,
-                                    timeout=max(0, deadline-time.monotonic())):
-                                return {'close_safe': True}
-                            raise RuntimeError('save protection unavailable; exact lease retained; no default close')
-                        from target_coordination import Target
-                        from target_journal import Journal
-                        from owner_identity import state_identity, owner_key
-                        with Target(instances[0].idb_path) as target:
-                            with target.locked(deadline=deadline):
-                                target.business_admission()
-                                journal = Journal(target)
-                                journal.gate(state_identity())
-                                journal.check_owner(owner_key(instances[0]))
-                                cleanup_handle = self.Handle.attach(instances[0])
-                        with self.lock:
-                            self.cleanup_handles[lease['lease_id']] = cleanup_handle
-                    checked = cleanup_handle.execute_python(cleanup_code,
-                        timeout=max(.001, deadline-time.monotonic()))
-                return dict(checked['result'], close_safe=True)
-            def publish(name, outcome):
-                channel.send({'event': 'release_observation', 'schema': 1, 'release_protocol': 1,
-                              'observation': name, 'attempt': attempt, 'outcome': outcome,
-                              'save_guard_error': outcome.get('save_guard_error'),
-                              'error': error('cancel_pending', 'lease release unconfirmed; owner retained')})
-            # Request every own lease before waiting for an owner that those
-            # leases keep alive. The primary check may create the helper.
-            release_handle(handle, deadline, check=check_primary, request_only=True)
-            participants = [handle]
-            if cleanup_handle is not None:
-                participants.append(cleanup_handle)
-                release_handle(cleanup_handle, deadline,
-                    errors=release_errors(handle), request_only=True)
-            errors = tuple(message for member in participants for message in release_errors(member))
-            outcomes = release_group(participants, deadline, publish, errors=errors)
-            errors = tuple(message for member in participants for message in release_errors(member))
-            if any(outcome is None for outcome in outcomes):
-                details = {'attempt': attempt, 'error': error('cancel_pending',
-                    'lease release unconfirmed; owner retained'),
-                    'save_guard_error': '; '.join(dict.fromkeys(errors)) or None,
-                    'outcome': {'save_guard_error': '; '.join(dict.fromkeys(errors)) or None}}
-                channel.send({'event': 'uncertain', **details})
-                channel.send({'event': 'release_unconfirmed', **details})
-                return
-            outcome = next((item for item in reversed(outcomes) if item.get('owner_released')),
-                           outcomes[-1])
-            if cleanup_handle is not None:
-                with self.lock:
-                    self.cleanup_handles.pop(lease['lease_id'], None)
-            self.drop_lifetime(lease["lease_id"])
-            with self.lock:
-                self.handles.pop(lease["lease_id"], None)
-                self.metadata_contexts.pop(lease["lease_id"], None)
-            channel.send({"event": "released", "attempt": attempt, "outcome": outcome,
-                          "save_guard_error": outcome["save_guard_error"]})
-            if release_custodian is not None:
-                release_custodian.release_outcome = outcome
-                release_custodian.release_event.set()
+            raise RuntimeError('ProtocolMismatch: owned release has no exact N1 custody; handle retained')
         elif kind == "shutdown":
             public_started[0] = True
             handle.execute_python(guarded_source('pass',
@@ -862,6 +922,12 @@ class Bridge(LifetimeListener):
             expired = []
             proven = []
             with self.lock:
+                for custody in self.acquisitions.values():
+                    if (custody.recovery_snapshot is not None and not custody.recovery_active
+                            and not custody.recovery_blocked and not custody.running
+                            and time.monotonic() >= custody.recovery_next):
+                        custody.recovery_active = True
+                        self.release_scheduler.submit(('restore', custody.watch), custody.advance_restore)
                 for operation_id, record in self.executing.items():
                     if (not record["unknown"] or not record["cancel_requested"]
                             or record["proving"] or record.get('cancel_inflight')):
@@ -948,17 +1014,8 @@ class Bridge(LifetimeListener):
                 record["handle"].cancel_operation_outcome(record.get("native_id", operation_id))
             except Exception as exc:
                 print(f"cancel during cleanup failed: {type(exc).__name__}", file=sys.stderr)
-        for key, handle in auxiliary:
-            try:
-                outcome = release_handle(handle, time.monotonic()+5)
-                if outcome is None:
-                    raise RuntimeError('auxiliary release unconfirmed; exact handle retained')
-                if outcome['save_guard_error']:
-                    print(outcome['save_guard_error'], file=sys.stderr)
-                with self.lock:
-                    self.cleanup_handles.pop(key, None)
-            except Exception as exc:
-                print(f'auxiliary lease retained; no default close: {type(exc).__name__}: {exc}', file=sys.stderr)
+        for key, custody in auxiliary:
+            print(f'auxiliary custody pending without N1 cleanup grant: {key}; independent helper retained', file=sys.stderr)
         for _lease, handle in handles:
             try:
                 if _lease['lease_id'] in self.custodians:
@@ -977,13 +1034,7 @@ class Bridge(LifetimeListener):
             except Exception as exc:
                 print(f"lease cleanup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         for path, handle in verifications:
-            if handle is None:
-                print(f"verification startup unconfirmed; staging retained: {path}", file=sys.stderr)
-                continue
-            try:
-                self.close_verification(path, handle, time.monotonic() + 5)
-            except Exception as exc:
-                print(f"verification cleanup unconfirmed; staging retained: {path}: {type(exc).__name__}", file=sys.stderr)
+            print(f"verification custody pending; staging retained: {path}", file=sys.stderr)
         for channel in (self.business, self.control):
             channel.socket.close()
         for pool in (self.business_pool, self.cancel_pool, self.release_pool, self.proof_pool, self.preflight_pool, self.detach_pool):

@@ -348,31 +348,46 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                 if proof.get('close_safe') is not True:
                     raise RuntimeError('save protection unavailable; owner and exact lease retained; '
                                        'no default close') from exc
-                if proof['initial']:
+                retryable = proof['initial'] and handle.instance.backend == 'idalib'
+                if retryable:
                     logging.getLogger('ida_cli.open').warning('Root Node initial-open failure: %s',
                         json.dumps(dict(attempt=number, maximum=3, record_id=handle.instance.record_id,
                                         evidence=proof['evidence'], recovery_snapshot=str(snapshot.path) if snapshot else None)))
                 observed, observation_error = None, None
-                if snapshot and proof['initial']:
+                if snapshot and retryable:
+                    # This is an accepted restore obligation, independent of
+                    # permission to start the next acquisition.
+                    snapshot.deadline = float('inf')
                     try:
-                        with custodian.file_gate() if custodian else locking.file_gate():
+                        with custodian.file_gate(recovery=True) if custodian else locking.file_gate():
                             observed = snapshot.failed(number)
                     except Exception as error:
                         observation_error = error
                 # Snapshot collection can take time or fail. Its earlier proof
                 # classifies the failure; only a new owner sample permits close.
-                outcome = (custodian.release_for_retry() if custodian else
-                           release_handle(handle, deadline, owner_required=proof['initial']))
-                if outcome is None or (proof['initial'] and not outcome['release_acknowledged']):
+                try:
+                    outcome = (custodian.release_for_retry(owner_required=retryable, require_ack=retryable) if custodian else
+                               release_handle(handle, deadline, owner_required=retryable))
+                except Exception as pending:
+                    if custodian and snapshot and observed is not None and observation_error is None:
+                        custodian.retain_restore(snapshot, observed)
+                    raise RuntimeError('initial open cleanup pending after attempt ' + str(number)
+                                       + '; original failure: ' + str(exc) + '; ' + str(pending)) from exc
+                if outcome is None or (retryable and not outcome.get('resource_retirement')
+                                       and not outcome['release_acknowledged']):
                     raise RuntimeError('open cleanup release unconfirmed; snapshot/scene retained') from exc
                 released(handle)
                 if observation_error:
+                    if custodian:
+                        custodian.retain_restore(snapshot, None)
+                        custodian.recovery_blocked = True
+                        custodian.recovery_error = type(observation_error).__name__ + ': ' + str(observation_error)
                     raise observation_error from exc
-                if not proof['initial']:
+                if not retryable:
                     raise RuntimeError('open runtime check failed; no initial Root retry: ' + str(exc)
                                        + '; ' + (outcome['save_guard_error'] or '')) from exc
                 if snapshot:
-                    with custodian.file_gate() if custodian else locking.file_gate():
+                    with custodian.file_gate(recovery=True) if custodian else locking.file_gate():
                         snapshot.rollback(observed)
                 if number == 3:
                     raise RuntimeError('Root Node initial open failed after 3 attempts; '

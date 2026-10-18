@@ -340,6 +340,9 @@ class GuardTests(unittest.TestCase):
         import threading
         import time
         from unittest.mock import Mock
+        from ida_nexus import RemoteError
+        sys.path.insert(0,str(Path(__file__).resolve().parent/'support'))
+        from release_wrapper import install
         directory = Path(__file__).resolve().parents[1] / 'nexus_bridge'
         with patch.object(sys, 'path', [str(directory), *sys.path]):
             import bridge
@@ -374,27 +377,36 @@ class GuardTests(unittest.TestCase):
                 owner.cleanup_handles, owner.metadata_contexts, owner.custodians = {}, {}, {}
                 owner.Handle = types.SimpleNamespace(attach=lambda _: auxiliary)
                 owner.drop_lifetime = Mock()
+                _, child = install(owner,lease,primary,auxiliary)
+                messages=[]
                 api = types.SimpleNamespace(
+                    RemoteError=RemoteError,
                     get_state_dir=lambda: Path(os.environ['IDA_NEXUS_STATE_DIR']),
                     discover_databases=lambda: [types.SimpleNamespace(instance=instance)],
                     wait_database_released=Mock(side_effect=AssertionError('unexpected lifetime wait')))
                 loader = sys.modules['ida_loader']
                 with patch.dict(sys.modules, {'ida_nexus': api, '_ida_cli_save_guard_v1': self.guard}), \
                         patch.object(loader, 'set_database_flag', side_effect=OSError('cannot protect close')):
-                    args = (Mock(), {'sequence': 1}, {'command': 'release', 'lease': lease},
-                            time.monotonic()+2, [False])
+                    try:
+                        owner.invoke(types.SimpleNamespace(send=messages.append),{'sequence':1},
+                            {'command':'release','lease':lease},time.monotonic()+15,[False])
+                        owner.invoke(types.SimpleNamespace(send=messages.append),{'sequence':2},
+                            {'command':'release','lease':child.lease},time.monotonic()+15,[False])
+                    finally:
+                        owner.detach_pool.shutdown(wait=True)
+                    self.assertEqual(messages[0]['event'],'released','primary parsed ACK must remain valid')
                     if loss:
-                        with self.assertRaisesRegex(RuntimeError, 'exact lease retained'):
-                            owner.invoke(*args)
-                        auxiliary.close.assert_not_called()
-                        self.assertIs(owner.cleanup_handles['exact'], auxiliary)
-                        self.assertIs(owner.handles['exact'][1], primary)
+                        self.assertEqual(messages[-1]['event'],'not_sent')
+                        self.assertIn('protection',messages[-1]['error']['message'])
+                        auxiliary.close_outcome.assert_not_called()
+                        self.assertIs(owner.handles[child.lease['lease_id']][1],auxiliary)
+                        self.assertNotIn('exact',owner.handles,'primary is already detached')
                     else:
-                        owner.invoke(*args)
+                        self.assertEqual(messages[-1]['event'],'released')
                         auxiliary.close_outcome.assert_called_once()
-                        auxiliary.close.assert_not_called()
-                        self.assertEqual(owner.cleanup_handles, {})
-                        self.assertEqual(owner.handles, {})
+                        self.assertEqual(owner.handles,{})
+                    auxiliary.close.assert_not_called()
+                    api.wait_database_released.assert_not_called()
                 primary.close_outcome.assert_called_once()
 
     def test_failure_captures_actual_components_before_protection(self):

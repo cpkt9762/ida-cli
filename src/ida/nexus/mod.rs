@@ -5,6 +5,7 @@
 //! execution while holding that lock. `NexusBackend::send` only enqueues commands.
 //! The legacy worker selection remains a development comparison until N9.
 
+mod acquisition;
 mod custody;
 mod deadline;
 mod delivery;

@@ -188,7 +188,7 @@ class Journal:
         self.target.directory.durable('custody.json', self.value)
         _, self.info, self.raw = self.target.directory.read('custody.json')
 
-    def gate(self, state_root=None, acquisition=None):
+    def gate(self, state_root=None, acquisition=None, *, cleanup_owner=None):
         # Unknown .new and unrecognized recovery files are never ignored.
         for name in os.listdir(self.target.directory.fd):
             if name.endswith('.new'):
@@ -199,7 +199,12 @@ class Journal:
         for item in self.value['entries'].values():
             if self.retirement(item):
                 continue
-            if item.get('detach_outcome', {}).get('ack_kind') == 'last' and not item.get('proof'):
+            cleanup = (cleanup_owner is not None and acquisition is not None
+                       and acquisition.get('purpose') == 'auxiliary'
+                       and item.get('owner') == cleanup_owner
+                       and item['acquisition']['parent'] == acquisition['parent']
+                       and cleanup_owner.get('state_root') == state_root)
+            if item.get('detach_outcome', {}).get('ack_kind') == 'last' and not item.get('proof') and not cleanup:
                 raise OwnerDraining('OwnerDraining: last ACK recorded; public owner proof pending')
             if item.get('launch') and not item.get('transferred') and item['acquisition'] != acquisition:
                 raise RuntimeError('StartupUnconfirmed: exact launch responsibility pending')

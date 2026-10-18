@@ -124,6 +124,28 @@ def watch_lease(context):
         try:
             if channel.recv(1):
                 raise RuntimeError("unexpected lifetime data")
+            if not any(job['context'] == context for job in jobs.values()):
+                return
+            # A live adapter owns both the admission slot and exact operations.
+            # A request that may have been delivered is never replayed locally.
+            cleanup = socket.socket(socket.AF_UNIX)
+            cleanup.settimeout(2)
+            try:
+                cleanup.connect(context[4])
+            except (ConnectionRefusedError, FileNotFoundError):
+                cleanup.close()
+                # The creating adapter is gone. This owner-local public handle
+                # is a third-party reference under C1, outside its custody set.
+                import logging
+                logging.getLogger(__name__).warning('third-party owner cleanup after adapter endpoint disappeared')
+            else:
+                try:
+                    cleanup.sendall(('cleanup:' + context[0] + ':' + context[1]).encode('ascii'))
+                    if cleanup.recv(2) != b'ok':
+                        raise RuntimeError('adapter cleanup acknowledgement missing; no local replay')
+                    return
+                finally:
+                    cleanup.close()
             from ida_nexus import discover_databases
             entries = [item.instance for item in discover_databases()
                        if item.instance.record_id == context[2]]

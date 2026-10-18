@@ -1,4 +1,4 @@
-"""Real pinned client + production bridge, fake public transport and IDA APIs."""
+"""Pinned SDK/guard wrapper units; production N1 custody is in nexus_r3b.rs."""
 import importlib.util
 import json
 import os
@@ -14,7 +14,8 @@ from unittest.mock import Mock, patch
 
 REPO = Path(__file__).resolve().parents[1]
 ROOT = Path(os.environ['R3A_CASE_ROOT'])
-sys.path.insert(0, str(REPO / "nexus_bridge"))
+sys.path[:0] = [str(REPO / "nexus_bridge"), str(REPO / "tests/support")]
+from release_wrapper import install
 import ida_nexus
 from ida_nexus import DatabaseHandle
 import ida_nexus.handle as client
@@ -126,6 +127,7 @@ def case(version='current', lost_ack=False, root_loss=False, slice_cleanup=False
         owner.Handle = types.SimpleNamespace(attach=lambda entry: auxiliary)
         owner.drop_lifetime = lambda key: None
         messages = []
+        _, child = install(owner, lease, primary, auxiliary)
         raised = []
         slices_module = None
         if slice_cleanup:
@@ -143,7 +145,13 @@ def case(version='current', lost_ack=False, root_loss=False, slice_cleanup=False
                     slices_module.cleanup_disconnected(*args)
                 else:
                     owner.invoke(types.SimpleNamespace(send=messages.append), {"sequence": 1},
-                                 {"command": "release", "lease": lease}, time.monotonic() + 1, [False])
+                                 {"command": "release", "lease": lease}, time.monotonic() + 15, [False])
+                    if child.lease['lease_id'] in owner.handles:
+                        owner.invoke(types.SimpleNamespace(send=messages.append), {"sequence": 2},
+                            {'command':'release','lease':child.lease},time.monotonic()+15,[False])
+                    if barrier:
+                        from lifecycle import release_handle
+                        release_handle(auxiliary,time.monotonic()+1,owner_required=True)
             except (RuntimeError, ValueError) as exc:
                 raised.append(str(exc))
         blocked = None
@@ -151,26 +159,33 @@ def case(version='current', lost_ack=False, root_loss=False, slice_cleanup=False
             worker = threading.Thread(target=invoke)
             worker.start()
             reached = arrived.wait(2)
-            blocked = reached and worker.is_alive() and not any(m['event']=='released' for m in messages)
+            blocked = reached and worker.is_alive() and sum(m['event']=='released' for m in messages) == 2
             state['proved'] = True
             proceed.set()
             worker.join(2)
             assert not worker.is_alive(), 'release worker remained blocked'
         else:
             invoke()
-        retained_before_retry = bool(slices_module.cleanup_handles if slice_cleanup else owner.cleanup_handles)
+        retained_before_retry = bool(slices_module.cleanup_handles if slice_cleanup else
+            child.lease['lease_id'] in owner.handles)
         if retry:
             before = len(calls)
             state['proved'] = True
-            invoke()
+            if slice_cleanup:
+                invoke()
+            else:
+                from lifecycle import release_handle
+                release_handle(auxiliary,time.monotonic()+1,request_only=True)
             assert len(calls) == before, 'proof coordination must never replay release'
-        retained_auxiliary = bool(slices_module.cleanup_handles if slice_cleanup else owner.cleanup_handles)
+        retained_auxiliary = bool(slices_module.cleanup_handles if slice_cleanup else
+            child.lease['lease_id'] in owner.handles)
         outcome = {"retained_before_retry": retained_before_retry, "barrier_blocked": blocked, "raised": raised, "version": version, "lost_auxiliary_ack": lost_ack, "root_loss": root_loss,
                    "release_calls": calls, "lifetime_queries": proofs,
                    "sample_results": checks, "flags": sorted(state["flags"]),
-                   "messages": messages, "retained_primary": bool(owner.handles),
+                   "messages": messages, "retained_primary": 'logical' in owner.handles,
                    "retained_auxiliary": retained_auxiliary,
                    "auxiliary_client_outcome": auxiliary._close_outcome}
+        owner.detach_pool.shutdown(wait=True)
     return outcome
 
 
@@ -206,21 +221,21 @@ class ReleaseTests(unittest.TestCase):
         row = case(barrier=True)
         self.assertTrue(row['barrier_blocked'], row)
         self.assertEqual(row['messages'][-1]['event'], 'released')
-        self.assertTrue(row['messages'][-1]['outcome']['owner_released'])
+        self.assertFalse(row['messages'][-1]['outcome'].get('owner_released',False), 'ACK never substitutes for owner proof')
 
     def test_lost_auxiliary_ack_retains_exact_responsibility(self):
         row = case(lost_ack=True)
-        self.assertFalse(any(m['event']=='released' for m in row['messages']), row)
-        self.assertTrue(row['retained_primary'])
+        self.assertEqual(sum(m['event']=='released' for m in row['messages']), 1, row)
+        self.assertFalse(row['retained_primary'])
         self.assertTrue(row['retained_auxiliary'])
-        self.assertTrue(row['lifetime_queries'])
+        self.assertFalse(row['lifetime_queries'], 'owner proof is independent of the detach lane')
 
     def test_lost_ack_retry_only_coordinates_proof(self):
         row = case(lost_ack=True, retry=True)
         self.assertTrue(row['retained_before_retry'])
-        self.assertEqual(row['messages'][-1]['event'], 'released')
+        self.assertEqual(row['messages'][-1]['event'], 'uncertain')
         self.assertEqual(len(row['release_calls']), 2)
-        self.assertFalse(row['retained_auxiliary'])
+        self.assertTrue(row['retained_auxiliary'], 'only real Rust proof custody can retire it')
 
     def test_real_sibling_allows_nonfinal_ack_without_owner_exit(self):
         row = case(sibling=True)

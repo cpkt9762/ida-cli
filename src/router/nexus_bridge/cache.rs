@@ -7,6 +7,7 @@ use crate::{
     preprocess::{Preparation, StagedArtifact},
 };
 use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,6 +16,8 @@ pub struct PreparedOpen {
     pub options: serde_json::Value,
     verification: Option<PathBuf>,
     verification_handed_off: bool,
+    verification_input_hash: Option<blake3::Hash>,
+    pub(crate) verification_cleanup: Option<std::sync::Arc<super::verification::Cleanup>>,
     generation: Option<(PathBuf, String, PathBuf)>,
     cache_guard: Option<std::sync::Arc<super::cache_lock::CacheGuard>>,
     pub(crate) content_guard: Option<std::sync::Arc<super::cache_lock::CacheGuard>>,
@@ -22,13 +25,15 @@ pub struct PreparedOpen {
 }
 impl Drop for PreparedOpen {
     fn drop(&mut self) {
-        if let Some(path) = &self.verification {
-            if self.verification_handed_off && !path.join("closed").is_file() {
-                tracing::warn!(path = %path.display(), "Nexus verification close unconfirmed; staging retained");
-                return;
-            }
-            if let Err(error) = std::fs::remove_dir_all(path) {
-                tracing::warn!(%error,"Nexus cache verification copy cleanup failed");
+        if let Some(cleanup) = &self.verification_cleanup {
+            match cleanup.complete(self.verification_handed_off) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(status=%cleanup.status(),"verification copy awaiting exact owner proof")
+                }
+                Err(error) => {
+                    tracing::warn!(%error,status=%cleanup.status(),"verification copy cleanup retained")
+                }
             }
         }
     }
@@ -41,6 +46,13 @@ impl PreparedOpen {
     /// closure. Retain that exact input snapshot before exposing the lease, so
     /// another open need not copy a packed IDB owned by a running instance.
     pub async fn publish_verified_input(&self, preparation: &Preparation) -> Result<(), ToolError> {
+        if self
+            .verification_cleanup
+            .as_ref()
+            .is_some_and(|c| c.status()["cleanup_complete"] == true)
+        {
+            return Ok(());
+        }
         if let Some((root, key, idb)) = self.generation.clone() {
             let guard = self.cache_guard.clone();
             let content_guard = self.content_guard.clone();
@@ -61,6 +73,8 @@ impl PreparedOpen {
         let preparing = preparation.clone();
         let guard = self.cache_guard.clone();
         let content_guard = self.content_guard.clone();
+        let expected_hash = self.verification_input_hash;
+        let cleanup = self.verification_cleanup.clone();
         preparation
             .wait(blocking::run(blocking::WorkClass::Prepare, move || {
                 let _guard = guard;
@@ -70,7 +84,27 @@ impl PreparedOpen {
                     "legacy verification close unconfirmed"
                 );
                 let snapshot = directory.join("input");
+                let source = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&snapshot)?;
+                let snapshot_identity = source.metadata()?;
+                anyhow::ensure!(
+                    snapshot_identity.is_file() && snapshot_identity.nlink() == 1,
+                    "verification input snapshot identity changed"
+                );
+                anyhow::ensure!(
+                    Some(digest_file(source, &preparing)?) == expected_hash,
+                    "verification input snapshot changed after custody"
+                );
                 let stage = StagedArtifact::create(&destination)?;
+                let current = std::fs::symlink_metadata(&snapshot)?;
+                anyhow::ensure!(
+                    current.is_file()
+                        && (current.dev(), current.ino())
+                            == (snapshot_identity.dev(), snapshot_identity.ino()),
+                    "verification input snapshot replaced before publication"
+                );
                 std::fs::hard_link(&snapshot, &stage.output)?;
                 if let Err(error) = stage.publish(&preparing) {
                     preparing.check()?;
@@ -81,6 +115,24 @@ impl PreparedOpen {
                     }
                     // An identical independently published snapshot is safe; never
                     // replace a collision or touch the packed database itself.
+                }
+                // publish() links rather than renames. Retire this exact owned
+                // stage link before checking for unknown extra hard links;
+                // StagedArtifact's asynchronous directory cleanup may run later.
+                let staged = std::fs::symlink_metadata(&stage.output)?;
+                anyhow::ensure!(
+                    staged.is_file()
+                        && (staged.dev(), staged.ino())
+                            == (snapshot_identity.dev(), snapshot_identity.ino()),
+                    "verification stage identity changed"
+                );
+                std::fs::remove_file(&stage.output)?;
+                drop(stage);
+                if let Some(cleanup) = cleanup {
+                    anyhow::ensure!(
+                        cleanup.complete(true)?,
+                        "verification closure not confirmed"
+                    );
                 }
                 Ok::<_, anyhow::Error>(())
             }))
@@ -95,6 +147,8 @@ impl PreparedOpen {
             options: serde_json::json!({"wait_analysis":true}),
             verification: None,
             verification_handed_off: false,
+            verification_input_hash: None,
+            verification_cleanup: None,
             generation: None,
             cache_guard: None,
             content_guard: None,
@@ -202,7 +256,12 @@ pub async fn prepare_open(
 }
 
 fn digest(path: &std::path::Path, preparation: &Preparation) -> anyhow::Result<blake3::Hash> {
-    let mut input = std::fs::File::open(path)?;
+    digest_file(std::fs::File::open(path)?, preparation)
+}
+fn digest_file(
+    mut input: std::fs::File,
+    preparation: &Preparation,
+) -> anyhow::Result<blake3::Hash> {
     let mut hash = blake3::Hasher::new();
     let mut buffer = [0; 65536];
     loop {
@@ -347,12 +406,20 @@ fn prepare_impl_inner(
                 IDS.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir(&directory)?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+            let identity = std::fs::symlink_metadata(&directory)?;
             let prepared = PreparedOpen {
                 path: idb.clone(),
                 options: serde_json::json!({"verification_idb":directory.join("probe.i64"),
                     "verify_input_snapshot":directory.join("input"),"auto_analysis":false}),
                 verification: Some(directory.clone()),
                 verification_handed_off: false,
+                verification_input_hash: Some(hash),
+                verification_cleanup: Some(std::sync::Arc::new(super::verification::Cleanup::new(
+                    directory.clone(),
+                    (identity.dev(), identity.ino()),
+                    Some(idb.with_extension("")),
+                ))),
                 generation: None,
                 cache_guard: None,
                 content_guard: None,

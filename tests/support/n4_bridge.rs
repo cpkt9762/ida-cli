@@ -30,6 +30,7 @@ async fn n4_fix_open_delivery_survives_broadcast_lag() {
     let (events, _) = broadcast::channel(8);
     let state = State {
         helper: None,
+        cache_root: std::env::temp_dir().join("unused-no-custody-root"),
         bridge_observer: None,
         bridge_exit: Mutex::new(None),
         observer_stop: tokio_util::sync::CancellationToken::new(),
@@ -157,6 +158,7 @@ async fn n5_old_delivery_callbacks_preserve_second_attempt_and_terminal_state() 
     let (events, _) = broadcast::channel(8);
     let state = Arc::new(State {
         helper: None,
+        cache_root: std::env::temp_dir().join("unused-no-custody-root"),
         bridge_observer: None,
         bridge_exit: Mutex::new(None),
         observer_stop: tokio_util::sync::CancellationToken::new(),

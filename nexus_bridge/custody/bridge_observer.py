@@ -126,7 +126,7 @@ class BackupSources:
                 entry['closed'].add(watch)
                 if entry['watches'] <= entry['closed']:
                     entry.pop('instance', None)
-                    for custodian in self.bridge.acquisitions.values():
+                    for custodian in dict.fromkeys([*self.bridge.acquisitions.values(), *self.bridge.custodians.values()]):
                         custodian.originals.pop(digest(owner), None)
         return closed
 
@@ -141,7 +141,7 @@ class BackupSources:
             entry['closed'].add(watch)
             if entry['watches'] <= entry['closed']:
                 entry['stop'].set()
-                for custody in self.bridge.acquisitions.values():
+                for custody in dict.fromkeys([*self.bridge.acquisitions.values(), *self.bridge.custodians.values()]):
                     custody.originals.pop(digest(owner), None)
             record = consumer['record']
             item = {'watch':watch, 'target':entry['owner']['canonical_idb_path'],

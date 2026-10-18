@@ -115,11 +115,19 @@ struct Database {
     opened_wall: std::time::SystemTime,
     _cache_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
 }
+#[derive(Clone)]
+struct CleanupReference {
+    handle: String,
+    path: PathBuf,
+    lease: SessionLease,
+    _cache_guard: Option<Arc<super::nexus_bridge::cache_lock::CacheGuard>>,
+}
 pub struct Tools {
     selected: bool,
     databases: Mutex<HashMap<String, Database>>,
     owner_resources: Mutex<HashMap<String, owner_resources::OwnerResources>>,
     owner_diagnostics: Mutex<HashMap<SessionLease, PathBuf>>,
+    cleanup_records: Mutex<HashMap<String, CleanupReference>>,
     capacity: Arc<Semaphore>,
     paths: Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     operations: Mutex<Vec<OperationIdentity>>,
@@ -139,6 +147,7 @@ impl Tools {
             databases: Mutex::new(HashMap::new()),
             owner_resources: Mutex::default(),
             owner_diagnostics: Mutex::default(),
+            cleanup_records: Mutex::default(),
             capacity: Arc::new(Semaphore::new(capacity)),
             paths: Mutex::new(HashMap::new()),
             operations: Mutex::new(Vec::new()),
@@ -502,6 +511,7 @@ impl Tools {
             uncertain_cache: self.uncertain_cache.clone(),
             open_guard: Some(open_guard),
             content_guard: prepared.content_guard.clone(),
+            verification: prepared.verification_cleanup.clone(),
         };
         let mut cancelled = false;
         let mut registered = false;
@@ -881,10 +891,23 @@ impl Tools {
             .records()
             .iter()
             .find(|(_, db)| db.token == token)
-            .map(|(h, db)| (h.clone(), db.clone()));
-        let Some((handle, database)) = record else {
+            .map(|(h, db)| CleanupReference {
+                handle: h.clone(),
+                path: db.path.clone(),
+                lease: db.lease.clone(),
+                _cache_guard: Some(db._cache_guard.clone()),
+            })
+            .or_else(|| {
+                self.cleanup_records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(token)
+                    .cloned()
+            });
+        let Some(database) = record else {
             return Ok(None);
         };
+        let handle = database.handle.clone();
         self.owner_diagnostics
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -892,6 +915,35 @@ impl Tools {
         let gate = self.path_gate(&database.path);
         let _path = gate.lock().await;
         let bridge = Self::bridge(router).await?;
+        if database._cache_guard.is_none()
+            && bridge
+                .endpoint()
+                .transition(|s, _| s.release_members(&database.lease))?
+                .len()
+                == 1
+        {
+            return Ok(None);
+        }
+        // Only this explicit close can renew a proven NotSent child's attempt.
+        // The old token remains absent from all business/session lookups.
+        for member in bridge
+            .endpoint()
+            .transition(|s, _| s.release_members(&database.lease))?
+            .into_iter()
+            .skip(1)
+        {
+            let not_sent = bridge
+                .endpoint()
+                .transition(|s, _| s.status(&member.client_id, &member))?
+                .control_delivery
+                .is_some_and(|d| d.state == DeliveryState::NotSent);
+            if not_sent {
+                bridge.retry_cleanup(&member);
+                bridge
+                    .endpoint()
+                    .transition(|s, t| s.release(&member.client_id, &member, t))?;
+            }
+        }
         // Installed before release's first await. Dropping the caller cannot
         // discard responsibility for a successfully published Database.
         let _cleanup = ReleaseCleanup {
@@ -922,7 +974,14 @@ impl Tools {
             .records()
             .values()
             .find(|db| db.token == token)
-            .map(|db| db.lease.clone());
+            .map(|db| db.lease.clone())
+            .or_else(|| {
+                self.cleanup_records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(token)
+                    .map(|db| db.lease.clone())
+            });
         let result = self.close_token(router, token).await;
         let observation = lease.and_then(|lease| {
             self.owner_status(router)
@@ -1477,7 +1536,33 @@ async fn release(
                 .control_delivery
                 .as_ref()
                 .is_none_or(|delivery| delivery.state == DeliveryState::Confirmed);
+            let auxiliary_error=bridge.owner_release_status(lease)["auxiliary_error"].clone();
+            if !auxiliary_error.is_null() {
+                return Err(ToolError::Nexus(serde_json::from_value(auxiliary_error)
+                    .map_err(|error|diagnostic(format!("invalid retained auxiliary error: {error}")))?));
+            }
             if state.phase == SessionPhase::Released && terminal {
+                let members = bridge.endpoint().transition(|s, _| s.release_members(lease))?;
+                let mut pending_members = false;
+                for member in members.iter().filter(|member| *member != lease) {
+                    let child = bridge.endpoint().transition(|s, _| s.status(&member.client_id, member))?;
+                    if let Some(error) = child.control_delivery.as_ref().and_then(|d| d.error.as_ref()) {
+                        let mut error = error.clone();
+                        error.message.push_str(&format!("; primary lease detached; auxiliary={}; primary_save_guard_error={:?}; auxiliary_save_guard_error={:?}",
+                            member.lease_id.as_str(), bridge.take_release_error(lease), bridge.take_release_error(member)));
+                        return Err(ToolError::Nexus(error));
+                    }
+                    if let Some(message) = bridge.take_release_error(member) {
+                        return Err(ToolError::Nexus(NexusError::new(NexusErrorCode::OperationFailed,
+                            format!("{message}; primary lease detached; auxiliary={}", member.lease_id.as_str()))));
+                    }
+                    pending_members |= child.phase != SessionPhase::Released || child.control_delivery.as_ref()
+                        .is_some_and(|d| d.state != DeliveryState::Confirmed);
+                }
+                if pending_members {
+                    receive(events.recv().await)?;
+                    continue;
+                }
                 return bridge.take_release_error(lease).map_or(Ok(()), |message| {
                     Err(ToolError::Nexus(NexusError::new(
                         NexusErrorCode::OperationFailed,
@@ -1518,6 +1603,7 @@ struct OpeningGuard {
     cache_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
     uncertain_cache: Arc<Mutex<Vec<Arc<RetainedOpen>>>>,
     content_guard: Option<Arc<super::nexus_bridge::cache_lock::CacheGuard>>,
+    verification: Option<Arc<super::nexus_bridge::verification::Cleanup>>,
 }
 struct RetainedOpen {
     bridge: Arc<super::nexus_bridge::NexusBridge>,
@@ -1525,6 +1611,7 @@ struct RetainedOpen {
     _cache_guard: Arc<super::nexus_bridge::cache_lock::CacheGuard>,
     _open_guard: Option<Arc<super::nexus_bridge::cache_lock::CacheGuard>>,
     _content_guard: Option<Arc<super::nexus_bridge::cache_lock::CacheGuard>>,
+    verification: Option<Arc<super::nexus_bridge::verification::Cleanup>>,
 }
 impl RetainedOpen {
     fn cleanup_confirmed(&self) -> bool {
@@ -1533,7 +1620,7 @@ impl RetainedOpen {
         if pending_resources {
             return false;
         }
-        self.bridge.endpoint().transition(|sessions, _| {
+        let terminal = self.bridge.endpoint().transition(|sessions, _| {
             let Ok((lease, failure)) =
                 sessions.open_progress(&self.identity.client_id, &self.identity)
             else {
@@ -1555,7 +1642,15 @@ impl RetainedOpen {
             // or the bridge confirmed acquisition failed.
             retired_resources
                 || failure.is_some_and(|error| error.code != NexusErrorCode::UnknownOutcome)
-        })
+        });
+        terminal
+            && self.verification.as_ref().is_none_or(|v| {
+                v.complete(true).unwrap_or_else(|error| {
+                    // The error is also retained for status; guards stay owned.
+                    tracing::debug!(%error,"verification cleanup remains blocked");
+                    false
+                })
+            })
     }
 }
 impl Drop for OpeningGuard {
@@ -1575,6 +1670,7 @@ impl Drop for OpeningGuard {
                 _cache_guard: self.cache_guard.clone(),
                 _open_guard: self.open_guard.clone(),
                 _content_guard: self.content_guard.clone(),
+                verification: self.verification.clone(),
             });
             if retained.cleanup_confirmed() {
                 return;
@@ -1585,11 +1681,11 @@ impl Drop for OpeningGuard {
                 .push(retained.clone());
             let registry = self.uncertain_cache.clone();
             // One bounded observer per retained opening; no remote work or
-            // replay. After the observation budget, protection stays registered
-            // and the next open checks the same authoritative N1 proof again.
+            // replay. Accepted cleanup keeps observing its exact proof/file
+            // conditions after the caller ends; capped backoff bounds the work.
             tokio::spawn(async move {
-                let deadline = Instant::now() + Duration::from_secs(120);
-                while Instant::now() < deadline {
+                let mut delay = 10;
+                loop {
                     if retained.cleanup_confirmed() {
                         registry
                             .lock()
@@ -1597,9 +1693,9 @@ impl Drop for OpeningGuard {
                             .retain(|item| !Arc::ptr_eq(item, &retained));
                         return;
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    delay = (delay * 2).min(800);
                 }
-                tracing::warn!("cache guards retained after unconfirmed open cleanup; router recovery required");
             });
         }
     }

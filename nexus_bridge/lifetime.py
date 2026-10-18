@@ -134,6 +134,26 @@ class LifetimeListener:
         try:
             connection.settimeout(2)
             raw = connection.recv(257)
+            if raw.startswith(b'cleanup:'):
+                parts = raw.decode('ascii').split(':')
+                if (len(parts) != 3 or any(len(p) != 32 or not all(c in '0123456789abcdef' for c in p)
+                                          for p in parts[1:])):
+                    raise ValueError('invalid cleanup resource identity')
+                def acknowledge(accepted):
+                    try:
+                        connection.sendall(b'ok' if accepted else b'no')
+                    finally:
+                        connection.close()
+                try:
+                    self.accept_cleanup(parts[1], parts[2], reply=acknowledge)
+                except Exception:
+                    LOG.exception('adapter auxiliary cleanup retained after failure')
+                    connection.sendall(b'no')
+                else:
+                    # The bounded preflight job owns this connection until
+                    # custody succeeds/fails. Accept continues independently.
+                    installed = True
+                return
             # Current owner sends one bounded ASCII UUID, without a delimiter.
             lease_id = raw.decode('ascii')
             if not 1 <= len(raw) <= 128 or not all(

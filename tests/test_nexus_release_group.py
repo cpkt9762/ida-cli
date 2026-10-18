@@ -1,4 +1,4 @@
-"""Lost ACK coordination with the pinned client and production bridge."""
+"""Independent pinned-SDK release wrapper units; real custody is in nexus_r3b."""
 import json
 import os
 from pathlib import Path
@@ -11,7 +11,9 @@ import unittest
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, os.environ.get('F10_SOURCE', str(REPO / 'nexus_bridge')))
+sys.path[:0] = [os.environ.get('F10_SOURCE', str(REPO / 'nexus_bridge')), str(REPO/'tests/support')]
+from release_wrapper import install
+from lifecycle import release_handle, release_state
 import bridge
 import ida_nexus
 from ida_nexus import DatabaseHandle
@@ -70,7 +72,7 @@ def scenario(*, sibling=False, both_lost=False, unsafe=False):
         primary._disconnected.set()
 
         def execute(source, **kwargs):
-            stage = 'primary' if 'module.release_lease' in source else 'auxiliary'
+            stage = 'primary' if not checks else 'auxiliary'
             checks.append(stage)
             return {'result': {'close_safe': not (unsafe and stage == 'auxiliary'),
                                'save_guard_error': stage + ' save refused'}}
@@ -81,62 +83,48 @@ def scenario(*, sibling=False, both_lost=False, unsafe=False):
         owner.lock = threading.Lock()
         owner.identity, owner.lifetime_path = 'group-bridge', '/private/lifetime'
         owner.handles = {'logical': (lease, primary)}
-        owner.custodians = {}  # This fixture exercises only the legacy auxiliary coordinator.
+        owner.custodians = {}  # Explicit wrapper boundary double, never N1 proof.
         owner.cleanup_handles, owner.metadata_contexts = {}, {}
         owner.Handle = types.SimpleNamespace(attach=lambda entry: auxiliary)
         owner.drop_lifetime = lambda key: None
 
-        def invoke():
-            owner.invoke(types.SimpleNamespace(send=messages.append), {'sequence': 1},
-                         {'command': 'release', 'lease': lease}, deadline, [False])
-
+        _, child = install(owner,lease,primary,auxiliary)
+        try:
+            owner.invoke(types.SimpleNamespace(send=messages.append), {'sequence':1},
+                {'command':'release','lease':lease},time.monotonic()+15,[False])
+            owner.invoke(types.SimpleNamespace(send=messages.append), {'sequence':2},
+                {'command':'release','lease':child.lease},time.monotonic()+15,[False])
+        finally:
+            owner.detach_pool.shutdown(wait=True)
+        terminals=[event for event in messages if event['event'] in ('released','uncertain','not_sent')]
+        assert len(terminals)==2 and terminals[0]['event']=='uncertain',terminals
+        assert calls.count('primary')==1
+        assert checks==['primary','auxiliary'] and not queries,(checks,queries)
+        assert owner.handles['logical'][1] is primary,'unknown primary must retain its own handle'
+        assert 'primary save refused' in terminals[0]['save_guard_error']
+        assert 'auxiliary save refused' in terminals[1]['save_guard_error']
+        before=list(calls)
+        release_handle(primary,deadline,request_only=True)
+        assert calls==before,'unknown primary cannot replay because another member succeeded'
         if unsafe:
-            owner.grants, owner.stopped = {}, threading.Event()
-            def send(event):
-                messages.append(event)
-                if event['event'] == 'dispatch_ready':
-                    ready, grants = owner.grants[1]
-                    grants.append(({'grant': True, 'remaining_ms': 1000}, deadline - 1))
-                    ready.set()
-            owner.run(types.SimpleNamespace(send=send), {'attempt': {'sequence': 1},
-                'payload': {'command': 'release', 'lease': lease}}, threading.Semaphore(0))
-            assert calls == ['primary'], calls
-            assert checks == ['primary', 'auxiliary'], checks
-            assert not queries, 'cannot spend proof deadline before checking own auxiliary'
-            assert owner.handles and owner.cleanup_handles
-            assert not any(m['event'] == 'released' for m in messages)
-            assert 'auxiliary' in live_names(live, names)
-            from lifecycle import save_guard_error
-            assert 'primary save refused' in save_guard_error(auxiliary)
-            assert 'auxiliary save refused' in save_guard_error(auxiliary)
-            assert messages[-1]['event'] == 'uncertain', messages
-            assert 'save protection unavailable' in messages[-1]['error']['message'], messages
-            assert 'primary save refused' in messages[-1]['save_guard_error'], messages
-            assert 'auxiliary save refused' in messages[-1]['save_guard_error'], messages
+            assert terminals[1]['event']=='not_sent' and calls==['primary'],terminals
+            assert child.lease['lease_id'] in owner.handles
+            assert release_state(auxiliary)['requested'] is False
+            assert 'save protection unavailable' in terminals[1]['error']['message']
         else:
-            invoke()
-            assert calls == ['primary', 'auxiliary'], calls
-            assert checks == ['primary', 'auxiliary'], checks
-            assert queries and all(q['calls'] == ['primary', 'auxiliary'] for q in queries), queries
+            assert calls==['primary','auxiliary'],calls
+            assert terminals[1]['event']==('uncertain' if both_lost else 'released'),terminals
+            assert (child.lease['lease_id'] in owner.handles) is both_lost
+            # A separate owner observation primitive can learn public True. It
+            # does not manufacture a Rust retirement or rewrite either SDK ACK.
             if sibling:
-                assert owner.handles and owner.cleanup_handles
-                assert not any(m['event'] == 'released' for m in messages)
-                assert live_names(live, names) == ['sibling']
-                invoke()
-                assert calls == ['primary', 'auxiliary'], 'never replay either own release'
-                # The real pinned sibling handle releases only on its caller's request.
-                external.close_outcome(wait_for_database=False, timeout=.1)
-                invoke()
-                assert calls == ['primary', 'auxiliary', 'sibling']
-            assert not owner.handles and not owner.cleanup_handles
-            final = messages[-1]
-            assert final['event'] == 'released', final
-            assert final['outcome']['failure'] is None
-            assert final['outcome']['proof'] == 'public_owner_lifetime', final
-            assert 'primary save refused' in final['save_guard_error'], final
-            assert 'auxiliary save refused' in final['save_guard_error'], final
-            if both_lost:
-                assert final['outcome']['release_acknowledged'] is False
+                assert release_handle(primary,deadline,owner_required=True) is None
+                assert live_names(live,names)==['sibling']
+                external.close_outcome(wait_for_database=False,timeout=.1)
+            proof=release_handle(primary,deadline,owner_required=True)
+            assert proof['owner_released'] and proof['release_acknowledged'] is False,proof
+            assert release_state(primary)['outcome']['lease_released'] is False
+            assert owner.handles['logical'][1] is primary,'only matching Rust custody retirement removes this entry'
         assert calls.count('primary') == 1 and calls.count('auxiliary') <= 1
         return {'calls': calls, 'queries': queries, 'checks': checks, 'events': messages}
 

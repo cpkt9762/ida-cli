@@ -44,7 +44,7 @@ pub enum InternalPurpose {
 }
 
 pub(super) struct Custody {
-    acquisition: AcquisitionId,
+    pub(super) acquisition: AcquisitionId,
     lease: SessionLease,
     decision: CustodyDecision,
     subscribed: bool,
@@ -52,6 +52,12 @@ pub(super) struct Custody {
 }
 
 impl<C: Clock> NexusSessions<C> {
+    pub fn cleanup_exhausted(&self, lease: &SessionLease) -> bool {
+        self.custodies
+            .get(&lease.lease_id)
+            .is_some_and(|c| c.lease == *lease && c.issued_operations >= 16)
+            && !self.occupied(lease)
+    }
     /// The adapter has durably verified every prior owner proof and typed
     /// absence of a lease. Consume the separate allowance before calling SDK.
     pub fn consume_post_exit_resolve(&mut self, parent: &OpenIdentity) -> Result<(), NexusError> {
@@ -77,6 +83,13 @@ impl<C: Clock> NexusSessions<C> {
                 NexusErrorCode::InvalidTransition,
                 "old boot resource retired; historical lifetime result cannot change",
             ));
+        }
+        for opening in self.openings.values_mut() {
+            for acquisition in &mut opening.acquisitions {
+                if acquisition.lease.as_ref() == Some(lease) {
+                    acquisition.owner_proof = true;
+                }
+            }
         }
         let operations: Vec<_> = self
             .operations
@@ -148,6 +161,12 @@ impl<C: Clock> NexusSessions<C> {
         lease: SessionLease,
         subscribed: bool,
     ) -> Result<CustodyDecision, NexusError> {
+        if lease.client_id != acquisition.parent.client_id {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidIdentity,
+                "acquisition lease client differs from retained parent",
+            ));
+        }
         if let Some(old) = self.custodies.get(&lease.lease_id) {
             if old.acquisition != *acquisition || old.lease != lease {
                 return Err(NexusError::new(
@@ -166,25 +185,48 @@ impl<C: Clock> NexusSessions<C> {
                     "acquisition parent missing",
                 )
             })?;
-        let expected_purpose = if parent.acquisition_ordinal == 1 {
-            AcquisitionPurpose::Final
-        } else {
-            AcquisitionPurpose::InitialRootRetry
-        };
-        if acquisition.ordinal != parent.acquisition_ordinal
-            || acquisition.purpose != expected_purpose
-        {
-            return Err(NexusError::new(
-                NexusErrorCode::InvalidIdentity,
-                "acquisition is not the reserved ordinal/purpose",
-            ));
-        }
+        let reserved = parent
+            .acquisitions
+            .iter()
+            .find(|a| a.identity == *acquisition && !a.closed && a.lease.is_none())
+            .ok_or_else(|| {
+                NexusError::new(
+                    NexusErrorCode::InvalidIdentity,
+                    "acquisition is not the reserved ordinal/purpose",
+                )
+            })?;
+        let publish_parent = reserved.publish_parent;
         let caps = self.ready()?.clone();
-        let disposition =
+        let disposition = if publish_parent {
             match self.register_acquisition(&acquisition.parent, lease.clone(), caps, false)? {
                 OpenDisposition::Ready(_) if subscribed => CustodyDisposition::Prepare,
                 _ => CustodyDisposition::CleanupOnly,
-            };
+            }
+        } else {
+            let prepare = acquisition.purpose != AcquisitionPurpose::Auxiliary
+                && subscribed
+                && !parent.cancel_requested
+                && !parent.uncertain
+                && parent.failure.is_none()
+                && !parent.request.deadline.expired(self.clock.now());
+            self.register(lease.clone(), caps)?;
+            if prepare {
+                CustodyDisposition::Prepare
+            } else {
+                CustodyDisposition::CleanupOnly
+            }
+        };
+        if let Some(reservation) = self
+            .openings
+            .get_mut(&acquisition.parent.operation_id)
+            .and_then(|p| {
+                p.acquisitions
+                    .iter_mut()
+                    .find(|a| a.identity == *acquisition)
+            })
+        {
+            reservation.lease = Some(lease.clone());
+        }
         if let Some(session) = self.sessions.get_mut(&lease.lease_id) {
             session.phase = if disposition == CustodyDisposition::Prepare {
                 SessionPhase::Preparing
@@ -214,6 +256,7 @@ impl<C: Clock> NexusSessions<C> {
     pub fn reserve_root_retry(
         &mut self,
         parent: &OpenIdentity,
+        predecessor: &AcquisitionId,
     ) -> Result<AcquisitionId, NexusError> {
         let opening = self.openings.get(&parent.operation_id).ok_or_else(|| {
             NexusError::new(NexusErrorCode::InvalidIdentity, "retry parent missing")
@@ -229,12 +272,41 @@ impl<C: Clock> NexusSessions<C> {
                 "retry parent no longer permits acquisition",
             ));
         }
-        let previous = opening.acquired.as_ref().ok_or_else(|| {
+        let reservation = opening
+            .acquisitions
+            .iter()
+            .find(|a| {
+                a.identity == *predecessor
+                    && predecessor.parent == *parent
+                    && predecessor.purpose != AcquisitionPurpose::Auxiliary
+            })
+            .ok_or_else(|| {
+                NexusError::new(
+                    NexusErrorCode::InvalidIdentity,
+                    "retry predecessor mismatch",
+                )
+            })?;
+        let previous = reservation.lease.as_ref().ok_or_else(|| {
             NexusError::new(NexusErrorCode::InvalidTransition, "no prior acquisition")
         })?;
-        if self.status(&parent.client_id, previous)?.phase != SessionPhase::Released
-            || self.occupied(previous)
-            || opening.acquisition_ordinal >= 3
+        let publish_parent = reservation.publish_parent;
+        let owner_proof = reservation.owner_proof;
+        let retired = self.resource_retirements.contains_key(&previous.lease_id);
+        let settled = opening
+            .acquisitions
+            .iter()
+            .any(|a| a.lease.as_ref() == Some(previous) && a.closed);
+        if previous.owner != OwnerKind::Managed
+            || !settled
+            || (!retired
+                && (!owner_proof
+                    || self.status(&parent.client_id, previous)?.phase != SessionPhase::Released
+                    || self.occupied(previous)
+                    || !self.control_delivery(previous).is_some_and(|d| {
+                        d.state == DeliveryState::Confirmed
+                            && matches!(d.attempt.target, DeliveryTarget::Release { .. })
+                    })))
+            || opening.root_attempts >= 3
         {
             return Err(NexusError::new(
                 NexusErrorCode::Busy,
@@ -242,16 +314,31 @@ impl<C: Clock> NexusSessions<C> {
             ));
         }
         let ordinal = opening.acquisition_ordinal + 1;
+        self.reserve_physical_slot(Some(parent))?;
         let opening = self.openings.get_mut(&parent.operation_id).ok_or_else(|| {
             NexusError::new(NexusErrorCode::InvalidIdentity, "retry parent disappeared")
         })?;
         opening.acquisition_ordinal = ordinal;
-        opening.acquired = None;
-        Ok(AcquisitionId {
+        opening.root_attempts += 1;
+        if publish_parent {
+            opening.acquired = None;
+        }
+        let identity = AcquisitionId {
             parent: parent.clone(),
             purpose: AcquisitionPurpose::InitialRootRetry,
             ordinal,
-        })
+        };
+        opening
+            .acquisitions
+            .push(super::acquisition::AcquisitionReservation {
+                identity: identity.clone(),
+                lease: None,
+                closed: false,
+                primary: None,
+                publish_parent,
+                owner_proof: false,
+            });
+        Ok(identity)
     }
 
     pub fn acquisition_cleanup(
@@ -259,6 +346,13 @@ impl<C: Clock> NexusSessions<C> {
         acquisition: &AcquisitionId,
         lease: &SessionLease,
     ) -> Result<(), NexusError> {
+        if !self.custodies.contains_key(&lease.lease_id)
+            && self.acquisition_lease(acquisition)?.as_ref() == Some(lease)
+            && (self.status(&lease.client_id, lease)?.phase == SessionPhase::Released
+                || self.resource_retirement(lease)?.is_some())
+        {
+            return Ok(());
+        }
         let custody = self.custodies.get_mut(&lease.lease_id).ok_or_else(|| {
             NexusError::new(NexusErrorCode::InvalidIdentity, "cleanup custody missing")
         })?;
@@ -301,6 +395,17 @@ impl<C: Clock> NexusSessions<C> {
         &mut self,
         lease: &SessionLease,
     ) -> Result<CustodyDecision, NexusError> {
+        if !self.custodies.contains_key(&lease.lease_id)
+            && (self.status(&lease.client_id, lease)?.phase == SessionPhase::Released
+                || self.resource_retirement(lease)?.is_some())
+        {
+            // Settled facts have no remaining execution epoch. They may still
+            // deliver the original parent error, but cannot grant another RPC.
+            return Ok(CustodyDecision {
+                disposition: CustodyDisposition::CleanupOnly,
+                grant_epoch: 0,
+            });
+        }
         let custody = self
             .custodies
             .get(&lease.lease_id)
@@ -351,6 +456,14 @@ impl<C: Clock> NexusSessions<C> {
         grant_epoch: u64,
     ) -> Result<(DeliveryAttempt, RemainingBudget), NexusError> {
         let lease = &identity.lease;
+        if self.resource_retirement(lease)?.is_some()
+            || self.status(&lease.client_id, lease)?.phase == SessionPhase::Released
+        {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "released acquisition cannot execute another RPC",
+            ));
+        }
         let decision = self.custody_decision(lease)?;
         let custody = self.custodies.get(&lease.lease_id).ok_or_else(|| {
             NexusError::new(NexusErrorCode::InvalidIdentity, "internal custody missing")
@@ -458,11 +571,40 @@ impl<C: Clock> NexusSessions<C> {
         acquisition: &AcquisitionId,
         error: NexusError,
     ) -> Result<(), NexusError> {
+        let opening = self
+            .openings
+            .get(&acquisition.parent.operation_id)
+            .ok_or_else(|| {
+                NexusError::new(
+                    NexusErrorCode::InvalidIdentity,
+                    "failed acquisition parent missing",
+                )
+            })?;
+        let current = opening
+            .acquisitions
+            .iter()
+            .rev()
+            .find(|a| a.identity.purpose != AcquisitionPurpose::Auxiliary);
+        let terminal = self
+            .deliveries
+            .get(&super::delivery::DeliveryKey::Open(
+                acquisition.parent.operation_id.clone(),
+            ))
+            .is_some_and(|d| d.snapshot.state == DeliveryState::Confirmed);
+        if current.is_none_or(|a| a.identity != *acquisition)
+            || (terminal && opening.failure.is_none())
+        {
+            return Err(NexusError::new(
+                NexusErrorCode::InvalidTransition,
+                "late acquisition failure cannot replace the parent terminal or a newer ordinal",
+            ));
+        }
         let lease = self
             .custodies
             .values()
             .find(|c| c.acquisition == *acquisition)
             .map(|c| c.lease.clone())
+            .or(self.acquisition_lease(acquisition)?)
             .ok_or_else(|| {
                 NexusError::new(
                     NexusErrorCode::InvalidIdentity,
@@ -481,7 +623,16 @@ impl<C: Clock> NexusSessions<C> {
         if parent.failure.is_none() {
             parent.failure = Some(error);
         }
-        self.custody_decision(&lease)?;
+        if self.custodies.contains_key(&lease.lease_id) {
+            self.custody_decision(&lease)?;
+        } else if self.status(&lease.client_id, &lease)?.phase != SessionPhase::Released
+            && self.resource_retirement(&lease)?.is_none()
+        {
+            return Err(NexusError::new(
+                NexusErrorCode::Busy,
+                "failed preparation retains live custody",
+            ));
+        }
         self.confirm_delivery(DeliveryTarget::Open {
             identity: acquisition.parent.clone(),
         });
@@ -507,7 +658,14 @@ impl<C: Clock> NexusSessions<C> {
             let running: Vec<_> = self
                 .operations
                 .values()
-                .filter(|op| op.snapshot.identity.lease == *lease && !op.snapshot.execution_stopped)
+                .filter(|op| {
+                    op.snapshot.identity.lease == *lease
+                        && !op.snapshot.execution_stopped
+                        && !self
+                            .internal_operations
+                            .get(&op.snapshot.identity.operation_id)
+                            .is_some_and(|(_, purpose, _)| *purpose == InternalPurpose::Cleanup)
+                })
                 .map(|op| op.snapshot.identity.clone())
                 .collect();
             for identity in running {
@@ -539,7 +697,17 @@ impl<C: Clock> NexusSessions<C> {
             .ok_or_else(|| {
                 NexusError::new(NexusErrorCode::InvalidIdentity, "prepared parent missing")
             })?;
-        if custody.acquisition != *acquisition || parent.wait_analysis != wait_analysis {
+        if custody.acquisition != *acquisition
+            || parent.wait_analysis != wait_analysis
+            || !parent
+                .acquisitions
+                .iter()
+                .any(|a| a.identity == *acquisition && a.publish_parent)
+            || !matches!(
+                acquisition.purpose,
+                AcquisitionPurpose::Final | AcquisitionPurpose::InitialRootRetry
+            )
+        {
             return Err(NexusError::new(
                 NexusErrorCode::InvalidIdentity,
                 "prepared acquisition or analysis requirement mismatch",

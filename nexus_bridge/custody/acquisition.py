@@ -12,11 +12,29 @@ from target_coordination import Target, canonical, digest
 from target_journal import Journal, OwnerDraining, ObservationPending
 
 
+class CleanupPending(TimeoutError):
+    """Caller may end while exact accepted cleanup remains independently owned."""
+
+
+def failure_details(error, depth=0):
+    """Preserve typed public errors and explicit exception chaining for callers."""
+    source = getattr(error, 'code', None)
+    value = {'code':'execution_timeout' if source == 'operation_timeout' else 'operation_failed',
+             'message':type(error).__name__ + (f'[{source}]' if source else '') + ': ' + str(error)}
+    cause = error.__cause__ or error.__context__
+    if cause is not None and cause is not error and depth < 7:
+        value['cause'] = failure_details(cause, depth+1)
+    return value
+
+
 class Custodian:
-    def __init__(self, bridge, attempt, command, deadline, track):
+    def __init__(self, bridge, attempt, command, deadline, track, *, acquisition=None):
         self.bridge, self.attempt, self.command = bridge, attempt, command
         self.deadline, self.track = deadline, track
-        self.acquisition = {'parent':command['identity'], 'purpose':'final', 'ordinal':1}
+        self.acquisition = {'parent':command['identity'],
+            'purpose':'verification' if command.get('options', {}).get('verification_idb') else 'final', 'ordinal':1}
+        if acquisition is not None:
+            self.acquisition = acquisition
         self.handle = self.lease = None
         self.decision = None
         self.watch = uuid.uuid4().hex
@@ -32,6 +50,17 @@ class Custodian:
         self.outcome = None
         self.attach_failures = []
         self.post_exit_resolve_used = False
+        self.verification_path = command.get('options', {}).get('verification_idb') if acquisition is None else None
+        self.verification_retired = False
+        self.verification_cleanup_error = None
+        self.last_auxiliary = None
+        self.adopted = False
+        self.retired = False
+        self.recovery_snapshot = None
+        self.recovery_error = None
+        self.recovery_active = False
+        self.recovery_blocked = False
+        self.recovery_next = 0
         if not bridge.helper_ready.wait(max(0, min(2, deadline-time.monotonic()))):
             raise RuntimeError('ObservationFailed: mandatory helper handshake unavailable')
         self.helper = bridge.helper_configuration
@@ -84,7 +113,9 @@ class Custodian:
             self.target_guard.__enter__()
             self.target.business_admission()
             try:
-                Journal(self.target).gate(self.helper['state_root'], acquisition)
+                cleanup_owner = getattr(self, 'cleanup_owner', None)
+                Journal(self.target).gate(self.helper['state_root'],
+                    self.acquisition if cleanup_owner is not None else acquisition, cleanup_owner=cleanup_owner)
                 return
             except (OwnerDraining, ObservationPending) as exc:
                 self.unlock_target()
@@ -108,17 +139,21 @@ class Custodian:
         return reply
 
     @contextmanager
-    def file_gate(self):
+    def file_gate(self, *, recovery=False):
         # Compatibility for the existing r9 snapshot path. Never hold EX while
         # waiting for owner lifetime or an analysis/cleanup RPC.
-        if self.target_guard is not None:
-            yield
+        if self.target is None:
+            with Target(self.target_path) as target:
+                with target.locked(deadline=time.monotonic()+15):
+                    yield target
+        elif self.target_guard is not None:
+            yield self.target
         else:
-            with self.target.locked(deadline=self.deadline):
-                yield
+            with self.target.locked(deadline=time.monotonic()+15 if recovery else self.deadline):
+                yield self.target
 
     def stage(self, stage, value):
-        if stage in ('BeforeAttach', 'AttachMayBeSent') and self.deadline <= time.monotonic():
+        if stage in ('BeforeResolve', 'LaunchIntent', 'BeforeAttach', 'AttachMayBeSent') and self.deadline <= time.monotonic():
             raise TimeoutError('original open budget exhausted before attach; signed custody retained')
         if stage == 'BeforeResolve' and value['reconnect']:
             unknown = next((a for a in self.attach_failures
@@ -213,6 +248,8 @@ class Custodian:
             # returns to the SDK's Popen call. A lost ACK retains the intent.
             self.signed_stage('launch', acquisition=self.acquisition, watch=watch,
                 launch=launch, receipt=receipt, target=self.target_path, coord_key=self.coord_key)
+            if self.deadline <= time.monotonic():
+                raise TimeoutError('original open budget exhausted after launch intent signing; no Popen')
         elif stage == 'Spawned':
             item = self.launches[value['suffix']]
             item['os_identity'] = capture(value['pid'])
@@ -234,6 +271,14 @@ class Custodian:
             # The SDK outcome repeats facts already signed at its public stage.
             # In particular, old proof-closed watches may already be retired.
             return
+        if item.get('proof'):
+            if state == 'exact_handle' and self.adopted and owner == self.owner:
+                # The public on_acquired callback already journaled this exact
+                # physical handle. A retired helper cannot sign another fact;
+                # retain the SDK's late result without reopening its watch.
+                item['attempts'][ordinal] = attempt
+                return
+            raise RuntimeError('owner already proved exited; no further attach side effect')
         reply = self.helper_request({'kind':'attach_attempt', 'watch':watch, 'attempt':attempt})
         item['attempts'][ordinal] = attempt
         return reply
@@ -274,6 +319,10 @@ class Custodian:
                 raise RuntimeError('ProtocolMismatch: acquisition delivered conflicting handle')
             if self.decision is not None:
                 return
+            if self.adopted:
+                self.ack_custody()
+                self.unlock_target()
+                return
         self.handle = handle
         with self.bridge.lock:
             already_tracked = any(held is handle for _, held in self.bridge.handles.values())
@@ -295,6 +344,7 @@ class Custodian:
             raise RuntimeError('ObservationFailed: acquired owner lacks exact prior subscription')
         Journal(self.target).adopt({'watch':self.watch, 'receipt':self.subscription,
             'owner':owner, 'acquisition':self.acquisition, 'lease':lease})
+        self.adopted = True
         self.ack_custody()
         # All execution remains gated by N1. Target EX ends once the exact
         # physical lease and prior helper subscription have reliable custody.
@@ -304,9 +354,19 @@ class Custodian:
         # adopt() already transferred the exact physical lease durably. The
         # control stream may have an earlier proof write waiting for target EX.
         self.unlock_target()
-        self.decision = self.transact('acquired', acquisition=self.acquisition, lease=self.lease,
+        reply = self.transact('acquired', acquisition=self.acquisition, lease=self.lease,
             owner=self.owner, watch=self.watch, receipt=self.subscription,
-            target=self.target_path, coord_key=self.coord_key)['decision']
+            target=self.target_path, coord_key=self.coord_key)
+        self.decision = reply['decision']
+        if reply.get('settled'):
+            self.retired = True
+            with self.bridge.lock:
+                held = self.bridge.handles.get(self.lease['lease_id'])
+                if held is not None and held[0] == self.lease and held[1] is self.handle:
+                    self.bridge.handles.pop(self.lease['lease_id'])
+                    self.bridge.metadata_contexts.pop(self.lease['lease_id'], None)
+                if self.bridge.custodians.get(self.lease['lease_id']) is self:
+                    self.bridge.custodians.pop(self.lease['lease_id'])
 
     def obtain(self, Handle, Options, path, options, context):
         outcome = Handle.open_outcome(path, options=Options(**dict(options,
@@ -357,8 +417,9 @@ class Custodian:
         # consumption. Failure still consumes no new resolver and retains cause.
         if self.deadline <= time.monotonic():
             return previous
-        self.target_guard = self.target.locked(deadline=self.deadline)
-        self.target_guard.__enter__()
+        if self.target is not None:
+            self.target_guard = self.target.locked(deadline=self.deadline)
+            self.target_guard.__enter__()
         self.target.business_admission()
         Journal(self.target).gate(self.helper['state_root'])
         remaining = self.deadline-time.monotonic()
@@ -385,7 +446,7 @@ class Custodian:
         outcome['prior_outcome'] = previous
         return outcome
 
-    def obtain_attach(self, Handle, instance, options, context):
+    def obtain_attach(self, Handle, instance, options, context, *, cleanup=False):
         self.stage('Resolved', instance)
         outcome = Handle.attach_outcome(instance, idle_timeout=options.get('idle_timeout'),
             on_acquired=lambda h:self.obtained(h, context), on_stage=self.stage)
@@ -398,9 +459,55 @@ class Custodian:
         self.reconcile_outcome(outcome)
         if outcome.get('cause') is not None:
             raise outcome['cause']
-        if handle is None or self.decision['disposition'] != 'prepare':
+        if handle is None or (self.decision['disposition'] != 'prepare' and not cleanup):
             raise RuntimeError('attach custody is cleanup-only or unavailable')
         return handle
+
+    def auxiliary(self, deadline):
+        # Reserve the second tenant slot before any helper/SDK side effect.
+        # The child retains its own exact handle even if its acquired ACK fails.
+        with self.bridge.lock:
+            child = self.bridge.cleanup_handles.get(self.lease['lease_id'])
+        if child is not None:
+            from lifecycle import release_state
+            settled_absence = child.handle is None and child.known_no_acquisition() and self.transact(
+                'acquisition_status', acquisition=child.acquisition)['settled']
+            closed_handle = child.handle is not None and release_state(child.handle)['requested']
+            if settled_absence or closed_handle:
+                with self.bridge.lock:
+                    if self.bridge.cleanup_handles.get(self.lease['lease_id']) is child:
+                        self.bridge.cleanup_handles.pop(self.lease['lease_id'], None)
+                child = None
+        if child is not None:
+            return child
+        identity = self.transact('reserve_acquisition', parent=self.acquisition['parent'],
+            purpose='auxiliary')['acquisition']
+        self.last_auxiliary = identity
+        child = None
+        try:
+            child = Custodian(self.bridge, self.attempt, self.command, deadline, self.track,
+                              acquisition=identity)
+            child.cleanup_context = [self.bridge.identity, self.lease['lease_id'],
+                self.lease['instance_id'], self.lease['generation'], self.bridge.lifetime_path]
+            child.cleanup_owner = self.owner
+            with self.bridge.lock:
+                self.bridge.cleanup_handles[self.lease['lease_id']] = child
+            with child.gate(self.owner['canonical_idb_path']):
+                from ida_nexus import discover_databases
+                candidates = [entry.instance for entry in discover_databases()
+                              if owner_key(entry.instance) == self.owner]
+                if len(candidates) != 1:
+                    raise RuntimeError('CleanupBlocked: exact owner unavailable for auxiliary; no SDK attach')
+                child.obtain_attach(self.bridge.Handle, candidates[0], {},
+                    {'method':'cleanup-auxiliary', 'parent':self.acquisition['parent']}, cleanup=True)
+        except Exception:
+            if child is None or (child.handle is None and not child.observations and not child.launches):
+                self.transact('unstarted_acquisition', acquisition=identity)
+                with self.bridge.lock:
+                    if self.bridge.cleanup_handles.get(self.lease['lease_id']) is child:
+                        self.bridge.cleanup_handles.pop(self.lease['lease_id'], None)
+            raise
+        return child
 
     def rpc(self, purpose, call, *, cleanup=False, deadline=None):
         if not self.lease or not self.decision:
@@ -460,7 +567,7 @@ class Custodian:
             if self.decision is None:
                 self.ack_custody()
             self.decision = self.transact('failed', attempt=self.attempt, acquisition=self.acquisition, lease=self.lease,
-                error={'code':'operation_failed', 'message':type(exc).__name__ + ': ' + str(exc)})['decision']
+                error=failure_details(exc))['decision']
         else:
             # No watch means no SDK side effect was possible. Existing watches
             # keep their reservation until exact settlement by Rust.
@@ -477,42 +584,119 @@ class Custodian:
     def cleanup(self):
         self.decision = self.transact('cleanup', acquisition=self.acquisition, lease=self.lease)['decision']
 
-    def release_for_retry(self):
+    def release_for_retry(self, *, owner_required=True, require_ack=True):
         self.cleanup()
-        if not self.release_event.wait(max(0, self.deadline-time.monotonic())):
-            raise TimeoutError('initial-open cleanup pending; exact custody retained')
-        # The release event records actual public evidence. N1 must also consume
-        # the ordered terminal before another ordinal can be reserved.
-        self.transact('cleanup_status', acquisition=self.acquisition, lease=self.lease)
+        # Only the caller's wait consumes the original budget. The already
+        # accepted N1 release and a failed snapshot retain their own custody.
+        while True:
+            reply = self.transact('cleanup_status', acquisition=self.acquisition,
+                lease=self.lease, require_ack=require_ack, owner_required=owner_required)
+            if reply['ready']:
+                break
+            if time.monotonic() >= self.deadline or reply.get('parent_terminal'):
+                raise CleanupPending('open ended while exact cleanup remains pending; no next acquisition')
+            if self.bridge.stopped.wait(.05):
+                raise RuntimeError('cleanup interrupted; independent helper and target obligation retained')
+        if not owner_required:
+            return reply.get('outcome') or self.release_outcome
         # N1 can learn the original release thread's real public lifetime before
         # the independent producer has published it to the target journal.
         # Consume that durable fact before a new owner reaches check_owner.
         delay = .01
         while True:
-            with self.file_gate():
-                journal = Journal(self.target)
+            with self.file_gate(recovery=True) as target:
+                journal = Journal(target)
                 journal.recover_public_proofs()
                 previous = next((i for i in journal.value['entries'].values() if i['watch'] == self.watch), None)
-                if previous is None or previous.get('proof'):
+                if previous is None or previous.get('proof') or previous.get('resource_retirement'):
                     break
+            if time.monotonic() >= self.deadline or reply.get('parent_terminal'):
+                raise CleanupPending('open ended while durable target proof remains pending; no next acquisition')
             self.bridge.backup_sources.query({'watch':self.watch, 'target':self.target_path,
                 'coord_key':self.coord_key, 'owner':self.owner, 'acquisition':self.acquisition,
                 'subscription_epoch':self.subscription['record']['subscription_epoch']})
-            remaining = self.deadline-time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError('r9 target proof custody pending; prior ordinal retained')
-            threading.Event().wait(min(delay, remaining))
+            if self.bridge.stopped.wait(delay):
+                raise RuntimeError('r9 proof custody pending; prior ordinal retained')
             delay = min(.2, delay*2)
-        return self.release_outcome
+        if reply.get('resource_retirement'):
+            from lifecycle import release_errors
+            outcome = dict(reply.get('outcome') or self.release_outcome or {})
+            outcome['resource_retirement'] = reply['resource_retirement']
+            outcome.setdefault('release_acknowledged', False)
+            outcome['save_guard_error'] = outcome.get('save_guard_error') or '; '.join(release_errors(self.handle)) or None
+            return outcome
+        return reply.get('outcome') or self.release_outcome
+
+    def retain_restore(self, snapshot, observed):
+        # Keep the existing Snapshot and a fresh root SH/target reference, not a
+        # second lease state machine. The current gate closes on caller return.
+        target = Target(self.target_path)
+        from target_coordination import Directory
+        root = Directory(canonical(snapshot.path.parent.parent), private=False)
+        try:
+            root_guard = root.lock('.cache.lock', shared=True)
+        except BaseException:
+            root.close()
+            target.close()
+            raise
+        snapshot.coordination = target
+        self.recovery_snapshot = (snapshot, observed, target, root, root_guard)
+        self.bridge.proof_wakeup.set()
+
+    def advance_restore(self):
+        # One bounded observation per fair turn. Waiting for a target or owner
+        # never occupies a business worker or spins in a preflight worker.
+        import os
+        try:
+            reply = self.transact('cleanup_status', acquisition=self.acquisition,
+                lease=self.lease, require_ack=True, owner_required=True)
+            if not reply['ready']:
+                return
+            snapshot, observed, target, root, root_guard = self.recovery_snapshot
+            with target.locked(nb=True):
+                journal = Journal(target)
+                journal.recover_public_proofs()
+                previous = next((i for i in journal.value['entries'].values() if i['watch'] == self.watch), None)
+                if previous is not None and not (previous.get('proof') or previous.get('resource_retirement')):
+                    return
+                try:
+                    snapshot.rollback(observed)
+                except Exception:
+                    # Existing v1 rollback is not a crash-transaction replay
+                    # engine. Retain its exact scene after any write failure.
+                    self.recovery_blocked = True
+                    raise
+            target.close()
+            os.close(root_guard)
+            root.close()
+            self.recovery_snapshot = None
+            self.recovery_error = None
+        except Exception as exc:
+            self.recovery_error = type(exc).__name__ + ': ' + str(exc)
+        finally:
+            with self.bridge.lock:
+                self.recovery_next = time.monotonic()+.2
+                self.recovery_active = False
+                parent = self.acquisition['parent']['operation_id']
+                if (self.recovery_snapshot is None and not self.running and self.retired
+                        and not self.originals and not self.launches
+                        and self.bridge.acquisitions.get(parent) is self):
+                    self.bridge.acquisitions.pop(parent)
 
     def next_retry(self):
+        self.next_acquisition('root_retry')
+
+    def next_acquisition(self, action='reserve_acquisition', purpose='final'):
         # A late retirement must still address the old physical ordinal.
         with self.bridge.lock:
             if self.lease and self.bridge.custodians.get(self.lease['lease_id']) is self:
                 previous = copy.copy(self)
                 previous.running = False
                 self.bridge.custodians[self.lease['lease_id']] = previous
-        self.acquisition = self.transact('root_retry', parent=self.command['identity'])['acquisition']
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError('original open budget exhausted; no next acquisition')
+        fields = {'predecessor':self.acquisition} if action == 'root_retry' else {'purpose':purpose}
+        self.acquisition = self.transact(action, parent=self.command['identity'], **fields)['acquisition']
         self.helper_request({'kind':'reserve_parent', 'parent':self.acquisition['parent']})
         self.handle = self.lease = self.decision = self.subscription = self.owner = None
         self.release_event = threading.Event()
@@ -520,8 +704,15 @@ class Custodian:
         self.outcome = None
         self.attach_ordinal = 0
         self.release_outcome = None
-        self.target_guard = self.target.locked(deadline=self.deadline)
-        self.target_guard.__enter__()
+        self.attach_failures = []
+        self.verification_retired = False
+        self.adopted = False
+        self.retired = False
+        if purpose == 'final' and action != 'root_retry':
+            self.verification_path = None
+        if self.target is not None:
+            self.target_guard = self.target.locked(deadline=self.deadline)
+            self.target_guard.__enter__()
 
     def ready(self, capabilities, wait_analysis, recovery):
         return self.transact('ready', attempt=self.attempt, acquisition=self.acquisition,

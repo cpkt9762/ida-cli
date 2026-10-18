@@ -13,8 +13,47 @@ pub(super) struct OwnerResources {
 }
 
 impl Tools {
+    fn auxiliary_guard_needed(
+        &self,
+        bridge: &super::super::nexus_bridge::NexusBridge,
+        primary: &SessionLease,
+    ) -> bool {
+        let members = match bridge
+            .endpoint()
+            .transition(|s, _| s.release_members(primary))
+        {
+            Ok(members) => members,
+            Err(error) => {
+                tracing::warn!(%error,"auxiliary custody query failed; root protection retained");
+                return true;
+            }
+        };
+        members.iter().skip(1).any(|member| {
+            let facts = bridge.owner_release_status(member);
+            if facts["owner_released"] == true || !facts["resource_retirement"].is_null() {
+                return false;
+            }
+            let detached = bridge
+                .endpoint()
+                .transition(|s, _| s.status(&member.client_id, member))
+                .is_ok_and(|s| s.phase == SessionPhase::Released);
+            !detached || facts["outcome"]["ack_kind"] != "nonlast"
+        })
+    }
     pub(super) fn consume_released(&self, bridge: &super::super::nexus_bridge::NexusBridge) {
         let endpoint = bridge.endpoint();
+        self.cleanup_records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, db| {
+                let auxiliary = self.auxiliary_guard_needed(bridge, &db.lease);
+                if !auxiliary {
+                    db._cache_guard = None;
+                }
+                let facts = bridge.owner_release_status(&db.lease);
+                auxiliary
+                    || (facts["owner_released"] != true && facts["resource_retirement"].is_null())
+            });
         let mut owners = self
             .owner_resources
             .lock()
@@ -27,7 +66,7 @@ impl Tools {
             !owner.references.is_empty()
         });
         let mut released = Vec::new();
-        self.records().retain(|_, db| {
+        self.records().retain(|handle, db| {
             let retired = endpoint
                 .transition(|s, _| s.resource_retirement(&db.lease))
                 .is_ok_and(|s| s.is_some());
@@ -38,7 +77,24 @@ impl Tools {
             if !confirmed {
                 return true;
             }
+            let auxiliary = self.auxiliary_guard_needed(bridge, &db.lease);
             let facts = bridge.owner_release_status(&db.lease);
+            if auxiliary
+                || (facts["owner_released"] != true && facts["resource_retirement"].is_null())
+            {
+                self.cleanup_records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        db.token.clone(),
+                        CleanupReference {
+                            handle: handle.clone(),
+                            path: db.path.clone(),
+                            lease: db.lease.clone(),
+                            _cache_guard: auxiliary.then(|| db._cache_guard.clone()),
+                        },
+                    );
+            }
             self.owner_diagnostics
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -84,6 +140,12 @@ impl Tools {
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .any(|r| r.references.contains_key(&lease.lease_id))
+            || self
+                .cleanup_records
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .any(|db| db.lease == *lease && db._cache_guard.is_some())
     }
 
     pub fn owner_status(&self, router: &RouterState) -> Vec<Value> {
@@ -96,7 +158,7 @@ impl Tools {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        diagnostics
+        let mut statuses: Vec<_> = diagnostics
             .iter()
             .map(|(lease, path)| {
                 let mut facts = bridge.owner_release_status(lease);
@@ -105,6 +167,30 @@ impl Tools {
                 facts["owner_observation_ref"] = facts["watch"].clone();
                 facts["cleanup_failures"] = facts["outcome"]["cleanup_failures"].clone();
                 facts["save_guard_error"] = json!(bridge.take_release_error(lease));
+                facts["owned_members"] = bridge
+                    .endpoint()
+                    .transition(|s, _| s.release_members(lease))
+                    .map_or_else(
+                        |error| json!({"error":error.details()}),
+                        |members| {
+                            json!(members
+                                .into_iter()
+                                .skip(1)
+                                .map(|member| {
+                                    let mut details = bridge.owner_release_status(&member);
+                                    details["phase"] = bridge
+                                        .endpoint()
+                                        .transition(|s, _| s.status(&member.client_id, &member))
+                                        .map_or_else(
+                                            |error| json!({"error":error.details()}),
+                                            |status| json!(status.phase),
+                                        );
+                                    details["lease"] = json!(member);
+                                    details
+                                })
+                                .collect::<Vec<_>>())
+                        },
+                    );
                 facts["lease_detached"] = json!(bridge
                     .endpoint()
                     .transition(|s, _| s.status(&lease.client_id, lease))
@@ -128,7 +214,20 @@ impl Tools {
                 });
                 facts
             })
-            .collect()
+            .collect();
+        statuses.extend(
+            self.uncertain_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter_map(|opening| {
+                    opening.verification.as_ref().map(|verification| {
+                        json!({"kind":"opening_cleanup","parent":opening.identity,
+                    "verification":verification.status(),"root_shared_guard":true})
+                    })
+                }),
+        );
+        statuses
     }
 
     pub async fn wait_owner_exit(

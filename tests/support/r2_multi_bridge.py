@@ -16,10 +16,68 @@ install()
 def owner_input(root):
     from r0_transport import Boundary, barrier
     with Boundary(root, 'slow-owner') as boundary:
+        if os.environ.get('R3B_CASE', '').startswith('verification'):
+            import hashlib
+            import ida_nalt
+            ida_nalt.retrieve_input_file_sha256 = lambda: hashlib.sha256(b'verification input').digest()
+            if os.environ.get('R3B_CASE') == 'verification-failure' and root.name == 'a':
+                def refuse_verification():
+                    raise RuntimeError('controlled original verification error')
+                ida_nalt.retrieve_input_file_sha256 = refuse_verification
         original = boundary.server.RequestHandlerClass.do_POST
         guard_calls = []
         pending = set()
+        release_preflights = [0]
+        detach_requests = [0]
+        sibling = [None]
+        actual_reply = boundary.server.RequestHandlerClass.reply
+        def reply(request, payload, status=200):
+            scenario = os.environ.get('R3B_CASE', '')
+            if request.path == '/release_lease' and root.name == 'a' and detach_requests[0] == 1:
+                if scenario == 'auxiliary-sibling-join':
+                    from ida_nexus import DatabaseHandle
+                    sibling[0] = DatabaseHandle.attach(boundary.instance)
+                    sibling[0].execute_python('result=True', operation_id='third-party-member', timeout=2)
+                elif scenario == 'auxiliary-sibling-leave' and sibling[0] is not None:
+                    third = sibling[0]
+                    sibling[0] = None
+                    closed = third.close_outcome(wait_for_database=False, timeout=2)
+                    assert closed['lease_released'],closed
+            return actual_reply(request,payload,status)
+        boundary.server.RequestHandlerClass.reply = reply
         def post(request):
+            scenario = os.environ.get('R3B_CASE', '')
+            if scenario in ('auxiliary-sibling-join','auxiliary-sibling-leave') and request.path == '/release_lease':
+                detach_requests[0] += 1
+            if (scenario in ('auxiliary-uncertain', 'primary-uncertain') and root.name == 'a'
+                    and request.path == '/release_lease'):
+                detach_requests[0] += 1
+                if detach_requests[0] == (1 if scenario == 'primary-uncertain' else 2):
+                    import socket
+                    payload = json.loads(request.rfile.read(int(request.headers['Content-Length'])))
+                    with boundary.lock:
+                        boundary.requests.append({'endpoint':request.path, **payload})
+                        boundary.leases.discard(payload['lease_id'])
+                    request.connection.shutdown(socket.SHUT_RDWR)
+                    request.close_connection = True
+                    return
+            if scenario in ('auxiliary-fault','late-auxiliary-fault') and request.path == '/execute_python':
+                raw = request.rfile.read(int(request.headers['Content-Length']))
+                payload = json.loads(raw)
+                if '\nresult = _r9_guard.close_status()' in payload['code']:
+                    release_preflights[0] += 1
+                    if release_preflights[0] == 2:
+                        with boundary.lock:
+                            boundary.requests.append({'endpoint':request.path, **payload})
+                        request.reply({'ok':False,'error':{'code':'execution_error',
+                            'message':'controlled auxiliary save protection failure'}})
+                        return
+                previous = request.rfile
+                request.rfile = io.BytesIO(raw)
+                try:
+                    return original(request)
+                finally:
+                    request.rfile = previous
             late = os.environ.get('R2_LATE_STOP') == '1'
             if request.path == '/cancel_operation' and late:
                 payload = json.loads(request.rfile.read(int(request.headers['Content-Length'])))
@@ -67,7 +125,26 @@ def owner_input(root):
                 temporary = root/'requests.new'
                 temporary.write_text(data)
                 temporary.replace(root/'requests.json')
+                if os.environ.get('R3B_CASE'):
+                    with boundary.lock:
+                        members = sorted(boundary.leases)
+                    stage = root/'leases.new'
+                    stage.write_text(json.dumps(members))
+                    stage.replace(root/'leases.json')
+            if (root/'disconnect-primary').exists() and not (root/'disconnected').exists():
+                import socket
+                if os.environ.get('R3B_CASE') == 'auxiliary-sibling-leave' and root.name == 'a':
+                    from ida_nexus import DatabaseHandle
+                    sibling[0] = DatabaseHandle.attach(boundary.instance)
+                    sibling[0].execute_python('result=True',operation_id='third-party-member',timeout=2)
+                with boundary.lock:
+                    first = next(iter(boundary.streams.values()))
+                    first.shutdown(socket.SHUT_RDWR)
+                (root/'disconnected').touch()
             threading.Event().wait(.005)
+        if sibling[0] is not None:
+            closed = sibling[0].close_outcome(wait_for_database=False,timeout=2)
+            assert closed['lease_released'],closed
 
 
 if len(sys.argv) == 3 and sys.argv[1] == '--owner':
@@ -87,8 +164,57 @@ else:
                     raise RuntimeError('native owner input did not become ready')
                 threading.Event().wait(.005)
         installation = Path(os.environ['IDA_CLI_BRIDGE_INSTALLATION'])
+        if os.environ.get('R3B_CASE') == 'verification-init-failure':
+            actual_start = threading.Thread.start
+            failed = [False]
+            def start_thread(thread, *args, **kwargs):
+                if thread.name.startswith('ida-nexus-lease-') and not failed[0]:
+                    failed[0] = True
+                    (root/'monitor-start-failed').touch()
+                    raise RuntimeError('controlled monitor thread start failure')
+                return actual_start(thread, *args, **kwargs)
+            threading.Thread.start = start_thread
         sys.argv = [str(installation/'bootstrap.py'), 'bridge', *sys.argv[1:]]
-        runpy.run_path(sys.argv[0], run_name='verified_multi_input')['load_entry']().main()
+        runtime = runpy.run_path(sys.argv[0], run_name='verified_multi_input')['load_entry']()
+        if os.environ.get('R3B_CASE') == 'late-auxiliary-fault':
+            original_drop = runtime.Bridge.drop_lifetime
+            def expose_owner_cleanup_context(self, lease_id):
+                with self.lock:
+                    custody = self.custodians.get(lease_id)
+                    if custody is not None and custody.acquisition['purpose'] == 'final':
+                        (root/'late-cleanup-context.json').write_text(json.dumps(
+                            [self.identity,lease_id,self.lifetime_path]))
+                return original_drop(self,lease_id)
+            runtime.Bridge.drop_lifetime = expose_owner_cleanup_context
+        if os.environ.get('R3B_CASE') == 'custody-before-callback':
+            from acquisition import Custodian
+            original_ack = Custodian.ack_custody
+            def delay_acquired(self):
+                self.unlock_target()
+                marker = root/'custody-dropped.json'
+                if not marker.exists():
+                    marker.write_text(json.dumps([self.lease]))
+                    until = time.monotonic()+8
+                    while not (root/'acquired-resume').exists():
+                        if time.monotonic() >= until:
+                            raise TimeoutError('controlled callback custody barrier')
+                        threading.Event().wait(.005)
+                return original_ack(self)
+            Custodian.ack_custody = delay_acquired
+        if os.environ.get('R3B_CASE') == 'custody-ack-lost':
+            original_receive = runtime.Bridge.receive
+            def lose_acquired_ack(self, channel, message):
+                decision = message.get('decision', {})
+                if 'custody_reply' in message and decision.get('disposition') == 'prepare':
+                    with self.lock:
+                        leases = [lease for lease, _ in self.handles.values()]
+                    marker = root/'custody-dropped.json'
+                    if not marker.exists():
+                        marker.write_text(json.dumps(leases))
+                    return
+                return original_receive(self, channel, message)
+            runtime.Bridge.receive = lose_acquired_ack
+        runtime.main()
     finally:
         for directory, child in children:
             (directory/'guard.release').touch()

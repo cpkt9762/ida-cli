@@ -28,6 +28,7 @@ class OpenTests(unittest.TestCase):
         self.recovering, self.tamper = False, lambda: None
         self.wait_calls, self.unreadable = 0, False
         self.close_safe = True
+        self.backend = 'idalib'
         self.mocks = [patch.dict(os.environ, {'IDA_CLI_HOME': str(self.root/'home')}),
             patch.object(recovery, 'public_owner_probe', return_value=None),
             patch.dict(sys.modules, {'ida_nexus': types.SimpleNamespace(
@@ -54,7 +55,8 @@ class OpenTests(unittest.TestCase):
         parent = self
 
         class Handle:
-            instance = types.SimpleNamespace(record_id='owner-'+str(number), idb_path=str(parent.target))
+            instance = types.SimpleNamespace(record_id='owner-'+str(number), idb_path=str(parent.target),
+                                             backend=parent.backend)
 
             def execute_python(self, source, **_options):
                 if source == 'guard':
@@ -109,6 +111,14 @@ class OpenTests(unittest.TestCase):
             self.run_open()
         self.assertEqual(len(self.handles), 1)
         self.assertEqual(self.wait_calls, 0, 'ordinary failure must not wait on a sibling owner')
+
+    def test_gui_initial_root_failure_only_detaches_its_own_lease(self):
+        self.losses, self.backend, self.lifetime = 3, 'gui', False
+        with self.assertRaisesRegex(RuntimeError, 'no initial Root retry'):
+            self.run_open()
+        self.assertEqual(len(self.handles), 1, 'GUI owner must never be automatically reopened')
+        self.assertEqual(self.calls.count('close'), 1)
+        self.assertEqual(self.wait_calls, 0, 'GUI/shared owner is allowed to remain alive')
 
     def test_disconnected_guard_query_never_retries_or_waits_on_sibling(self):
         self.losses, self.unreadable, self.lifetime = 1, True, False

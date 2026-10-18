@@ -9,6 +9,7 @@ pub mod protocol;
 mod receiver;
 #[cfg(feature = "nexus-test-support")]
 mod test_process_ledger;
+pub(crate) mod verification;
 
 fn spawn_child(command: &mut tokio::process::Command) -> anyhow::Result<tokio::process::Child> {
     #[cfg(feature = "nexus-test-support")]
@@ -98,6 +99,7 @@ struct State {
     events: broadcast::Sender<Value>,
     open_replies: Mutex<HashMap<OperationId, tokio::sync::oneshot::Sender<Value>>>,
     open_reply_capacity: usize,
+    cache_root: PathBuf,
     failed: std::sync::atomic::AtomicBool,
     stop: tokio_util::sync::CancellationToken,
 }
@@ -261,6 +263,10 @@ impl NexusBridge {
     /// Non-secret current obligations, independent of command subscribers.
     pub fn lifecycle_status(&self) -> Value {
         let state = &self.state;
+        let acquisitions = state
+            .endpoint
+            .transition(|s, _| Ok::<_, NexusError>(s.acquisition_status()))
+            .unwrap_or_else(|error| json!({"error":error.details()}));
         let resources: Vec<_> = state.custody_resources.lock().unwrap_or_else(|e|e.into_inner())
             .values().map(|r|json!({"watch":r.watch,"target":r.target,"owner":r.owner,
                 "lease":r.lease,"acquisition":r.acquisition,"public_proof_adopted":r.proof.is_some(),
@@ -284,7 +290,7 @@ impl NexusBridge {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         json!({"resources":resources.len(),"startup_and_pre_attach":startups.len(),
-            "resource_details":resources,"startup_details":startups,"blocked":blocked,
+            "resource_details":resources,"startup_details":startups,"blocked":blocked,"acquisitions":acquisitions,
             "retirement_acks":state.custody_retirements.lock().unwrap_or_else(|e|e.into_inner()).len(),
             "helper":state.helper.as_ref().map(|h|h.status_snapshot()),
             "state_root":state.helper.as_ref().map(|h|&h.state_root),
@@ -361,6 +367,19 @@ impl NexusBridge {
             value["cleanup_state"] = json!("CleanupBlocked");
             if value["cleanup_error"].is_null() {
                 value["cleanup_error"] = error.details();
+            }
+        }
+    }
+    pub(crate) fn retry_cleanup(&self, lease: &SessionLease) {
+        if let Some((exact, facts)) = self
+            .state
+            .release_facts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&lease.lease_id)
+        {
+            if exact == lease {
+                facts["cleanup_state"] = json!("CleanupRetryAccepted");
             }
         }
     }
@@ -520,6 +539,7 @@ impl NexusBridge {
             .ok_or_else(|| anyhow::anyhow!("Nexus lanes already consumed"))?;
         let (events, _) = broadcast::channel(capacity.max(8));
         let state = Arc::new(State {
+            cache_root: ida_home.join("idb"),
             endpoint,
             helper,
             bridge_observer,
@@ -611,7 +631,17 @@ impl NexusBridge {
                         if let Err(error) = s.poll_preparation(&lease, t) {
                             tracing::debug!(%error, "Nexus preparing cancellation pending");
                         }
-                        if s.status(&lease.client_id, &lease).is_ok_and(|status| status.phase == SessionPhase::ReleaseRequired) {
+                        if s.cleanup_exhausted(&lease) && s.status(&lease.client_id,&lease)
+                            .is_ok_and(|status| status.phase == SessionPhase::ReleaseRequired) {
+                            let mut facts=ticking.release_facts.lock().unwrap_or_else(|e|e.into_inner());
+                            let entry=facts.entry(lease.lease_id.clone()).or_insert_with(||(lease.clone(),json!({})));
+                            entry.1["cleanup_state"]=json!("CleanupBlocked");
+                            entry.1["cleanup_error"]=NexusError::new(NexusErrorCode::Busy,
+                                "exact acquisition cleanup RPC capacity exhausted; retained without replay").details();
+                        }
+                        let blocked = ticking.release_facts.lock().unwrap_or_else(|e|e.into_inner())
+                            .get(&lease.lease_id).is_some_and(|(_, facts)| facts["cleanup_state"] == "CleanupBlocked");
+                        if !blocked && s.status(&lease.client_id, &lease).is_ok_and(|status| status.phase == SessionPhase::ReleaseRequired) {
                             if let Err(error) = s.release(&lease.client_id, &lease, t) {
                                 tracing::debug!(%error, lease_id=lease.lease_id.as_str(), "Nexus retained open lease cleanup pending");
                             }
@@ -1335,6 +1365,9 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
         return Ok(());
     }
     if event["event"] == "local_status" {
+        event["n1_acquisitions"] = state
+            .endpoint
+            .transition(|s, _| Ok::<_, NexusError>(s.acquisition_status()))?;
         let helper_status = state.helper.as_ref().map(|h| h.status_snapshot());
         let resources: Vec<_> = state
             .custody_resources
@@ -1755,9 +1788,15 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
                 entry.1["terminal"] = json!(name);
                 if let Some(outcome) = event.get("outcome") {
                     entry.1["outcome"] = outcome.clone();
+                    if outcome["cleanup_blocked"] == true {
+                        entry.1["cleanup_state"] = json!("CleanupBlocked");
+                    }
                 }
                 if let Some(error) = event.get("error") {
                     entry.1["command_error"] = error.clone();
+                    if entry.1["original_error"].is_null() {
+                        entry.1["original_error"] = error.clone();
+                    }
                 }
             }
         }

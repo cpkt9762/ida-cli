@@ -27,6 +27,7 @@ class LifetimeRig:
         b.handles = {key: ({'lease_id': key, 'instance_id': 'owner', 'generation': 1},
                           types.SimpleNamespace(connected=True)) for key in ('a', 'b')}
         b.executing, b.identity = {}, 'incarnation'
+        b.acquisitions = {}
         b.proof_wakeup = threading.Event()
         b.lifetime_path = str(root / 'l')
         b.init_lifetimes(8)

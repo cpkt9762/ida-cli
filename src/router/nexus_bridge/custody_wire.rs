@@ -1,5 +1,6 @@
 //! Early resource handoff and exact preparation grants, independent of pending commands.
 use super::*;
+use std::path::Path;
 
 #[derive(Clone)]
 pub(super) struct Resource {
@@ -15,6 +16,7 @@ pub(super) struct Resource {
     pub bridge_proof_ack: bool,
     pub backup: Option<Value>,
     pub origin_binding: Value,
+    pub cache_guard: Arc<Mutex<Option<Arc<cache_lock::CacheGuard>>>>,
 }
 
 pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result<Value> {
@@ -34,6 +36,69 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
         .ok_or_else(|| anyhow::anyhow!("mandatory proof helper unavailable"))?;
     let mut response = json!({"custody_reply":nonce,"ok":true});
     match action {
+        "acquisition_status" => {
+            let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
+            response["settled"] = json!(state
+                .endpoint
+                .transition(|s, _| s.acquisition_closed(&acquisition))?);
+        }
+        "auxiliary_failed" => {
+            let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
+            let lease: SessionLease = decode(event["lease"].clone())?;
+            let error: NexusError = decode(event["error"].clone())?;
+            anyhow::ensure!(
+                state
+                    .endpoint
+                    .transition(|s, _| s.acquisition_lease(&acquisition))?
+                    .as_ref()
+                    == Some(&lease),
+                "auxiliary failure parent mismatch"
+            );
+            let mut facts = state
+                .release_facts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = facts
+                .entry(lease.lease_id.clone())
+                .or_insert_with(|| (lease.clone(), json!({})));
+            anyhow::ensure!(entry.0 == lease, "auxiliary failure lease mismatch");
+            if entry.1["auxiliary_error"].is_null() {
+                entry.1["auxiliary_error"] = json!(error);
+            }
+        }
+        "unstarted_acquisition" => {
+            let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
+            anyhow::ensure!(
+                state
+                    .startups
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .all(|item| item["acquisition"] != event["acquisition"])
+                    && state
+                        .custody_resources
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .values()
+                        .all(|r| r.acquisition != acquisition),
+                "unstarted acquisition already has physical/observation responsibility"
+            );
+            state
+                .endpoint
+                .transition(|s, _| s.acquisition_absent(&acquisition))?;
+            helper
+                .call(json!({"kind":"retire_parent","parent":acquisition.parent}))
+                .await?;
+        }
+        "reserve_acquisition" => {
+            let parent: OpenIdentity = decode(event["parent"].clone())?;
+            let purpose: AcquisitionPurpose = decode(event["purpose"].clone())?;
+            response["acquisition"] = serde_json::to_value(
+                state
+                    .endpoint
+                    .transition(|s, _| s.reserve_acquisition(&parent, purpose))?,
+            )?;
+        }
         "post_exit_resolve" => {
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
             let watches = event["watches"]
@@ -153,6 +218,9 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                 )
             });
             entry.1["preflight"] = event["outcome"].clone();
+            if entry.1["original_preflight"].is_null() {
+                entry.1["original_preflight"] = event["outcome"].clone();
+            }
         }
         "no_attach" => {
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
@@ -216,6 +284,22 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
             helper
                 .call(json!({"kind":"retire_parent","parent":acquisition.parent}))
                 .await?;
+            let pending = state
+                .startups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .any(|item| item["acquisition"] == json!(acquisition));
+            if !pending
+                && state
+                    .endpoint
+                    .transition(|s, _| s.acquisition_lease(&acquisition))?
+                    .is_none()
+            {
+                state
+                    .endpoint
+                    .transition(|s, _| s.acquisition_absent(&acquisition))?;
+            }
         }
         "observe" | "launch" | "spawned" => {
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
@@ -282,6 +366,80 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
             let watch = event["watch"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("watch missing"))?;
+            anyhow::ensure!(
+                lease.client_id == acquisition.parent.client_id
+                    && event["owner"]["record_id"].as_str() == Some(lease.instance_id.as_str())
+                    && (lease.owner == OwnerKind::Gui) == (event["owner"]["backend"] == "gui"),
+                "acquired complete lease binding mismatch"
+            );
+            let registered = state
+                .endpoint
+                .transition(|s, _| s.acquisition_lease(&acquisition))?;
+            if registered.as_ref() == Some(&lease) {
+                let status = state
+                    .endpoint
+                    .transition(|s, _| s.status(&lease.client_id, &lease))?;
+                let retired = state
+                    .endpoint
+                    .transition(|s, _| s.resource_retirement(&lease))?;
+                if status.phase == SessionPhase::Released || retired.is_some() {
+                    let proof = state
+                        .owner_proofs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&lease.lease_id)
+                        .map(|(_, p)| p.clone());
+                    let binding = retired
+                        .clone()
+                        .or_else(|| proof.as_ref().map(|p| p["record"].clone()))
+                        .unwrap_or(Value::Null);
+                    anyhow::ensure!(
+                        binding["owner"] == event["owner"]
+                            && binding["watch"] == event["watch"]
+                            && binding["acquisition"] == event["acquisition"],
+                        "settled custody owner binding mismatch"
+                    );
+                    response["decision"] = json!(state
+                        .endpoint
+                        .transition(|s, _| s.custody_decision(&lease))?);
+                    response["settled"] = json!(!state
+                        .custody_resources
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains_key(&lease.lease_id));
+                    return Ok(response);
+                }
+            }
+            if registered.is_none() {
+                let cached = state
+                    .startup_proofs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(watch)
+                    .cloned();
+                if let Some(cached) = cached {
+                    anyhow::ensure!(
+                        cached["owner"] == event["owner"]
+                            && cached["acquisition"] == event["acquisition"]
+                            && cached["receipt"] == event["receipt"]
+                            && cached["target"] == event["target"]
+                            && cached["coord_key"] == event["coord_key"]
+                            && cached["proof"]["record"]["evidence_type"]
+                                == "public_owner_lifetime",
+                        "late acquired callback does not match the already consumed public proof"
+                    );
+                    response["decision"] = json!(state.endpoint.transition(
+                        |s, _| s.adopt_disposed_acquisition(&acquisition, lease.clone())
+                    )?);
+                    state
+                        .owner_proofs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(lease.lease_id.clone(), (lease, cached["proof"].clone()));
+                    response["settled"] = json!(true);
+                    return Ok(response);
+                }
+            }
             let status = helper.call(json!({"kind":"lookup", "watch":watch})).await?;
             anyhow::ensure!(
                 status["state_root"] == helper.state_root
@@ -302,6 +460,46 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                 event["owner"]["record_id"].as_str() == Some(lease.instance_id.as_str()),
                 "custody owner differs from lease"
             );
+            let reserved = state
+                .endpoint
+                .transition(|s, _| s.acquisition_lease(&acquisition))?;
+            anyhow::ensure!(
+                lease.client_id == acquisition.parent.client_id
+                    && reserved.as_ref().is_none_or(|old| old == &lease),
+                "acquisition reservation binding mismatch"
+            );
+            let cache_guard = {
+                use std::os::unix::fs::MetadataExt;
+                let root = if event["coord_key"]["kind"] == "generation" {
+                    let target = Path::new(
+                        event["target"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("target missing"))?,
+                    );
+                    let root = target
+                        .parent()
+                        .and_then(Path::parent)
+                        .and_then(Path::parent)
+                        .ok_or_else(|| anyhow::anyhow!("managed target root missing"))?;
+                    let metadata = std::fs::symlink_metadata(root)?;
+                    anyhow::ensure!(
+                        metadata.is_dir()
+                            && event["coord_key"]["root"]
+                                == json!([metadata.dev(), metadata.ino(), metadata.uid()]),
+                        "actual cache root identity mismatch"
+                    );
+                    root.to_path_buf()
+                } else {
+                    state.cache_root.clone()
+                };
+                Some(
+                    cache_lock::acquire(
+                        &root,
+                        &crate::preprocess::Preparation::new(Duration::from_secs(2)),
+                    )
+                    .await?,
+                )
+            };
             let mut verify = event.clone();
             verify["action"] = json!("verify_adopt");
             let verified = helper.journal(verify).await?;
@@ -335,6 +533,7 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                     bridge_proof_ack: false,
                     backup: None,
                     origin_binding: verified["origin_binding"].clone(),
+                    cache_guard: Arc::new(Mutex::new(cache_guard)),
                 };
                 if let Some(old) = resources.get(&lease.lease_id) {
                     anyhow::ensure!(
@@ -412,10 +611,17 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&lease.lease_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("cleanup custody missing"))?;
+                .cloned();
             anyhow::ensure!(
-                resource.acquisition == acquisition && resource.lease == lease,
+                resource
+                    .as_ref()
+                    .is_some_and(|r| r.acquisition == acquisition && r.lease == lease)
+                    || (resource.is_none()
+                        && state
+                            .endpoint
+                            .transition(|s, _| s.acquisition_lease(&acquisition))?
+                            .as_ref()
+                            == Some(&lease)),
                 "cleanup acquisition mismatch"
             );
             state.endpoint.transition(|s, _| {
@@ -481,10 +687,11 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
         }
         "root_retry" => {
             let parent: OpenIdentity = decode(event["parent"].clone())?;
+            let predecessor: AcquisitionId = decode(event["predecessor"].clone())?;
             response["acquisition"] = serde_json::to_value(
                 state
                     .endpoint
-                    .transition(|s, _| s.reserve_root_retry(&parent))?,
+                    .transition(|s, _| s.reserve_root_retry(&parent, &predecessor))?,
             )?;
         }
         "cleanup_status" => {
@@ -500,9 +707,9 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                     "cleanup status binding mismatch"
                 );
             } else {
-                let (acquired, _) = state
+                let acquired = state
                     .endpoint
-                    .transition(|s, _| s.open_progress(&lease.client_id, &acquisition.parent))?;
+                    .transition(|s, _| s.acquisition_lease(&acquisition))?;
                 anyhow::ensure!(
                     acquired.as_ref() == Some(&lease),
                     "settled cleanup parent mismatch"
@@ -511,10 +718,48 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
             let status = state
                 .endpoint
                 .transition(|s, _| s.status(&lease.client_id, &lease))?;
-            anyhow::ensure!(
-                status.phase == SessionPhase::Released,
-                "cleanup has not been confirmed by N1"
-            );
+            drop(resources);
+            let retired = state
+                .endpoint
+                .transition(|s, _| s.resource_retirement(&lease))?;
+            let public = state
+                .owner_proofs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&lease.lease_id)
+                .is_some_and(|(l, _)| *l == lease);
+            let facts = state
+                .release_facts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&lease.lease_id)
+                .filter(|(l, _)| *l == lease)
+                .map(|(_, facts)| facts.clone())
+                .unwrap_or(Value::Null);
+            let ack = facts["outcome"]["lease_released"] == true;
+            let terminal = status.control_delivery.as_ref().is_none_or(|d| {
+                matches!(
+                    d.state,
+                    DeliveryState::Confirmed | DeliveryState::NotSent | DeliveryState::Uncertain
+                )
+            });
+            let ready = retired.is_some()
+                || (status.phase == SessionPhase::Released
+                    && (event["owner_required"] == false || public)
+                    && terminal
+                    && (event["require_ack"] != true || ack));
+            response["ready"] = json!(ready);
+            response["parent_terminal"] = json!(state
+                .endpoint
+                .transition(|s, _| s.open_wait_ended(&acquisition.parent))?);
+            response["resource_retirement"] = json!(retired);
+            response["outcome"] = facts["outcome"].clone();
+            response["command_error"] = facts["command_error"].clone();
+            if ready {
+                state
+                    .endpoint
+                    .transition(|s, _| s.acquisition_settled(&acquisition, &lease))?;
+            }
         }
         _ => anyhow::bail!("unknown custody request"),
     }
@@ -555,6 +800,14 @@ pub(super) async fn detach_fact(event: &Value, state: &Arc<State>) -> anyhow::Re
         // N1 still validates that ACK's exact delivery; do not recreate a watch.
         return Ok(());
     };
+    if event["outcome"]["lease_released"] == true && event["outcome"]["ack_kind"] == "nonlast" {
+        // The parsed ACK is independent of subsequent local persistence I/O.
+        resource
+            .cache_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
     let ordinary = state
         .release_facts
         .lock()
@@ -669,6 +922,11 @@ async fn retire_resource(
     state
         .endpoint
         .transition(|s, _| s.retire_boot_resource(&resource.lease, evidence.clone()))?;
+    resource
+        .cache_guard
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     helper
         .call(json!({"kind":"resource_retired","watch":resource.watch,"evidence":evidence}))
         .await?;
@@ -970,6 +1228,11 @@ async fn observe_resource(
         state
             .endpoint
             .transition(|s, _| s.public_owner_lifetime(&resource.lease))?;
+        resource
+            .cache_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         state
             .custody_resources
             .lock()

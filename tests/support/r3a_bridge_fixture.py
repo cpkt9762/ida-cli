@@ -37,6 +37,16 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
     original_get = handler.do_GET
     original_post = handler.do_POST
     scenario = os.environ.get('R3A_SCENARIO', 'healthy')
+    if scenario == 'r9-restore-held':
+        boundary.release_owner()
+        boundary.path.with_suffix('.id0').write_bytes(bytes(18)+b'\x01B-tree v2original component')
+    r3b_failures = int(os.environ.get('R3B_R9_FAILURES', '0'))
+    if scenario == 'r9-gui':
+        boundary.release_owner()
+        boundary.registration = InstanceRegistration(REGISTRY_DIR,
+            InstanceIdentity(str(boundary.path),str(boundary.path),'gui',False),token=secrets.token_hex(24))
+        boundary.instance = boundary.registration.publish(boundary.server.server_port)
+        boundary.released = False
     attach_count = [0]
     r9 = scenario.startswith('r9-')
     if r9:
@@ -78,6 +88,11 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
         return original_get(request)
     first_preparation = [True]
     def post_input(request):
+        if (request.path == '/execute_python' and scenario == 'r9-restore-held'
+                and not (root/'recovered-product').exists()):
+            boundary.path.write_bytes(b'failed recovered packed')
+            boundary.path.with_suffix('.id0').write_bytes(bytes(18)+b'\x01B-tree v2failed component')
+            (root/'recovered-product').touch()
         if request.path == '/execute_python' and (root/'poison-root').exists():
             import ida_netnode
             ida_netnode.netnode.exist = staticmethod(lambda _:False)
@@ -107,7 +122,11 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
     handler.do_GET, handler.do_POST = get_input, post_input
     original_reply = handler.reply
     def analysis_response(request, payload, status=200):
-        if request.path == '/release_lease' and r9 and not (root/'r9-successor').exists():
+        failed_releases = sum(r['endpoint'] == '/release_lease' for r in boundary.requests)
+        if request.path == '/release_lease' and scenario == 'r9-gui':
+            payload['result']['shutdown_pending'] = False
+        if (request.path == '/release_lease' and r9 and scenario not in ('r9-gui', 'r9-restore-held')
+                and (not (root/'r9-successor').exists() or (r3b_failures and failed_releases <= r3b_failures))):
             boundary.release_owner()
             (root/'r9-public-exit').touch()
             if scenario == 'r9-proof-before-release':
@@ -118,10 +137,14 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
             for name in ('_ida_cli_save_guard_v1', '_ida_cli_release_protocol_v1'):
                 sys.modules.pop(name, None)
             install_ida_inputs(boundary.path)
-            boundary.registration = InstanceRegistration(REGISTRY_DIR,
-                InstanceIdentity(str(boundary.path), str(boundary.path), 'idalib', True), token=secrets.token_hex(24))
-            boundary.instance = boundary.registration.publish(boundary.server.server_port)
-            boundary.released = False
+            if not (r3b_failures == 3 and failed_releases == 3):
+                boundary.registration = InstanceRegistration(REGISTRY_DIR,
+                    InstanceIdentity(str(boundary.path), str(boundary.path), 'idalib', True), token=secrets.token_hex(24))
+                boundary.instance = boundary.registration.publish(boundary.server.server_port)
+                boundary.released = False
+                if failed_releases < r3b_failures:
+                    import ida_netnode
+                    ida_netnode.netnode.exist = staticmethod(lambda _:False)
             (root/'release-requested').unlink(missing_ok=True)
             (root/'r9-successor').touch()
         if request.path == '/wait_autoanalysis' and payload.get('ok') is True:
@@ -179,6 +202,36 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
     sys.argv = [str(installation / 'bootstrap.py'), 'bridge', *sys.argv[1:]]
     try:
         runtime = vars(runpy.run_path(sys.argv[0], run_name='verified_fixture')['load_entry']())
+        if scenario == 'r9-restore-held':
+            import open_recovery
+            from acquisition import Custodian
+            from r0_transport import barrier
+            original_transact = Custodian.transact
+            def restore_transactions(self, action, **fields):
+                try:
+                    result = original_transact(self, action, **fields)
+                except Exception as exc:
+                    result = {'error':str(exc)}
+                    raise
+                finally:
+                    with (root/'restore-transactions.jsonl').open('a') as log:
+                        log.write(json.dumps({'action':action,'result':result})+'\n')
+                return result
+            Custodian.transact = restore_transactions
+            original_advance = Custodian.advance_restore
+            def deferred_restore(self):
+                barrier(root, 'restore', seconds=8)
+                return original_advance(self)
+            Custodian.advance_restore = deferred_restore
+            original_snapshot = open_recovery.Snapshot.__init__
+            def snapshot_before_external_owner(self, *args, **kwargs):
+                original_snapshot(self, *args, **kwargs)
+                boundary.registration = InstanceRegistration(REGISTRY_DIR,
+                    InstanceIdentity(str(boundary.path),str(boundary.path),'idalib',True),token=secrets.token_hex(24))
+                boundary.instance = boundary.registration.publish(boundary.server.server_port)
+                boundary.released = False
+                (root/'snapshot-ready').write_text(str(self.path))
+            open_recovery.Snapshot.__init__ = snapshot_before_external_owner
         if scenario.startswith('post-exit-') or scenario == 'attach-eof':
             from acquisition import Custodian
             original_stage = Custodian.stage
@@ -274,7 +327,7 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
                     barrier(root, 'terminal', seconds=8)
                 return send_terminal(self, message)
             runtime['Channel'].send = terminal_barrier
-        if r9:
+        if r9 and scenario != 'r9-gui':
             from acquisition import Custodian
             original_receive = runtime['Bridge'].receive
             delayed = []
@@ -315,6 +368,20 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
                         (root/'r9-retirement.json').write_text(json.dumps({'current_ordinal':2, 'receipt':message['custody_retired']}))
                     assert self.bridge.custodians[self.lease['lease_id']] is self
             Custodian.obtained = obtained_input
+        if scenario == 'r9-expired-after-cleanup':
+            import acquisition as acquisition_module
+            from types import SimpleNamespace
+            actual_next = acquisition_module.Custodian.next_retry
+            def expired_next(self):
+                original = acquisition_module.time
+                (root/'r9-expiry.json').write_text(json.dumps({'original_deadline':self.deadline,
+                    'acquisition':self.acquisition,'cleanup_outcome':self.release_outcome}))
+                acquisition_module.time = SimpleNamespace(monotonic=lambda:self.deadline)
+                try:
+                    return actual_next(self)
+                finally:
+                    acquisition_module.time = original
+            acquisition_module.Custodian.next_retry = expired_next
         if scenario == 'proof-ack-barrier':
             original_receive = runtime['Bridge'].receive
             def proof_acknowledgement_input(self, channel, message):
