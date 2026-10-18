@@ -1323,3 +1323,48 @@ Exact-clock models cover healthy, expired entry, exact deadline and late ACK.
 Identical custody-retirement/public-proof ACKs coalesce only while queued/in flight, with
 tracking bounded by the output queue plus its current write. The original ACK
 still completes; duplicates cannot block the control reader's custody RPC reply.
+
+### N7a-R R3b K2 orchestration (implementation, awaiting independent review)
+
+The current adapter contract is wire2/schema1, release3/open2/custody3/helper2,
+SDK boundary2 and target_gate1. The fixed SDK modules and four patches are
+unchanged; partial installations and mismatched capability sets are rejected.
+`nexus_r3b` exercises actual N1, installed bridge/helper and the fixed SDK over
+controlled native IDA/HTTP inputs. `nexus_r3b_real` separately uses IDA9.5 and a
+private small database; artificial Root failures and OS inputs are not real IDA
+or host-reboot evidence.
+
+Each retained parent reserves physical capacity before acquiring a final,
+verification, root-retry or cleanup-only auxiliary handle. Ordinals never repeat,
+the parent has at most two simultaneous physical slots, and every slot consumes
+the original tenant limit. Verification does not publish the parent's final
+lease. Root attempts share one original deadline and a three-attempt limit;
+SDK internal and post-exit resolver allowances remain separate parent budgets.
+Same-boot retry requires its own detach ACK, exact public owner proof and stopped
+operations. Qualified U6 retires only old resources and preserves their history.
+
+`acquired_ack_loss_then_public_proof` covers both lost custody ACK and public
+proof before the first acquired callback, without new LeaseKeys or unauthorized
+RPCs. Verification cancellation ends the caller's wait before owner exit while
+keeping its copy. `cancelled_root_retry_restores` retains the existing Snapshot
+and independent root SH/target references after the caller ends, then performs
+accepted rollback through the existing fair cleanup pool. Failed file writes
+remain blocked with the original scene, without replaying v1 rollback. Full
+crash-atomic staging/transfer/maintenance remains R4.
+
+`disconnected_primary_and_auxiliary` checks independent mixed outcomes, sibling
+membership changes, explicit retry of NotSent auxiliary cleanup after the primary
+ends, actual SDK/server/Python/N1 sets and operation-ID mapping, and no replay of
+unknown detach. Owner-local slice handles use adapter custody when its lifetime
+endpoint is live; a truly absent endpoint leaves the owner-local handle as C1
+third-party responsibility. Public proof never replaces the original close or
+save command error. Verification payload deletion additionally requires current
+occupancy and file-identity checks; stable coordination/proof files remain.
+
+Run each integration target in a fresh private HOME/state/tmp/IPC and case root,
+recording before/after uptime. Use `timeout 120s cargo test --locked --features
+nexus-test-support --test nexus_r3b -- --test-threads=1`; allow 180s for the private
+real-IDA target and cold build, with the reason stated before execution. Preserve
+all nonzero/forced/124 runs. The external R3b report indexes frozen inputs,
+commands, exits, hashes, identity gaps and the final resource audit. R3b acceptance
+belongs to the independent reviewer and orchestrator.

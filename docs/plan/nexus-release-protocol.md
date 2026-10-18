@@ -1128,3 +1128,22 @@ fix2在最后attach_attempt helper签收/记账后重核原deadline，SDK真实N
 R2验收范围是普通lease两阶段释放、owner保留、立即重开及既定scope资源投影，作为R3b输入。
 sameboot仍Unsupported，U6仅OS输入注入；完整r9/verification/auxiliary编排、crash文件事务、
 维护、大库/真实跨boot和后续唯一后端收敛不由本次验收替代。
+
+### 12.6 R3b实现边界（待独立复验与评审）
+
+K2接线使用既有父opening/Preparing/custody和逐lease释放权威；purpose/ordinal在
+副作用前预留同tenant物理容量，每parent最多两槽，不预留七槽。verification独立
+custody且不发布父最终lease；auxiliary创建即cleanup-only，父终态后仍可定位并推进
+确切NotSent项，Unknown不重放。实际SDK operation_id用于关联两侧成员，不使用私有计数。
+同boot r9沿同一原deadline至多三次，先各自detach/公共owner证明、停止及文件gate；
+U6仅结旧boot资源前提，原Unknown/ACK/历史stop不改。GUI不重开共享owner。
+
+父取消/到期结束业务等待，不撤已受理释放/恢复。已有Snapshot保留在原custodian，
+独立root SH/target引用保护后续文件步骤，既有公平preflight池逐次观察后续跑；
+写失败保现场并blocked，不将v1回滚当幂等事务重放。verification副本只在精确证明、
+当前占用和文件核验后删自有payload，稳定锁与proof保留。R4仍负责完整durable文件
+事务、跨进程移交和维护，不由本轮正常回滚证据替代。协议为release3/open2/custody3/
+helper2/target_gate1，SDK字节及sameboot Unsupported不变。
+
+可执行入口与证据分类见docs/TESTING.md的R3b节及外部n7a-refactor/r3b/报告。
+本记录仅描述实现边界，不自行验收R3b、不启动R4或宣称N7a/唯一后端迁移完成。

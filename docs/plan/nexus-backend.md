@@ -981,3 +981,11 @@ R3a两组128轮、五startup及必要静态/旧回归；不把执行记录和重
 本次仅验收R2普通lease两阶段、owner保留、立即重开和既定资源投影，作为R3b输入。
 sameboot仍Unsupported，U6注入不等于真实重启；R3b完整r9/verification/auxiliary编排、
 R4事务/维护、R7大库/跨boot及N7b/N7c/N8/N9继续按序，不声称N7a或唯一后端迁移已完成。
+
+R3b实现边界（待独立复验/评审）：r9、verification、adapter可托管auxiliary和父业务
+终态后cleanup接入既有N1 Preparing/custody、精确operation与helper/target gate；按需
+两槽共用tenant容量，逐成员混合NotSent/Unknown独立推进，公共proof不抹掉原caller
+错误。父deadline约束新获取，已受理Snapshot恢复保root SH/target引用并在公平池
+续跑；写失败保现场，不重放v1文件步骤。当前严格协议release3/open2/custody3/helper2，
+SDK四patch/三模块与sameboot Unsupported不改。详细边界见保护释放协议§12.6及
+TESTING的R3b入口；R4完整durable事务/移交/维护继续后续，不由本记录验收或启动。
