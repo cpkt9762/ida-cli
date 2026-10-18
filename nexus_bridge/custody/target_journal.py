@@ -83,11 +83,8 @@ class Journal:
         maximum = (1 << 64)-1
         if not (0 <= v['revision'] <= maximum and 0 <= v['closed_through'] < v['next_epoch'] <= maximum):
             raise RuntimeError('CoordinationBlocked: invalid epoch/revision range')
-        scope = v.get('verification_scope')
-        if scope is not None and (not isinstance(scope, dict) or set(scope) != {'schema','parent','directory'}
-                or scope.get('schema') != 1 or scope.get('directory') != self.target.key.get('parent')
-                or (scope.get('parent') is not None and not isinstance(scope['parent'],dict))):
-            raise RuntimeError('VerificationCleanupBlocked: invalid copy scope')
+        if 'verification_scope' in v:
+            validate_verification_scope(v['verification_scope'],self.target)
         if type(v.get('verification_cleanup_conflict',False)) is not bool:
             raise RuntimeError('VerificationCleanupBlocked: invalid copy conflict')
         ranges = v['closed_after_holes']
@@ -828,20 +825,56 @@ def verification_file(path):
             'size':before.st_size,'sha256':digest.hexdigest()}
 
 
-def verification_scope(target, parent):
-    """One permanent copy owner; a later journal actor revokes old cleanup."""
-    if not isinstance(parent,dict):
-        raise RuntimeError('VerificationCleanupBlocked: exact parent missing')
-    journal = Journal(target)
-    scope = journal.value.get('verification_scope')
-    expected = {'schema':1,'parent':parent,'directory':list(target.key['parent'])}
-    if scope is not None and scope != expected:
+def verification_parent(parent):
+    def identifier(value):
+        return (type(value) is str and 1 <= len(value) <= 128
+                and all(c.isascii() and (c.isalnum() or c in '-_.:') for c in value))
+    if (type(parent) is not dict or set(parent) != {'client_id','request_id','operation_id','task_id'}
+            or any(not identifier(parent[key]) for key in ('client_id','request_id','operation_id'))
+            or (parent['task_id'] is not None and not identifier(parent['task_id']))):
+        raise RuntimeError('VerificationCleanupBlocked: invalid exact parent identity')
+    return parent
+
+
+def validate_verification_scope(scope,target):
+    if (type(scope) is not dict or set(scope) != {'schema','parent','directory'}
+            or type(scope.get('schema')) is not int or scope['schema'] != 1
+            or type(scope.get('directory')) is not list or len(scope['directory']) != 3
+            or any(type(n) is not int or n < 0 for n in scope['directory'])
+            or scope['directory'] != target.key.get('parent')):
+        raise RuntimeError('VerificationCleanupBlocked: invalid copy scope')
+    verification_parent(scope['parent'])
+    return scope
+
+
+def require_verification_scope(target,parent):
+    """Cleanup consumes existing authority; it never initializes or repairs it."""
+    verification_parent(parent)
+    journal=Journal(target)
+    if 'verification_scope' not in journal.value:
+        raise RuntimeError('VerificationCleanupBlocked: existing copy authority missing')
+    scope=validate_verification_scope(journal.value['verification_scope'],target)
+    if scope['parent'] != parent:
         raise RuntimeError('VerificationCleanupBlocked: copy ownership changed')
-    if scope is None:
-        if any(i['acquisition']['parent'] != parent for i in journal.value['entries'].values()):
-            raise RuntimeError('VerificationCleanupBlocked: foreign acquisition already owns copy')
-        journal.value['verification_scope'] = expected
-        journal.save()
+    if journal.value.get('verification_cleanup_conflict'):
+        raise RuntimeError('VerificationCleanupBlocked: newer journal responsibility retained')
+    return journal
+
+
+def verification_scope(target,parent):
+    """Initialize once, before any persisted journal or acquisition history."""
+    verification_parent(parent)
+    journal=Journal(target)
+    if 'verification_scope' in journal.value:
+        return require_verification_scope(target,parent)
+    if (journal.info is not None or journal.value['next_epoch'] != 1
+            or journal.value['closed_through'] != 0 or journal.value['entries']
+            or journal.value['summary'] or journal.value['closed_after_holes']
+            or journal.value.get('compaction') or journal.value.get('file_intents')
+            or journal.value.get('verification_cleanup_conflict')):
+        raise RuntimeError('VerificationCleanupBlocked: late initialization cannot replace authorization history')
+    journal.value['verification_scope']={'schema':1,'parent':parent,'directory':list(target.key['parent'])}
+    journal.save()
     return journal
 
 
@@ -853,7 +886,7 @@ def verification_probe_cleanup(target, state_root, parent):
     """
     from cache_store import public_owner_probe, sync_directory
     from ida_nexus import probe_database_state
-    journal = verification_scope(target, parent)
+    journal = require_verification_scope(target,parent)
     journal.gate(state_root)
     if journal.value.get('verification_cleanup_conflict'):
         raise RuntimeError('VerificationCleanupBlocked: newer journal responsibility retained')
