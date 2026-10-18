@@ -953,3 +953,11 @@ Rust库565项（2既有ignored）、Python155项/102子测试、SDK12、readines
 3个故障socket路径无holder并保留。验收时当前源码、36条日志、27项证据及6个二进制hash均重新核对一致，未重复计算历史运行。
 本次验收只覆盖R3a基础及返修，未验收整个N7a、R2/R3b/R4或GUI/Linux/大库/跨boot。
 后续委托R2普通lease两阶段释放、owner保留表、立即重开及相应证据scope投影；保持既定保护、不重放与文件门禁。
+
+
+R2实现接续（待编排者独立复验与审查）：普通lease ACK与owner保存/退出独立，last/unknown保精确owner保护，
+nonlast撤本lease SH；有界公平preflight/detach/stop、durable保存错误、同跨router原预算立即重开已接通。
+单次post-exit公开resolve保持总最多三次/未知不重放；U6独立资源退休保原Unknown/ACK/stop及完整诊断，
+sameboot资格仍Unsupported，真实跨boot/大库未由注入模型验收。协议/29成员闭包与当前SDK contract严格匹配。
+当前证据、失败保留和资源审计交付在`n7a-refactor/r2-handoff/`，测试入口见TESTING的R2小节。
+R3a七项返修保持；完整R3b辅助编排、R4事务/维护、R7及后续N7b/N7c/N8/N9仍按原顺序推进。

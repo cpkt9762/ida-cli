@@ -1224,3 +1224,56 @@ installation manifests, final-byte runs and failures are recorded separately in
 `/tmp/ida-nexus-run-20261015.98rmfb/n7a-refactor/r3a-fix1/`. Original review/root
 evidence remains read-only. Fix1 awaits independent review; it does not accept
 R3a or start R2. SDK hashes/patches and Unsupported same-boot status are unchanged.
+
+
+### N7a-R R2 ordinary release and owner resources
+
+R2 uses wire2/schema1, release2/custody2/helper2, SDK boundary2 and a closed
+installation of 28 source members plus its manifest. Current SDK module hashes
+are authoritative in `scripts/nexus/client-sdk-contract.json`; the R1 hashes
+and protocol paragraphs above describe their historical stage. Boot retirement1
+names the consumer protocol, while each creation/consumption still needs a
+qualified native physical-host/local-volume scope. Same-boot OS exit remains
+Unsupported/false. OS-source injection is not a real reboot test.
+
+`tests/nexus_r2.rs` exercises ordinary last/nonlast ACKs, lost ACK, guard refusal,
+three fair bounded lanes, caller drop, queue saturation, guard timeout before
+actual stop, same/cross-router immediate reopen, post-exit resolve counts and U6
+retirement with original outcome/preflight/error/ACK/stop preserved. Run each
+case in a fresh `R3A_CASE_ROOT`, HOME/state/tmp/IPC; do not run the entire target
+against a single shared case directory. Set `R2_REAL_INPUT` only to a disposable
+prepared fixture for the real IDA9.5 save/shared-lease/immediate-reopen case.
+R2's implementation evidence and all failures are indexed in the external
+`n7a-refactor/r2-handoff/` report directory; independent acceptance remains pending.
+
+Ordinary valid ACK invalidates the lease token immediately; last/unknown retains
+owner protection. Close does not wait for saving or guarantee that it succeeded.
+Use `owner_observation_ref` with `wait_owner_exit` and an independent caller budget
+before copying a database. The local socket RPC `wait_owner_exit` takes
+`owner_observation_ref` and optional `timeout_secs` (default120, capped600), with
+no path or lease acquisition. The CLI's existing `raw` command sends this RPC.
+Public proof does not replace original caller errors;
+verified boot retirement only settles current old-boot resources. Unknown attach,
+detach and business effects never replay, and the original open budget never resets.
+
+Keep `IDA_CLI_NEXUS_DEV` unset for the general library suite. The actual MCP R2
+fixture selects Nexus in its own child process, avoiding process-global selector
+contamination. Create the private `R5_ROOT` before receiver evidence output.
+`F1_PYTHON`, `R3A_PYTHON`, `IDA_NEXUS_PYTHON` name the new formal SDK interpreter;
+bootstrap tests also require `R3A_INSTALLATION` from the current Rust-produced
+installation. The existing test-support process ledger records pre-spawn intent
+and native birth when `R2_LEDGER` names a private append-only evidence file.
+
+```sh
+timeout 120s cargo test --locked --features nexus-test-support --lib -- --test-threads=1
+timeout 30s cargo test --locked --features nexus-test-support --test nexus_r2 last_ack_finishes_lease_before_owner_exit -- --exact
+timeout 30s cargo test --locked --features nexus-test-support --test nexus_r2 boot_source_injection_retires_only_current_resources_and_preserves_unknown_history -- --exact
+timeout 30s "$R3A_PYTHON" -B tests/support/r2_sdk.py
+```
+
+The 120-second library allowance covers real pipe/process fault teardown; each
+ordinary R2 case retains 30 seconds. Multiple-process R3a matrices/128 rounds use
+120 seconds and fresh prepare/cold build/real tiny IDA use 180 seconds, with the
+reason stated before running. These shell limits do not change product budgets.
+Full auxiliary/r9/verification orchestration remains R3b, file transactions and
+maintenance remain R4, and large databases/real cross-boot/platform E2E remain R7.

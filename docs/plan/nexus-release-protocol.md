@@ -1089,3 +1089,19 @@ R2完整两阶段、R3b/R4和跨boot仍按原顺序另行委托；R3a验收依�
 原自动复审两次被平台拒绝的历史保留，不记为自动复审通过；本次审查来源为用户人工确认。
 R3a基础托管/helper/gate/routine及返修验收为R2输入；同boot OS资格仍Unsupported，
 R2完整释放/立即重开、R3b完整编排、R4事务/维护和跨boot产品实证仍由后续阶段完成。
+
+
+### 12.4 R2实现记录（待编排者独立复验与审查）
+
+普通lease由fresh保护/精确N1停止门禁后一次公开detach，有效last/nonlast ACK结本lease；
+Tools按物理OwnerKey保owner/rootSH，nonlast只撤本lease保护，公共proof独立结owner。
+preflight/detach/stop各两槽且按owner公平，有界准入及原deadline/HTTP余量不变。
+保存错误先经target durable接管/签收，caller/status保原cause、preflight及structured outcome；
+每attempt一个命令终态，迟到重复不覆盖历史，公共proof先于原ACK的既有R3a规则保留。
+同/跨router立即重开沿原预算等draining；helper先签收，释放EX等待IPC后重取并重核完整gate。
+初段最多两次resolve，精确durable公共退出proof后仅一次公开resolve_outcome+attach_outcome，未知attach不重放。
+U6通过已绑定宿主/本地卷/boot的生产消费者仅退休旧资源和当前执行存活，不伪Released/ACK/停止成功；
+原Unknown/preflight/outcome/command_error保留，退休后拒旧boot迟到消息，新owner独立受保护。
+当前sameboot资格继续Unsupported；注入OS来源不作为真实重启，R3b/R4/R7边界不变。
+协议release/custody/helper=2、sdk_boundary=2、boot_retirement消费者=1，严格闭包为28源码+manifest。
+实现/所有失败/当前字节验证及资源审计见外部`n7a-refactor/r2-handoff/`；本节不自行验收R2或启动R3b。
