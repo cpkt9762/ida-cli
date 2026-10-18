@@ -511,7 +511,7 @@ async fn dispatch_cli_request(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "nexus-test-support"))]
 pub(crate) async fn test_owner_wait_rpc(
     router: RouterState,
     reference: &str,

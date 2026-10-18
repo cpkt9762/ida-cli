@@ -7,8 +7,9 @@ import socket
 import subprocess
 import sys
 
-from r2_process_ledger import install
-install()
+if os.environ.get('R2_LEDGER'):
+    import runpy
+    runpy.run_path(os.environ['R2_TELEMETRY_SOURCE'])['install']()
 
 mode, socket_path, marker = sys.argv[1:4]
 if mode == 'escaped_pipe':

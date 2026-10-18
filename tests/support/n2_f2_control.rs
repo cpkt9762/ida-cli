@@ -5,11 +5,11 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::AsyncWrite;
 
 fn caps() -> NexusCapabilities {
@@ -71,6 +71,7 @@ struct ReadyWriter {
     bytes: Arc<Mutex<Vec<u8>>>,
     prefix: usize,
     entered: Option<Arc<AtomicBool>>,
+    expiry: Option<Arc<AtomicU64>>,
 }
 impl AsyncWrite for ReadyWriter {
     fn poll_write(
@@ -78,6 +79,18 @@ impl AsyncWrite for ReadyWriter {
         _: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        if let Some(expiry) = &self.expiry {
+            if expiry.load(Ordering::SeqCst) == 0 {
+                let frame: serde_json::Value =
+                    serde_json::from_slice(bytes).expect("first full control frame");
+                expiry.store(
+                    frame["expires_monotonic_ns"]
+                        .as_u64()
+                        .expect("signed wire expiry"),
+                    Ordering::SeqCst,
+                );
+            }
+        }
         if let Some(entered) = &self.entered {
             entered.store(true, Ordering::SeqCst);
         }
@@ -107,7 +120,6 @@ async fn expired_control(kind: &str, prefix: usize) {
     let endpoint = NexusEndpoint::with_capabilities(8, Ok(caps()));
     let mut lanes = endpoint.take_lanes().unwrap();
     let lease = open(&endpoint, &mut lanes).await;
-    let accepted_at = Instant::now();
     match kind {
         "cancel" => {
             let request = AcceptedRequest::new(
@@ -171,18 +183,37 @@ async fn expired_control(kind: &str, prefix: usize) {
     let attempt = delivery.attempt.clone();
     let ready = Arc::new(AtomicBool::new(false));
     let bytes = Arc::new(Mutex::new(Vec::new()));
+    let expiry = Arc::new(AtomicU64::new(0));
     let mut writer = ReadyWriter {
         ready: ready.clone(),
         bytes: bytes.clone(),
         prefix,
         entered: None,
+        expiry: Some(expiry.clone()),
     };
     let mut writing = Box::pin(delivery.write(&mut writer));
     let pending =
         std::future::poll_fn(|cx| Poll::Ready(matches!(writing.as_mut().poll(cx), Poll::Pending)))
             .await;
-    // Deliberately cross the control frame's 2s deadline; not a guessed start barrier.
-    tokio::time::sleep_until((accepted_at + Duration::from_millis(2100)).into()).await;
+    // Cross the actual signed frame deadline. R2's release frame includes
+    // preflight, so it no longer has cancel's fixed two-second budget.
+    let mut native = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes only the initialized timespec passed here.
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut native) },
+        0
+    );
+    let now = u64::try_from(native.tv_sec).expect("nonnegative clock seconds") * 1_000_000_000
+        + u64::try_from(native.tv_nsec).expect("nonnegative clock nanos");
+    let deadline = expiry.load(Ordering::SeqCst);
+    assert!(deadline > 0, "writer never received the real control frame");
+    tokio::time::sleep(
+        Duration::from_nanos(deadline.saturating_sub(now)) + Duration::from_millis(10),
+    )
+    .await;
     ready.store(true, Ordering::SeqCst);
     let result = writing.await;
     let length = bytes.lock().unwrap().len();
@@ -290,6 +321,7 @@ async fn lifecycle_rejection_after_pending_write_keeps_cancelled_code_and_no_byt
         bytes: bytes.clone(),
         prefix: 0,
         entered: Some(entered.clone()),
+        expiry: None,
     };
     let mut writing = Box::pin(delivery.write(&mut writer));
     std::future::poll_fn(|cx| match writing.as_mut().poll(cx) {
