@@ -1,3 +1,4 @@
+use crate::preprocess::OutputRecorded as _;
 use crate::preprocess::SpawnRecorded as _;
 pub(crate) async fn isolated(name: &str) -> bool {
     if std::env::var("IDA_N4_FIX_CASE").as_deref() == Ok(name) {
@@ -24,7 +25,7 @@ pub(crate) async fn isolated(name: &str) -> bool {
         .spawn_recorded()
         .unwrap();
     crate::preprocess::record_owned_fixture(child.id().unwrap(), false, "n4-isolated-libtest");
-    let result = child.wait_with_output().await.unwrap();
+    let result = child.output_recorded().await.unwrap();
     std::fs::remove_dir_all(home).unwrap();
     assert!(
         result.status.success(),

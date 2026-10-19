@@ -1,5 +1,13 @@
 # Testing
 
+R4-fix4 定向回归增加 `tests/nexus_bridge/test_legacy_scan_isolation.py` 与
+`test_unpublished_creation.py`：前者实跑 OpenGate/Custodian.gate，坏的 home 盘点项
+只作诊断，匹配目标的未结义务仍拒绝；后者以真实子进程退出覆盖四种记录的三个新增内部
+创建/绑定边界及副本创建/写入/fsync/checkpoint，负例精确核 inode、字节、权限及外来工作槽。
+Rust `concurrent_spawn_cannot_inherit_received_target_ofd` 在 recvmsg 返回后暂停，
+并发启动真实子进程核对其文件描述符及独立 OFD fence；原 close-only 断言保留。
+以上不是平台重启或最终验收结论，运行证据在外部 `n7a-refactor/r4-fix4/`。
+
 N6 的完整工具与能力覆盖见 [能力对照表](plan/nexus-n6-capabilities.md) 和计划 N6 小节。
 真实验证为四个独立套件：lifecycle 9、contract 4、concurrency 14、n6 4；历史结果
 不能代替改动后的验证。正式结果、每条命令的 exit/uptime、失败历史与审计保存在外部

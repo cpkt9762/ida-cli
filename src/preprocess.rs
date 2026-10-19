@@ -592,6 +592,27 @@ pub(crate) trait SpawnRecorded {
     type Child;
     fn spawn_recorded(&mut self) -> std::io::Result<Self::Child>;
 }
+
+#[cfg(test)]
+pub(crate) trait OutputRecorded {
+    fn output_recorded(
+        self,
+    ) -> impl std::future::Future<Output = std::io::Result<std::process::Output>>;
+}
+
+#[cfg(test)]
+impl OutputRecorded for tokio::process::Child {
+    async fn output_recorded(self) -> std::io::Result<std::process::Output> {
+        #[cfg(feature = "nexus-test-support")]
+        {
+            crate::router::nexus_bridge::test_output_child(self).await
+        }
+        #[cfg(not(feature = "nexus-test-support"))]
+        {
+            self.wait_with_output().await
+        }
+    }
+}
 #[cfg(any(test, feature = "nexus-test-support"))]
 impl SpawnRecorded for tokio::process::Command {
     type Child = tokio::process::Child;

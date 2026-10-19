@@ -1,5 +1,6 @@
 //! Exercise the actual MCP close wrapper over production custody and SDK.
 use super::*;
+use crate::preprocess::OutputRecorded as _;
 use crate::{preprocess::Preparation, router::nexus_bridge::BridgeConfig};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
@@ -32,7 +33,7 @@ async fn close_preserves_text_error_and_lifecycle() {
                 .kill_on_drop(true)
                 .spawn_recorded()
                 .expect("isolated Nexus MCP child");
-        let output = child.wait_with_output().await.expect("MCP child reaped");
+        let output = child.output_recorded().await.expect("MCP child reaped");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success() && stdout.contains("1 passed"),
@@ -271,7 +272,7 @@ async fn public_proof_before_terminal_keeps_actual_mcp_and_cli_error_responsibil
             .env("R2_MCP_CHILD","1").env("IDA_CLI_NEXUS_DEV","1")
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
             .kill_on_drop(true).spawn_recorded().expect("isolated MCP child")
-            .wait_with_output().await.expect("reaped child");
+            .output_recorded().await.expect("reaped child");
         assert!(
             output.status.success(),
             "{}\n{}",
@@ -437,7 +438,7 @@ async fn eight_owner_waits_share_real_listener_without_starving_status_or_cancel
             .env("IDA_NEXUS_IPC_ROOT", private.join("ipc"))
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
             .kill_on_drop(true).spawn_recorded().expect("isolated observer child")
-            .wait_with_output().await.expect("child reaped");
+            .output_recorded().await.expect("child reaped");
         assert!(
             output.status.success(),
             "{}\n{}",

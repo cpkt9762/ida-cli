@@ -1,3 +1,4 @@
+use ida_mcp::process_spawn::SpawnFenced;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
@@ -72,7 +73,7 @@ async fn spawn_worker() -> WorkerClient {
 
     let mut std_cmd = cmd.into_std();
     let mut child = std_cmd
-        .spawn()
+        .spawn_fenced()
         .expect("failed to spawn ida-cli serve-worker");
     let stdin = child.stdin.take().expect("failed to capture child stdin");
     let stdout = child.stdout.take().expect("failed to capture child stdout");

@@ -17,6 +17,7 @@
 //! example the release binary); `DECOMPILE_LINES_E2E_OUT` writes the answers
 //! to that file.
 
+use ida_mcp::process_spawn::SpawnFenced;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -104,7 +105,7 @@ impl Daemon {
             .stdin(Stdio::null())
             .stdout(log.try_clone().expect("clone daemon log"))
             .stderr(log)
-            .spawn()
+            .spawn_fenced()
             .unwrap_or_else(|e| panic!("cannot start {}: {e}", bin.display()));
         let mut daemon = Self { child, home, bin };
         daemon.wait_until_ready();

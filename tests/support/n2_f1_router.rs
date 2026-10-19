@@ -1,4 +1,5 @@
 use super::*;
+use crate::preprocess::OutputRecorded as _;
 use crate::preprocess::SpawnRecorded as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -630,7 +631,7 @@ async fn isolated_f3_case(name: &str, work: impl std::future::Future<Output = ()
             .spawn_recorded()
             .unwrap();
         crate::preprocess::record_owned_fixture(child.id().unwrap(), false, "f3-isolated-libtest");
-        let output = child.wait_with_output().await.unwrap();
+        let output = child.output_recorded().await.unwrap();
         std::fs::remove_dir_all(directory).unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(

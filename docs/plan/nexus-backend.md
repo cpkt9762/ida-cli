@@ -161,6 +161,11 @@ notifyOnFinish=true；同仓库workspaceId默认省略，真实工作目录写�
 
 R4 原定的真实整机重启/重新挂载产品验证移入 R7；原生证据缺口在 R4-fix4 内补齐或如实列为未验证。
 
+R4-fix4 候选实现已接进程级 descriptor/spawn 栅栏、逐条 legacy 盘点诊断及
+unpublished→精确持久绑定→工作槽发布；中断 scratch 保留且计费，不作为恢复权威。
+测试采集增加实际 waitid(WNOWAIT) 与 Popen.wait，分别保留公共 lifetime 和进程终态
+证据层级；最终矩阵与未匹配项以 `n7a-refactor/r4-fix4/report.md` 为准，交编排者审查验收。
+
 ## 4. Git worktree 与分支强制要求
 
 本计划文档可先写在当前工作区。任何实现代码、依赖修改或新的测试 harness，必须在新 worktree 开始。

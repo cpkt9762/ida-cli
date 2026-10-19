@@ -1,4 +1,5 @@
 use super::*;
+use crate::preprocess::OutputRecorded as _;
 use crate::preprocess::SpawnRecorded as _;
 static FIXTURE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 async fn run_case(fault: &str) {
@@ -38,7 +39,7 @@ async fn run_case(fault: &str) {
             false,
             "n4-f2-isolated-libtest",
         );
-        let output = child.wait_with_output().await.unwrap();
+        let output = child.output_recorded().await.unwrap();
         // fixture child is also reaped by production bridge.shutdown below.
         let process_file = root.join("bridge-process.json");
         if process_file.exists() {

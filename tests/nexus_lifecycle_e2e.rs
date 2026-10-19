@@ -3,6 +3,7 @@
 mod env;
 use env::*;
 use ida_mcp::nexus::*;
+use ida_mcp::process_spawn::SpawnFenced;
 use serde_json::{json, Value};
 use std::process::Stdio;
 use std::time::Duration;
@@ -180,7 +181,7 @@ impl External {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
-            .spawn()
+            .spawn_fenced()
             .unwrap();
         let input = child.stdin.take().unwrap();
         let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
