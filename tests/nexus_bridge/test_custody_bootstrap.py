@@ -74,6 +74,32 @@ class VerifiedCustodyInstallation(unittest.TestCase):
                              expected['sha256'])
         self.assertEqual(self.run_entry().returncode, 0)
 
+    def test_short_entry_compiles_only_imported_fd_verified_members(self):
+        code = '''
+import builtins, json, os, runpy, sys
+bootstrap = sys.argv[1]
+runtime = runpy.run_path(bootstrap, run_name='verified_test')
+compiled = []
+original = builtins.compile
+def tracked(source, filename, *args, **kwargs):
+    compiled.append(os.path.basename(filename))
+    return original(source, filename, *args, **kwargs)
+builtins.compile = tracked
+sys.argv = [bootstrap, 'cache_store', '--help']
+entry = runtime['load_entry']()
+assert 'cache_store.py' in compiled, compiled
+assert 'bridge.py' not in compiled and 'tools.py' not in compiled, compiled
+manifest = json.load(open(os.path.join(os.path.dirname(bootstrap), 'manifest.json')))
+expected = {name for name in manifest['files'] if name.endswith('.py') and name != 'bootstrap.py'}
+assert set(sys._ida_cli_verified_sources) == expected
+assert entry.__verified_source__ == sys._ida_cli_verified_sources['cache_store.py']
+print('complete closure verified; only imported original bytes compiled')
+'''
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', code,
+                                 str(self.installation/'bootstrap.py')], cwd=self.cwd,
+                                env=self.environment, capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

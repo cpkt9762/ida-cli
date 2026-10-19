@@ -99,7 +99,7 @@ def load_entry():
         if hashlib.sha256(data).hexdigest() != expected['sha256']:
             raise RuntimeError('manifest mismatch')
         if name != 'bootstrap.py' and name.endswith('.py'):
-            verified[name[:-3]] = (os.path.join(root, name), compile(data, os.path.join(root, name), 'exec'), data.decode('utf-8'))
+            verified[name[:-3]] = (os.path.join(root, name), data, data.decode('utf-8'))
 
     class VerifiedSource(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         def find_spec(self, fullname, path=None, target=None):
@@ -111,10 +111,15 @@ def load_entry():
             return None
 
         def exec_module(self, module):
-            path, code, source = verified[module.__name__]
+            path, data, source = verified[module.__name__]
             module.__verified_source__ = source
             module.__file__ = path
-            exec(code, vars(module))
+            # Verify the entire closure above before importing any member, but
+            # compile only a member that is actually loaded. Short-lived target
+            # writers must not compile the unrelated IDA tool implementation on
+            # every proof/settlement. Execute the same FD-verified bytes; never
+            # reopen a source path or use a bytecode cache.
+            exec(compile(data, path, 'exec'), vars(module))
 
     if set(verified) & set(sys.modules):
         raise RuntimeError('installation module was already imported before verification')
