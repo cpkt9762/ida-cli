@@ -37,7 +37,7 @@ class TargetCustody(unittest.TestCase):
         import recovery_files
         original_link=os.link
         for fault in ('rename','hardlink','write'):
-            with self.subTest(fault=fault):
+            with self.subTest(fault=fault), patch.dict('target_coordination._capabilities',{},clear=True):
                 code=errno.ENOTSUP if fault!='write' else errno.ENOSPC
                 def refuse(*_args,**_kwargs):
                     raise OSError(code,'actual filesystem exception injection')
@@ -76,6 +76,10 @@ class TargetCustody(unittest.TestCase):
             self.assertEqual(target.target.name,'Foo.i64')
 
     def setUp(self):
+        from target_coordination import _capabilities
+        isolated=patch.dict(_capabilities,{},clear=True)
+        isolated.start()
+        self.addCleanup(isolated.stop)
         base = Path(os.environ['R3A_CASE_ROOT'])
         base.mkdir(parents=True, exist_ok=True)
         self.root = Path(tempfile.mkdtemp(prefix='t-', dir=base))

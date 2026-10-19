@@ -152,7 +152,7 @@ def ensure_binding(target):
         if target.directory.native_identity[0]!=target.directory.canonical_device:
             raise RuntimeError('UnsupportedBootScope: missing original volume binding; no device remapping')
         value={'schema':1,'device':target.directory.native_identity[0],
-            'scope':creation_scope(target.directory.path,'target-volume',refresh=True),
+            'scope':creation_scope(target.directory.path,'target-volume'),
             'coordination':target.directory.identity,'root_binding':target.recovery_root_binding(),
             'coord_key':target.key,'generation':target.binding,'target':target.original,
             'lock_identity':identity(os.fstat(target.target_fd))}

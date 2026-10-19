@@ -84,10 +84,15 @@ def creation_scope(path, incarnation, *, refresh=False):
             'same_boot_eligibility':False,
             'boot_retirement_capability':'UnsupportedBootScope',
             'unsupported_reason':'creation binding platform not validated'}
-    with _lock:
-        if refresh or device not in _scopes:
-            _scopes[device] = native_scope(directory, device)
-        scope = dict(_scopes[device])
+    from target_coordination import capability_key,native_mount
+    descriptor=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:
+        key=capability_key(descriptor,native_mount(descriptor))
+        with _lock:
+            if refresh or key not in _scopes:
+                _scopes[key] = native_scope(directory, device)
+            scope = dict(_scopes[key])
+    finally:os.close(descriptor)
     info = directory.stat()
     scope.update(incarnation=incarnation, creator=capture(os.getpid()),
                  file_id=info.st_ino, uid=info.st_uid,

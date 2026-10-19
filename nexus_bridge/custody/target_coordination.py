@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+import threading
 import time
 
 SCHEMA = 1
@@ -21,6 +22,7 @@ SUMMARY_BYTES = 16384
 MAX_RECORD = 1024 * 1024
 _permission_diagnostics = set()
 _capabilities = {}
+_capability_lock = threading.Lock()
 
 
 class FilesystemCapabilityError(RuntimeError):
@@ -31,7 +33,9 @@ class FilesystemCapabilityError(RuntimeError):
 
 
 def capability_key(fd, mounted):
-    return (os.fstat(fd).st_dev,mounted['filesystem'],mounted['flags'],mounted['owner'],tuple(mounted['fsid']))
+    return (os.fstat(fd).st_dev,mounted['filesystem'],mounted['flags'],mounted['owner'],
+            tuple(mounted['fsid']),mounted['mounted_on'],mounted['mounted_from'],
+            tuple(mounted['root_identity']),mounted['device_epoch'])
 
 
 def capability_status(fd, mounted=None):
@@ -40,11 +44,46 @@ def capability_status(fd, mounted=None):
     return json.loads(encoded(value))
 
 
+def native_device_epoch(source):
+    """IORegistry IDs distinguish detach/attach even when BSD names are reused."""
+    import ctypes
+    if not source.startswith('/dev/'):
+        return None
+    library=ctypes.CDLL('/System/Library/Frameworks/IOKit.framework/IOKit')
+    match=library.IOBSDNameMatching
+    match.argtypes=(ctypes.c_uint32,ctypes.c_uint32,ctypes.c_char_p)
+    match.restype=ctypes.c_void_p
+    service=library.IOServiceGetMatchingService
+    service.argtypes=(ctypes.c_uint32,ctypes.c_void_p)
+    service.restype=ctypes.c_uint32
+    entry=library.IORegistryEntryGetRegistryEntryID
+    entry.argtypes=(ctypes.c_uint32,ctypes.POINTER(ctypes.c_uint64))
+    entry.restype=ctypes.c_int
+    release=library.IOObjectRelease
+    release.argtypes=(ctypes.c_uint32,)
+    release.restype=ctypes.c_int
+    matching=match(0,0,os.fsencode(source.removeprefix('/dev/')))
+    if not matching:
+        raise RuntimeError('CoordinationBlocked: native device matching unavailable')
+    # IOServiceGetMatchingService consumes the matching dictionary reference.
+    handle=service(0,matching)
+    if not handle:
+        raise RuntimeError('CoordinationBlocked: mounted device instance unavailable')
+    try:
+        result=ctypes.c_uint64()
+        if entry(handle,ctypes.byref(result)) or not result.value:
+            raise RuntimeError('CoordinationBlocked: mounted device epoch unavailable')
+        return result.value
+    finally:release(handle)
+
+
 def native_mount(fd):
     """Darwin SDK sys/mount.h __DARWIN_STRUCT_STATFS64, queried by FD."""
     import ctypes
     if sys.platform != 'darwin':
-        return {'filesystem':'unvalidated','flags':0,'owner':-1,'fsid':[]}
+        info=os.fstat(fd)
+        return {'filesystem':'unvalidated','flags':0,'owner':-1,'fsid':[],
+                'mounted_on':'','mounted_from':'','root_identity':identity(info),'device_epoch':None}
     class Statfs(ctypes.Structure):
         _fields_=[('bsize',ctypes.c_uint32),('iosize',ctypes.c_int32),
             ('counts',ctypes.c_uint64*5),('fsid',ctypes.c_int32*2),
@@ -62,8 +101,19 @@ def native_mount(fd):
     if function(fd,ctypes.byref(value)):
         code=ctypes.get_errno()
         raise OSError(code,'native mounted-volume identity unavailable')
+    mounted_on=os.fsdecode(bytes(value.mounted_on))
+    root=os.open(mounted_on,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:
+        info=os.fstat(root)
+        if info.st_dev!=os.fstat(fd).st_dev:
+            raise RuntimeError('CoordinationBlocked: mounted root changed during identity capture')
+        root_identity=[*identity(info),info.st_birthtime]
+    finally:os.close(root)
+    source=os.fsdecode(bytes(value.mounted_from))
     return {'filesystem':bytes(value.filesystem).decode('ascii'),
-            'flags':value.flags,'owner':value.owner,'fsid':list(value.fsid)}
+            'flags':value.flags,'owner':value.owner,'fsid':list(value.fsid),
+            'mounted_on':mounted_on,'mounted_from':source,
+            'root_identity':root_identity,'device_epoch':native_device_epoch(source)}
 
 
 def permission_scope(fd):
@@ -389,15 +439,25 @@ def preflight_capabilities(path):
         # Managed payload selection remains under the constructor's stable
         # root SH, so GC may rename/delete payloads without racing this probe.
         mounted=native_mount(probe.fd)
-        with probe.fact_view():
-            result=probe_capabilities(probe,mounted)
-        _capabilities[capability_key(probe.fd,mounted)]=result
+        key=capability_key(probe.fd,mounted)
+        with _capability_lock:
+            result=_capabilities.get(key)
+            # Capability is a mount property; writability is still a per-parent
+            # admission check. A transient write/probe failure never poisons it.
+            if result is None or not os.access(probe.path,os.W_OK|os.X_OK):
+                with probe.fact_view():
+                    result=probe_capabilities(probe,mounted)
+                stable_refusal=(not result.get('probe_error') and not result['cleanup_errors']
+                    and result['missing_capabilities']
+                    and all(reason.endswith('_unsupported') for reason in result['missing_capabilities']))
+                if result['supported'] or stable_refusal:
+                    _capabilities[key]=json.loads(encoded(result))
         if not result['supported']:
             import logging
             failure=FilesystemCapabilityError(result)
             logging.getLogger(__name__).warning('%s',failure)
             raise failure
-        return result
+        return json.loads(encoded(result))
     finally:
         probe.close()
 
