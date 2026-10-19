@@ -164,6 +164,11 @@ class Journal:
                   'retained_evidence_bytes':sum(len(encoded(i)) for i in self.value['entries'].values()
                                                if i.get('resource_retirement') or self.manual_closed(i)),
                   'namespace_bytes':0, 'routine_files':0}
+        from recovery_files import unpublished
+        root_preparations=unpublished(self.target.directory)
+        totals['unpublished_preparations']=sorted(root_preparations)
+        totals['retained_evidence_bytes']+=sum(os.stat(name,dir_fd=self.target.directory.fd,follow_symlinks=False).st_size
+                                              for name in root_preparations)
         scanned = [0]
         def scan(directory, namespace, depth=0):
             with directory.fact_view(shared=True):
@@ -172,11 +177,15 @@ class Journal:
         def scan_locked(directory, namespace, depth):
             if depth > 2:
                 raise RuntimeError('RetainedEvidenceFull: coordination namespace depth budget')
+            preparations=unpublished(directory)
             for name in os.listdir(directory.fd):
                 scanned[0] += 1
                 if scanned[0] > 4096:
                     raise RuntimeError('RetainedEvidenceFull: coordination namespace count budget')
                 info = os.stat(name, dir_fd=directory.fd, follow_symlinks=False)
+                if name in preparations:
+                    totals['retained_evidence_bytes']+=info.st_size
+                    continue
                 if name.endswith('.new'):
                     raise RuntimeError('RoutineCompactionFailed: interrupted write retained: ' + name)
                 if __import__('stat').S_ISDIR(info.st_mode):
@@ -234,7 +243,8 @@ class Journal:
                 if self.info is not None:raise
             self.validate()
         # Unknown .new and unrecognized recovery files are never ignored.
-        for name in os.listdir(self.target.directory.fd):
+        from recovery_files import visible_names,unpublished
+        for name in visible_names(self.target.directory):
             if name.endswith('.new'):
                 raise RuntimeError('CoordinationBlocked: interrupted durable write retained: ' + name)
             allowed = {'lock','target.json','volume.json','custody.json','proofs','observations','retained'}
@@ -272,6 +282,8 @@ class Journal:
         if self.value.get('file_intents'):
             raise RuntimeError('RecoveryBlocked: retained file intent requires explicit recovery: '
                                + ','.join(self.value['file_intents']))
+        self.legacy_diagnostics=getattr(self.target,'legacy_diagnostics',[])
+        self.unpublished_preparations=sorted(unpublished(self.target.directory))
         return self.value
 
     def referenced_record(self, reference):
@@ -310,7 +322,8 @@ class Journal:
                 return []
             try:
                 with directory.fact_view(shared=True):
-                    names = os.listdir(directory.fd)
+                    from recovery_files import visible_names
+                    names = visible_names(directory)
                     if len(names) > 4096:
                         raise RuntimeError('ObservationRecoveryBlocked: fact namespace budget')
                     result = []
@@ -733,7 +746,8 @@ class Journal:
                 except FileNotFoundError:
                     continue
                 try:
-                    for name in os.listdir(producer.fd):
+                    from recovery_files import visible_names
+                    for name in visible_names(producer):
                         record, _, data = producer.read(name)
                         if record.get('helper') != value['incarnation'] or record.get('watch') != item['watch']:
                             continue

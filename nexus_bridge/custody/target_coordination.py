@@ -46,6 +46,7 @@ def checked(fd, directory=False):
 class Directory:
     def __init__(self, path, *, private=True, _fd=None):
         self.path = Path(path)
+        self.private = private
         self.fd = _fd if _fd is not None else self.open_path(self.path)
         value = os.fstat(self.fd)
         try:
@@ -437,6 +438,7 @@ class Target:
 
     @contextmanager
     def locked(self, *, deadline=None, nb=False, recover=True, _received=None):
+        from recovery_files import visible_names
         if self.target_guard is not None:
             raise RuntimeError('CoordinationBlocked: target guard already owned')
         guard = _received or TransferredTargetGuard(self.directory.lock(deadline=deadline, nb=nb, create=self.create))
@@ -456,7 +458,7 @@ class Target:
                     expected['generation'] = value.get('generation')
                 initial = {'lock','target.json'} | ({'root.lock'} if self.root is None else set())
                 if (recover and encoded(value) == encoded(dict(expected, creation_intent=True))
-                        and set(os.listdir(self.directory.fd)) == initial):
+                        and visible_names(self.directory) == initial):
                     self.directory.durable('target.json', expected)
                     value = expected
                 if encoded(value) != encoded(expected) or (self.root is not None and not expected['generation']):
@@ -466,7 +468,7 @@ class Target:
                     raise RuntimeError('CoordinationBlocked: read-only target identity missing') from None
                 if self.root is not None and self.binding is None:
                     raise RuntimeError('CoordinationBlocked: missing payload has no stable identity') from None
-                if set(os.listdir(self.directory.fd)) != ({'lock','root.lock'} if self.root is None else {'lock'}):
+                if visible_names(self.directory) != ({'lock','root.lock'} if self.root is None else {'lock'}):
                     raise RuntimeError('CoordinationBlocked: missing target identity with existing responsibilities') from None
                 # A crash at either durable boundary preserves an explicit
                 # uncommitted identity instead of blessing a partial namespace.

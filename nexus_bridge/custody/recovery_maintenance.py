@@ -10,7 +10,7 @@ import subprocess
 from types import SimpleNamespace
 
 from origin import creation_scope
-from recovery_files import file_info, inventory
+from recovery_files import file_info, inventory, visible_names
 from recovery_transaction import Transaction, recovery_name
 from target_coordination import Directory, Target, digest, encoded
 
@@ -124,7 +124,7 @@ def preview(target, transaction, evidence):
             raise RuntimeError('MaintenanceBlocked: failure has no durable attempted scene')
         snapshot=transaction.directory.child('snapshot',create=False)
         try:
-            if set(os.listdir(snapshot.fd)) != names:
+            if visible_names(snapshot) != names:
                 raise RuntimeError('MaintenanceBlocked: snapshot component set incomplete')
             from recovery_files import compatible
             for name,expected in transaction.data['snapshot_files'].items():

@@ -6,6 +6,50 @@ import os
 from pathlib import Path
 import stat
 import sys
+import uuid
+
+PREPARATION_PREFIX = '.ida-cli-unpublished-'
+
+
+def preparation_name(name):
+    return (type(name) is str and name.startswith(PREPARATION_PREFIX)
+            and len(name) == len(PREPARATION_PREFIX)+32
+            and all(c in '0123456789abcdef' for c in name[len(PREPARATION_PREFIX):]))
+
+
+def unpublished(directory):
+    """Retain uncommitted scratch, never consume it as a file obligation.
+
+    A fixed owner/checkpoint must name an exact inode before a scratch can
+    enter a live slot. Abandoned scratch, even foreign bytes in this reserved
+    namespace, is never read as authority, unlinked, published or GC'd.
+    """
+    result=set()
+    for name in os.listdir(directory.fd):
+        if preparation_name(name):
+            info=os.stat(name,dir_fd=directory.fd,follow_symlinks=False)
+            regular(info,directory.native_identity[0])
+            result.add(name)
+    return result
+
+
+def visible_names(directory):
+    return set(os.listdir(directory.fd))-unpublished(directory)
+
+
+def rename_noreplace(source, name, destination, destination_name):
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin':
+        function, flags = library.renameatx_np, 4
+    elif sys.platform.startswith('linux'):
+        function, flags = library.renameat2, 1
+    else:
+        raise RuntimeError('RecoveryBlocked: non-overwriting rename unsupported')
+    function.argtypes = (ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint)
+    function.restype = ctypes.c_int
+    if function(source.fd, os.fsencode(name), destination.fd, os.fsencode(destination_name), flags):
+        code = ctypes.get_errno()
+        raise OSError(code, 'RecoveryBlocked: non-overwriting rename failed')
 
 
 def boundary(action, stage, detail):
@@ -87,7 +131,8 @@ def maybe_info(directory, name):
 def inventory(directory, coordination=None):
     result = {}
     directory.verify()
-    for name in sorted(os.listdir(directory.fd)):
+    names=visible_names(directory) if directory.private else os.listdir(directory.fd)
+    for name in sorted(names):
         info = os.stat(name, dir_fd=directory.fd, follow_symlinks=False)
         if stat.S_ISREG(info.st_mode):
             result[name] = file_info(directory, name)
@@ -126,18 +171,7 @@ def rename_exact(source, source_name, destination, destination_name, expected, a
     source.verify()
     destination.verify()
     boundary('rename','before',{'source':str(source.path/source_name),'destination':str(destination.path/destination_name)})
-    library = ctypes.CDLL(None, use_errno=True)
-    if sys.platform == 'darwin':
-        function, flags = library.renameatx_np, 4
-    elif sys.platform.startswith('linux'):
-        function, flags = library.renameat2, 1
-    else:
-        raise RuntimeError('RecoveryBlocked: non-overwriting rename unsupported')
-    function.argtypes = (ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint)
-    function.restype = ctypes.c_int
-    if function(source.fd, os.fsencode(source_name), destination.fd, os.fsencode(destination_name), flags):
-        code = ctypes.get_errno()
-        raise OSError(code, 'RecoveryBlocked: non-overwriting rename failed')
+    rename_noreplace(source,source_name,destination,destination_name)
     boundary('rename','after',{'source':str(source.path/source_name),'destination':str(destination.path/destination_name)})
     os.fsync(source.fd)
     boundary('rename','source_fsynced',{'directory':str(source.path)})
@@ -163,6 +197,12 @@ def copy_exact(source, name, destination, expected, mode, binding, checkpoint, a
         raise OSError(errno.EXDEV, 'RecoveryBlocked: copy destination is not on target volume')
     authorize()
     existing = maybe_info(destination, name)
+    if binding is not None and 'prepared' in binding:
+        return publish_copy(destination,name,binding,authorize)
+    if binding is None:
+        if existing is not None:
+            raise RuntimeError('RecoveryBlocked: unbound existing copy retained')
+        return prepare_copy(source,name,destination,expected,mode,checkpoint,authorize)
     if existing is not None and binding is not None:
         if [existing['device'],existing['inode'],existing['uid']] != binding['identity']:
             raise RuntimeError('RecoveryBlocked: reserved copy inode changed')
@@ -229,3 +269,56 @@ def copy_exact(source, name, destination, expected, mode, binding, checkpoint, a
         if output is not None:
             os.close(output)
         os.close(source_fd)
+
+
+def publish_copy(destination,name,binding,authorize):
+    """Only a complete, fsynced and checkpointed inode enters the live name."""
+    prepared=binding['prepared']
+    expected=binding['metadata']
+    if (not preparation_name(prepared) or binding['identity'] !=
+            [expected['device'],expected['inode'],expected['uid']]):
+        raise RuntimeError('RecoveryBlocked: invalid prepared copy reservation')
+    authorize()
+    return rename_exact(destination,prepared,destination,name,expected,authorize)
+
+
+def prepare_copy(source,name,destination,expected,mode,checkpoint,authorize):
+    """Pre-binding crashes retain scratch; they cannot occupy a live slot."""
+    prepared=PREPARATION_PREFIX+uuid.uuid4().hex
+    input_fd=os.open(name,os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,dir_fd=source.fd)
+    output=None
+    try:
+        opened=metadata(os.fstat(input_fd))
+        opened['device']=source.object_identity(os.fstat(input_fd))[0]
+        if opened != {k:v for k,v in expected.items() if k!='sha256'}:
+            raise RuntimeError('RecoveryBlocked: source replaced before preparation')
+        output=os.open(prepared,os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                       0o600,dir_fd=destination.fd)
+        boundary('copy','unbound_created',{'destination':str(destination.path/prepared)})
+        boundary('copy','created',{'destination':str(destination.path/name),'preparation':prepared})
+        copied=0
+        while chunk:=os.read(input_fd,1024*1024):
+            authorize()
+            view=memoryview(chunk)
+            while view:
+                count=os.write(output,view)
+                if count<=0:raise OSError(errno.EIO,'short recovery preparation copy')
+                view=view[count:];copied+=count
+            boundary('copy','chunk',{'destination':str(destination.path/name),'bytes':copied})
+        os.fchmod(output,mode)
+        os.fsync(output)
+        boundary('copy','file_fsynced',{'destination':str(destination.path/name)})
+        os.fsync(destination.fd)
+        boundary('copy','directory_fsynced',{'destination':str(destination.path/name)})
+        final=file_info(destination,prepared)
+        if (final['size'],final['sha256'],final['mode']) != (expected['size'],expected['sha256'],mode):
+            raise RuntimeError('RecoveryBlocked: prepared copy verification failed')
+        if not compatible(file_info(source,name),expected):
+            raise RuntimeError('RecoveryBlocked: source changed during preparation')
+        binding={'identity':destination.object_identity(os.fstat(output)),'prepared':prepared,'metadata':final}
+        checkpoint(binding)
+        boundary('copy','checkpointed',{'destination':str(destination.path/name),'binding':binding})
+        return publish_copy(destination,name,binding,authorize)
+    finally:
+        if output is not None:os.close(output)
+        os.close(input_fd)

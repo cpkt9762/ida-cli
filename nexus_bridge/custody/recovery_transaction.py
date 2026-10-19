@@ -16,7 +16,7 @@ import uuid
 from custody_process_identity import capture
 from target_coordination import Directory, digest, encoded
 from recovery_files import (boundary, compatible, component_names, copy_exact,
-                            file_info, inventory, rename_exact, validate_info)
+                            file_info, inventory, rename_exact, validate_info, visible_names)
 from recovery_resources import ResourceCustody
 
 PHASES = frozenset(('snapshotting','ready','failed-owner-held','staging','prepared',
@@ -200,7 +200,7 @@ class Transaction(ResourceCustody):
         for name in tuple(allowed):
             if name.startswith('resource-') and name.endswith('.json'):
                 allowed.update((name+'.new',name+'.new.owner'))
-        if set(os.listdir(self.directory.fd))-allowed:
+        if visible_names(self.directory)-allowed:
             raise RuntimeError('RecoveryBlocked: unknown transaction namespace retained')
 
     def parent_directory(self):
@@ -700,7 +700,7 @@ def resume_at_gate(target):
                 if indexed:
                     snapshot=transaction.directory.child('snapshot',create=False)
                     try:
-                        if set(os.listdir(snapshot.fd)) != set(transaction.data['files']) or set(transaction.data['snapshot_files']) != set(transaction.data['files']):
+                        if visible_names(snapshot) != set(transaction.data['files']) or set(transaction.data['snapshot_files']) != set(transaction.data['files']):
                             raise RuntimeError('RecoveryBlocked: incomplete ready snapshot')
                         for component,expected in transaction.data['snapshot_files'].items():
                             if not compatible(file_info(snapshot,component),expected):
@@ -753,7 +753,7 @@ def finish_creation(target):
         try:
             stored, _, _ = directory.read('recovery.json')
         except FileNotFoundError:
-            if os.listdir(directory.fd):
+            if visible_names(directory):
                 raise RuntimeError('RecoveryBlocked: creation directory contains unknown evidence') from None
             directory.durable('recovery.json',value,immutable=True)
         else:

@@ -435,6 +435,8 @@ class Bridge(LifetimeListener):
                     'next_action':'inspect_copy_occupancy_and_file_gate' if getattr(c, 'verification_cleanup_error', None)
                                   else 'wait_exact_owner_proof'} for path,c in self.verification_probes.items()]
                 recovery_refs=[]
+                legacy_diagnostics=[dict(acquisition=c.acquisition,entries=c.legacy_diagnostics)
+                    for c in self.acquisitions.values() if getattr(c,'legacy_diagnostics',None)]
                 for custody in self.acquisitions.values():
                     snapshot=(custody.recovery_snapshot[0] if custody.recovery_snapshot is not None
                               else getattr(custody,'file_snapshot',None))
@@ -453,6 +455,7 @@ class Bridge(LifetimeListener):
                           "held": held, "owners": owners, "verification_probes": verifications,
                           "verification_cleanup":verification_cleanup,
                           "recovery_cleanup":recoveries,
+                          "legacy_diagnostics":legacy_diagnostics,
                           "acquisitions":len(self.acquisitions), "custodians":len(self.custodians),
                           "original_instances":len(self.backup_sources.items),
                           "backup_closures":len(getattr(self.backup_sources, 'closed', {})),

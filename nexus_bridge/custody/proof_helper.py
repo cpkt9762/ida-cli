@@ -172,7 +172,8 @@ class Observer:
                             continue
                         try:
                             records = []
-                            for name in os.listdir(producer.fd):
+                            from recovery_files import visible_names
+                            for name in visible_names(producer):
                                 record, _, data = producer.read(name)
                                 if record.get('watch') != watch or record.get('helper') != self.incarnation:
                                     continue

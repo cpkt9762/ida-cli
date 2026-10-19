@@ -122,7 +122,7 @@ class Custodian:
                 cleanup_owner = getattr(self, 'cleanup_owner', None)
                 from config import ida_cli_home
                 from recovery_legacy import import_known_home
-                import_known_home(self.target,ida_cli_home()/'idb')
+                self.legacy_diagnostics=import_known_home(self.target,ida_cli_home()/'idb')
                 Journal(self.target).gate(self.helper['state_root'],
                     self.acquisition if cleanup_owner is not None else acquisition, cleanup_owner=cleanup_owner)
                 return

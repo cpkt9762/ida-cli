@@ -6,6 +6,7 @@ inode/content. Unknown, incomplete or replaced slots are never removed.
 import json
 import os
 import stat
+import uuid
 
 
 def boundary(directory, name, stage):
@@ -66,8 +67,12 @@ def read_owner(directory, name):
         value = json.loads(data)
     except (json.JSONDecodeError,UnicodeDecodeError) as error:
         raise RuntimeError('DurableWriteBlocked: interrupted durable write ownership is corrupt; evidence retained') from error
-    if (type(value) is not dict or set(value) != {'schema','writer','target','directory','new','previous','immutable'}
-            or type(value['schema']) is not int or value['schema'] != 1
+    from recovery_files import preparation_name
+    base={'schema','writer','target','directory','new','previous','immutable'}
+    if (type(value) is not dict or set(value) not in (base,base|{'prepared'})
+            or type(value['schema']) is not int or value['schema'] not in (1,2)
+            or (value['schema']==2) != ('prepared' in value)
+            or ('prepared' in value and not preparation_name(value['prepared']))
             or value['writer'] != 'ida-cli-durable-v2' or value['target'] != name
             or value['directory'] != directory.identity or type(value['immutable']) is not bool
             or type(value['directory']) is not list or any(type(n) is not int for n in value['directory'])
@@ -95,19 +100,22 @@ def inspect(directory, name):
         owner, _ = read_owner(directory, name)
     except FileNotFoundError:
         if os.path.lexists(directory.path/(name+'.new')):
-            raise RuntimeError('DurableWriteBlocked: pending bytes lack durable ownership') from None
+            raise RuntimeError('DurableWriteBlocked: interrupted durable write: pending bytes lack durable ownership') from None
         info, data = raw(directory, name)
         return json.loads(data), info, data
     expected = owner['new']
+    temporary=name+'.new'
+    if not os.path.lexists(directory.path/temporary) and owner.get('prepared') and os.path.lexists(directory.path/owner['prepared']):
+        temporary=owner['prepared']
     try:
-        pending = os.stat(name+'.new', dir_fd=directory.fd, follow_symlinks=False)
+        pending = os.stat(temporary, dir_fd=directory.fd, follow_symlinks=False)
     except FileNotFoundError:
         if version(directory, name) != expected:
             raise RuntimeError('DurableWriteBlocked: published write identity/content conflict') from None
         info, data = raw(directory, name)
     else:
         linked = owner['immutable'] and pending.st_nlink == 2
-        info, data = raw(directory, name+'.new', links=2 if linked else 1)
+        info, data = raw(directory, temporary, links=2 if linked else 1)
         actual = {'identity':directory.object_identity(info), 'sha256':digest(data), 'size':len(data)}
         if actual != expected:
             raise RuntimeError('DurableWriteBlocked: partial/foreign pending bytes retained')
@@ -129,9 +137,19 @@ def resume(directory, name, *, validate=None):
         owner, owner_info = read_owner(directory, name)
     except FileNotFoundError:
         if os.path.lexists(directory.path/temporary):
-            raise RuntimeError('DurableWriteBlocked: pending bytes lack durable ownership') from None
+            raise RuntimeError('DurableWriteBlocked: interrupted durable write: pending bytes lack durable ownership') from None
         return False
     expected = owner['new']
+    if owner.get('prepared') and not os.path.lexists(directory.path/temporary):
+        prepared=owner['prepared']
+        if os.path.lexists(directory.path/prepared):
+            if version(directory,prepared) != expected or version(directory,name) != owner['previous']:
+                raise RuntimeError('DurableWriteBlocked: prepared inode/content or destination changed')
+            if validate is not None:validate(raw(directory,prepared)[1])
+            from recovery_files import rename_noreplace
+            directory.verify()
+            rename_noreplace(directory,prepared,directory,temporary)
+            os.fsync(directory.fd)
     try:
         temp_info = os.stat(temporary, dir_fd=directory.fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -210,17 +228,27 @@ def write(directory, name, value, *, immutable=False):
     if immutable and previous is not None:
         raise FileExistsError(str(directory.path/name))
     temporary, marker = name+'.new', name+'.new.owner'
-    fd = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+    from recovery_files import PREPARATION_PREFIX,rename_noreplace
+    prepared, owner_prepared = (PREPARATION_PREFIX+uuid.uuid4().hex for _ in range(2))
+    fd = os.open(prepared, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                  0o600, dir_fd=directory.fd)
     try:
         info = checked(fd)
-        record = {'schema':1,'writer':'ida-cli-durable-v2','target':name,'directory':directory.identity,
+        boundary(directory,name,'unbound_created')
+        record = {'schema':2,'writer':'ida-cli-durable-v2','target':name,'directory':directory.identity,
                   'new':{'identity':directory.object_identity(info),'sha256':digest(data),'size':len(data)},
-                  'previous':previous,'immutable':immutable}
-        owner_fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                  'previous':previous,'immutable':immutable,'prepared':prepared}
+        view=memoryview(data)
+        while view:
+            count=os.write(fd,view)
+            if count <= 0:raise OSError('short durable preparation write')
+            view=view[count:]
+        os.fsync(fd)
+        owner_fd = os.open(owner_prepared, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                            0o600, dir_fd=directory.fd)
         try:
             checked(owner_fd)
+            boundary(directory,name,'owner_unbound_created')
             view = memoryview(encoded(record))
             while view:
                 count = os.write(owner_fd, view)
@@ -230,16 +258,24 @@ def write(directory, name, value, *, immutable=False):
             os.fsync(owner_fd)
         finally:
             os.close(owner_fd)
+        directory.verify()
+        rename_noreplace(directory,owner_prepared,directory,marker)
         os.fsync(directory.fd)
-        view = memoryview(data)
-        while view:
-            count = os.write(fd, view)
-            if count <= 0:
-                raise OSError('short durable record write')
-            view = view[count:]
+        boundary(directory,name,'owner_published')
+        rename_noreplace(directory,prepared,directory,temporary)
         boundary(directory, name, 'temp_written')
         os.fsync(fd)
         boundary(directory, name, 'file_fsynced')
+    except OSError:
+        # An observed I/O failure remains an explicit blocked write, with its
+        # original errno. Only a process crash before any published reservation
+        # leaves inert scratch. Do not silently turn ENOSPC into admission.
+        if (not os.path.lexists(directory.path/marker) and not os.path.lexists(directory.path/temporary)
+                and directory.object_identity(os.fstat(fd)) == directory.object_identity(
+                    os.stat(prepared,dir_fd=directory.fd,follow_symlinks=False))):
+            rename_noreplace(directory,prepared,directory,temporary)
+            os.fsync(directory.fd)
+        raise
     finally:
         os.close(fd)
     resume(directory, name)

@@ -5,12 +5,12 @@ from pathlib import Path
 import re
 import stat
 
-from recovery_files import compatible, component_names, file_info, inventory
+from recovery_files import compatible, component_names, file_info, inventory, visible_names
 from recovery_transaction import Transaction, boundary, finish_creation, recovery_name
 from target_coordination import Directory, MAX_RECORD, digest, encoded
 
 
-def legacy_record(source):
+def legacy_value(source):
     info=file_info(source,'recovery.json')
     if info['size'] > MAX_RECORD:
         raise RuntimeError('RecoveryBlocked: oversized legacy journal')
@@ -22,7 +22,11 @@ def legacy_record(source):
     finally:os.close(fd)
     if digest(raw) != info['sha256'] or file_info(source,'recovery.json') != info:
         raise RuntimeError('RecoveryBlocked: legacy journal changed during read')
-    value=json.loads(raw)
+    return json.loads(raw),info
+
+
+def legacy_record(source):
+    value,info=legacy_value(source)
     required={'version','target','status','before','parent_identity','files','snapshot_files','attempts'}
     if (type(value) is not dict or set(value) != required
             or type(value['version']) is not int or value['version'] != 1
@@ -44,7 +48,7 @@ def legacy_record(source):
 def sources(source, target, *, archive_pointer=None):
     result={'root':{}}
     allowed=component_names(target.target)
-    for name in sorted(os.listdir(source.fd)):
+    for name in sorted(visible_names(source)):
         if name in ('imported-v2.json','imported-v2.json.new','imported-v2.json.new.owner'):
             if archive_pointer is None:
                 raise RuntimeError('RecoveryBlocked: unbound legacy archive pointer retained: '+name)
@@ -118,7 +122,7 @@ def accept_locator_custody(target, transaction):
         name='legacy-source-'+folder
         directory=transaction.directory.child(name,create=False)
         try:
-            if directory.identity != transaction.data['directories'].get(name) or set(os.listdir(directory.fd)) != set(entries):
+            if directory.identity != transaction.data['directories'].get(name) or visible_names(directory) != set(entries):
                 raise RuntimeError('RecoveryBlocked: imported evidence namespace differs before handoff')
             for component,expected in entries.items():
                 actual=file_info(directory,component)
@@ -127,7 +131,7 @@ def accept_locator_custody(target, transaction):
         finally:directory.close()
     snapshot=transaction.directory.child('snapshot',create=False)
     try:
-        if set(os.listdir(snapshot.fd)) != set(transaction.data['snapshot_files']):
+        if visible_names(snapshot) != set(transaction.data['snapshot_files']):
             raise RuntimeError('RecoveryBlocked: imported complete snapshot missing')
         for name,expected in transaction.data['snapshot_files'].items():
             if not compatible(file_info(snapshot,name),expected):
@@ -264,19 +268,49 @@ def import_v1(target, path):
 
 
 def import_known_home(target, root):
-    """Only the explicitly configured home is inventoried, never other homes."""
+    """Inventory only this home; unattributed evidence is diagnostic, not a gate.
+
+    The old producer atomically published its first recovery.json after mkdir
+    and hashing. Missing records therefore never accepted a file obligation.
+    A readable target attribution is checked before schema/import validation:
+    errors belonging to this target still fail closed. No old evidence moves.
+    """
+    diagnostics=[]
+    target.legacy_diagnostics=diagnostics
     path=Path(os.path.realpath(root))/'recovery'
-    if not os.path.lexists(path):return
-    directory=Directory(path)
+    if not os.path.lexists(path):return diagnostics
+    def note(name,kind,cause=None):
+        diagnostics.append(dict(path=str(path/name),kind=kind,cause=cause))
+    try:directory=Directory(path)
+    except (OSError,RuntimeError) as error:
+        note('', 'unattributed_record', str(error))
+        return diagnostics
     try:
         for name in sorted(os.listdir(directory.fd)):
             if not recovery_name(name):
-                raise RuntimeError('RecoveryBlocked: unknown legacy recovery namespace')
-            child=directory.child(name,create=False)
-            try:value,_=legacy_record(child)
-            finally:child.close()
-            if value['target']==target.original:import_v1(target,path/name)
+                # Non-v1 names cannot be locators produced by the v1 writer.
+                note(name,'non_v1_entry')
+                continue
+            try:
+                child=directory.child(name,create=False)
+                try:
+                    try:value,_=legacy_value(child)
+                    except FileNotFoundError:
+                        note(name,'unrecorded_v1_directory')
+                        continue
+                finally:child.close()
+            except (OSError,RuntimeError,ValueError) as error:
+                # No target can safely be inferred from unreadable bytes.
+                note(name,'unattributed_record',str(error))
+                continue
+            if type(value) is not dict or type(value.get('target')) is not str:
+                note(name,'unattributed_record','legacy record has no target attribution')
+            elif value['target']==target.original:
+                import_v1(target,path/name)
+            else:
+                note(name,'other_target')
     finally:directory.close()
+    return diagnostics
 
 
 def resume_pending_imports(target):
