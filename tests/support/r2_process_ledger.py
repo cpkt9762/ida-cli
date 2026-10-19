@@ -43,11 +43,22 @@ def install():
             captured = identity(self.pid)
             record({'kind':'started', 'intent':self._r2_intent, 'pid':self.pid,
                     'identity':captured, 'already_exited':self.poll() is not None})
-            # A retained SDK launcher can outlive run/communicate's caller.
-            # Wait on the actual Popen, under CPython's waitpid lock. This is
-            # test telemetry only; it neither signals nor grants public proof.
+            # Observe a retained launcher without consuming its owner's wait.
+            # Existing callers may themselves use WNOWAIT before Popen.wait.
             def collect():
-                original.wait(self)
+                while True:
+                    try:observed=os.waitid(os.P_PID,self.pid,os.WEXITED | os.WNOWAIT)
+                    except InterruptedError:continue
+                    except ChildProcessError:return  # Another actual waiter won; absence is not evidence.
+                    if observed is not None and observed.si_pid==self.pid:
+                        code=observed.si_status if observed.si_code==os.CLD_EXITED else None
+                        signal=observed.si_status if observed.si_code in (os.CLD_KILLED,os.CLD_DUMPED) else None
+                        if code is not None or signal is not None:
+                            record({'kind':'terminal','intent':self._r2_intent,'pid':self.pid,
+                                    'method':'os.waitid.P_PID.WEXITED.WNOWAIT',
+                                    'raw_si_code':observed.si_code,'raw_si_status':observed.si_status,
+                                    'exit_code':code,'signal':signal,'success':code==0})
+                    return
             waiter=threading.Thread(target=collect,daemon=True)
             waiters.append(waiter)
             waiter.start()
