@@ -1,8 +1,117 @@
 //! Exercise the actual MCP close wrapper over production custody and SDK.
 use super::*;
 use crate::preprocess::OutputRecorded as _;
-use crate::{preprocess::Preparation, router::nexus_bridge::BridgeConfig};
+use crate::{
+    preprocess::Preparation,
+    router::{nexus_bridge::BridgeConfig, RouterState},
+};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_save_public_rpc_refusal_reaches_mcp_and_cli_without_prefill() {
+    if std::env::var("R6_SAVE_CHILD").as_deref() != Ok("1") {
+        use crate::preprocess::SpawnRecorded as _;
+        let output=tokio::process::Command::new("timeout")
+            .arg("30s").arg(std::env::current_exe().expect("lib executable"))
+            .args(["--exact","server::r2_lifecycle::explicit_save_public_rpc_refusal_reaches_mcp_and_cli_without_prefill","--nocapture"])
+            .env("R6_SAVE_CHILD","1").env("IDA_CLI_NEXUS_DEV","1")
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .kill_on_drop(true).spawn_recorded().expect("private MCP/CLI child")
+            .output_recorded().await.expect("child reaped");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root"))
+        .join("explicit-save");
+    std::fs::create_dir_all(&root).expect("private fixture");
+    let router = RouterState::new().expect("router");
+    let mut environment: BTreeMap<String, String> = std::env::vars().collect();
+    environment.insert("R3A_CASE_ROOT".into(), root.display().to_string());
+    environment.insert("R3A_SCENARIO".into(), "slow-owner".into());
+    environment.insert(
+        "IDA_NEXUS_STATE_DIR".into(),
+        root.join("state").display().to_string(),
+    );
+    let bridge = router
+        .connect_nexus(BridgeConfig {
+            python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("fresh SDK")),
+            script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/r3a_bridge_fixture.py"),
+            directory: root.join("i"),
+            environment,
+        })
+        .await
+        .expect("production bridge/helper");
+    let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+    let server = IdaMcpServer::new(
+        Arc::new(IdaWorker::new(tx)),
+        ServerMode::Router(router.clone()),
+    );
+    let result: anyhow::Result<Value> = async {
+        let path = root.join("tiny.i64");
+        let (handle, token) = router
+            .ensure_worker_prepared(
+                path.to_str().expect("path"),
+                None,
+                None,
+                Preparation::new(Duration::from_secs(10)),
+            )
+            .await?;
+        std::fs::write(root.join("save-refuse"), b"")?;
+        let code = "import sys\nresult = sys.modules['_ida_cli_save_guard_v1'].save_database()";
+        let mcp = server
+            .run_script(Parameters(RunScriptRequest {
+                db_handle: Some(handle),
+                code: Some(code.to_owned()),
+                file: None,
+                timeout_secs: Some(10),
+            }))
+            .await?;
+        let expected=json!({"success":false,"stdout":"","stderr":"",
+            "error":"saving refused: explicit native save rejected",
+            "error_summary":"saving refused: explicit native save rejected"});
+        let body:Value=serde_json::from_str(&mcp.content[0].as_text().expect("native script JSON envelope").text)?;
+        anyhow::ensure!(mcp.is_error==Some(false) && body==expected,
+            "MCP changed the native run_script failure envelope or lost the public save refusal: {mcp:?}");
+        let cli = super::socket_listener::test_save_rpc(
+            router.clone(),
+            path.to_str().expect("path"),
+            code,
+        )
+        .await;
+        anyhow::ensure!(cli["error"].is_null() && cli["result"]==expected,
+            "CLI changed the native run_script failure envelope or lost the public save refusal: {cli}");
+        let calls: Value =
+            serde_json::from_slice(&std::fs::read(root.join("save-refusals.json"))?)?;
+        anyhow::ensure!(
+            calls["calls"] == 2,
+            "each caller must execute exactly once: {calls}"
+        );
+        router.nexus_close_token(&token).await?;
+        Ok(json!({"mcp":mcp,"cli":cli,"native_save_calls":calls}))
+    }
+    .await;
+    std::fs::write(root.join("owner-release"), b"").expect("finally real owner lifetime unlock");
+    let settled = tokio::time::timeout(Duration::from_secs(8), async {
+        while bridge.lifecycle_status()["resources"] != 0
+            || bridge.lifecycle_status()["retirement_acks"] != 0
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let shutdown = bridge.shutdown().await;
+    std::fs::write(root.join("save-callers.json"),serde_json::to_vec_pretty(&json!({"result":result.as_ref().ok(),
+        "error":result.as_ref().err().map(ToString::to_string),"settled":settled.is_ok(),"shutdown":format!("{shutdown:?}")})).expect("JSON")).expect("evidence");
+    settled.expect("exact custody settles");
+    shutdown.expect("natural shutdown");
+    result.expect("real explicit-save callers");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_preserves_text_error_and_lifecycle() {

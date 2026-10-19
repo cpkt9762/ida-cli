@@ -27,6 +27,414 @@ fn public_owner_birth_timestamp_survives_both_json_hops() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge_and_helper_loss_preserve_draining_owner_until_public_release() {
+    use ida_mcp::preprocess::Preparation;
+    use ida_mcp::router::nexus_bridge::{test_output_child, test_spawn_child};
+    let base = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private base"));
+    for (mode, helper_fault, proof_first) in [
+        ("bridge-held", false, false),
+        ("both-held", true, false),
+        ("bridge-proof", false, true),
+        ("both-proof", true, true),
+    ] {
+        let root = base.join(mode);
+        std::fs::create_dir_all(root.join("a")).expect("private owner");
+        let mut command = tokio::process::Command::new("timeout");
+        command
+            .arg("45s")
+            .arg(std::env::var_os("R3A_PYTHON").expect("fixed SDK"))
+            .args([
+                "-B",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/support/r2_multi_bridge.py"
+                ),
+                "--owner",
+            ])
+            .arg(root.join("a"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let child = test_spawn_child(&mut command).expect("independent public owner process");
+        wait_for(|| Ok(root.join("a/ready").exists()))
+            .await
+            .expect("real owner ready");
+        let router = RouterState::new().expect("router");
+        let environment: BTreeMap<String, String> = std::env::vars().collect();
+        let bridge = router
+            .connect_nexus(BridgeConfig {
+                python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("SDK")),
+                script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/support/r2_client_bridge.py"),
+                directory: root.join("i"),
+                environment,
+            })
+            .await
+            .expect("production independent bridge/helper");
+        let result:anyhow::Result<Value>=async {
+            let (_,token)=router.ensure_worker_prepared(root.join("a/tiny.i64").to_str().expect("path"),None,None,
+                Preparation::new(Duration::from_secs(10))).await?;
+            let lease:SessionLease=serde_json::from_value(bridge.lifecycle_status()["resource_details"][0]["lease"].clone())?;
+            router.nexus_close_token(&token).await?;
+            wait_for(||Ok(root.join("a/release-requested").exists())).await?;
+            let held=bridge.lifecycle_status();
+            anyhow::ensure!(held["resources"]==1,"last ACK discarded owner responsibility: {held}");
+            let acknowledged=bridge.endpoint().transition(|s,_|s.status(&lease.client_id,&lease))?;
+            anyhow::ensure!(acknowledged.phase==SessionPhase::Released,
+                "last ACK did not finish its exact N1 lease");
+            if proof_first {
+                std::fs::write(root.join("a/owner-release"),b"")?;
+                wait_for(||Ok(bridge.lifecycle_status()["resources"]==0 && bridge.lifecycle_status()["retirement_acks"]==0)).await?;
+            }
+            bridge.terminate().await?;
+            std::fs::write(root.join("after-bridge.json"),serde_json::to_vec_pretty(&bridge.lifecycle_status())?)?;
+            let fault=if helper_fault {Some(bridge.test_helper_fault(false).await?)} else {None};
+            if !proof_first {
+                anyhow::ensure!(bridge.lifecycle_status()["resources"]==1,"bridge/helper death fabricated owner proof");
+                if helper_fault {
+                    // I5 requires a healthy public observer again. Releasing
+                    // the final original before re-subscription is the separate
+                    // explicitly blocked missing-source case, not convergence.
+                    wait_for(||Ok(bridge.lifecycle_status()["helper"]["snapshot"]["recovered"]==true
+                        && bridge.lifecycle_status()["helper"]["snapshot"]["owner_count"]==1)).await?;
+                }
+                std::fs::write(root.join("a/owner-release"),b"")?;
+            }
+            let settled=wait_for(||Ok(bridge.lifecycle_status()["resources"]==0)).await;
+            std::fs::write(root.join("after-owner.json"),serde_json::to_vec_pretty(&bridge.lifecycle_status())?)?;
+            settled?;
+            anyhow::ensure!(bridge.lifecycle_status()["retirement_acks"]==if proof_first {0}else{1},
+                "a dead bridge must not fabricate a retirement delivery ACK");
+            let after=bridge.endpoint().transition(|s,_|s.status(&lease.client_id,&lease))?;
+            anyhow::ensure!(after.phase==SessionPhase::Released && json!(after.control_delivery)==json!(acknowledged.control_delivery),"public lifetime rewrote exact ACK history: {after:?}");
+            Ok(json!({"mode":mode,"held":held,"after":bridge.lifecycle_status(),"session":after,"helper_fault":fault}))
+        }.await;
+        std::fs::write(root.join("a/owner-release"), b"")
+            .expect("finally release owned native lifetime");
+        let output = test_output_child(child).await.expect("actual owner wait");
+        let shutdown = bridge.shutdown().await;
+        std::fs::write(root.join("draining-result.json"),serde_json::to_vec_pretty(&json!({"result":result.as_ref().ok(),
+            "error":result.as_ref().err().map(ToString::to_string),"owner_exit":output.status.code(),
+            "owner_stderr":String::from_utf8_lossy(&output.stderr),"shutdown":format!("{shutdown:?}")})).expect("evidence")).expect("write evidence");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        shutdown.expect("failed bridge and exact helper naturally collected");
+        result.expect("real bridge/helper crashes cannot replace public owner proof");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn filesystem_capability_refusal_precedes_public_sdk_calls() {
+    let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private case"));
+    let physical = std::env::var_os("R6_VOLUME_ROOT");
+    let parent = physical.as_ref().map_or_else(
+        || root.join("unsupported"),
+        |volume| {
+            PathBuf::from(volume).join(root.parent().expect("case").file_name().expect("label"))
+        },
+    );
+    std::fs::create_dir(&parent).expect("fresh target parent");
+    let path = parent.join("tiny.i64");
+    let bytes = b"private capability refusal input; must remain unchanged";
+    std::fs::write(&path, bytes).expect("private input");
+    let before = std::fs::metadata(&path).expect("input identity");
+    let trace = root.join("sdk-calls.jsonl");
+    let mut environment: BTreeMap<String, String> = std::env::vars().collect();
+    environment.insert("R6_CAPABILITY_TRACE".into(), trace.display().to_string());
+    environment.insert(
+        "R6_CAPABILITY_FAULT".into(),
+        if physical.is_some() { "0" } else { "1" }.into(),
+    );
+    let router = RouterState::new().expect("production router");
+    let bridge = router
+        .connect_nexus(BridgeConfig {
+            python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("fixed SDK")),
+            script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/r2_client_bridge.py"),
+            directory: root.join("i"),
+            environment,
+        })
+        .await
+        .expect("production installed bridge");
+    let mut events = bridge.subscribe();
+    let client = ClientId::new("r6-capabilities").expect("client");
+    let opening = bridge
+        .endpoint()
+        .transition(|s, t| {
+            s.open(
+                &client,
+                AcceptedRequest::new(
+                    &SystemClock,
+                    RequestId::new("refused-open")?,
+                    None,
+                    "open",
+                    json!({"timeout_secs":10}),
+                )?,
+                OpenSpec {
+                    operation_id: OperationId::new("refused-open")?,
+                    path: path.display().to_string(),
+                    options: json!({"spawn":true}),
+                },
+                t,
+            )
+        })
+        .expect("accepted caller");
+    let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await?;
+            if matches!(
+                event["event"].as_str(),
+                Some("opened" | "failed" | "uncertain" | "not_sent")
+            ) {
+                break Ok::<_, anyhow::Error>(event);
+            }
+        }
+    })
+    .await
+    .expect("bounded real terminal")
+    .expect("event stream");
+    let progress = bridge
+        .endpoint()
+        .transition(|s, _| s.open_progress(&client, &opening))
+        .expect("caller status");
+    let status = bridge.lifecycle_status();
+    let shutdown = bridge.shutdown().await;
+    std::fs::write(root.join("capability-refusal.json"),serde_json::to_vec_pretty(&json!({
+        "terminal":terminal,"caller_status":progress,"lifecycle_status":status,"physical_volume":physical,
+        "target":path,"shutdown":format!("{shutdown:?}")})).expect("evidence JSON")).expect("evidence");
+    shutdown.expect("natural teardown");
+    assert_eq!(terminal["event"], "failed");
+    let message = terminal["error"]["message"].as_str().expect("public error");
+    for text in [
+        "FilesystemCapabilitiesRefused",
+        "no_replace_rename_unsupported",
+        "errno",
+    ] {
+        assert!(message.contains(text), "{message}");
+    }
+    if physical.is_some() {
+        for text in ["exfat", "hardlink_unsupported", "45"] {
+            assert!(message.contains(text), "{message}");
+        }
+    }
+    assert!(progress.0.is_none(), "refusal fabricated a handle");
+    assert!(progress
+        .1
+        .expect("status retains exact refusal")
+        .message
+        .contains(message.trim_start_matches("RuntimeError: ")));
+    assert_eq!(status["resources"], 0);
+    assert_eq!(status["startup_and_pre_attach"], 0);
+    assert!(
+        !trace.exists(),
+        "Nexus probe/open/resolve/attach ran before capability refusal"
+    );
+    assert_eq!(std::fs::read(&path).expect("unchanged input"), bytes);
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::fs::metadata(&path).expect("retained identity").ino(),
+        before.ino()
+    );
+    let entries: Vec<_> = std::fs::read_dir(&parent)
+        .expect("parent")
+        .map(|v| v.expect("entry").path())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![path],
+        "refusal left coordination or probe debris"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn analysis_does_not_hold_target_ex_against_an_independent_home() {
+    use ida_mcp::{
+        preprocess::Preparation,
+        router::nexus_bridge::{test_output_child, test_spawn_child},
+    };
+    let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private case root"));
+    let path = root.join("a/tiny.i64");
+    if std::env::var("R6_ANALYSIS_CHILD").as_deref() == Ok("1") {
+        let router = RouterState::new().expect("independent process router");
+        let bridge = router
+            .connect_nexus(BridgeConfig {
+                python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("fixed SDK")),
+                script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/support/r2_client_bridge.py"),
+                directory: root.join("b/i"),
+                environment: std::env::vars().collect(),
+            })
+            .await
+            .expect("second production bridge and target gate");
+        let result: anyhow::Result<Value> = async {
+            let (handle, token) = router
+                .ensure_worker_prepared(
+                    path.to_str().expect("path"),
+                    None,
+                    None,
+                    Preparation::new(Duration::from_secs(10)),
+                )
+                .await?;
+            let status = bridge.lifecycle_status();
+            anyhow::ensure!(
+                status["resources"] == 1,
+                "second home did not acquire a real handle: {status}"
+            );
+            std::fs::write(
+                root.join("b-opened.json"),
+                serde_json::to_vec(&json!({"handle":handle,"status":status,
+                "home":std::env::var("IDA_CLI_HOME").expect("private second home")}))?,
+            )?;
+            wait_for(|| Ok(root.join("b-close").exists())).await?;
+            anyhow::ensure!(
+                router.nexus_close_token(&token).await?.is_some(),
+                "second close lost its lease"
+            );
+            std::fs::write(root.join("b-closed"), b"")?;
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while bridge.lifecycle_status()["resources"] != 0
+                    || bridge.lifecycle_status()["retirement_acks"] != 0
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+            Ok(status)
+        }
+        .await;
+        let shutdown = bridge.shutdown().await;
+        std::fs::write(root.join("b-result.json"),serde_json::to_vec_pretty(&json!({"result":result.as_ref().ok(),
+            "error":result.as_ref().err().map(ToString::to_string),"shutdown":format!("{shutdown:?}")})).expect("JSON")).expect("evidence");
+        shutdown.expect("second natural shutdown");
+        result.expect("second home passes target gate during analysis");
+        return;
+    }
+    for name in ["a", "b", "b-home/.ida", "b-tmp", "state"] {
+        std::fs::create_dir_all(root.join(name)).expect("new owned directories");
+    }
+    let router = RouterState::new().expect("parent production router");
+    let mut environment: BTreeMap<String, String> = std::env::vars().collect();
+    environment.insert("R3A_CASE_ROOT".into(), root.join("a").display().to_string());
+    environment.insert("R3A_SCENARIO".into(), "analysis-barrier".into());
+    environment.insert(
+        "IDA_NEXUS_STATE_DIR".into(),
+        root.join("state").display().to_string(),
+    );
+    let bridge = router
+        .connect_nexus(BridgeConfig {
+            python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("SDK")),
+            script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/r3a_bridge_fixture.py"),
+            directory: root.join("a/i"),
+            environment,
+        })
+        .await
+        .expect("production N1 bridge and held native analysis input");
+    let mut events = bridge.subscribe();
+    let client = ClientId::new("r6-analysis-a").expect("client");
+    bridge
+        .endpoint()
+        .transition(|s, t| {
+            s.open(
+                &client,
+                AcceptedRequest::new(
+                    &SystemClock,
+                    RequestId::new("analysis-open")?,
+                    None,
+                    "open",
+                    json!({"timeout_secs":20}),
+                )?,
+                OpenSpec {
+                    operation_id: OperationId::new("analysis-open")?,
+                    path: path.display().to_string(),
+                    options: json!({"spawn":false,"wait_analysis":true}),
+                },
+                t,
+            )
+        })
+        .expect("real preparing open");
+    let mut child = None;
+    let result:anyhow::Result<Value>=async {
+        wait_for(||Ok(root.join("a/analysis.arrived").exists())).await?;
+        let before=bridge.lifecycle_status();
+        let lease:SessionLease=serde_json::from_value(before["resource_details"][0]["lease"].clone())?;
+        anyhow::ensure!(bridge.endpoint().transition(|s,_|s.status(&client,&lease))?.phase==SessionPhase::Preparing,
+            "first caller must still be in real analysis preparation");
+        let mut command=tokio::process::Command::new("timeout");
+        command.arg("30s").arg(std::env::var_os("R3A_PYTHON").expect("prepared telemetry Python"))
+            .args(["-B","-c","import subprocess,sys; raise SystemExit(subprocess.run(sys.argv[1:],check=False).returncode)"])
+            .arg(std::env::current_exe().expect("same test binary"))
+            .args(["analysis_does_not_hold_target_ex_against_an_independent_home","--exact","--nocapture","--test-threads=1"])
+            .env("R6_ANALYSIS_CHILD","1").env("HOME",root.join("b-home"))
+            .env("IDA_CLI_HOME",root.join("b-home/.ida")).env("TMPDIR",root.join("b-tmp"))
+            .env("IDA_NEXUS_STATE_DIR",root.join("state")).env("IDA_NEXUS_IPC_ROOT",root.join("b/ipc"))
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        child=Some(test_spawn_child(&mut command)?);
+        wait_for(||Ok(root.join("b-opened.json").exists())).await?;
+        anyhow::ensure!(!root.join("a/analysis.release").exists(),"B must acquire before A analysis resumes");
+        let second:Value=serde_json::from_slice(&std::fs::read(root.join("b-opened.json"))?)?;
+        anyhow::ensure!(second["home"]==root.join("b-home/.ida").display().to_string(),"second process reused the first home");
+        anyhow::ensure!(second["status"]["resource_details"][0]["owner"]==before["resource_details"][0]["owner"],
+            "the independent home must attach to the same physical owner");
+        std::fs::write(root.join("a/analysis.release"),b"")?;
+        tokio::time::timeout(Duration::from_secs(8),async {
+            loop {
+                let event=events.recv().await?;
+                if event["event"]=="opened" {break Ok::<_,anyhow::Error>(event);}
+            }
+        }).await??;
+        bridge.endpoint().transition(|s,t|s.release(&client,&lease,t))?;
+        tokio::time::timeout(Duration::from_secs(8),async {
+            loop {
+                let event=events.recv().await?;
+                if event["event"]=="released" {break Ok::<_,anyhow::Error>(event);}
+            }
+        }).await??;
+        std::fs::write(root.join("b-close"),b"")?;
+        wait_for(||Ok(root.join("b-closed").exists())).await?;
+        Ok(json!({"preparing":before,"second_home":second,"analysis_released_after_second_acquired":true}))
+    }.await;
+    for name in ["a/analysis.release", "a/owner-release", "b-close"] {
+        std::fs::write(root.join(name), b"").expect("finally release only owned barriers");
+    }
+    let child_output = match child {
+        Some(child) => Some(
+            test_output_child(child)
+                .await
+                .expect("actual independent child wait"),
+        ),
+        None => None,
+    };
+    let settled = tokio::time::timeout(Duration::from_secs(8), async {
+        while bridge.lifecycle_status()["resources"] != 0
+            || bridge.lifecycle_status()["retirement_acks"] != 0
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let shutdown = bridge.shutdown().await;
+    std::fs::write(root.join("analysis-two-home.json"),serde_json::to_vec_pretty(&json!({"result":result.as_ref().ok(),
+        "error":result.as_ref().err().map(ToString::to_string),"child_status":child_output.as_ref().map(|o|o.status.code()),
+        "child_stdout":child_output.as_ref().map(|o|String::from_utf8_lossy(&o.stdout)),
+        "child_stderr":child_output.as_ref().map(|o|String::from_utf8_lossy(&o.stderr)),
+        "settled":settled.is_ok(),"shutdown":format!("{shutdown:?}")})).expect("JSON")).expect("evidence");
+    let output = child_output.expect("independent child was actually created");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    settled.expect("all current resources settle");
+    shutdown.expect("parent natural shutdown");
+    result.expect("analysis does not own target EX");
+}
+
 #[tokio::test]
 async fn final_preparation_and_f4_keep_exact_physical_responsibility() {
     let _ = tracing_subscriber::fmt()

@@ -1657,6 +1657,23 @@ async fn startup_proof(
     }
     #[cfg(feature = "nexus-test-support")]
     super::test_barriers::asynchronous("proof_before_retire", launch.clone()).await?;
+    // Public lifetime can precede the final typed attach facts. Cache the
+    // producer-closed helper view, rather than the earlier proof snapshot,
+    // before retirement makes this exact watch unavailable to lookup.
+    let latest = helper.call(json!({"kind":"lookup","watch":watch})).await?;
+    anyhow::ensure!(
+        latest["state_root"] == helper.state_root
+            && latest["item"]["acquisition"] == launch["acquisition"]
+            && latest["item"]["owner"] == launch["owner"]
+            && latest["item"]["proof"] == launch["proof"]
+            && latest["item"]["consumer"] == launch["consumer"],
+        "retiring startup helper facts changed identity or proof"
+    );
+    state
+        .startup_proofs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(watch.clone(), latest["item"].clone());
     helper
         .call(json!({"kind":"retire","watch":watch,"sha256":launch["consumer"]["sha256"]}))
         .await?;

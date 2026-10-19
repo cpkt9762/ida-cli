@@ -1,5 +1,24 @@
 # Testing
 
+R6 的原语图不按初始成员数排除 owner 时序，逐轨迹 JSON 保留原始 ACK、错误、
+I1–I6 检查和 I5 的 pending 前提；Rust `nexus_r3b` 另记录真实 HTTP detach 后继集合，
+在同一 router 释放 owner barrier 后检查 I5。S1 已改用生产 custody/SDK/helper，
+旧 transport 夹具不再拦截 `released` 作为 owner 证明。独立 explicit-save 回归精确检查
+CLI/MCP 原有 `run_script` 失败正文，原 close 的错误与逐成员断言保留。
+
+`origin` 对无 U6 能力的卷保留 `UnsupportedBootScope` 和诊断；无义务设备重绑定
+用原生卷 UUID、协调目录/锁/代际身份核验，目标 EX 下先持久记录再接纳。
+macOS 无 Unix 模式的本地卷仅在 `statfs.MNT_LOCAL`、挂载 uid 与对象 uid 均匹配，
+且文件系统命中白名单、已实测通过非覆盖 rename 和 hardlink 时等价检查私有模式。
+APFS/HFS+/网络卷继续严格检查。exFAT 的两项 API 实测均 errno45，按用户裁定拒绝：
+在任何 Nexus probe/open/spawn 前报卷类型、缺失能力和 errno，清理本次自有探测文件，
+不创建协调区或修改 IDB。这是与旧后端的已知差异；不模拟或覆盖发布。
+
+维护 preview 包含 `unpublished_scratch` 的路径、大小、inode 和哈希。
+显式离线证据 `cleanup_unpublished=true` 并批准当前计划哈希后，apply 才删除精确的
+未引用 scratch；owner/checkpoint 引用或身份变化拒绝，没有自动 GC。
+R6 运行与未完成项见外部 `n7a-refactor/r6/report.md`，不构成 R6/R7 验收。
+
 R4-fix4 定向回归增加 `tests/nexus_bridge/test_legacy_scan_isolation.py` 与
 `test_unpublished_creation.py`：前者实跑 OpenGate/Custodian.gate，坏的 home 盘点项
 只作诊断，匹配目标的未结义务仍拒绝；后者以真实子进程退出覆盖四种记录的三个新增内部

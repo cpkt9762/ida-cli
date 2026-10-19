@@ -494,7 +494,12 @@ async fn actual_guard_errors_reach_close_caller_and_remain_after_proof() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn post_exit_resolves_once_and_unknown_attach_never_replays() {
-    for scenario in ["post-exit-success", "post-exit-final503", "attach-eof"] {
+    for scenario in [
+        "post-exit-success",
+        "post-exit-final503",
+        "attach-eof",
+        "post-exit-reap-before-subscribe",
+    ] {
         let root =
             PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root")).join(scenario);
         std::fs::create_dir_all(&root).expect("scenario directory");
@@ -519,7 +524,7 @@ async fn post_exit_resolves_once_and_unknown_attach_never_replays() {
         let result: Result<Value, anyhow::Error> = async {
             let opened = router.ensure_worker_prepared(root.join("tiny.i64").to_str().expect("utf8"), None, None,
                 Preparation::new(Duration::from_secs(12))).await;
-            if scenario == "post-exit-success" {
+            if scenario == "post-exit-success" || scenario == "post-exit-reap-before-subscribe" {
                 let (_, token) = opened?;
                 router.nexus_close_token(&token).await?;
             } else {
@@ -532,6 +537,11 @@ async fn post_exit_resolves_once_and_unknown_attach_never_replays() {
             let expected = if scenario == "attach-eof" { 1 } else { 3 };
             anyhow::ensure!(resolves == expected && attaches == expected,
                 "actual public resolver/attach counts {resolves}/{attaches}, expected {expected}: {stages:?}");
+            if scenario == "post-exit-reap-before-subscribe" {
+                let boundary:Value=serde_json::from_slice(&std::fs::read(root.join("resolved-reaped.json"))?)?;
+                anyhow::ensure!(boundary["helper_signed"]==false && boundary["public_original_held"]==true
+                    && boundary["native_lifetime_released"]==true,"resolved/reap boundary was not exercised: {boundary}");
+            }
             Ok(json!({"scenario":scenario,"public_stages":stages,"resolvers":resolves,"attaches":attaches}))
         }.await;
         std::fs::write(
@@ -683,7 +693,7 @@ async fn last_ack_finishes_lease_before_owner_exit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nonlast_ack_drops_only_its_guard_and_unknown_never_replays() {
-    for scenario in ["slow-owner", "lost-ack"] {
+    for scenario in ["slow-owner", "lost-ack", "gui-reference"] {
         let root =
             PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root")).join(scenario);
         std::fs::create_dir_all(&root).expect("isolated scenario");
@@ -715,7 +725,7 @@ async fn nonlast_ack_drops_only_its_guard_and_unknown_never_replays() {
             let first=router.nexus_close_token(&one).await;
             let first_status=router.status_snapshot().await.owner_observations;
             let second=router.nexus_close_token(&two).await;
-            if scenario == "slow-owner" {
+            if scenario != "lost-ack" {
                 anyhow::ensure!(first.is_ok() && second.is_ok(),"valid ACK close {first:?}/{second:?}");
                 anyhow::ensure!(first_status.len() == 1 && first_status[0]["outcome"]["ack_kind"] == "nonlast"
                     && first_status[0]["root_shared_guard"] == false,"nonlast must not keep an extra rootSH: {first_status:?}");
@@ -731,6 +741,11 @@ async fn nonlast_ack_drops_only_its_guard_and_unknown_never_replays() {
             let snapshot:Value=serde_json::from_slice(&std::fs::read(root.join("snapshot.json"))?)?;
             anyhow::ensure!(snapshot["requests"].as_array().expect("requests").iter()
                 .filter(|r|r["endpoint"] == "/release_lease").count() == 2,"each lease detached exactly once");
+            if scenario=="gui-reference" {
+                anyhow::ensure!(router.status_snapshot().await.owner_observations.iter()
+                    .all(|s|s["outcome"]["ack_kind"]=="nonlast" && s["root_shared_guard"]==false),
+                    "the independently held GUI owner may not retain our lease guards");
+            }
             Ok(json!({"first":format!("{first:?}"),"second":format!("{second:?}"),"status":first_status,"snapshot":snapshot}))
         }.await;
         std::fs::write(root.join("owner-release"), b"").expect("finally release private owner");
@@ -1031,18 +1046,38 @@ async fn real_ida95_saved_modification_immediate_reopen_and_shared_lease() {
         .with_max_level(tracing::Level::DEBUG)
         .try_init();
     let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root"));
-    let path = root.join("tiny");
-    std::fs::copy(
-        std::env::var_os("R2_REAL_INPUT").expect("private prepared sample"),
-        &path,
-    )
-    .expect("fresh sample copy");
+    let volume_seed = std::env::var_os("R6_VOLUME_SEED");
+    let case_alias = std::env::var("R6_CASE_ALIAS").as_deref() == Ok("1");
+    let path = root.join(if case_alias {
+        "Foo.i64"
+    } else if volume_seed.is_some() {
+        "tiny.i64"
+    } else {
+        "tiny"
+    });
+    let remounted = std::env::var("R6_VOLUME_REOPEN").as_deref() == Ok("1");
+    if !remounted {
+        std::fs::copy(
+            volume_seed.unwrap_or_else(|| {
+                std::env::var_os("R2_REAL_INPUT").expect("private prepared sample")
+            }),
+            &path,
+        )
+        .expect("fresh sample copy");
+    }
     let first = RouterState::new().expect("first router");
     let second = RouterState::new().expect("independent router");
+    let runtime = std::env::var_os("R6_VOLUME_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.clone());
     let configuration = |name: &str| BridgeConfig {
         python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("formal SDK")),
         script: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("nexus_bridge/bridge.py"),
-        directory: root.join(name),
+        directory: runtime.join(if remounted {
+            format!("{name}-remount")
+        } else {
+            name.to_owned()
+        }),
         environment: std::env::vars().collect(),
     };
     let a = first
@@ -1060,11 +1095,18 @@ async fn real_ida95_saved_modification_immediate_reopen_and_shared_lease() {
         let open=||Preparation::new(Duration::from_secs(30));
         let (one,t1)=first.ensure_worker_prepared(path.to_str().expect("utf8"),None,None,open()).await?;
         tokens.push((false,t1.clone()));
-        let (two,t2)=second.ensure_worker_prepared(path.to_str().expect("utf8"),None,None,open()).await?;
+        let alias=if case_alias {root.join("foo.i64")}else{path.clone()};
+        let (two,t2)=second.ensure_worker_prepared(alias.to_str().expect("utf8"),None,None,open()).await?;
         tokens.push((true,t2.clone()));
         let version=first.route_request_prepared(Some(&one),"run_script",
             json!({"code":"import ida_kernwin\nprint(ida_kernwin.get_kernel_version())"}),open()).await?;
         anyhow::ensure!(version["success"] == true && version["stdout"] == "9.5\n","actual IDA version: {version}");
+        if remounted {
+            let persisted=first.route_request_prepared(Some(&one),"run_script",json!({"code":
+                "import ida_ida, ida_bytes\nprint(ida_bytes.get_cmt(ida_ida.inf_get_min_ea(), False))"}),open()).await?;
+            anyhow::ensure!(persisted["success"]==true && persisted["stdout"]=="r2_saved_20261018\n",
+                "remount lost the previously saved modification: {persisted}");
+        }
         let wrote=first.route_request_prepared(Some(&one),"run_script",json!({"code":
             "import ida_ida, ida_bytes\nassert ida_bytes.set_cmt(ida_ida.inf_get_min_ea(), 'r2_saved_20261018', False)\nprint('saved modification')"}),open()).await?;
         anyhow::ensure!(wrote["success"] == true && wrote["stdout"] == "saved modification\n","real modification: {wrote}");

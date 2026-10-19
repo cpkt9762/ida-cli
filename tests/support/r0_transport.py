@@ -25,6 +25,11 @@ def install_ida_inputs(path):
         sys.modules[name] = result
         return result
     flags = set()
+    module("ida_auto", auto_is_ok=lambda:True, get_auto_state=lambda:0)
+    module("ida_funcs")
+    module("ida_idaapi", BADADDR=0xFFFFFFFFFFFFFFFF)
+    module("idautils")
+    module("idc")
     module("ida_kernwin", get_kernel_version=lambda: "9.5")
     module("ida_netnode", netnode=type("Netnode", (), {"exist": staticmethod(lambda _: True)}))
     module("ida_nalt", get_input_file_path=lambda: str(path), retrieve_input_file_size=lambda: 1,
@@ -45,6 +50,7 @@ class Boundary:
         self.path.write_bytes(b"R0 external database-state input")
         self.scenario = scenario
         self.requests = []
+        self.transitions = []
         self.leases = set()
         self.analysis_failed = False
         self.streams = {}
@@ -85,7 +91,10 @@ class Boundary:
                     return
                 lease = query["lease_id"][0]
                 with owner.lock:
+                    before = sorted(owner.leases)
                     owner.leases.add(lease)
+                    owner.transitions.append({'edge':'attach','call':'GET /health?sse',
+                        'lease':lease,'before':before,'after':sorted(owner.leases)})
                     owner.streams[lease] = self.connection
                     owner.requests.append({"endpoint": "lease", "lease": lease})
                 self.send_response(200)
@@ -109,8 +118,14 @@ class Boundary:
                     owner.requests.append({"endpoint": self.path, **payload})
                 if self.path == "/release_lease":
                     with owner.lock:
+                        before = sorted(owner.leases)
                         owner.leases.discard(payload["lease_id"])
-                        last = not owner.leases
+                        last = not owner.leases and owner.instance.backend != 'gui'
+                        owner.transitions.append({'edge':'detach','call':'POST /release_lease',
+                            'lease':payload['lease_id'],'before':before,'after':sorted(owner.leases),
+                            'ack_kind':'last' if last else 'nonlast',
+                            'owner_backend':owner.instance.backend,
+                            'ack_delivery':'lost' if owner.scenario in ('lost-ack','early-analysis') else 'parsed'})
                     (owner.root / "release-requested").touch()
                     if owner.scenario in ("lost-ack", "early-analysis"):
                         self.connection.shutdown(socket.SHUT_RDWR)

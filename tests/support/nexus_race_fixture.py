@@ -26,7 +26,7 @@ import ida_nexus.handle as handle_module
 def barrier(name):
     (ROOT / (name + ".arrived")).touch()
     # File barriers include test-process scheduling/startup, not response latency.
-    until = time.monotonic() + (150 if name == 'n7-release-proof' else 15)
+    until = time.monotonic() + 15
     while not (ROOT / (name + ".release")).exists():
         if time.monotonic() > until:
             raise TimeoutError("fixture barrier " + name)
@@ -42,10 +42,6 @@ original_send = bridge.Channel.send
 
 
 def send(self, event):
-    if event.get('event') == 'opened' and SCENARIO == 'n7-open-drop':
-        barrier('n7-open-proof')
-    if event.get('event') == 'released' and SCENARIO in ('n7-close-drop', 'n7-open-drop'):
-        barrier('n7-release-proof')
     if event.get("event") == "ack" and SCENARIO == "expired-proof":
         # Shorten only stop-proof admission. The owner must still receive the
         # accepted execution deadline so its new deadline guard runs normally.
@@ -66,8 +62,6 @@ def send(self, event):
     if event.get("event") == "stopped" and SCENARIO == "expired-proof":
         barrier("stopped")
     original_send(self, event)
-    if event.get('event') == 'released' and SCENARIO == 'n7-close-drop':
-        (ROOT / 'n7-proof-sent').touch()
 bridge.Channel.send = send
 
 
@@ -139,8 +133,6 @@ class Connection:
 
 counts = {}
 SCENARIO = os.environ.get("F1_SCENARIO")
-if SCENARIO in ('n7-close-drop', 'n7-open-drop'):
-    DatabaseHandle.wait_autoanalysis = lambda *_a, **_k: None
 original_loads = json.loads
 
 def causal_loads(raw, *args, **kwargs):

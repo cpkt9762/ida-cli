@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 import unittest
-import inspect
 import sys
 import threading
 import tempfile
@@ -138,10 +137,8 @@ def case(version='current', lost_ack=False, root_loss=False, slice_cleanup=False
             try:
                 if slice_cleanup:
                     args = [auxiliary, ["bridge", "logical", "review-owner", 1, str(ROOT / "lifetime")], slices_module.incarnation]
-                    # F9 makes the shared release function an explicit payload dependency.
-                    if len(inspect.signature(slices_module.cleanup_disconnected).parameters) == 4:
-                        from lifecycle import release_handle
-                        args.append(release_handle)
+                    from lifecycle import release_handle
+                    args.append(release_handle)
                     slices_module.cleanup_disconnected(*args)
                 else:
                     owner.invoke(types.SimpleNamespace(send=messages.append), {"sequence": 1},

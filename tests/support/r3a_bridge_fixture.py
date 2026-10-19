@@ -57,7 +57,7 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
         boundary.release_owner()
         boundary.path.with_suffix('.id0').write_bytes(bytes(18)+b'\x01B-tree v2original component')
     r3b_failures = int(os.environ.get('R3B_R9_FAILURES', '0'))
-    if scenario == 'r9-gui':
+    if scenario in ('r9-gui','gui-reference'):
         boundary.release_owner()
         boundary.registration = InstanceRegistration(REGISTRY_DIR,
             InstanceIdentity(str(boundary.path),str(boundary.path),'gui',False),token=secrets.token_hex(24))
@@ -103,7 +103,21 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
                 barrier(root, 'attach-response')
         return original_get(request)
     first_preparation = [True]
+    close_barrier_used = [False]
+    save_refusals = [0]
     def post_input(request):
+        if request.path == '/execute_python' and (root/'save-refuse').exists():
+            import ida_loader
+            def refuse_save(*_args, **_options):
+                save_refusals[0] += 1
+                write_evidence_json(root/'save-refusals.json',{'calls':save_refusals[0]})
+                raise PermissionError('saving refused: explicit native save rejected')
+            ida_loader.save_database = refuse_save
+        if (request.path == '/execute_python' and (root/'r6-close.arm').exists()
+                and not close_barrier_used[0]):
+            close_barrier_used[0] = True
+            from r0_transport import barrier
+            barrier(root, 'r6-close')
         if (request.path == '/execute_python' and scenario == 'r9-restore-held'
                 and not (root/'recovered-product').exists()):
             boundary.path.write_bytes(b'failed recovered packed')
@@ -145,8 +159,6 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
                 'tcp_nodelay_enabled':bool(request.connection.getsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY)),
                 'split_headers_body':True}))
         failed_releases = sum(r['endpoint'] == '/release_lease' for r in boundary.requests)
-        if request.path == '/release_lease' and scenario == 'r9-gui':
-            payload['result']['shutdown_pending'] = False
         if (request.path == '/release_lease' and r9 and scenario not in ('r9-gui', 'r9-restore-held')
                 and (not (root/'r9-successor').exists() or (r3b_failures and failed_releases <= r3b_failures))):
             boundary.release_owner()
@@ -322,6 +334,22 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
             def public_stage(self, stage, value):
                 # Public observer telemetry only; never substitutes a resolver,
                 # result, proof, SDK object or production admission decision.
+                if scenario == 'post-exit-reap-before-subscribe' and stage == 'Resolved' and not (root/'resolved-reaped.json').exists():
+                    # The SDK has already returned this real public instance,
+                    # but no helper/backup subscription has been signed yet.
+                    assert self.subscription is None and not self.originals
+                    held_record=value.record_id
+                    boundary.release_owner()
+                    from ida_nexus import wait_database_released
+                    assert boundary.registration.registry_path is None
+                    assert wait_database_released(value,timeout=0) is True
+                    write_evidence_json(root/'resolved-reaped.json',{
+                        'record_id':held_record,'helper_signed':False,
+                        'public_original_held':True,'native_lifetime_released':True})
+                    boundary.registration=InstanceRegistration(REGISTRY_DIR,
+                        InstanceIdentity(str(boundary.path),str(boundary.path),'idalib',True),token=secrets.token_hex(24))
+                    boundary.instance=boundary.registration.publish(boundary.server.server_port)
+                    boundary.released=False
                 if scenario == 'post-exit-attach-ack' and self.post_exit_resolve_used and stage == 'AttachMayBeSent':
                     import time
                     # Enter the production stage with a small positive budget;
@@ -392,7 +420,7 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
             import origin
             observed_scope = runpy.run_path(str(Path(__file__).with_name('r2_boot_writer.py')))['observed_scope']
             native_scope = target_journal.creation_scope
-            target_journal.creation_scope = lambda path, incarnation: observed_scope(native_scope, path, incarnation)
+            target_journal.creation_scope = lambda path, incarnation, **options: observed_scope(native_scope, path, incarnation, **options)
             origin.creation_scope=target_journal.creation_scope
         if scenario == 'r2-save-refused-notsent':
             from acquisition import Custodian

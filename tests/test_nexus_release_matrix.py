@@ -35,7 +35,7 @@ def cases():
         count = 1 if group == 'primary' else 2
         def visit(index, live, guards=(), outcomes=()):
             if index == count:
-                for timing in TIMES if not live else ('held',):
+                for timing in TIMES:
                     rows.append((group, guards, outcomes, timing))
                 return
             for guard in GUARDS:
@@ -62,6 +62,7 @@ def exercise(row, directory, *, alien=None):
     real_wait = instances.wait_database_released
     clock = [time.monotonic()]
     deadline = clock[0]+1
+    owner_can_exit = all(guard in GUARDS[:2] for guard in guards)
 
     class Handle:
         def __init__(self,index):
@@ -89,7 +90,7 @@ def exercise(row, directory, *, alien=None):
     def lifetime(owner,**_options):
         if not lifecycle.same_owner(handles[0],types.SimpleNamespace(instance=owner)):
             raise OSError('no matching original public object for this OwnerKey')
-        if timing=='during':
+        if timing=='during' and owner_can_exit:
             fcntl.flock(fd,fcntl.LOCK_UN)
         if timing=='after_deadline' and not queries:
             clock[0] += 2
@@ -116,13 +117,18 @@ def exercise(row, directory, *, alien=None):
                 except RuntimeError as error:
                     errors.append(str(error))
                     outcomes.append(None)
-            if timing=='before':
+            # A sibling can leave after our nonlast ACKs. A refused own guard
+            # instead keeps an explicit pending member and owner-held premise.
+            if group=='sibling' and timing!='held':
+                live.remove(count)
+            if timing=='before' and owner_can_exit:
                 fcntl.flock(fd,fcntl.LOCK_UN)
             for handle in handles:
                 if release_state(handle)['requested']:
                     observe(handle)
             if timing=='after_deadline':
-                fcntl.flock(fd,fcntl.LOCK_UN)
+                if owner_can_exit:
+                    fcntl.flock(fd,fcntl.LOCK_UN)
                 for handle in handles:
                     if release_state(handle)['requested']:
                         observe(handle)
@@ -132,8 +138,9 @@ def exercise(row, directory, *, alien=None):
                     release_handle(handle,deadline,request_only=True)
             assert calls==before,'later observations must not replay a native request'
 
-        failures = []
+        failures, assertions = [], []
         def invariant(name, value):
+            assertions.append({'invariant':name,'passed':bool(value)})
             if not value:
                 failures.append(name)
         invariant('I1',all(guards[i] in GUARDS[:2] for i in calls))
@@ -155,14 +162,21 @@ def exercise(row, directory, *, alien=None):
             if i in calls and not expected_ack and not state.get('owner_proved'):
                 invariant('I6',state['requested'] and raw.get('lease_released') is False
                     and raw.get('status')=='uncertain')
-        if timing!='held' and not alien:
+        if timing!='held' and owner_can_exit and not alien:
             invariant('I5',all(release_state(h).get('owner_proved') for h in handles))
-        if timing=='held':
+        if timing=='held' or not owner_can_exit:
             invariant('owner_held',not any(release_state(h).get('owner_proved') for h in handles))
         if alien:
             invariant('exact_owner',not release_state(handles[1]).get('owner_proved') and bool(observation_errors))
         return failures, {'case':row,'calls':calls,'checks':checks,'queries':queries,
-                          'errors':errors,'observation_errors':observation_errors,'failures':failures}
+                          'errors':errors,'observation_errors':observation_errors,'failures':failures,
+                          'invariants':assertions,
+                          'members':[{'index':i,'guard':guards[i],'requested':release_state(handle)['requested'],
+                              'outcome':release_state(handle)['outcome'],'owner_proved':release_state(handle).get('owner_proved',False),
+                              'errors':release_errors(handle)} for i,handle in enumerate(handles)],
+                          'I5_applicable':timing!='held' and owner_can_exit and not alien,
+                          'pending':sorted(live),
+                          'I5_pending_reason':('owner lifetime held or own guard refused' if timing=='held' or not owner_can_exit else None)}
     finally:
         os.close(fd)
 
@@ -170,18 +184,22 @@ def exercise(row, directory, *, alien=None):
 class MatrixTests(unittest.TestCase):
     def test_reachable_matrix(self):
         rows = cases()
-        failures = []
+        failures, trajectories = [], []
         counts = collections.Counter(row[0] for row in rows)
         with tempfile.TemporaryDirectory(prefix='n7matrix-') as root:
             for row in rows:
                 failed, detail = exercise(row,Path(root))
+                trajectories.append(detail)
                 if failed:
                     failures.append(detail)
         result={'scope':'per-member primitive, not Rust/N1 custody','reachable':len(rows),
-                'groups':dict(counts),'failed':failures,'static_exclusions':0}
+                'groups':dict(counts),'failed':failures,'trajectories':trajectories,
+                'static_exclusions':0,'exclusions':[]}
         if os.environ.get('F11_MATRIX_RESULT'):
             Path(os.environ['F11_MATRIX_RESULT']).write_text(json.dumps(result,indent=2)+'\n')
-        self.assertGreater(len(rows),200,'must enumerate actual guard/request/owner edges')
+        self.assertEqual({guard for row in rows for guard in row[1]},set(GUARDS))
+        self.assertEqual({mode for row in rows for mode in row[2]},set(ACKS)|{None})
+        self.assertEqual({row[3] for row in rows},set(TIMES))
         self.assertEqual(failures,[],json.dumps(result))
 
     def test_different_owner_proof_is_not_shared(self):

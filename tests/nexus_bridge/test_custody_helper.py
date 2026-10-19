@@ -475,6 +475,24 @@ with Target(sys.argv[1]) as target:
                     'target':str(boundary.path), 'coord_key':coord, 'owner':owner, 'subscription_epoch':1,
                     'acquisition':{'parent':'wrong-parent', 'purpose':'final', 'ordinal':1}})
             self.assertEqual(request(endpoint, self.identity, {'kind':'heartbeat'})['items'], [])
+            original=owner_key(boundary.instance)
+            variants=[]
+            for field,value in (('record_id',original['record_id']+'-foreign'),
+                    ('pid',original['pid']+1),('started_at',original['started_at']+1),
+                    ('canonical_idb_path',str((self.root/'other.i64').resolve())),('backend','gui')):
+                changed=dict(original,**{field:value})
+                absent=dict(original);absent.pop(field)
+                variants.extend(((field,'changed',changed),(field,'absent',absent)))
+            evidence=[]
+            for number,(field,variant,changed) in enumerate(variants):
+                with self.subTest(field=field,variant=variant):
+                    with self.assertRaisesRegex(RuntimeError,'ProtocolMismatch|exact public instance unavailable') as failure:
+                        request(endpoint,self.identity,{'kind':'subscribe','watch':'foreign-'+str(number),
+                            'target':str(boundary.path),'coord_key':coord,'owner':changed,'subscription_epoch':1,
+                            'acquisition':{'parent':'wrong-parent','purpose':'final','ordinal':1}})
+                    self.assertEqual(request(endpoint,self.identity,{'kind':'heartbeat'})['items'],[])
+                    evidence.append(dict(field=field,variant=variant,error=str(failure.exception),proof=False))
+            (self.root/'owner-field-matrix.json').write_text(json.dumps(evidence,indent=2))
             request(endpoint, self.identity, {'kind':'retire_parent', 'parent':'wrong-parent'})
             request(endpoint, self.identity, {'kind':'finish'})
 

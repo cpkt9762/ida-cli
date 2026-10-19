@@ -290,7 +290,7 @@ async fn dispatch_cli_request(
                                 "timeout_secs must be an unsigned integer",
                             ),
                             None,
-                        )
+                        );
                     }
                 },
             };
@@ -553,6 +553,21 @@ pub(crate) async fn test_owner_wait_rpc(
 #[cfg(all(test, feature = "nexus-test-support"))]
 pub(crate) async fn test_close_rpc(router: RouterState, path: &str) -> serde_json::Value {
     test_cli_rpc(router, "close", serde_json::json!({"path":path}), 5).await
+}
+
+#[cfg(all(test, feature = "nexus-test-support"))]
+pub(crate) async fn test_save_rpc(
+    router: RouterState,
+    path: &str,
+    code: &str,
+) -> serde_json::Value {
+    test_cli_rpc(
+        router,
+        "run_script",
+        serde_json::json!({"path":path,"code":code,"timeout_secs":10}),
+        12,
+    )
+    .await
 }
 
 #[cfg(all(test, feature = "nexus-test-support"))]

@@ -73,7 +73,11 @@ def owner_input(root):
                     payload = json.loads(request.rfile.read(int(request.headers['Content-Length'])))
                     with boundary.lock:
                         boundary.requests.append({'endpoint':request.path, **payload})
+                        before = sorted(boundary.leases)
                         boundary.leases.discard(payload['lease_id'])
+                        boundary.transitions.append({'edge':'detach','call':'POST /release_lease',
+                            'lease':payload['lease_id'],'before':before,'after':sorted(boundary.leases),
+                            'ack_kind':'last' if not boundary.leases else 'nonlast','ack_delivery':'lost'})
                     request.connection.shutdown(socket.SHUT_RDWR)
                     request.close_connection = True
                     return
@@ -138,6 +142,10 @@ def owner_input(root):
             if (root/'snapshot-request').exists():
                 with boundary.lock:
                     data = json.dumps(boundary.requests)
+                    transitions = json.dumps(boundary.transitions)
+                temporary = root/'transitions.new'
+                temporary.write_text(transitions)
+                temporary.replace(root/'transitions.json')
                 temporary = root/'requests.new'
                 temporary.write_text(data)
                 temporary.replace(root/'requests.json')
@@ -194,6 +202,27 @@ else:
         runtime = runpy.run_path(sys.argv[0], run_name='verified_multi_input')['load_entry']()
         from acquisition import Custodian
         schedule_parent(Custodian)
+        if os.environ.get('R3B_CASE') == 'auxiliary-deadline':
+            import owner_release
+            import types
+            actual_transact=Custodian.transact
+            actual_clock=owner_release.time
+            expired=[False]
+            def deadline_after_guard(self,action,**fields):
+                result=actual_transact(self,action,**fields)
+                if action=='release_observation' and self.acquisition['purpose']=='auxiliary' and not expired[0]:
+                    expired[0]=True
+                    assert fields['outcome']['protection']['close_safe'] is True
+                    (root/'deadline-after-guard.json').write_text(json.dumps(fields['outcome']))
+                    calls=[0]
+                    def tick():
+                        calls[0]+=1
+                        if calls[0]<=2:return fields['_deadline']+3
+                        owner_release.time=actual_clock
+                        return actual_clock.monotonic()
+                    owner_release.time=types.SimpleNamespace(monotonic=tick)
+                return result
+            Custodian.transact=deadline_after_guard
         if os.environ.get('R3B_CASE') == 'late-auxiliary-fault':
             original_drop = runtime.Bridge.drop_lifetime
             def expose_owner_cleanup_context(self, lease_id):

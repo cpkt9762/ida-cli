@@ -377,6 +377,7 @@ async fn disconnected_primary_and_auxiliary_progress_independently_to_actual_cal
     for scenario in [
         "auxiliary-healthy",
         "auxiliary-fault",
+        "auxiliary-deadline",
         "auxiliary-uncertain",
         "auxiliary-sibling-join",
         "auxiliary-sibling-leave",
@@ -461,7 +462,7 @@ async fn disconnected_primary_and_auxiliary_progress_independently_to_actual_cal
             } else {anyhow::ensure!(first.phase==SessionPhase::Released,"primary ACK must survive auxiliary error: {first:?}");}
             match scenario {
                 "auxiliary-healthy" | "auxiliary-sibling-join" | "auxiliary-sibling-leave" | "primary-uncertain" => anyhow::ensure!(second.phase==SessionPhase::Released,"{second:?}"),
-                "auxiliary-fault" | "late-auxiliary-fault" => anyhow::ensure!(second.control_delivery.as_ref().is_some_and(|d|d.state==DeliveryState::NotSent),"{second:?}"),
+                "auxiliary-fault" | "late-auxiliary-fault" | "auxiliary-deadline" => anyhow::ensure!(second.control_delivery.as_ref().is_some_and(|d|d.state==DeliveryState::NotSent),"{second:?}"),
                 _ => anyhow::ensure!(second.control_delivery.as_ref().is_some_and(|d|d.state==DeliveryState::Uncertain),"{second:?}"),
             }
             std::fs::write(root.join("a/snapshot-request"),b"")?;
@@ -470,7 +471,7 @@ async fn disconnected_primary_and_auxiliary_progress_independently_to_actual_cal
             }).await?;
             let requests:Vec<Value>=serde_json::from_slice(&std::fs::read(root.join("a/requests.json"))?)?;
             let detach_count=requests.iter().filter(|r|r["endpoint"]=="/release_lease").count();
-            anyhow::ensure!(detach_count==if scenario=="auxiliary-fault" || scenario=="late-auxiliary-fault" {1}else if scenario=="auxiliary-sibling-leave"{3}else{2},"per-handle requests replayed or lost: {requests:?}");
+            anyhow::ensure!(detach_count==if scenario=="auxiliary-fault" || scenario=="late-auxiliary-fault" || scenario=="auxiliary-deadline" {1}else if scenario=="auxiliary-sibling-leave"{3}else{2},"per-handle requests replayed or lost: {requests:?}");
             bridge.status("member-sets").await?;
             let local=tokio::time::timeout(Duration::from_secs(2),async {
                 loop {let event=events.recv().await?;if event["event"]=="local_status" {break Ok::<_,anyhow::Error>(event);}}
@@ -504,12 +505,19 @@ async fn disconnected_primary_and_auxiliary_progress_independently_to_actual_cal
                 let child=primary_facts["owned_members"].as_array().and_then(|a|a.first()).ok_or_else(||anyhow::anyhow!("child diagnostics"))?;
                 anyhow::ensure!(child["outcome"]["ack_kind"]==if scenario=="auxiliary-sibling-join"{"nonlast"}else{"last"},"dynamic membership was not applied: {child}");
             }
-            if scenario=="auxiliary-fault" || scenario=="late-auxiliary-fault" {
+            if scenario=="auxiliary-fault" || scenario=="late-auxiliary-fault" || scenario=="auxiliary-deadline" {
                 anyhow::ensure!(server_live.len()==1,"NotSent member lost actual server handle");
                 if scenario=="late-auxiliary-fault" {
                     let status=router.status_snapshot().await.owner_observations;
                     anyhow::ensure!(serde_json::to_string(&status)?.contains("controlled auxiliary save protection failure"),
                         "late typed cause must remain visible in the actual caller status: {status:?}");
+                }
+                if scenario=="auxiliary-deadline" {
+                    let protection:Value=serde_json::from_slice(&std::fs::read(root.join("deadline-after-guard.json"))?)?;
+                    anyhow::ensure!(protection["protection"]["close_safe"]==true && protection["detach_called"]==false,
+                        "deadline boundary must follow a real healthy guard");
+                    anyhow::ensure!(second.control_delivery.as_ref().and_then(|d|d.error.as_ref())
+                        .is_some_and(|e|e.message.contains("original close budget exhausted")),"late deadline lost its cause: {second:?}");
                 }
                 let retried=router.nexus_close_token(&token).await?;
                 anyhow::ensure!(retried.is_some(),"released primary token must retain cleanup-only auxiliary access");
@@ -520,10 +528,44 @@ async fn disconnected_primary_and_auxiliary_progress_independently_to_actual_cal
                 anyhow::ensure!(router.nexus_close_token(&token).await.is_err(),"unknown member cannot be silently retried or forgotten");
             } else if scenario=="auxiliary-sibling-join" {anyhow::ensure!(server_live.len()==1 && third_party.contains(&server_live[0]),"sibling live set lost");}
             else {anyhow::ensure!(server_live.is_empty(),"healthy own server set not empty");}
+            let transitions:Vec<Value>=serde_json::from_slice(&std::fs::read(root.join("a/transitions.json"))?)?;
+            for edge in &transitions {
+                if edge["edge"]=="detach" {
+                    let remaining=edge["after"].as_array().ok_or_else(||anyhow::anyhow!("missing real successor set"))?;
+                    anyhow::ensure!(edge["ack_kind"]==if remaining.is_empty(){"last"}else{"nonlast"},
+                        "ACK must be derived from the actual detach successor, never prefilled: {edge}");
+                }
+            }
+            for member in &remote_members {
+                anyhow::ensure!(requests.iter().filter(|r|r["endpoint"]=="/release_lease" && r["lease_id"]==*member).count()<=1,
+                    "I2: physical member detach replayed");
+            }
             let (_,other)=router.ensure_worker_prepared(root.join("b/tiny.i64").to_str().expect("path"),None,None,
                 Preparation::new(Duration::from_secs(10))).await?;
             tokio::time::timeout(Duration::from_secs(2),router.nexus_close_token(&other)).await??;
-            Ok(json!({"caller":format!("{closed:?}"),"primary":first,"auxiliary":second,"requests":requests,"physical_sets":local,"server_live":server_live}))
+            // I5 was inapplicable while the real owner lifetime lock was held.
+            // Continue this SAME router/run after releasing that exact barrier.
+            for name in ["a","b"] {std::fs::write(root.join(name).join("owner-release"),b"")?;}
+            tokio::time::timeout(Duration::from_secs(8),async {
+                while bridge.lifecycle_status()["resources"]!=0 || bridge.lifecycle_status()["retirement_acks"]!=0
+                    || bridge.lifecycle_status()["startup_and_pre_attach"]!=0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await?;
+            let final_primary=bridge.endpoint().transition(|s,_|s.status(&primary.client_id,&primary))?;
+            let final_auxiliary=bridge.endpoint().transition(|s,_|s.status(&auxiliary.client_id,auxiliary))?;
+            anyhow::ensure!(final_primary.phase==SessionPhase::Released && final_auxiliary.phase==SessionPhase::Released,
+                "I5: actual owner release must settle both members: {final_primary:?}/{final_auxiliary:?}");
+            for (before,after) in [(&first,&final_primary),(&second,&final_auxiliary)] {
+                if before.control_delivery.as_ref().is_some_and(|d|d.state==DeliveryState::Uncertain) {
+                    anyhow::ensure!(serde_json::to_value(&before.control_delivery)?==serde_json::to_value(&after.control_delivery)?,
+                        "I3/C4: owner proof rewrote original uncertain command history");
+                }
+            }
+            Ok(json!({"caller":format!("{closed:?}"),"primary":first,"auxiliary":second,"requests":requests,"physical_sets":local,"server_live":server_live,
+                "reachable_edges":transitions,"excluded_edges":[],"I5_before_barrier":{"applicable":false,"reason":"owner lifetime held"},
+                "I5_after_barrier":{"primary":final_primary,"auxiliary":final_auxiliary},
+                "trace_count":1,"scenario":scenario}))
         }.await;
         for name in ["a", "b"] {
             std::fs::write(root.join(name).join("guard.release"), b"").expect("finally guard");
@@ -538,8 +580,10 @@ async fn disconnected_primary_and_auxiliary_progress_independently_to_actual_cal
         let stopped = bridge.shutdown().await;
         std::fs::write(
             root.join("auxiliary-result.json"),
-            serde_json::to_vec_pretty(&json!({"result":format!("{result:?}"),
-            "settled":settled.is_ok(),"shutdown":format!("{stopped:?}")}))
+            serde_json::to_vec_pretty(
+                &json!({"result":format!("{result:?}"),"trace":result.as_ref().ok(),
+            "settled":settled.is_ok(),"shutdown":format!("{stopped:?}")}),
+            )
             .expect("encode"),
         )
         .expect("evidence");
