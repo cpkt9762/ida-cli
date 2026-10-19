@@ -130,7 +130,7 @@ pub async fn run(
     #[cfg(feature = "nexus-test-support")]
     let spawned = command.spawn_recorded();
     #[cfg(not(feature = "nexus-test-support"))]
-    let spawned = command.spawn();
+    let spawned = crate::process_spawn::with_spawn_fence(|| command.spawn());
     let mut child =
         spawned.map_err(|e| ToolError::IdaError(format!("offline process spawn: {e}")))?;
     let pid = child
@@ -602,7 +602,7 @@ impl SpawnRecorded for tokio::process::Command {
         }
         #[cfg(not(feature = "nexus-test-support"))]
         {
-            self.spawn()
+            crate::process_spawn::with_spawn_fence(|| self.spawn())
         }
     }
 }
@@ -617,7 +617,7 @@ impl SpawnRecorded for std::process::Command {
         }
         #[cfg(not(feature = "nexus-test-support"))]
         {
-            self.spawn()
+            crate::process_spawn::with_spawn_fence(|| self.spawn())
         }
     }
 }

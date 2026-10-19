@@ -3,6 +3,7 @@
 //! Manages the `~/.ida/` directory hierarchy and an `index.json` that tracks
 //! metadata about every analysed binary.
 
+use crate::process_spawn::StdOutputFenced;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -178,7 +179,7 @@ impl IdbStore {
             if let Some(key) = key {
                 command.arg("--key").arg(key);
             }
-            let output = command.output()?;
+            let output = command.output_fenced()?;
             anyhow::ensure!(
                 output.status.success(),
                 "cache maintenance failed: {}; {}",
@@ -849,7 +850,7 @@ mod tests {
                     std::env::var_os("IDA_NEXUS_PYTHON")
                         .unwrap_or_else(|| "/usr/bin/python3".into()),
                 )
-                .status()
+                .status_fenced()
                 .unwrap();
             assert!(status.success());
             return;

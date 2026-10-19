@@ -1,4 +1,6 @@
 //! Root shared locks cover preparation, publication and tracked leases.
+#[cfg(test)]
+use crate::process_spawn::StdOutputFenced;
 use crate::{error::ToolError, preprocess::Preparation};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -166,7 +168,7 @@ mod tests {
             std::process::Command::new("timeout")
                 .args(["5s", "/usr/bin/python3", "-c", "import fcntl,sys; f=open(sys.argv[1], 'r+');\ntry: fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(4)"])
                 .arg(&lock)
-                .status()
+                .status_fenced()
                 .expect("independent lock contender")
                 .code()
         };

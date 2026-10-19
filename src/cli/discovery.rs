@@ -1,3 +1,4 @@
+use crate::process_spawn::SpawnFenced;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
@@ -82,7 +83,7 @@ fn auto_start_server() -> Result<(), String> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
+        .spawn_fenced()
         .map_err(|e| format!("Failed to start server: {e}"))?;
 
     eprintln!("Server starting (pid {})...", child.id());

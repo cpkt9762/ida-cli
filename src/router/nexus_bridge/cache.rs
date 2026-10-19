@@ -1,6 +1,8 @@
 //! Prepare a canonical cache input before acquiring any Nexus lease.
 #[cfg(test)]
 use crate::idb_store::IdbStore;
+#[cfg(test)]
+use crate::process_spawn::StdOutputFenced;
 use crate::{
     blocking,
     error::ToolError,
@@ -506,7 +508,7 @@ mod f1_regressions {
             let status = std::process::Command::new("timeout")
                 .args(["10s"]).arg(std::env::current_exe().unwrap())
                 .args(["--exact", "router::nexus_bridge::cache::f1_regressions::n7_fix1_direct_idb_bypasses_processor_and_rejects_force", "--nocapture"])
-                .env("IDA_NEXUS_INPUT_PREPROCESSOR", "/bin/cp").status().unwrap();
+                .env("IDA_NEXUS_INPUT_PREPROCESSOR", "/bin/cp").status_fenced().unwrap();
             assert!(status.success());
             return;
         }

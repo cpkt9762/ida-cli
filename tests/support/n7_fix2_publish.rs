@@ -1,4 +1,5 @@
 use super::*;
+use crate::process_spawn::StdOutputFenced;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 
@@ -41,7 +42,7 @@ pub async fn released_waiter_retains_content_until_publication_syscall_returns()
                 std::env::var_os("F1_PYTHON")
                     .expect("prepared F1_PYTHON required for gate 13 protocol regression"),
             )
-            .status()
+            .status_fenced()
             .unwrap();
         assert!(status.success(), "isolated real bridge protocol regression");
         std::fs::remove_dir_all(root).unwrap();

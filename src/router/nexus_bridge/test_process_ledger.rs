@@ -5,6 +5,43 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(unix)]
+fn observe_exit(pid: u32, intent: String) {
+    // This neutral observer does not reap: the actual Child owner still waits
+    // normally. WNOWAIT supplies a kernel exit status, never an absence guess.
+    std::thread::spawn(move || {
+        // SAFETY: siginfo_t is POD; waitid writes this local, aligned buffer.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: P_PID restricts observation to the newly captured child;
+            // WNOWAIT preserves the owner's right to reap it.
+            let result =
+                unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+            if result < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return; // ECHILD is not exit evidence: the owner may have won.
+            }
+            // SAFETY: waitid returned siginfo for a child termination event.
+            let status = unsafe { info.si_status() };
+            let (exit_code, signal) = match info.si_code {
+                libc::CLD_EXITED => (Some(status), None),
+                libc::CLD_KILLED | libc::CLD_DUMPED => (None, Some(status)),
+                _ => return,
+            };
+            if let Err(error) = append(&json!({"kind":"terminal","parent":std::process::id(),
+                "pid":pid,"intent":intent,"method":"waitid.P_PID.WEXITED.WNOWAIT",
+                "exit_code":exit_code,"signal":signal,"raw_si_code":info.si_code,
+                "raw_si_status":status,"success":exit_code==Some(0)}))
+            {
+                tracing::error!(%error,"test waitid observer ledger append failed");
+            }
+            return;
+        }
+    });
+}
+
 pub(super) fn terminal(pid: Option<u32>, status: &std::process::ExitStatus, method: &str) {
     use std::os::unix::process::ExitStatusExt;
     let Some(pid) = pid else { return };
@@ -71,7 +108,7 @@ pub(super) fn spawn(
     command: &mut tokio::process::Command,
 ) -> anyhow::Result<tokio::process::Child> {
     if std::env::var_os("R2_LEDGER").is_none() {
-        return Ok(command.spawn()?);
+        return Ok(crate::process_spawn::with_spawn_fence(|| command.spawn())?);
     }
     let intent = format!(
         "rust-{}-{}",
@@ -83,7 +120,7 @@ pub(super) fn spawn(
         &json!({"kind":"intent", "intent":intent, "parent":std::process::id(),
         "program":native.get_program(), "argv":native.get_args().collect::<Vec<_>>()}),
     )?;
-    let child = command.spawn()?;
+    let child = crate::process_spawn::with_spawn_fence(|| command.spawn())?;
     let evidence = match child.id() {
         Some(pid) => match identity(pid) {
             Ok(identity) => json!({"kind":"started","intent":intent,"parent":std::process::id(),
@@ -101,6 +138,9 @@ pub(super) fn spawn(
     if let Err(error) = append(&evidence) {
         tracing::error!(%error, "R2 process ledger failed after spawn; child custody retained");
     }
+    if let Some(pid) = child.id() {
+        observe_exit(pid, intent);
+    }
     Ok(child)
 }
 
@@ -108,7 +148,7 @@ pub(super) fn spawn_std(
     command: &mut std::process::Command,
 ) -> anyhow::Result<std::process::Child> {
     if std::env::var_os("R2_LEDGER").is_none() {
-        return Ok(command.spawn()?);
+        return Ok(crate::process_spawn::with_spawn_fence(|| command.spawn())?);
     }
     let intent = format!(
         "std-{}-{}",
@@ -119,7 +159,7 @@ pub(super) fn spawn_std(
         &json!({"kind":"intent","intent":intent,"parent":std::process::id(),
         "program":command.get_program(),"argv":command.get_args().collect::<Vec<_>>()}),
     )?;
-    let child = command.spawn()?;
+    let child = crate::process_spawn::with_spawn_fence(|| command.spawn())?;
     let evidence = match identity(child.id()) {
         Ok(identity) => {
             json!({"kind":"started","intent":intent,"parent":std::process::id(),"pid":child.id(),"identity":identity})
@@ -131,5 +171,6 @@ pub(super) fn spawn_std(
     if let Err(error) = append(&evidence) {
         tracing::error!(%error, "R2 process ledger failed after std spawn; child custody retained");
     }
+    observe_exit(child.id(), intent);
     Ok(child)
 }

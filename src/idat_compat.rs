@@ -1,3 +1,4 @@
+use crate::process_spawn::StdOutputFenced;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -2142,7 +2143,7 @@ fn run_idat_script(
     cmd.arg(target_path);
 
     let output = cmd
-        .output()
+        .output_fenced()
         .map_err(|err| ToolError::IdaError(format!("failed to run idat: {err}")))?;
 
     let _ = fs::remove_file(&script_path);

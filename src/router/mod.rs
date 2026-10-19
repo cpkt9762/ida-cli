@@ -909,7 +909,8 @@ impl RouterState {
         #[cfg(feature = "nexus-test-support")]
         let spawned = nexus_bridge::test_spawn_child(&mut cmd);
         #[cfg(not(feature = "nexus-test-support"))]
-        let spawned = cmd.spawn().map_err(anyhow::Error::from);
+        let spawned =
+            crate::process_spawn::with_spawn_fence(|| cmd.spawn()).map_err(anyhow::Error::from);
         let mut child =
             spawned.map_err(|e| anyhow::anyhow!("Failed to spawn worker process: {e}"))?;
 

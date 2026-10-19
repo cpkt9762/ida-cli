@@ -199,11 +199,23 @@ fn receive_rights(channel: &UnixDatagram) -> io::Result<(Vec<u8>, Vec<File>)> {
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
     message.msg_controllen = (control.len() * size_of::<usize>()) as _;
-    // SAFETY: all buffers and their capacities are valid and writable.
-    let received = unsafe { libc::recvmsg(channel.as_raw_fd(), &mut message, 0) };
+    let receive_guard = crate::process_spawn::receive_fence()?;
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    // SAFETY: all buffers and their capacities are valid and writable. The
+    // process fence excludes spawn until every received descriptor is sealed.
+    let received = unsafe { libc::recvmsg(channel.as_raw_fd(), &mut message, flags) };
     if received < 0 {
         return Err(io::Error::last_os_error());
     }
+    #[cfg(all(test, feature = "nexus-test-support"))]
+    RECEIVE_WINDOW.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     let mut files = Vec::new();
     let mut unexpected = false;
     // SAFETY: CMSG traversal operates only on the kernel-filled msghdr. Each
@@ -235,6 +247,12 @@ fn receive_rights(channel: &UnixDatagram) -> io::Result<(Vec<u8>, Vec<File>)> {
             header = libc::CMSG_NXTHDR(&message, header);
         }
     }
+    // Seal all rights, including surplus/rejected ones, before any validation
+    // can fail or any concurrent spawn can inherit their open descriptions.
+    for file in &files {
+        close_on_exec(file.as_raw_fd())?;
+    }
+    drop(receive_guard);
     if unexpected || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
         return Err(io::Error::other(
             "HandoffBlocked: truncated/unexpected ancillary data",
@@ -243,6 +261,11 @@ fn receive_rights(channel: &UnixDatagram) -> io::Result<(Vec<u8>, Vec<File>)> {
     let length = usize::try_from(received).map_err(io::Error::other)?;
     payload.truncate(length);
     Ok((payload, files))
+}
+
+#[cfg(all(test, feature = "nexus-test-support"))]
+thread_local! {
+    static RECEIVE_WINDOW: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(all(test, feature = "nexus-test-support"))]
@@ -287,6 +310,105 @@ with socket.socket(fileno=int(sys.argv[1])) as channel:
         }
         assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
         true
+    }
+
+    #[test]
+    fn concurrent_spawn_cannot_inherit_received_target_ofd() {
+        use std::io::{BufRead, Write};
+        use std::sync::mpsc;
+        let root =
+            std::path::PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private case"));
+        let lock = root.join("receive-window.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock)
+            .expect("private lock");
+        // SAFETY: exclusive flock on this owned regular file.
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let directory = File::open(&root).expect("private directory");
+        let (sender, receiver) = UnixDatagram::pair().expect("private transfer channel");
+        let source = TransferredTargetGuard { file };
+        source
+            .relay(&sender, &directory, b"window")
+            .expect("real SCM_RIGHTS");
+        let (began_tx, began_rx) = mpsc::channel();
+        let (spawned_tx, spawned_rx) = mpsc::channel();
+        let spawned_rx = std::sync::Arc::new(std::sync::Mutex::new(spawned_rx));
+        let window_rx = spawned_rx.clone();
+        let (go_tx, go_rx) = mpsc::channel();
+        let child_root = root.clone();
+        let spawn = std::thread::spawn(move || {
+            go_rx
+                .recv()
+                .expect("recvmsg reached exact publication window");
+            let mut command = std::process::Command::new(
+                std::env::var_os("R3A_PYTHON").expect("prepared Python"),
+            );
+            command.args(["-B", "-c", "import json,os,sys; p=os.stat(sys.argv[1]); matches=[]\nfor fd in range(3,1024):\n try:\n  s=os.fstat(fd)\n  if (s.st_dev,s.st_ino)==(p.st_dev,p.st_ino): matches.append(fd)\n except OSError: pass\nprint(json.dumps(matches),flush=True); sys.stdin.readline()"])
+                .arg(child_root.join("receive-window.lock"))
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+            began_tx.send(()).expect("spawn attempt");
+            let mut child = crate::router::nexus_bridge::test_spawn_std_child(&mut command)
+                .expect("concurrent real spawn");
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().expect("child output"))
+                .read_line(&mut line)
+                .expect("actual child fstat");
+            spawned_tx.send(()).expect("exec marker");
+            (child, line)
+        });
+        RECEIVE_WINDOW.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                go_tx.send(()).expect("open receive window");
+                began_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("concurrent spawn entered");
+                // The old path completes exec here; a fenced spawn must wait until
+                // the receiver has set CLOEXEC. No sleep or scheduler luck opens it.
+                let _ = window_rx
+                    .lock()
+                    .expect("window marker")
+                    .recv_timeout(Duration::from_millis(500));
+            }))
+        });
+        let (_, received) = receive_rights(&receiver).expect("actual received rights");
+        let (mut child, line) = spawn.join().expect("concurrent spawn worker");
+        let inherited: Vec<i32> = serde_json::from_str(&line).expect("exact inherited inode list");
+        drop(received);
+        drop(source);
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .expect("independent OFD");
+        // SAFETY: independent NB fence; never unlock a transferred OFD.
+        let fence = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        child
+            .stdin
+            .take()
+            .expect("child finish input")
+            .write_all(b"finish\n")
+            .expect("natural finish");
+        let pid = child.id();
+        let status = child.wait().expect("real child terminal");
+        crate::router::nexus_bridge::test_record_child_exit(
+            pid,
+            &status,
+            "Child.wait.receive_window",
+        );
+        std::fs::write(root.join("receive-window.json"), serde_json::to_vec(&serde_json::json!({"inherited_fds":inherited,"independent_fence":fence,"child_exit":status.code()})).unwrap()).unwrap();
+        assert!(status.success());
+        assert!(
+            inherited.is_empty(),
+            "unrelated child inherited exact target EX OFD: {inherited:?}"
+        );
+        assert_eq!(
+            fence, 0,
+            "job close must release exclusion while unrelated child lives"
+        );
     }
 
     #[test]

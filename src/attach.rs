@@ -1,5 +1,6 @@
 //! Stdio proxy for attaching an MCP client to the long-lived daemon.
 
+use crate::process_spawn::SpawnFenced;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -132,7 +133,7 @@ fn start_daemon() -> anyhow::Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
+        .spawn_fenced()
         .map_err(|error| anyhow::anyhow!("failed to start ida-cli daemon: {error}"))?;
     tracing::info!(pid = child.id(), "started ida-cli daemon for MCP attach");
     Ok(())

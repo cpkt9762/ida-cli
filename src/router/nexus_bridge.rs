@@ -22,7 +22,7 @@ fn spawn_child(command: &mut tokio::process::Command) -> anyhow::Result<tokio::p
     }
     #[cfg(not(feature = "nexus-test-support"))]
     {
-        Ok(command.spawn()?)
+        Ok(crate::process_spawn::with_spawn_fence(|| command.spawn())?)
     }
 }
 
