@@ -79,6 +79,7 @@ async fn verification_without_handle_retains_exact_launch_copy_and_budget() {
         let target=PathBuf::from(launch["launch"]["target"].as_str().ok_or_else(||anyhow::anyhow!("target"))?);
         let directory=target.parent().ok_or_else(||anyhow::anyhow!("copy directory"))?;
         let before=bridge.lifecycle_status();
+        std::fs::write(root.join("startup-before-fault.json"),serde_json::to_vec_pretty(&before)?)?;
         anyhow::ensure!(directory.join("input").exists()&&target.exists()&&!directory.join("closed").exists(),"copy disappeared before launch/owner proof");
         anyhow::ensure!(bridge.endpoint().transition(|s,_|s.acquisition_lease(&acquisition))?.is_none(),"barrier must precede acquired callback");
         anyhow::ensure!(!bridge.endpoint().transition(|s,_|s.acquisition_closed(&acquisition))?,"live launch lost physical reservation");
@@ -89,6 +90,7 @@ async fn verification_without_handle_retains_exact_launch_copy_and_budget() {
             _=>anyhow::bail!("unknown startup fault"),
         }
         if fault!="eof" {std::fs::write(root.join("startup.release"),b"")?;}
+        std::fs::write(root.join("startup-before-opening-result.json"),serde_json::to_vec_pretty(&bridge.lifecycle_status())?)?;
         let outcome=tokio::time::timeout(Duration::from_secs(4),opening).await??;
         anyhow::ensure!(outcome.is_err(),"failed verification revived final acquisition");
         let cause=format!("{outcome:?}");
@@ -149,6 +151,11 @@ print(json.dumps({'owner_released':outcome['owner_released']}))
         Ok(json!({"cause":cause,"acquisition":acquisition,"before":before,"settled":settled,"budget_secs":30,"copy_payload_removed":true,"scope":"actual private IDA verification, LaunchIntent/Popen before acquired, RetainedOpen verification cleanup"}))
     }.await;
     let forced = if result.is_err() {
+        std::fs::write(
+            root.join("startup-failed-status.json"),
+            serde_json::to_vec_pretty(&bridge.lifecycle_status()).expect("encode failed status"),
+        )
+        .expect("preserve failed status");
         let _ = bridge.terminate().await;
         Some(
             bridge

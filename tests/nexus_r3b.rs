@@ -103,11 +103,28 @@ async fn verification_owner_proof_precedes_copy_cleanup_and_final_acquisition() 
         .expect("parent reserves verification first");
     let result: anyhow::Result<Value> = async {
         tokio::time::timeout(Duration::from_secs(8), async {
-            while !root.join("a/release-requested").exists() {
+            let verification = AcquisitionId {
+                parent: parent.clone(),
+                purpose: AcquisitionPurpose::Verification,
+                ordinal: 1,
+            };
+            loop {
+                // The HTTP fixture's marker precedes the ACK. Observe N1's
+                // exact member terminal before asserting the post-ACK view.
+                let detached = bridge.endpoint().transition(|sessions, _| {
+                    let Some(lease) = sessions.acquisition_lease(&verification)? else {
+                        return Ok::<_, NexusError>(false);
+                    };
+                    Ok(sessions.status(&client, &lease)?.phase == SessionPhase::Released)
+                })?;
+                if root.join("a/release-requested").exists() && detached {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            Ok::<_, anyhow::Error>(())
         })
-        .await?;
+        .await??;
         bridge.status("verify-held").await?;
         let mut evidence = Vec::new();
         let held = tokio::time::timeout(Duration::from_secs(2), async {
