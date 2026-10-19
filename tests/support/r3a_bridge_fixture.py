@@ -14,6 +14,16 @@ from ida_nexus._registry import InstanceIdentity, InstanceRegistration, REGISTRY
 
 from r0_transport import Boundary
 
+
+def write_evidence_json(path, value):
+    """Publish a complete trace before a concurrent Rust reader sees its name."""
+    temporary=path.with_name(path.name+'.writing')
+    with temporary.open('x') as output:
+        json.dump(value,output)
+        output.flush()
+    os.replace(temporary,path)
+
+
 root = Path(os.environ['R3A_CASE_ROOT'])
 managed = os.environ.get('R3A_MANAGED') == '1'
 owner_root = root/'cache/generations/g-fixed' if managed else root
@@ -348,15 +358,15 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
                 if (self.post_exit_resolve_used and value['kind'] == 'attach_attempt'
                         and value['attempt']['state'] == 'may_send'):
                     self._r2_attach_watch = value['watch']
-                    (root/'attach-ack-stage.json').write_text(json.dumps({
+                    write_evidence_json(root/'attach-ack-stage.json',{
                         'deadline':self.deadline, 'entry_at':self._r2_attach_entry,
                         'signed_at':time.monotonic(), 'remaining':self.deadline-time.monotonic(),
                         'consumed':self.post_exit_resolve_used, 'watch':value['watch'],
                         'signed':reply['receipt']['record']['attempt'],
-                        'strong_instances':len(self.originals), 'launches':list(self.launches)}))
+                        'strong_instances':len(self.originals), 'launches':list(self.launches)})
                     barrier(root, 'attach-ack', seconds=3)
-                    (root/'attach-ack-return.json').write_text(json.dumps({
-                        'returned_at':time.monotonic(), 'deadline':self.deadline}))
+                    write_evidence_json(root/'attach-ack-return.json',{
+                        'returned_at':time.monotonic(), 'deadline':self.deadline})
                 return reply
             Custodian.helper_request = final_attach_ack
             actual_obtain = Custodian.obtain
@@ -366,7 +376,7 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
                 finally:
                     if self.outcome is not None:
                         value = self.outcome
-                        (root/'attach-outcome.json').write_text(json.dumps({
+                        write_evidence_json(root/'attach-outcome.json',{
                             'failure_kind':value['failure_kind'], 'handle':value['handle'] is not None,
                             'cause':None if value['cause'] is None else type(value['cause']).__name__,
                             'consumed':self.post_exit_resolve_used,
@@ -375,7 +385,7 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
                                 for a in value.get('prior_outcome',{}).get('attempts',[])],
                             'attempts':[{'attempt':a['attempt'],'failure_kind':a['failure_kind'],
                                 'handle':a['handle'] is not None} for a in value['attempts']],
-                            'launches':[stage for stage,_ in value['launches']]}))
+                            'launches':[stage for stage,_ in value['launches']]})
             Custodian.obtain = record_attach_outcome
         if os.environ.get('R2_BOOT_SOURCE_INPUT'):
             import target_journal
