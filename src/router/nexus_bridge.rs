@@ -2,11 +2,13 @@
 pub mod cache;
 pub mod cache_lock;
 mod custody_wire;
+mod file_jobs;
 pub mod generations;
 mod helper;
 pub(crate) mod installation;
 pub mod protocol;
 mod receiver;
+pub mod recovery_guard;
 #[cfg(feature = "nexus-test-support")]
 mod test_barriers;
 #[cfg(feature = "nexus-test-support")]
@@ -1212,6 +1214,9 @@ async fn event_received(
             .cloned();
         if let Some((original, response)) = retained {
             anyhow::ensure!(original == event, "conflicting custody retransmission");
+            if response.is_null() {
+                return Ok(()); // One in-flight receiver preparation owns this nonce.
+            }
             send(writer, &response).await.map_err(|error| {
                 error
                     .downcast::<std::io::Error>()
@@ -1230,6 +1235,37 @@ async fn event_received(
                 < state.open_reply_capacity + 8,
             "Busy: unacknowledged custody replies full; existing obligations retained"
         );
+        if event["action"] == "file_job_prepare" {
+            // A receiver may need root SH/startup. Its bounded preparation must
+            // not occupy the physical control reader or any N1 short lock.
+            state
+                .custody_replies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(nonce.into(), (event.clone(), Value::Null));
+            let owned_state = state.clone();
+            let owned_writer = writer.clone();
+            tokio::spawn(async move {
+                let result = custody_wire::receive(&event, &owned_state).await;
+                let reply = match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        json!({"custody_reply":event["nonce"],"ok":false,"error":error.to_string()})
+                    }
+                };
+                if let Some(nonce) = event["nonce"].as_str() {
+                    owned_state
+                        .custody_replies
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(nonce.into(), (event.clone(), reply.clone()));
+                }
+                if let Err(error) = send(&owned_writer, &reply).await {
+                    tracing::error!(%error,"file-job preparation reply delivery failed");
+                }
+            });
+            return Ok(());
+        }
         let result = custody_wire::receive(&event, state).await;
         let reply = match result {
             Ok(value) => value,

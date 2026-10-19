@@ -138,8 +138,12 @@ class Transfer(unittest.TestCase):
                             transaction.resume_executor()
                             with self.assertRaises(TypeError):copy.copy(target.target_guard)
                             offer=FrozenOffer(transaction,hello['actor'])
+                            old_token=transaction.token
+                            old_epoch=old_token.epoch
                             with self.assertRaisesRegex(RuntimeError,'Stale'):transaction.save()
                             offer.abort_unsent()
+                            self.assertEqual(transaction.token.epoch,old_epoch+1)
+                            with self.assertRaisesRegex(RuntimeError,'Stale'):old_token.check()
                             transaction.authorize()
                             offer=FrozenOffer(transaction,hello['actor'])
                             duplicate_fd=os.dup(target.target_fd) if fault=='duplicate' else None

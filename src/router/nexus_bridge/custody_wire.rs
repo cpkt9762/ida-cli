@@ -122,6 +122,9 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
         .ok_or_else(|| anyhow::anyhow!("mandatory proof helper unavailable"))?;
     let mut response = json!({"custody_reply":nonce,"ok":true});
     match action {
+        "file_job_prepare" => {
+            response["job"] = helper.prepare_file_job(event.clone()).await?;
+        }
         "acquisition_finished" => {
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
             let watches: Vec<String> = decode(event["watches"].clone())?;

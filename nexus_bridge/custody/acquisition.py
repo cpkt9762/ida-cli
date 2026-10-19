@@ -60,6 +60,7 @@ class Custodian:
         self.file_gate_admitted = False
         self.absence_confirmed = False
         self.recovery_snapshot = None
+        self.file_snapshot = None
         self.recovery_error = None
         self.recovery_active = False
         self.recovery_blocked = False
@@ -101,6 +102,7 @@ class Custodian:
     @contextmanager
     def gate(self, target):
         self.target = Target(target)
+        self.target.file_job_prepare = self.prepare_file_job
         try:
             self.target_path, self.coord_key = str(self.target.target), self.target.key
             self.admit_target()
@@ -118,6 +120,9 @@ class Custodian:
             self.target.business_admission()
             try:
                 cleanup_owner = getattr(self, 'cleanup_owner', None)
+                from config import ida_cli_home
+                from recovery_legacy import import_known_home
+                import_known_home(self.target,ida_cli_home()/'idb')
                 Journal(self.target).gate(self.helper['state_root'],
                     self.acquisition if cleanup_owner is not None else acquisition, cleanup_owner=cleanup_owner)
                 return
@@ -712,20 +717,49 @@ class Custodian:
             self.bridge.proof_wakeup.set()
             return
         target = Target(self.target_path)
+        target.file_job_prepare = self.prepare_file_job
         snapshot.coordination = target
         self.recovery_snapshot = (snapshot, observed, target)
         self.bridge.proof_wakeup.set()
+
+    def prepare_file_job(self, transaction, reply, identity, nonce):
+        return self.transact('file_job_prepare',target=transaction.data['target'],
+            coord_key=transaction.target.key,directory=transaction.target.directory.identity,
+            root_binding=transaction.target.recovery_root_binding(),epoch=transaction.token.epoch,
+            recovery_id=transaction.recovery_id,job_nonce=nonce,
+            reply_endpoint=str(reply),reply_identity=list(identity))['job']
 
     def advance_restore(self):
         # One bounded observation per fair turn. Waiting for a target or owner
         # never occupies a business worker or spins in a preflight worker.
         try:
+            snapshot, observed, target = self.recovery_snapshot
+            if self.retired and not self.originals and not self.launches:
+                from recovery_transaction import Transaction
+                from target_coordination import digest
+                with target.locked(nb=True):
+                    with Transaction(target,snapshot.recovery_id,recover=False) as completed:
+                        terminal=completed.data['status'] in ('restored','opened','archived')
+                        if terminal and completed.data['failure_intent']:
+                            if not completed.data['attempts'][-1]['restored']:
+                                raise RuntimeError('RecoveryBlocked: terminal file state lacks completed scene')
+                            for requirement in completed.data['requirements']:
+                                certificate=completed.data['certified_resources'].get(digest(requirement))
+                                if certificate is None:
+                                    raise RuntimeError('RecoveryBlocked: terminal file resource certificate missing')
+                                completed.validate_certificate(requirement,certificate)
+                if terminal:
+                    target.close()
+                    self.recovery_snapshot=None
+                    self.recovery_error=None
+                    return
+            if self.recovery_blocked:
+                return
             reply = self.transact('cleanup_status', acquisition=self.acquisition,
                 lease=self.lease, require_ack=True, owner_required=True,
                 recovery_id=getattr(self,'file_recovery_id',None))
             if not reply['ready']:
                 return
-            snapshot, observed, target = self.recovery_snapshot
             with target.locked(nb=True):
                 journal = Journal(target)
                 journal.recover_public_proofs()

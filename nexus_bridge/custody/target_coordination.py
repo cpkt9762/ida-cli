@@ -397,6 +397,7 @@ class Target:
         self.target_guard = guard
         self.transferred = _received is not None
         self.target_fd = fd
+        self.lock_deadline=deadline
         try:
             if recover:
                 self.directory.recover_record('target.json')
@@ -424,11 +425,32 @@ class Target:
                 # uncommitted identity instead of blessing a partial namespace.
                 self.directory.durable('target.json', dict(expected, creation_intent=True), immutable=True)
                 self.directory.durable('target.json', expected)
+            self.lock_binding=encoded(expected)
             yield self
         finally:
+            active=self.target_guard
             self.target_fd = None
             self.target_guard = None
+            if active is not None and active is not guard:
+                active.close()
             guard.close()
+
+    def reacquire_after_transfer(self):
+        """New OFD fence after old rights moved; never reenable the old token."""
+        if self.root_fd is None or self.target_guard is None or self.target_guard.fd is not None or self.target_fd is not None:
+            raise RuntimeError('HandoffBlocked: old target reference must be closed before fence')
+        fd=self.directory.lock(nb=True,create=False)
+        try:
+            value,_,_=self.directory.read('target.json')
+            if encoded(value) != self.lock_binding:
+                raise RuntimeError('HandoffBlocked: target identity changed before independent fence')
+            self.recovery_root_binding()
+            self.target_guard=TransferredTargetGuard(fd)
+            self.target_fd=fd
+            self.transferred=False
+        except BaseException:
+            os.close(fd)
+            raise
 
     def move_guard(self):
         if self.target_guard is None:

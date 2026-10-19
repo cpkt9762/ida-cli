@@ -148,7 +148,7 @@ def rename_exact(source, source_name, destination, destination_name, expected, a
     return final
 
 
-def copy_exact(source, name, destination, expected, mode, binding, checkpoint, authorize):
+def copy_exact(source, name, destination, expected, mode, binding, checkpoint, authorize, *, external=False):
     """Copy only inside a private evidence/staging directory, never final paths.
 
     An interrupted bound copy resumes only after its existing prefix matches
@@ -158,7 +158,7 @@ def copy_exact(source, name, destination, expected, mode, binding, checkpoint, a
     current = file_info(source, name)
     if not compatible(current, expected):
         raise RuntimeError('RecoveryBlocked: copy source identity/content changed')
-    if source.identity[0] != destination.identity[0]:
+    if not external and source.identity[0] != destination.identity[0]:
         raise OSError(errno.EXDEV, 'RecoveryBlocked: copy destination is not on target volume')
     authorize()
     existing = maybe_info(destination, name)

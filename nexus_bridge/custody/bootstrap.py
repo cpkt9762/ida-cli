@@ -11,7 +11,7 @@ if os is None or os.__spec__.origin != 'frozen' or os.path.__spec__.origin != 'f
 REQUIRED = frozenset(('acquisition.py', 'analysis_tools.py', 'bootstrap.py', 'bridge.py', 'bridge_observer.py', 'cache_store.py', 'config.py', 'durable_records.py', 'edit_tools.py', 'lifecycle.py', 'lifetime.py', 'metadata.py', 'open_recovery.py', 'owner_modules.py', 'owner_release.py', 'origin.py', 'owner_identity.py', 'custody_process_identity.py', 'proof_helper.py', 'protocol.py', 'query_tools.py', 'recovery_files.py', 'recovery_transaction.py', 'save_guard.py', 'search_tools.py', 'slices.py', 'struct_tools.py', 'target_coordination.py', 'target_journal.py', 'tools.py', 'type_tools.py'))
 
 
-REQUIRED |= frozenset(('recovery_job.py','recovery_transfer.py','recovery_maintenance.py','recovery_probe.py'))
+REQUIRED |= frozenset(('recovery_job.py','recovery_transfer.py','recovery_maintenance.py','recovery_probe.py','recovery_resources.py','recovery_legacy.py'))
 ASSETS = frozenset(('maintenance-launch',))
 
 

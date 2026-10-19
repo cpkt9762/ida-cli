@@ -16,6 +16,10 @@ from origin import creation_scope, boot_change
 from custody_process_identity import capture
 
 
+def compaction_boundary(_stage, _detail):
+    """Deterministic process-exit fault point; production performs no action."""
+
+
 class OwnerDraining(RuntimeError):
     """A confirmed last ACK retains its physical owner until public proof."""
 
@@ -195,6 +199,8 @@ class Journal:
                       summary_bytes=len(encoded(self.value['summary'])), namespace_reclaimable_bytes=0)
         percent = totals['retained_evidence_bytes'] * 100 // totals['retained_evidence_limit_bytes']
         totals['retained_warning_percent'] = next((n for n in (100, 95, 80) if percent >= n), 0)
+        from recovery_transaction import accounting as file_accounting
+        totals.update(file_accounting(self.target))
         return totals
 
     def save(self):
@@ -210,6 +216,12 @@ class Journal:
         from recovery_transaction import inspect_transactions, recovery_name, finish_creation, resume_at_gate
         if not self.target.root_locked:
             finish_creation(self.target)
+            from recovery_legacy import resume_pending_imports
+            resume_pending_imports(self.target)
+            try:self.value,self.info,self.raw=self.target.directory.read('custody.json')
+            except FileNotFoundError:
+                if self.info is not None:raise
+            self.validate()
         # Unknown .new and unrecognized recovery files are never ignored.
         for name in os.listdir(self.target.directory.fd):
             if name.endswith('.new'):
@@ -223,6 +235,10 @@ class Journal:
                 raise RuntimeError('RecoveryBlocked: unsupported target coordination entry: ' + name)
         self.recover_public_proofs()
         resume_at_gate(self.target)
+        try:self.value,self.info,self.raw=self.target.directory.read('custody.json')
+        except FileNotFoundError:
+            if self.info is not None:raise
+        self.validate()
         for transaction in inspect_transactions(self.target):
             if transaction['phase'] not in ('snapshotting','ready','restored','opened','archived'):
                 raise RuntimeError('RecoveryBlocked: accepted file job '+transaction['job_id']
@@ -826,6 +842,7 @@ class Journal:
         self.value['closed_after_holes'] = intervals
         self.value['compaction'] = {'epochs':epochs, 'files':files}
         self.save()  # Summary and complete deletion manifest precede every unlink.
+        compaction_boundary('intent_durable',self.value['compaction'])
         self.resume_compaction()
 
     def manual_closed(self, item):
@@ -907,11 +924,22 @@ class Journal:
         expected = [entry for n in intent['epochs'] for entry in self.value['entries'].get(str(n), {}).get('facts', [])]
         if intent['files'] != expected:
             raise RuntimeError('RoutineCompactionFailed: deletion intent differs from exact closed references')
+        from recovery_transaction import pinned_epochs
+        pinned = pinned_epochs(self.target)
+        if self.value.get('file_intents') or pinned is None or set(intent['epochs']) & pinned:
+            raise RuntimeError('RoutineCompactionFailed: file recovery acquired a new reference')
         for epoch in intent['epochs']:
             item = self.value['entries'].get(str(epoch))
             if not item or not (item['producer_closed'] and item['consumer_closed'] and item['detached']
-                                and not item['unacked_events'] and not item.get('failure')):
+                                and not item['unacked_events'] and not item.get('failure')
+                                and not item.get('manual_offline_recovery')
+                                and (item.get('bridge_closed') or item.get('transferred_to') in intent['epochs'])
+                                and (not item.get('launch') or item.get('transferred_to') in intent['epochs'])):
                 raise RuntimeError('RoutineCompactionFailed: live reference appeared')
+        paths={entry['path'] for entry in intent['files']}
+        if any(reference['path'] in paths for key,item in self.value['entries'].items()
+               if int(key) not in intent['epochs'] for reference in item['facts']):
+            raise RuntimeError('RoutineCompactionFailed: another epoch still references deletion manifest')
         for entry in intent['files']:
             relative = Path(entry['path']).relative_to(self.target.directory.path)
             if len(relative.parts) != 3 or relative.parts[0] not in ('observations', 'proofs'):
@@ -920,17 +948,24 @@ class Journal:
             try:
                 producer = container.child(relative.parts[1], create=False)
             except FileNotFoundError:
+                os.fsync(container.fd)
                 container.close()
                 continue  # An earlier exact deletion completed this directory.
             try:
                 try:
                     _, info, data = producer.read(relative.name)
                 except FileNotFoundError:
+                    os.fsync(producer.fd)
                     continue  # The durable exact intent authorizes only this name.
+                except (json.JSONDecodeError,UnicodeDecodeError) as error:
+                    raise RuntimeError('RoutineCompactionFailed: immutable fact is corrupt; evidence retained') from error
                 if [info.st_dev, info.st_ino] != entry['inode'] or digest(data) != entry['sha256']:
                     raise RuntimeError('RoutineCompactionFailed: immutable fact changed')
+                compaction_boundary('before_unlink',entry)
                 os.unlink(relative.name, dir_fd=producer.fd)
+                compaction_boundary('after_unlink',entry)
                 os.fsync(producer.fd)
+                compaction_boundary('file_directory_fsynced',entry)
             finally:
                 try:
                     if not os.listdir(producer.fd):
@@ -939,7 +974,9 @@ class Journal:
                             raise RuntimeError('RoutineCompactionFailed: empty observation directory replaced')
                         container.verify()
                         os.rmdir(relative.parts[1], dir_fd=container.fd)
+                        compaction_boundary('producer_removed',entry)
                         os.fsync(container.fd)
+                        compaction_boundary('container_fsynced',entry)
                 finally:
                     producer.close()
                     container.close()
@@ -947,6 +984,7 @@ class Journal:
             self.value['entries'].pop(str(epoch))
         self.value['compaction'] = None
         self.save()
+        compaction_boundary('committed',{'closed_through':self.value['closed_through']})
 
 
 

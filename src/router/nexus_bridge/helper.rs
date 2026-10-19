@@ -22,6 +22,7 @@ pub(super) struct Helper {
     last_heartbeat: std::sync::Mutex<Value>,
     calls: Mutex<()>,
     finished: std::sync::atomic::AtomicBool,
+    file_job_slots: Arc<tokio::sync::Semaphore>,
 }
 impl Helper {
     pub async fn start(
@@ -134,6 +135,7 @@ impl Helper {
             last_heartbeat: std::sync::Mutex::new(Value::Null),
             calls: Mutex::new(()),
             finished: std::sync::atomic::AtomicBool::new(false),
+            file_job_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -266,10 +268,14 @@ impl Helper {
     }
 
     pub fn status_snapshot(&self) -> Value {
-        self.last_heartbeat
+        let mut status = self
+            .last_heartbeat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .clone();
+        status["file_job_capacity"] = json!(8);
+        status["file_jobs_pending"] = json!(8 - self.file_job_slots.available_permits());
+        status
     }
 
     fn finish_accepted(&self) -> anyhow::Result<bool> {
@@ -430,6 +436,26 @@ impl Helper {
         let response: Value = serde_json::from_slice(&output.stdout)?;
         anyhow::ensure!(response["ok"] == true, "target writer rejected custody");
         Ok(response)
+    }
+
+    pub async fn prepare_file_job(&self, request: Value) -> anyhow::Result<Value> {
+        let permit = self
+            .file_job_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Busy: file-job supervisors full; existing file obligations retained"
+                )
+            })?;
+        super::file_jobs::prepare(
+            self.python.clone(),
+            self.installation.clone(),
+            self.environment.clone(),
+            permit,
+            request,
+        )
+        .await
     }
 
     pub async fn finish(&self) -> anyhow::Result<()> {

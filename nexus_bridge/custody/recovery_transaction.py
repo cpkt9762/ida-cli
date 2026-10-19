@@ -17,6 +17,7 @@ from custody_process_identity import capture
 from target_coordination import Directory, digest, encoded, identity
 from recovery_files import (boundary, compatible, component_names, copy_exact,
                             file_info, inventory, rename_exact, validate_info)
+from recovery_resources import ResourceCustody
 
 PHASES = frozenset(('snapshotting','ready','failed-owner-held','staging','prepared',
                     'isolating','publishing','restored','opened','archived'))
@@ -66,7 +67,7 @@ class ExecutorToken:
             raise RuntimeError('RecoveryExecutorStale: moved/frozen/forked executor')
 
 
-class Transaction:
+class Transaction(ResourceCustody):
     def __init__(self, target, recovery_id, *, token=None, recover=True):
         if target.target_fd is None or not recovery_name(recovery_id):
             raise RuntimeError('RecoveryBlocked: target EX and exact RecoveryId required')
@@ -83,17 +84,21 @@ class Transaction:
             raise
 
     @classmethod
-    def create(cls, target, *, on_begin=None):
+    def allocate(cls, target, *, recovery_id=None, source_files=None, extra=None):
         from origin import creation_scope
         if target.target_fd is None:
             raise RuntimeError('RecoveryBlocked: creation requires target EX')
         if len([name for name in os.listdir(target.directory.fd) if recovery_name(name)]) >= MAX_TRANSACTIONS:
             raise RuntimeError('RetainedEvidenceFull: transaction count budget')
-        recovery_id, token = uuid.uuid4().hex, ExecutorToken()
+        recovery_id, token = recovery_id or uuid.uuid4().hex, ExecutorToken()
+        if not recovery_name(recovery_id):
+            raise RuntimeError('RecoveryBlocked: invalid allocation RecoveryId')
         parent = Directory(target.target.parent, private=False)
         try:
             before = inventory(parent,target.directory)
             files = {name:value for name,value in before.items() if name in component_names(target.target)}
+            if source_files is not None:
+                files=copy.deepcopy(source_files)
             if any('sha256' not in value for value in files.values()):
                 raise RuntimeError('RecoveryBlocked: nonregular database component')
             total = sum(value['size'] for value in files.values())
@@ -110,11 +115,17 @@ class Transaction:
                     'progress':{'bytes_total':0,'bytes_done':0,'source_bytes':total,'reserved_bytes':reservation},
                     'executor':{'epoch':1,'state':'LocalExecuting','actor':token.actor,'transfer_id':None},
                     'origin_binding':creation_scope(target.directory.path,'recovery-'+recovery_id)}
+            data.update(extra or {})
             target.directory.durable('recovery-create.json',{'schema':1,'record':data},immutable=True)
             boundary('create','intent',{'recovery_id':recovery_id})
             finish_creation(target)
         finally:
             parent.close()
+        return recovery_id,token
+
+    @classmethod
+    def create(cls, target, *, on_begin=None):
+        recovery_id,token=cls.allocate(target)
         transaction = cls(target,recovery_id,token=token)
         try:
             with transaction:
@@ -140,7 +151,7 @@ class Transaction:
         required = {'version','recovery_id','coord_key','target','directory','parent_identity','root_binding',
                     'status','failure_intent','revision','before','files','snapshot_files','attempts','copies','moves',
                     'directories','requirements','certified_resources','backups','intent','cause','progress','executor','origin_binding'}
-        optional = {'manual_offline_recovery','archived_reason','imported_v1','job','last_error','updated_at'}
+        optional = {'manual_offline_recovery','archived_reason','imported_v1','restore_modes','job','last_error','updated_at'}
         if (type(value) is not dict or not required <= set(value) or set(value)-required-optional
                 or type(value['version']) is not int or value['version'] != 2
                 or value['recovery_id'] != self.recovery_id or value['target'] != self.target.original
@@ -162,6 +173,10 @@ class Transaction:
             raise RuntimeError('RecoveryBlocked: transaction contains foreign component')
         for table in ('files','snapshot_files'):
             for file in value[table].values():validate_info(file)
+        modes=value.get('restore_modes',{})
+        if (type(modes) is not dict or set(modes)-set(value['files'])
+                or any(type(mode) is not int or not 0 <= mode <= 0o777 or mode & 0o022 for mode in modes.values())):
+            raise RuntimeError('RecoveryBlocked: invalid restore modes')
         for requirement in value['requirements']:
             if (type(requirement) is not dict or set(requirement) != {'watch','epoch','acquisition','owner','lease','origin_binding'}
                     or type(requirement['epoch']) is not int or requirement['epoch'] < 1
@@ -169,6 +184,16 @@ class Transaction:
                 raise RuntimeError('RecoveryBlocked: invalid exact file-resource requirement')
         if encoded(self.target.recovery_root_binding()) != encoded(value['root_binding']):
             raise RuntimeError('RecoveryBlocked: root guard identity changed')
+        allowed={'recovery.json','recovery.json.new','recovery.json.new.owner'} | set(value['directories'])
+        allowed.update(reference['name'] for reference in value['certified_resources'].values())
+        intent=value['intent']
+        if type(intent) is dict and intent.get('kind') in ('mkdir','resource_certificate'):
+            allowed.add(intent['name'])
+        for name in tuple(allowed):
+            if name.startswith('resource-') and name.endswith('.json'):
+                allowed.update((name+'.new',name+'.new.owner'))
+        if set(os.listdir(self.directory.fd))-allowed:
+            raise RuntimeError('RecoveryBlocked: unknown transaction namespace retained')
 
     def parent_directory(self):
         if self.parent is None:
@@ -211,7 +236,9 @@ class Transaction:
         self.data['status'] = status
         self.save()
         from target_journal import Journal
-        Journal(self.target).file_intent(self.directory.path/'recovery.json',status,self.data['attempts'])
+        recorded=status
+        if self.data.get('imported_v1',{}).get('state') in ('Importing','Published'):recorded='snapshotting'
+        Journal(self.target).file_intent(self.directory.path/'recovery.json',recorded,self.data['attempts'])
         boundary('phase',status,{'recovery_id':self.recovery_id})
 
     @serialized
@@ -239,12 +266,13 @@ class Transaction:
         return self.copy_file(source,name,destination,expected,mode)
 
     @serialized
-    def copy_file(self, source, name, destination, expected, mode):
+    def copy_file(self, source, name, destination, expected, mode, *, external=False):
         self.authorize()
         key = digest([str(destination.path),name])
         prior = self.data['copies'].get(key)
         binding = {'source':str(source.path/name),'destination':str(destination.path/name),
                    'expected':expected,'mode':mode}
+        if external:binding['external_source_volume']=True
         if prior is not None and prior['binding'] != binding:
             raise RuntimeError('RecoveryBlocked: conflicting copy intent')
         if prior is None:
@@ -263,7 +291,7 @@ class Transaction:
             self.data['copies'][key]['reserved'] = reserved
             self.save()
         final = copy_exact(source,name,destination,expected,mode,
-                           self.data['copies'][key]['reserved'],checkpoint,self.authorize)
+                           self.data['copies'][key]['reserved'],checkpoint,self.authorize,external=external)
         self.data['copies'][key]['result'] = final
         self.data['progress']['bytes_done'] += final['size']
         self.data['intent'] = None
@@ -387,148 +415,6 @@ class Transaction:
             failed.close()
         return current
 
-    def require_resources(self, *, manual=False):
-        permission=self.data.get('manual_offline_recovery')
-        if permission is not None:
-            self.validate_manual_permission(permission)
-            from recovery_maintenance import occupancy
-            self.owner_probe=lambda path:occupancy(permission['plan']['state_roots'],path)
-            return
-        if manual:
-            raise RuntimeError('MaintenanceBlocked: no accepted offline permission')
-        from target_journal import Journal
-        journal = Journal(self.target)
-        journal.recover_public_proofs()
-        from target_journal import fact
-        for requirement in sorted(self.data['requirements'],key=lambda item:item['epoch'],reverse=True):
-            key = digest(requirement)
-            certificate = self.data['certified_resources'].get(key)
-            if certificate is not None:
-                self.validate_certificate(requirement,certificate)
-                continue
-            item = journal.value['entries'].get(str(requirement['epoch']))
-            fields = ('watch','epoch','acquisition','owner','lease','origin_binding')
-            if item is None or any(item.get(k) != requirement.get(k) for k in fields):
-                raise RuntimeError('RecoveryBlocked: exact resource evidence missing')
-            if journal.retirement(item):
-                evidence = {'scope':'verified_boot_change_resource_retirement',
-                            'record':journal.retirement(item)}
-            elif item.get('transferred_to') is not None:
-                successor = next((r for r in self.data['requirements'] if r['epoch']==item['transferred_to']),None)
-                if successor is None or digest(successor) not in self.data['certified_resources']:
-                    raise RuntimeError('RecoveryBlocked: startup successor proof still pending')
-                evidence = {'scope':'startup_transfer','successor':digest(successor),'record':copy.deepcopy(item)}
-            elif item.get('launch'):
-                raise RuntimeError('StartupUnconfirmed: recovery still has exact launch obligation')
-            elif item.get('no_attach') or item.get('no_launch'):
-                if not (item['producer_closed'] and item['consumer_closed'] and not item['unacked_events']):
-                    raise RuntimeError('RecoveryBlocked: no-acquisition closure pending')
-                evidence = {'scope':'no_acquisition','record':copy.deepcopy(item)}
-            else:
-                permission = item.get('file_recovery_ack',{})
-                ack = item.get('detach_outcome',{})
-                if permission.get('recovery_id') == self.recovery_id:
-                    ack = permission['outcome']
-                if not item.get('proof') or (item.get('lease') and
-                        ack.get('lease_released') is not True):
-                    raise RuntimeError('RecoveryBlocked: sameboot detach/public-owner double proof pending')
-                # Verify the original immutable bytes before taking an
-                # independent retained copy into this failed transaction.
-                proof_record = journal.referenced_record(item['proof'])
-                fact(dict(item['proof'],record=proof_record),self.target,kind='PublicOwnerLifetime')
-                evidence = {'scope':'public_owner_lifetime','record':copy.deepcopy(item),
-                            'proof_record':proof_record,'ack':ack}
-            record = {'schema':1,'kind':'FileRecoveryResourceCustody','coord_key':self.target.key,
-                      'target':self.target.original,'recovery_id':self.recovery_id,
-                      'requirement':requirement,'evidence':evidence,'guard_epoch':self.token.epoch}
-            name = 'resource-'+key+'.json'
-            prior_intent = self.data['intent']
-            if prior_intent and prior_intent.get('kind')=='resource_certificate' and prior_intent.get('name')==name:
-                record = prior_intent['record']
-            else:
-                self.data['intent'] = {'kind':'resource_certificate','name':name,'record':record}
-                self.save()
-            self.directory.recover_record(name)
-            try:
-                stored, _, _ = self.directory.read(name)
-            except FileNotFoundError:
-                self.directory.durable(name,record,immutable=True)
-            else:
-                if encoded(stored) != encoded(record):
-                    raise RuntimeError('RecoveryBlocked: retained resource certificate conflict')
-            certificate = {'name':name,'sha256':digest(record)}
-            self.data['certified_resources'][key] = certificate
-            self.data['intent'] = None
-            self.save()
-            self.validate_certificate(requirement,certificate)
-
-    def validate_manual_permission(self, permission):
-        if (type(permission) is not dict or set(permission) != {'schema','plan_sha256','plan','applied_at'}
-                or type(permission['schema']) is not int or permission['schema'] != 1
-                or digest(permission['plan']) != permission['plan_sha256']):
-            raise RuntimeError('MaintenanceBlocked: corrupt offline permission')
-        plan=permission['plan']
-        if (plan.get('kind') != 'manual_offline_recovery' or plan.get('target') != self.target.original
-                or encoded(plan.get('coord_key')) != encoded(self.target.key)
-                or plan.get('directory') != self.target.directory.identity
-                or plan.get('transaction') != self.recovery_id
-                or plan.get('operator',{}).get('uid') != os.getuid()
-                or plan.get('operator',{}).get('confirmation') != 'I established and maintain this exclusive offline window'
-                or not plan['window']['started_at'] <= permission['applied_at'] < plan['window']['expires_at']
-                or not plan['window']['started_at'] <= time.time() < plan['window']['expires_at']):
-            raise RuntimeError('MaintenanceBlocked: accepted offline window no longer valid')
-
-    def validate_certificate(self, requirement, certificate):
-        record, _, raw = self.directory.read(certificate['name'])
-        if (certificate['name'] != 'resource-'+digest(requirement)+'.json'
-                or digest(raw) != certificate['sha256']
-                or type(record.get('schema')) is not int or record['schema'] != 1 or record.get('kind') != 'FileRecoveryResourceCustody'
-                or encoded(record.get('coord_key')) != encoded(self.target.key)
-                or record.get('target') != self.target.original or record.get('recovery_id') != self.recovery_id
-                or encoded(record.get('requirement')) != encoded(requirement)):
-            raise RuntimeError('RecoveryBlocked: retained file-resource custody binding mismatch')
-        evidence = record['evidence']
-        if evidence['scope']=='verified_boot_change_resource_retirement':
-            from origin import boot_change, creation_scope
-            original = evidence['record']
-            expected = boot_change(requirement['origin_binding'],original.get('current'))
-            expected.update(schema=1,watch=requirement['watch'],epoch=requirement['epoch'],
-                acquisition=requirement['acquisition'],owner=requirement['owner'],lease=requirement['lease'],
-                launch=original.get('launch'),coord_key=self.target.key,target_binding=self.target.binding)
-            expected['sha256'] = digest(expected)
-            if encoded(original) != encoded(expected):
-                raise RuntimeError('RecoveryBlocked: retained resource retirement certificate changed')
-            boot_change(requirement['origin_binding'],creation_scope(self.target.directory.path,'file-recovery-consumer'))
-        elif evidence['scope']=='public_owner_lifetime':
-            item = evidence['record']
-            proof = item.get('proof',{})
-            proof_record = evidence['proof_record']
-            permission = item.get('file_recovery_ack',{})
-            ack = permission.get('outcome') if permission.get('recovery_id') == self.recovery_id else item.get('detach_outcome')
-            if (not proof or digest(proof_record) != proof['sha256']
-                    or proof_record.get('evidence_type') != 'public_owner_lifetime'
-                    or proof_record.get('owner') != requirement['owner']
-                    or proof_record.get('watch') != requirement['watch']
-                    or proof_record.get('acquisition') != requirement['acquisition']
-                    or proof_record.get('subscription_epoch') != requirement['epoch']
-                    or encoded(proof_record.get('coord_key')) != encoded(self.target.key)
-                    or encoded(ack) != encoded(evidence['ack'])
-                    or (requirement['lease'] is not None and (not ack or ack.get('lease_released') is not True))):
-                raise RuntimeError('RecoveryBlocked: retained public double proof changed')
-        elif evidence['scope']=='startup_transfer':
-            successor = next((r for r in self.data['requirements'] if digest(r)==evidence['successor']),None)
-            if successor is None or successor['epoch'] <= requirement['epoch']:
-                raise RuntimeError('RecoveryBlocked: invalid retained startup successor')
-            if evidence['successor'] not in self.data['certified_resources']:
-                raise RuntimeError('RecoveryBlocked: retained startup successor missing')
-            self.validate_certificate(successor,self.data['certified_resources'][evidence['successor']])
-        elif evidence['scope']=='no_acquisition':
-            item = evidence['record']
-            if (requirement['lease'] is not None or not (item.get('no_attach') or item.get('no_launch'))
-                    or not item['producer_closed'] or not item['consumer_closed'] or item['unacked_events']):
-                raise RuntimeError('RecoveryBlocked: retained no-acquisition evidence changed')
-        else:
-            raise RuntimeError('RecoveryBlocked: unsupported file-resource evidence scope')
 
     def check_occupancy(self):
         from cache_store import public_owner_probe
@@ -579,6 +465,9 @@ class Transaction:
         self.authorize()
         if not self.data['failure_intent']:
             raise RuntimeError('RecoveryBlocked: no failure intent; refusing rollback')
+        if (set(self.data['snapshot_files']) != set(self.data['files'])
+                or self.data.get('imported_v1',{}).get('state') in ('Importing','Published')):
+            raise RuntimeError('RecoveryBlocked: complete published immutable snapshot/evidence required')
         if self.data['status'] in ('restored','opened','archived'):
             return self.data
         self.require_resources(manual=manual)
@@ -587,6 +476,16 @@ class Transaction:
         names = component_names(self.target.target)
         if set(record['captured']) != set(record['failed']) & names:
             raise RuntimeError('RecoveryBlocked: failed bytes not fully captured')
+        for directory_name,expected in (('snapshot',self.data['snapshot_files']),
+                ('failed-files-'+str(record['attempt']),record['captured'])):
+            directory=self.directory.child(directory_name,create=False)
+            try:
+                if directory.identity != self.data['directories'].get(directory_name):
+                    raise RuntimeError('RecoveryBlocked: retained evidence directory replaced')
+                actual=inventory(directory)
+                if set(actual) != set(expected) or any(not compatible(actual[k],v) for k,v in expected.items()):
+                    raise RuntimeError('RecoveryBlocked: immutable snapshot/failed scene changed')
+            finally:directory.close()
         self.expect_unrelated(self.data['before'])
         if self.data['status'] == 'failed-owner-held':
             current = inventory(self.parent_directory(),self.target.directory)
@@ -604,7 +503,7 @@ class Transaction:
             try:
                 for name, expected in self.data['snapshot_files'].items():
                     record['staged'][name] = self.copy(snapshot,name,staging,expected,
-                                                      stat.S_IMODE(self.data['files'][name]['mode']))
+                                                      self.data.get('restore_modes',{}).get(name,stat.S_IMODE(self.data['files'][name]['mode'])))
                 self.phase('prepared')
             finally:
                 snapshot.close()
@@ -632,7 +531,7 @@ class Transaction:
                     raise RuntimeError('RecoveryBlocked: restored component set differs')
                 for name, expected in self.data['files'].items():
                     if (actual[name]['size'],actual[name]['sha256'],actual[name]['mode']) != (
-                            expected['size'],expected['sha256'],expected['mode']):
+                            expected['size'],expected['sha256'],self.data.get('restore_modes',{}).get(name,expected['mode'])):
                         raise RuntimeError('RecoveryBlocked: restored bytes/mode differ')
                 self.check_occupancy()
                 self.expect_unrelated(self.data['before'])
@@ -755,16 +654,67 @@ def resume_at_gate(target):
         if not recovery_name(name):
             continue
         with Transaction(target,name) as transaction:
-            if transaction.data['status'] in ('restored','opened','archived','ready','snapshotting'):
+            phase=transaction.data['status']
+            if str(transaction.data.get('last_error') or '').startswith('NexusBackupUnconfirmed:'):
+                raise RuntimeError('RecoveryBlocked: exact Nexus backup remains unconfirmed; scene retained')
+            from target_journal import Journal
+            journal=Journal(target)
+            locator=digest(str(transaction.directory.path/'recovery.json').encode())
+            indexed=locator in journal.value.get('file_intents',{})
+            if phase=='restored' and indexed:
+                transaction.resume_executor()
+                transaction.require_resources()
+                transaction.check_occupancy()
+                actual=transaction.expect_unrelated(transaction.data['before'])
+                expected=transaction.data['attempts'][-1]['restored']
+                if expected is None or encoded(actual) != encoded(expected):
+                    raise RuntimeError('RecoveryBlocked: terminal file bytes changed before locator closure')
+                transaction.phase('restored')
+                continue
+            if phase in ('ready','snapshotting') and not transaction.data['failure_intent']:
+                from custody_process_identity import identity as process_identity
+                original=transaction.data['origin_binding']['creator']
+                current=process_identity(original['pid'])
+                ended=current is None or any(current.get(k) != original.get(k) for k in ('kind','boot_id','birth'))
+                closed=all(journal.retirement(item) or journal.manual_closed(item)
+                    or (item['producer_closed'] and item['consumer_closed'] and not item['unacked_events']
+                        and (item.get('proof') or item.get('no_attach') or item.get('no_launch')))
+                    for item in journal.value['entries'].values())
+                if ended and closed:
+                    transaction.resume_executor()
+                    transaction.archive('orphan no-failure snapshot retained; independent resource closures preserved')
+                    continue
+                if phase=='snapshotting':
+                    raise RuntimeError('RecoveryBlocked: immutable snapshot has not published ready')
+                if indexed:
+                    snapshot=transaction.directory.child('snapshot',create=False)
+                    try:
+                        if set(os.listdir(snapshot.fd)) != set(transaction.data['files']) or set(transaction.data['snapshot_files']) != set(transaction.data['files']):
+                            raise RuntimeError('RecoveryBlocked: incomplete ready snapshot')
+                        for component,expected in transaction.data['snapshot_files'].items():
+                            if not compatible(file_info(snapshot,component),expected):
+                                raise RuntimeError('RecoveryBlocked: ready snapshot changed before locator closure')
+                    finally:snapshot.close()
+                    transaction.resume_executor()
+                    transaction.phase('ready')
+                continue
+            if phase in ('archived','opened') and indexed and not transaction.data['failure_intent']:
+                transaction.resume_executor()
+                transaction.phase(phase)
+                continue
+            if phase in ('restored','opened','archived'):
                 continue
             transaction.resume_executor()
             transaction.require_resources()
             from recovery_job import start
             result = start(transaction)
-            # The target guard was moved. A new business acquisition must
-            # reenter through its ordinary root->target gate, never borrow it.
-            raise RuntimeError('RecoveryCompleted: '+str(result['status']['job_id'])
-                               +'; reenter target gate for a new acquisition')
+            # Reenter with a NEW independent OFD under the original gate
+            # budget. The frozen sender token is never reenabled by a reply.
+            target.reacquire_after_transfer()
+            with Transaction(target,name) as completed:
+                if completed.data['status'] != 'restored' or result['status']['job_id'] != name:
+                    raise RuntimeError('RecoveryBlocked: exact job completion not observed at independent fence')
+                completed.resume_executor()
 
 
 def finish_creation(target):

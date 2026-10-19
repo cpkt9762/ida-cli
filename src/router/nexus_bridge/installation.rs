@@ -49,6 +49,14 @@ impl Drop for Temporary {
 
 const SOURCES: &[(&str, &[u8])] = &[
     (
+        "recovery_legacy.py",
+        include_bytes!("../../../nexus_bridge/custody/recovery_legacy.py"),
+    ),
+    (
+        "recovery_resources.py",
+        include_bytes!("../../../nexus_bridge/custody/recovery_resources.py"),
+    ),
+    (
         "recovery_probe.py",
         include_bytes!("../../../nexus_bridge/custody/recovery_probe.py"),
     ),

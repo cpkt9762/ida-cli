@@ -36,7 +36,13 @@ if __name__ == '__main__':
                 result['identity'] = dict(result['identity'], boot_id=marker.read_text())
             return result
         entry.Observer.receive = receive
-    else:
+    elif hasattr(entry,'creation_scope'):
         native_scope = entry.creation_scope
         entry.creation_scope = lambda path, incarnation: observed_scope(native_scope, path, incarnation)
+    else:
+        # The independent file executor imports the same authority through
+        # origin; only the OS scope input changes, never its real actor birth.
+        import origin
+        native_scope=origin.creation_scope
+        origin.creation_scope=lambda path, incarnation:observed_scope(native_scope,path,incarnation)
     entry.main()

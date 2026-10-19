@@ -1098,17 +1098,161 @@ async fn late_custody_proof_case(scenario: &str) {
 #[cfg(feature = "nexus-test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_root_retry_restores_accepted_snapshot_after_parent_terminal() {
+    retained_file_job_case(None).await;
+}
+
+#[cfg(feature = "nexus-test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_job_sender_exits_preserve_frozen_authority_and_next_gate() {
+    for fault in ["source_prepared", "source_before_send", "source_sent"] {
+        retained_file_job_case(Some(fault)).await;
+    }
+}
+
+#[cfg(feature = "nexus-test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_job_receiver_exits_resume_exact_transaction() {
+    for fault in [
+        "receiver_start",
+        "receiver_ready",
+        "receiver_received",
+        "receiver_before_accept",
+        "receiver_accepted",
+        "receiver_first_intent",
+        "receiver_after_rename",
+    ] {
+        retained_file_job_case(Some(fault)).await;
+    }
+}
+
+#[cfg(feature = "nexus-test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_job_lost_ack_does_not_revoke_accepted_executor() {
+    retained_file_job_case(Some("receiver_drop_ack")).await;
+}
+
+#[cfg(feature = "nexus-test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_job_rejects_wrong_epoch_closes_duplicates_and_fences_both_exits() {
+    for fault in ["source_bad_epoch", "source_duplicate", "both_exit"] {
+        retained_file_job_case(Some(fault)).await;
+    }
+}
+
+#[cfg(feature = "nexus-test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boot_retired_file_job_keeps_unknown_and_requires_current_vacancy() {
+    retained_file_job_case(Some("u6_no_ack")).await;
+}
+
+#[cfg(feature = "nexus-test-support")]
+struct FileJobEventLog {
+    values: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+#[cfg(feature = "nexus-test-support")]
+impl FileJobEventLog {
+    fn new(bridge: &ida_mcp::router::nexus_bridge::NexusBridge, root: &std::path::Path) -> Self {
+        let mut receiver = bridge.subscribe();
+        let values = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = values.clone();
+        let failure = error.clone();
+        let path = root.join("restore-events.jsonl");
+        let task = tokio::spawn(async move {
+            use std::io::Write;
+            loop {
+                let result: Result<bool, anyhow::Error> = async {
+                    match receiver.recv().await {
+                        Ok(event) => {
+                            let mut events = sink.lock().expect("test event sink");
+                            anyhow::ensure!(events.len() < 4096, "test event sink overflow");
+                            let mut log = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&path)?;
+                            writeln!(log, "{}", serde_json::to_string(&event)?)?;
+                            events.push(event);
+                            Ok(true)
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => Ok(false),
+                        Err(error) => Err(error.into()),
+                    }
+                }
+                .await;
+                match result {
+                    Ok(true) => (),
+                    Ok(false) => break,
+                    Err(error) => {
+                        *failure.lock().expect("event failure") = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            values,
+            error,
+            task,
+        }
+    }
+    fn check(&self) -> anyhow::Result<()> {
+        let error = self.error.lock().expect("event failure").clone();
+        anyhow::ensure!(
+            error.is_none(),
+            "continuous EventLog failed/Lagged: {error:?}"
+        );
+        Ok(())
+    }
+    async fn failed_parent(&self) -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                self.check()?;
+                if self
+                    .values
+                    .lock()
+                    .expect("events")
+                    .iter()
+                    .any(|e| e["event"] == "failed" && e["attempt"]["target"]["kind"] == "open")
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await?
+    }
+}
+#[cfg(feature = "nexus-test-support")]
+impl Drop for FileJobEventLog {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(feature = "nexus-test-support")]
+async fn retained_file_job_case(fault: Option<&str>) {
     use ida_mcp::router::{nexus_bridge::BridgeConfig, RouterState};
     use serde_json::Value;
     use std::os::fd::AsRawFd;
     use std::{collections::BTreeMap, path::PathBuf, time::Duration};
     let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root"))
-        .join("restore-parent");
+        .join(fault.unwrap_or("restore-parent"));
     std::fs::create_dir(&root).expect("private restore case");
     let router = RouterState::new().expect("router");
     let mut environment: BTreeMap<String, String> = std::env::vars().collect();
     environment.insert("R3A_SCENARIO".into(), "r9-restore-held".into());
     environment.insert("R3A_MANAGED".into(), "1".into());
+    if fault == Some("u6_no_ack") {
+        environment.insert("R4_U6_FILE_JOB".into(), "1".into());
+        environment.insert(
+            "R2_BOOT_SOURCE_INPUT".into(),
+            root.join("os-source.json").display().to_string(),
+        );
+    } else if let Some(fault) = fault {
+        environment.insert("R4_FILE_JOB_FAULT".into(), fault.into());
+    }
     environment.insert("R3A_CASE_ROOT".into(), root.display().to_string());
     environment.insert(
         "IDA_NEXUS_STATE_DIR".into(),
@@ -1124,7 +1268,7 @@ async fn cancelled_root_retry_restores_accepted_snapshot_after_parent_terminal()
         })
         .await
         .expect("actual bridge/helper and native state inputs");
-    let mut events = bridge.subscribe();
+    let events = FileJobEventLog::new(&bridge, &root);
     let client = ClientId::new("cancelled-restore").expect("client");
     let target = root.join("cache/generations/g-fixed/input.i64");
     let parent = bridge
@@ -1158,30 +1302,44 @@ async fn cancelled_root_retry_restores_accepted_snapshot_after_parent_terminal()
         bridge
             .endpoint()
             .transition(|s, _| s.cancel_open(&client, &parent))?;
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                let e = events.recv().await?;
-                use std::io::Write;
-                writeln!(
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(root.join("restore-events.jsonl"))?,
-                    "{}",
-                    serde_json::to_string(&e)?
-                )?;
-                if e["event"] == "failed" && e["attempt"]["target"]["kind"] == "open" {
-                    break Ok::<_, anyhow::Error>(());
-                }
-            }
-        })
-        .await??;
+        events.failed_parent().await?;
         let snapshot = PathBuf::from(std::fs::read_to_string(root.join("snapshot-ready"))?);
         anyhow::ensure!(target.exists() && std::fs::read(&target)? == b"failed recovered packed");
         let before: Value =
             serde_json::from_slice(&std::fs::read(snapshot.join("recovery.json"))?)?;
         anyhow::ensure!(before["status"] == "failed-owner-held", "{before}");
-        std::fs::write(root.join("owner-release"), b"")?;
+        std::fs::write(root.join("snapshot-request"), b"")?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !root.join("snapshot.json").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        let old_history = if fault == Some("u6_no_ack") {
+            let lifecycle = bridge.lifecycle_status();
+            let lease: SessionLease =
+                serde_json::from_value(lifecycle["resource_details"][0]["lease"].clone())?;
+            let history = bridge
+                .endpoint()
+                .transition(|s, _| s.status(&client, &lease))?;
+            anyhow::ensure!(
+                history
+                    .control_delivery
+                    .as_ref()
+                    .is_some_and(|d| d.state == DeliveryState::Uncertain),
+                "real lost release ACK must remain Uncertain: {history:?}"
+            );
+            std::fs::write(
+                root.join("os-source.json"),
+                serde_json::to_vec(&json!({
+                "creator":{"boot_id":"00000000-0000-4000-8000-000000000001"}}))?,
+            )?;
+            bridge.test_boot_resource_projection().await?;
+            Some((lease, history))
+        } else {
+            std::fs::write(root.join("owner-release"), b"")?;
+            None
+        };
         tokio::time::timeout(Duration::from_secs(5), async {
             while bridge.lifecycle_status()["resources"] != 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1195,6 +1353,109 @@ async fn cancelled_root_retry_restores_accepted_snapshot_after_parent_terminal()
             "file recovery must retain root SH after physical custody has settled"
         );
         std::fs::write(root.join("restore.release"), b"")?;
+        if let Some((lease, history)) = &old_history {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !root.join("r4-file-blocked").exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+            anyhow::ensure!(
+                std::fs::read(&target)? == b"failed recovered packed",
+                "boot retirement cannot bypass a current occupied target"
+            );
+            let blocked: Value =
+                serde_json::from_slice(&std::fs::read(snapshot.join("recovery.json"))?)?;
+            std::fs::write(
+                root.join("u6-file-blocked.json"),
+                serde_json::to_vec_pretty(&blocked)?,
+            )?;
+            anyhow::ensure!(blocked["status"] == "failed-owner-held");
+            anyhow::ensure!(
+                blocked["last_error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("public owner holds database")),
+                "must block on actual current occupancy, not an OS/setup error: {blocked}"
+            );
+            let certificates = blocked["certified_resources"]
+                .as_object()
+                .expect("resource custody");
+            anyhow::ensure!(!certificates.is_empty());
+            for reference in certificates.values() {
+                let certificate: Value = serde_json::from_slice(&std::fs::read(
+                    snapshot.join(
+                        reference["name"]
+                            .as_str()
+                            .expect("exact retained certificate"),
+                    ),
+                )?)?;
+                anyhow::ensure!(
+                    certificate["evidence"]["scope"] == "verified_boot_change_resource_retirement",
+                    "file restoration must use U6, not a late public ACK/proof"
+                );
+            }
+            std::fs::write(root.join("owner-release"), b"")?;
+            std::fs::write(root.join("r4-gate.request"), b"")?;
+            let current = bridge
+                .endpoint()
+                .transition(|s, _| s.status(&client, lease))?;
+            anyhow::ensure!(
+                serde_json::to_value(history)? == serde_json::to_value(current)?,
+                "resource retirement may not rewrite command delivery/phase/stop history"
+            );
+        }
+        if let Some(fault) = fault
+            .filter(|f| *f != "receiver_drop_ack" && *f != "u6_no_ack" && *f != "source_duplicate")
+        {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !root.join("file-fault-fired.json").exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+            if fault == "both_exit" {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !root.join("file-fault-fired-source.json").exists()
+                        || !root.join("file-fault-fired-receiver.json").exists()
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await?;
+            }
+            let failed_record: Value =
+                serde_json::from_slice(&std::fs::read(snapshot.join("recovery.json"))?)?;
+            std::fs::write(
+                root.join("record-after-exit.json"),
+                serde_json::to_vec_pretty(&failed_record)?,
+            )?;
+            anyhow::ensure!(failed_record["recovery_id"] == before["recovery_id"]);
+            if fault.starts_with("source_") {
+                anyhow::ensure!(
+                    failed_record["executor"]["state"] == "FrozenOffer"
+                        || failed_record["executor"]["state"] == "Accepted"
+                );
+            }
+            let output = tokio::process::Command::new("timeout")
+                .arg("15s")
+                .arg(std::env::var_os("R3A_PYTHON").expect("SDK"))
+                .arg("-I")
+                .arg("-B")
+                .arg(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/r4_file_gate.py"),
+                )
+                .arg(root.join("i/installation"))
+                .arg(&target)
+                .output()
+                .await?;
+            std::fs::write(root.join("fresh-gate.stdout"), &output.stdout)?;
+            std::fs::write(root.join("fresh-gate.stderr"), &output.stderr)?;
+            anyhow::ensure!(
+                output.status.success(),
+                "fresh gate failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let data: Value =
@@ -1206,6 +1467,24 @@ async fn cancelled_root_retry_restores_accepted_snapshot_after_parent_terminal()
             }
         })
         .await??;
+        if fault == Some("receiver_drop_ack") {
+            anyhow::ensure!(
+                root.join("file-ack-dropped").exists(),
+                "must exercise lost ACK"
+            );
+        }
+        if fault == Some("source_duplicate") {
+            anyhow::ensure!(
+                root.join("file-fault-fired.json").exists(),
+                "must deliver duplicate rights"
+            );
+            let completed: Value =
+                serde_json::from_slice(&std::fs::read(snapshot.join("recovery.json"))?)?;
+            anyhow::ensure!(
+                completed["executor"]["epoch"] == 1,
+                "duplicate cannot spawn another executor"
+            );
+        }
         anyhow::ensure!(std::fs::read(&target)? == b"R0 external database-state input");
         anyhow::ensure!(
             std::fs::read(target.with_extension("id0"))?
@@ -1241,15 +1520,25 @@ async fn cancelled_root_retry_restores_accepted_snapshot_after_parent_terminal()
     .await;
     std::fs::write(root.join("restore.release"), b"").expect("finally restore");
     std::fs::write(root.join("owner-release"), b"").expect("finally owner");
+    let supervision = tokio::time::timeout(Duration::from_secs(8), async {
+        while bridge.lifecycle_status()["helper"]["file_jobs_pending"] != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
     let stopped = bridge.shutdown().await;
     std::fs::write(
         root.join("restore-result.json"),
         serde_json::to_vec_pretty(
-            &json!({"result":format!("{result:?}"),"shutdown":format!("{stopped:?}")}),
+            &json!({"result":format!("{result:?}"),"shutdown":format!("{stopped:?}"),"supervision":format!("{supervision:?}")}),
         )
         .expect("encode"),
     )
     .expect("evidence");
     stopped.expect("natural shutdown");
+    supervision.expect("every file-job native child naturally reaped before test runtime ends");
+    events
+        .check()
+        .expect("continuous exact EventLog has no Lagged or I/O failure");
     result.expect("accepted snapshot outlives cancelled parent and retains exact locks");
 }

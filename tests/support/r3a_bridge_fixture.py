@@ -20,7 +20,7 @@ owner_root = root/'cache/generations/g-fixed' if managed else root
 owner_root.mkdir(parents=True, exist_ok=True)
 if managed:
     (owner_root/'generation.json').write_text(json.dumps({'version':1,'key':'r3a-fixed'}))
-with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-uncertain' else os.environ.get('R3A_SCENARIO', 'healthy'))) as boundary:
+with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-uncertain' or os.environ.get('R4_U6_FILE_JOB') else os.environ.get('R3A_SCENARIO', 'healthy'))) as boundary:
     if managed:
         from r0_transport import install_ida_inputs
         boundary.release_owner()
@@ -217,6 +217,9 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
             import open_recovery
             from acquisition import Custodian
             from r0_transport import barrier
+            if os.environ.get('R4_FILE_JOB_FAULT'):
+                install_file_fault=runpy.run_path(str(Path(__file__).with_name('r4_file_job_faults.py')))['install']
+                install_file_fault('source')
             original_transact = Custodian.transact
             def restore_transactions(self, action, **fields):
                 try:
@@ -232,7 +235,17 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
             original_advance = Custodian.advance_restore
             def deferred_restore(self):
                 barrier(root, 'restore', seconds=8)
-                return original_advance(self)
+                if os.environ.get('R4_U6_FILE_JOB') and (root/'r4-gate.request').exists() and self.recovery_snapshot:
+                    from target_coordination import Target
+                    from target_journal import Journal
+                    with Target(self.target_path) as target,target.locked(nb=True):
+                        target.file_job_prepare=self.prepare_file_job
+                        Journal(target).gate()
+                    (root/'r4-gate.done').touch()
+                result=original_advance(self)
+                if os.environ.get('R4_U6_FILE_JOB') and self.recovery_blocked:
+                    (root/'r4-file-blocked').write_text(str(self.recovery_error))
+                return result
             Custodian.advance_restore = deferred_restore
             original_snapshot = open_recovery.Snapshot.__init__
             def snapshot_before_external_owner(self, *args, **kwargs):
@@ -317,9 +330,11 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
             Custodian.obtain = record_attach_outcome
         if os.environ.get('R2_BOOT_SOURCE_INPUT'):
             import target_journal
+            import origin
             observed_scope = runpy.run_path(str(Path(__file__).with_name('r2_boot_writer.py')))['observed_scope']
             native_scope = target_journal.creation_scope
             target_journal.creation_scope = lambda path, incarnation: observed_scope(native_scope, path, incarnation)
+            origin.creation_scope=target_journal.creation_scope
         if scenario == 'r2-save-refused-notsent':
             from acquisition import Custodian
             real_transaction = Custodian.transact

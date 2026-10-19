@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import subprocess
 
 REPO=Path(__file__).resolve().parents[2]
 sys.path[:0]=[str(REPO/'nexus_bridge/custody'),str(REPO/'nexus_bridge'),str(Path(__file__).parent)]
@@ -18,6 +19,35 @@ from target_journal import Journal
 class ResourceCertificates(unittest.TestCase):
     def setUp(self):
         isolate_owner_input(self)
+
+    def test_certificate_durable_boundaries_resume_before_routine_source_collection(self):
+        no_owner_input()
+        for stage in ('file_fsynced','before_rename','after_rename','directory_fsynced'):
+            with self.subTest(stage=stage):
+                case=Path(tempfile.mkdtemp(prefix='certificate-'+stage+'-',dir=os.environ['R3A_CASE_ROOT']))
+                (case/'payload').mkdir(mode=0o700)
+                path=case/'payload/input.i64'
+                path.write_bytes(b'original')
+                snapshot=Snapshot(case/'home',path,float('inf'),owner_probe=lambda _:None)
+                with Target(path) as target,target.locked():
+                    journal=Journal(target)
+                    epoch=journal.begin({'parent':{'operation_id':'no-sdk'},'purpose':'final','ordinal':1},'no-sdk')
+                    journal.abort_unstarted('no-sdk')
+                    item=journal.value['entries'][str(epoch)]
+                    snapshot.requirements=[{k:copy.deepcopy(item.get(k)) for k in
+                        ('watch','epoch','acquisition','owner','lease','origin_binding')}]
+                path.write_bytes(b'failed')
+                snapshot.failed(1)
+                results=[]
+                for boundary,expected in ((stage,96),('none',0)):
+                    argv=['timeout','10s',sys.executable,'-B',__file__,'--certificate',str(path),snapshot.recovery_id,boundary]
+                    before=subprocess.check_output(['uptime'],text=True).strip()
+                    result=subprocess.run(argv,capture_output=True,text=True,check=False)
+                    results.append({'argv':argv,'exit':result.returncode,'stdout':result.stdout,'stderr':result.stderr,
+                        'uptime_before':before,'uptime_after':subprocess.check_output(['uptime'],text=True).strip()})
+                    (case/'runs.json').write_text(__import__('json').dumps(results,indent=2))
+                    self.assertEqual(result.returncode,expected,result.stderr)
+                self.assertEqual(path.read_bytes(),b'original')
 
     def test_internal_snapshot_resolves_original_authority_and_rejects_business(self):
         no_owner_input()
@@ -93,4 +123,15 @@ class ResourceCertificates(unittest.TestCase):
         self.assertEqual(snapshot.data['status'],'failed-owner-held')
 
 
-if __name__=='__main__':unittest.main(verbosity=2)
+if __name__=='__main__':
+    if len(sys.argv)>1 and sys.argv[1]=='--certificate':
+        no_owner_input()
+        import durable_records
+        def exit_boundary(_directory,name,stage):
+            if name.startswith('resource-') and stage==sys.argv[4]:os._exit(96)
+        durable_records.boundary=exit_boundary
+        with Target(sys.argv[2]) as target,target.locked():
+            with Transaction(target,sys.argv[3]) as transaction:
+                transaction.resume_executor()
+                transaction.restore()
+    else:unittest.main(verbosity=2)

@@ -181,8 +181,8 @@ class OpenTests(unittest.TestCase):
                 self.losses, self.close_safe = 1, True
                 self.handles.clear()
                 self.calls.clear()
-                def collect(snapshot, number):
-                    observed = original(snapshot, number)
+                def collect(snapshot, number, **kwargs):
+                    observed = original(snapshot, number, **kwargs)
                     self.close_safe = False
                     if fails:
                         raise OSError('injected snapshot collection failure')

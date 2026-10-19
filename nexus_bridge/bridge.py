@@ -34,7 +34,7 @@ from lifecycle import database_diagnostics, release_handle, release_errors, rele
 from metadata import idb_context
 from open_recovery import open_checked
 from config import ida_cli_home, startup_paths
-from protocol import SDK_FILES, admission
+from protocol import admission, verify_client
 from lifetime import LifetimeListener
 from acquisition import Custodian, failure_details
 from owner_release import FairReleases, ordinary_release
@@ -87,7 +87,7 @@ TOOL_SOURCE += ("\n_tools_metadata = {}\n"
 RELEASE_SOURCE = module_source('lifecycle.py')
 SLICE_GATE_SOURCES = {name: module_source(name + '.py', custody=True) for name in (
     'target_coordination', 'custody_process_identity', 'origin', 'owner_identity', 'target_journal',
-    'durable_records', 'recovery_files', 'recovery_transaction')}
+    'durable_records', 'recovery_files', 'recovery_resources', 'recovery_transaction','recovery_legacy')}
 SLICE_SOURCE = ("import sys, types\n"
     + f"_target_gate_sources = {SLICE_GATE_SOURCES!r}\n"
     "if '_ida_cli_release_protocol_v1' not in sys.modules:\n"
@@ -106,19 +106,7 @@ def readiness():
     try:
         paths = startup_paths()
         protocol = admission()
-        import ida_nexus
-        versions = [importlib.metadata.version(name) for name in ("ida-nexus", "ida-domain")]
-        if versions != ["0.13.4", "0.5.1"]:
-            raise ValueError(f"requires pinned Nexus 0.13.4/Domain 0.5.1; got {versions}")
-        package = Path(ida_nexus.__file__).resolve().parent
-        sdk_modules = {}
-        for name, expected in SDK_FILES.items():
-            module = importlib.import_module("ida_nexus." + name.removesuffix(".py"))
-            source = Path(module.__file__).resolve()
-            actual = hashlib.sha256(source.read_bytes()).hexdigest()
-            if source != package / name or actual != expected:
-                raise ValueError(f"ProtocolMismatch: incompatible SDK module {name}")
-            sdk_modules[name] = {"path": str(source), "sha256": actual}
+        sdk_modules = verify_client()
     except (ImportError, importlib.metadata.PackageNotFoundError, ValueError, OSError) as exc:
         return {"ready": False, "error": error("dependency_unavailable", exc)}
     try:
@@ -435,15 +423,20 @@ class Bridge(LifetimeListener):
                     'owner_proof_consumed':getattr(c, 'verification_retired', False),
                     'next_action':'inspect_copy_occupancy_and_file_gate' if getattr(c, 'verification_cleanup_error', None)
                                   else 'wait_exact_owner_proof'} for path,c in self.verification_probes.items()]
-                recovery_refs = [(c.acquisition,c.recovery_snapshot[0],c.recovery_error,c.recovery_blocked)
-                                 for c in self.acquisitions.values() if c.recovery_snapshot is not None]
+                recovery_refs=[]
+                for custody in self.acquisitions.values():
+                    snapshot=(custody.recovery_snapshot[0] if custody.recovery_snapshot is not None
+                              else getattr(custody,'file_snapshot',None))
+                    if snapshot is not None and (custody.recovery_snapshot is not None
+                            or snapshot.data['status'] not in ('restored','opened','archived')):
+                        recovery_refs.append((custody.acquisition,snapshot,custody.recovery_error,custody.recovery_blocked))
             recoveries=[]
             for acquisition,snapshot,cause,blocked in recovery_refs:
                 try:actual=snapshot.status()
                 except Exception as error:
                     actual={'job_id':snapshot.recovery_id,'transaction':str(snapshot.path),
                             'status_error':type(error).__name__+': '+str(error)}
-                recoveries.append(dict(actual,acquisition=acquisition,cause=cause,blocked=blocked,
+                recoveries.append(dict(actual,acquisition=acquisition,execution_error=cause,blocked=blocked,
                     next_action='inspect_retained_scene' if blocked else 'wait_exact_cleanup_then_restore'))
             channel.send({"event": "local_status", "id": message["local_status"],
                           "held": held, "owners": owners, "verification_probes": verifications,
@@ -932,7 +925,7 @@ class Bridge(LifetimeListener):
             with self.lock:
                 for custody in self.acquisitions.values():
                     if (custody.recovery_snapshot is not None and not custody.recovery_active
-                            and not custody.recovery_blocked and not custody.running
+                            and not custody.running
                             and time.monotonic() >= custody.recovery_next):
                         custody.recovery_active = True
                         self.release_scheduler.submit(('restore', custody.watch), custody.advance_restore)

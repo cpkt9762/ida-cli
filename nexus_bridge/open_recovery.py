@@ -86,6 +86,8 @@ from lifecycle import release_handle
 
 
 def maintenance_main():
+    from protocol import verify_client
+    verify_client()
     from recovery_maintenance import main
     return main()
 
@@ -138,6 +140,8 @@ class OpenGate:
             self.legacy.__enter__()
             self.lock()
             self.target.business_admission()
+            from recovery_legacy import import_known_home
+            import_known_home(self.target,self.root)
             Journal(self.target).gate(state_identity())
             return self
         except BaseException:
@@ -307,7 +311,7 @@ class Snapshot:
             output_directory.close()
             input_directory.close()
 
-    def failed(self, attempt):
+    def failed(self, attempt, *, cause=None):
         with self.transaction() as transaction:
             custodian = getattr(self,'custodian',None)
             if custodian is not None:
@@ -319,7 +323,7 @@ class Snapshot:
                     if item['acquisition'] == custodian.acquisition]
                 if not self.requirements:
                     raise RuntimeError('RecoveryBlocked: failed acquisition has no exact durable resource source')
-            observed = transaction.capture_failure(attempt,getattr(self,'requirements',()))
+            observed = transaction.capture_failure(attempt,getattr(self,'requirements',()),cause=cause)
             from target_journal import Journal
             Journal(transaction.target).file_intent(self.path/'recovery.json',transaction.data['status'],transaction.data['attempts'])
             return observed
@@ -412,6 +416,7 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
             snapshot.custodian = custodian
             if custodian is not None:
                 custodian.file_recovery_id = snapshot.recovery_id
+                custodian.file_snapshot = snapshot
         for number in range(1, 4):
             logging.getLogger('ida_cli.open').debug('open attempt %d/3: %s', number, target)
             attempt_context = dict(context, open_attempt=number, deadline=deadline)
@@ -475,7 +480,8 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                     snapshot.deadline = float('inf')
                     try:
                         with custodian.file_gate(recovery=True) if custodian else locking.file_gate():
-                            observed = snapshot.failed(number)
+                            from acquisition import failure_details
+                            observed = snapshot.failed(number,cause=failure_details(exc))
                     except Exception as error:
                         observation_error = error
                 # Snapshot collection can take time or fail. Its earlier proof

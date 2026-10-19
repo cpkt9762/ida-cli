@@ -56,6 +56,8 @@ class FrozenOffer:
             'lock_identity':identity(os.fstat(transaction.target.target_fd))}
         transaction.data['executor']['state'] = 'FrozenOffer'
         transaction.data['executor']['transfer_id'] = self.binding
+        if transaction.data.get('job') is not None:
+            transaction.data['job']['transfer']=self.binding
         transaction.save()
         transaction.token.valid = False
         boundary('prepared', self.binding)
@@ -71,10 +73,12 @@ class FrozenOffer:
             raise RuntimeError('HandoffBlocked: offer changed before definitely-not-sent abort')
         current['executor']['state'] = 'LocalExecuting'
         current['executor']['transfer_id'] = None
+        current['executor']['epoch'] += 1
         current['revision'] += 1
         transaction.directory.durable('recovery.json', current)
         transaction.data, transaction.info, transaction.raw = transaction.directory.read('recovery.json')
-        transaction.token.valid = True
+        from recovery_transaction import ExecutorToken
+        transaction.token = ExecutorToken(current['executor']['actor'], current['executor']['epoch'])
 
     def send(self, channel):
         if self.started:
@@ -114,6 +118,7 @@ def accept(transaction, binding, receiver):
     transaction.data['executor'] = dict(expected,state='Accepted',actor=receiver)
     transaction.data['revision'] += 1
     transaction.validate()
+    boundary('before_accept',binding)
     transaction.directory.durable('recovery.json',transaction.data)
     transaction.data, transaction.info, transaction.raw = transaction.directory.read('recovery.json')
     transaction.token = token
@@ -129,6 +134,7 @@ def receive_guard(channel, target):
             raise RuntimeError('HandoffBlocked: received directory differs from independent path')
         if identity(os.fstat(lock_fd)) != identity(os.stat('lock',dir_fd=directory_fd,follow_symlinks=False)):
             raise RuntimeError('HandoffBlocked: received target lock replaced')
+        boundary('received',binding)
         guard = TransferredTargetGuard(lock_fd)
         lock_fd = None
         return binding, guard
