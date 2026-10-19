@@ -20,7 +20,8 @@ from target_coordination import Target
 from recovery_transaction import Transaction,recovery_name
 
 EXTENSIONS=('i64','id0','id1','id2','nam','til')
-DURABLE=('temp_written','file_fsynced','before_rename','after_rename','directory_fsynced')
+DURABLE=('unbound_created','owner_unbound_created','owner_published',
+         'temp_written','file_fsynced','before_rename','after_rename','directory_fsynced')
 
 
 def record(case,value):
@@ -70,7 +71,12 @@ def action(case,fault):
     def metadata(directory,name,stage):
         current=active[0]
         if current is None or name!='recovery.json' or directory.path != current['transaction'].directory.path:return
-        value,_,_=directory.inspect_record(name)
+        # Before owner publication the prospective bytes are deliberately not
+        # authority. Attribute this test hook to the actual caller's in-memory
+        # intent; all published boundaries still inspect exact durable bytes.
+        if stage in ('unbound_created','owner_unbound_created'):
+            value=current['transaction'].data
+        else:value,_,_=directory.inspect_record(name)
         if current['kind']=='rename':site='intent' if value['intent'] else 'complete'
         elif value['intent'] is None:site='complete'
         else:
@@ -103,7 +109,7 @@ class Components(unittest.TestCase):
         name='input.'+extension
         matrix=[]
         for phase,folder in (('snapshot','snapshot'),('capture','failed-files-1'),('restore','staging-1')):
-            for stage in ('created','chunk','file_fsynced','directory_fsynced'):
+            for stage in ('unbound_created','created','chunk','file_fsynced','directory_fsynced','checkpointed'):
                 matrix.append((phase,[folder,name,'file.'+stage]))
             for site in ('intent','reserved','complete'):
                 matrix.extend((phase,[folder,name,'record.'+site+'.'+stage]) for stage in DURABLE)
