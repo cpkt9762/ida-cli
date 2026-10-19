@@ -23,6 +23,13 @@ _permission_diagnostics = set()
 _capabilities = {}
 
 
+class FilesystemCapabilityError(RuntimeError):
+    """Admission refusal with diagnostics that require no Nexus discovery."""
+    def __init__(self, details):
+        self.details=json.loads(encoded(details))
+        super().__init__('FilesystemCapabilitiesRefused: '+encoded(self.details).decode())
+
+
 def capability_key(fd, mounted):
     return (os.fstat(fd).st_dev,mounted['filesystem'],mounted['flags'],mounted['owner'],tuple(mounted['fsid']))
 
@@ -391,9 +398,9 @@ def preflight_capabilities(path):
         _capabilities[capability_key(probe.fd,mounted)]=result
         if not result['supported']:
             import logging
-            message='FilesystemCapabilitiesRefused: '+encoded(result).decode()
-            logging.getLogger(__name__).warning('%s',message)
-            raise RuntimeError(message)
+            failure=FilesystemCapabilityError(result)
+            logging.getLogger(__name__).warning('%s',failure)
+            raise failure
         return result
     finally:
         if root is not None:root.close()

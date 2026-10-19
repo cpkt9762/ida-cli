@@ -531,8 +531,12 @@ class Bridge(LifetimeListener):
                         return
             if frame["payload"]["command"] == "open":
                 command = frame["payload"]
-                details['diagnostics'] = database_diagnostics(
-                    command.get('options', {}).get('output_database') or command['path'])
+                from target_coordination import FilesystemCapabilityError
+                diagnostic_target=command.get('options', {}).get('output_database') or command['path']
+                if isinstance(exc,FilesystemCapabilityError):
+                    details['diagnostics']={'target':diagnostic_target,
+                        'filesystem_capabilities':exc.details}
+                else:details['diagnostics'] = database_diagnostics(diagnostic_target)
                 if custody is None and not public_started[0]:
                     channel.send({'event':'not_sent','attempt':attempt,
                         'error':failure_details(exc), **details})

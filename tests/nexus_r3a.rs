@@ -384,12 +384,25 @@ async fn filesystem_capability_refusal_precedes_public_sdk_calls() {
         .expect("caller status");
     let status = bridge.lifecycle_status();
     let shutdown = bridge.shutdown().await;
+    let trace_text = match std::fs::read_to_string(&trace) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => panic!("SDK trace unreadable: {error}"),
+    };
+    let sdk_calls: Vec<Value> = trace_text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("complete SDK trace record"))
+        .collect();
     std::fs::write(root.join("capability-refusal.json"),serde_json::to_vec_pretty(&json!({
         "terminal":terminal,"caller_status":progress,"lifecycle_status":status,"physical_volume":physical,
-        "target":path,"shutdown":format!("{shutdown:?}")})).expect("evidence JSON")).expect("evidence");
+        "target":path,"sdk_calls":sdk_calls,"shutdown":format!("{shutdown:?}")})).expect("evidence JSON")).expect("evidence");
     shutdown.expect("natural teardown");
     assert_eq!(terminal["event"], "failed");
     let message = terminal["error"]["message"].as_str().expect("public error");
+    let capabilities = &terminal["diagnostics"]["filesystem_capabilities"];
+    assert_eq!(capabilities["supported"], false);
+    assert_eq!(capabilities["cleanup_errors"], json!([]));
+    assert_eq!(capabilities["no_replace_rename"]["errno"], libc::ENOTSUP);
     for text in [
         "FilesystemCapabilitiesRefused",
         "no_replace_rename_unsupported",
@@ -398,6 +411,8 @@ async fn filesystem_capability_refusal_precedes_public_sdk_calls() {
         assert!(message.contains(text), "{message}");
     }
     if physical.is_some() {
+        assert_eq!(capabilities["filesystem"], "exfat");
+        assert_eq!(capabilities["hardlink"]["errno"], 45);
         for text in ["exfat", "hardlink_unsupported", "45"] {
             assert!(message.contains(text), "{message}");
         }
@@ -410,9 +425,14 @@ async fn filesystem_capability_refusal_precedes_public_sdk_calls() {
         .contains(message.trim_start_matches("RuntimeError: ")));
     assert_eq!(status["resources"], 0);
     assert_eq!(status["startup_and_pre_attach"], 0);
+    // Record the existing status observer as well. Its independent discovery
+    // does not belong to this target request or establish target admission.
     assert!(
-        !trace.exists(),
-        "Nexus probe/open/resolve/attach ran before capability refusal"
+        sdk_calls
+            .iter()
+            .all(|call| call["origin"] == "background_status"
+                && call["sdk_call"] == "discover_databases"),
+        "target request reached Nexus: {sdk_calls:?}"
     );
     assert_eq!(std::fs::read(&path).expect("unchanged input"), bytes);
     use std::os::unix::fs::MetadataExt;
