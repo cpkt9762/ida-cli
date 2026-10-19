@@ -1461,8 +1461,9 @@ evidence. Protocol versions and fixed SDK modules/patches are unchanged.
 ### R4 file transaction implementation (in progress)
 
 R3b has independent acceptance through `5d8a215`; the historical paragraphs above
-describe their original delivery state. The R4 adapter now requires open3,
-custody5, target_gate2 and `file_recovery_ack_v1`; fixed SDK bytes stay unchanged.
+describe their original delivery state. The R4 adapter now requires open4,
+custody5, target_gate2, `file_recovery_ack_v1` and `file_job_relay_v1`;
+fixed SDK bytes stay unchanged.
 R4 is not yet accepted. Stage results and all failures are preserved in the
 external `n7a-refactor/r4-implementation/` directory.
 
@@ -1487,5 +1488,21 @@ database or owner is an authorized maintenance target.
 Use a fresh private HOME/state/tmp/IPC and `R3A_CASE_ROOT`; the maintenance test
 also needs the prepared `R3A_PYTHON` and disposable `R3F1_SAMPLE`. File matrices
 allow shell timeout120s; stage compilation allows180s, stated before execution.
-Product barrier budgets are unchanged. Full transfer, v1, quota, maintenance and
-U6 product acceptance matrices remain required before claiming R4 complete.
+Product barrier budgets are unchanged. The `file_job_` Rust/N1 cases exercise
+sender/receiver exits, both exits, exact epoch rejection, duplicate rights and
+lost ACK through the installed receiver. Continuous EventLog rejects Lagged;
+each native supervisor is naturally reaped before its test runtime ends.
+The U6 case injects only the OS scope input: real lost SDK ACK remains Uncertain,
+current owner occupancy blocks file writes, and a later gate restores the same
+transaction after that occupancy ends. It is not a real kernel reboot.
+
+Creation and retained-resource certificate exits also recover in new processes.
+`test_recovery_compaction.py` separates synthetic closed-epoch inputs from the
+real helper proof test, and checks each durable deletion boundary and new refs.
+`test_recovery_io.py` labels injected errno separately from real hostile files;
+its 80/95/100 percent retained thresholds use actual file bytes.
+The installed maintenance driver covers snapshotless/two-target permissions,
+accepted-plan process-exit continuation, env-i/absolute entry/four launch modes,
+tampered members and missing dependencies. Final-SHA regressions, physical U6,
+device-number remapping and the remaining R4 gates are still required before
+claiming R4 complete.

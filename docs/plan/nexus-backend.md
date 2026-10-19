@@ -1007,7 +1007,7 @@ R3b正式验收（R4输入）：编排者44ad已接受到`5d8a215f92b4405e6db99a
 
 R4当前实施中：文件执行器移到目标协调区，使用同卷snapshot/staging/quarantine、
 精确文件intent和非覆盖rename；接入唯一epoch、close-only目标guard、独立已安装文件job，
-N1原ACK与公共proof单独签收文件责任。新接线要求open3/custody5/target_gate2和
-`file_recovery_ack_v1`，固定SDK不变。维护入口的offline operator证据不产生公共proof，
+N1原ACK与公共proof单独签收文件责任。新接线要求open4/custody5/target_gate2和
+`file_recovery_ack_v1`/`file_job_relay_v1`，固定SDK不变。维护入口的offline operator证据不产生公共proof，
 preview/apply分别取同序锁。这里仅登记阶段实现，完整v1/移交/配额/平台与最终矩阵仍需R4交付，
 不得据此自行验收R4或启动R6；当前阶段证据在`n7a-refactor/r4-implementation/`。

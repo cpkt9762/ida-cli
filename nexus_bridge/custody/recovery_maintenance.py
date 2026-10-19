@@ -7,11 +7,16 @@ from pathlib import Path
 import sys
 import time
 import subprocess
+from types import SimpleNamespace
 
 from origin import creation_scope
 from recovery_files import file_info, inventory
 from recovery_transaction import Transaction, recovery_name
 from target_coordination import Directory, Target, digest, encoded
+
+
+def boundary(_stage,_detail):
+    """Deterministic exit input; accepted offline permission stays durable."""
 
 
 def tree(directory, depth=0):
@@ -126,15 +131,79 @@ def preview(target, transaction, evidence):
                 if not compatible(file_info(snapshot,name),expected):
                     raise RuntimeError('MaintenanceBlocked: immutable snapshot changed')
         finally:snapshot.close()
+    return make_plan(target,transaction.recovery_id,evidence,components,retained,digest(transaction.raw),
+        'restore_complete_snapshot' if transaction.data['failure_intent'] else 'archive_without_rollback')
+
+
+def make_plan(target,recovery_id,evidence,components,retained,record_hash,action):
     plan={'schema':1,'kind':'manual_offline_recovery','target':target.original,'coord_key':target.key,
-        'directory':target.directory.identity,'transaction':transaction.recovery_id,
-        'record_sha256':digest(transaction.raw),'components':components,'retained':retained,
+        'directory':target.directory.identity,'transaction':recovery_id,
+        'root_binding':target.recovery_root_binding(),
+        'record_sha256':record_hash,'components':components,'retained':retained,
         'operator':evidence['operator'],'window':evidence['window'],'host':evidence['host'],
         'stopped_openers':evidence['stopped_openers'],'offline_scope':evidence['offline_scope'],
         'state_roots':evidence['state_roots'],
         'backup':evidence['backup'],
-        'action':'restore_complete_snapshot' if transaction.data['failure_intent'] else 'archive_without_rollback'}
+        'action':action}
     return plan,digest(plan)
+
+
+def snapshotless_preview(target,recovery_id,evidence):
+    from target_journal import Journal
+    from recovery_transaction import inspect_transactions
+    if Journal(target,recover=False).value.get('file_intents') or any(
+            item['phase'] not in ('restored','opened','archived') for item in inspect_transactions(target)):
+        raise RuntimeError('MaintenanceBlocked: unresolved file transaction requires its exact RecoveryId')
+    parent=Directory(target.target.parent,private=False)
+    try:
+        current=inventory(parent,target.directory)
+        components={k:v for k,v in current.items() if k in __import__('recovery_files').component_names(target.target)}
+    finally:parent.close()
+    validate_evidence(evidence,target,SimpleNamespace(recovery_id=recovery_id),components,{})
+    if occupancy(evidence['state_roots'],target.target):
+        raise RuntimeError('MaintenanceBlocked: current target remains occupied')
+    return make_plan(target,recovery_id,evidence,components,{},None,'archive_without_snapshot')
+
+
+def apply(target,transaction,plan,plan_hash):
+    transaction.resume_executor()
+    permission=transaction.data.get('manual_offline_recovery')
+    if permission is None or permission['plan_sha256'] != plan_hash:
+        permission={'schema':1,'plan_sha256':plan_hash,'plan':plan,'applied_at':time.time()}
+    transaction.data['manual_offline_recovery']=permission
+    transaction.save()
+    boundary('accepted',permission)
+    if transaction.data['failure_intent']:
+        transaction.restore(manual=True)
+    else:transaction.archive('authorized offline no-failure archive')
+    from target_journal import Journal
+    Journal(target).complete_manual(permission)
+    return transaction.status()
+
+
+def accepted_preview(target,transaction,evidence):
+    """An accepted plan resumes only inside its original operator window.
+
+    The backup and approved original inputs stay immutable. Current bytes may
+    differ only as allowed by the transaction's exact staged rename intents.
+    """
+    permission=transaction.data.get('manual_offline_recovery')
+    if permission is None or evidence.get('approved_plan_sha256') != permission['plan_sha256']:
+        return preview(target,transaction,evidence)
+    transaction.validate_manual_permission(permission)
+    plan=permission['plan']
+    if any(encoded(evidence.get(key)) != encoded(plan.get(key))
+           for key in ('operator','window','host','components','retained','backup','stopped_openers','state_roots','offline_scope')):
+        raise RuntimeError('MaintenanceBlocked: original accepted offline evidence changed')
+    validate_evidence(evidence,target,transaction,plan['components'],plan['retained'])
+    transaction.owner_probe=lambda path:occupancy(evidence['state_roots'],path)
+    transaction.check_occupancy()
+    if not transaction.data['failure_intent']:
+        current=inventory(transaction.parent_directory(),target.directory)
+        components={k:v for k,v in current.items() if k in __import__('recovery_files').component_names(target.target)}
+        if encoded(components) != encoded(plan['components']):
+            raise RuntimeError('MaintenanceBlocked: no-failure scene changed after offline acceptance')
+    return plan,permission['plan_sha256']
 
 
 def occupancy(roots, path):
@@ -166,23 +235,28 @@ def main():
     # Never initialize a missing marker, lock, journal, or pending write during
     # preview. Apply also begins with the SAME immutable preview under new locks.
     with Target(args.target,create=False) as target,target.locked(nb=True,recover=False):
-        with Transaction(target,args.transaction,recover=False) as transaction:
-            plan,plan_hash=preview(target,transaction,evidence)
+        try:os.stat(args.transaction,dir_fd=target.directory.fd,follow_symlinks=False)
+        except FileNotFoundError:
+            plan,plan_hash=snapshotless_preview(target,args.transaction,evidence)
             result={'dry_run':args.dry_run,'plan':plan,'plan_sha256':plan_hash,
                     'bridge_dir':str(Path(__file__).parent),'prepared_python':sys.executable,
                     'evidence_type':'manual_offline_recovery','public_owner_proof':False}
             if not args.dry_run:
                 if evidence['approved_plan_sha256'] != plan_hash:
                     raise RuntimeError('MaintenanceBlocked: reviewed plan hash changed or not approved')
-                transaction.resume_executor()
-                permission={'schema':1,'plan_sha256':plan_hash,'plan':plan,'applied_at':time.time()}
-                transaction.data['manual_offline_recovery']=permission
-                transaction.save()
-                if transaction.data['failure_intent']:
-                    transaction.restore(manual=True)
-                else:transaction.archive('authorized offline no-failure archive')
-                from target_journal import Journal
-                Journal(target).complete_manual(permission)
-                result['status']=transaction.status()
+                recovery_id,token=Transaction.allocate(target,recovery_id=args.transaction,source_files={})
+                with Transaction(target,recovery_id,token=token) as transaction:
+                    result['status']=apply(target,transaction,plan,plan_hash)
+            print(json.dumps(result,sort_keys=True))
+            return 0
+        with Transaction(target,args.transaction,recover=False) as transaction:
+            plan,plan_hash=accepted_preview(target,transaction,evidence)
+            result={'dry_run':args.dry_run,'plan':plan,'plan_sha256':plan_hash,
+                    'bridge_dir':str(Path(__file__).parent),'prepared_python':sys.executable,
+                    'evidence_type':'manual_offline_recovery','public_owner_proof':False}
+            if not args.dry_run:
+                if evidence['approved_plan_sha256'] != plan_hash:
+                    raise RuntimeError('MaintenanceBlocked: reviewed plan hash changed or not approved')
+                result['status']=apply(target,transaction,plan,plan_hash)
             print(json.dumps(result,sort_keys=True))
     return 0
