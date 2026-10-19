@@ -11,13 +11,27 @@ import unittest
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO / 'nexus_bridge/custody'))
+sys.path[:0]=[str(REPO/'nexus_bridge/custody'),str(REPO/'nexus_bridge')]
 from target_coordination import Target
 from target_journal import Journal
 from acquisition import Custodian
 
 
 class TargetCustody(unittest.TestCase):
+    def test_unwritable_actual_parent_refuses_before_public_probe_and_leaves_no_coordination(self):
+        from open_recovery import open_checked
+        with patch('ida_nexus.probe_database_state',side_effect=AssertionError('probe before writable gate')) as probe:
+            self.root.chmod(0o500)
+            try:
+                with self.assertRaisesRegex(RuntimeError,'FilesystemCapabilitiesRefused') as caught:
+                    open_checked(None,None,str(self.path),{},time.monotonic()+2,None,{})
+                diagnostic=json.loads(str(caught.exception).split(': ',1)[1])
+                self.assertEqual(diagnostic['probe_error']['errno'],errno.EACCES)
+                self.assertEqual(diagnostic['cleanup_errors'],[])
+                probe.assert_not_called()
+                self.assertEqual(set(self.root.iterdir()),{self.path})
+            finally:self.root.chmod(0o700)
+
     def test_capabilities_are_measured_before_coordination_and_cleanup_on_refusal(self):
         from target_coordination import preflight_capabilities
         import recovery_files

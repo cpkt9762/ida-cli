@@ -128,10 +128,13 @@ class FileTransaction(unittest.TestCase):
 
     def child(self, mode, case, fault='none'):
         argv=['timeout','10s',sys.executable,'-B',__file__,mode,str(case),fault]
-        before=subprocess.check_output(['uptime'],text=True).strip()
-        result=subprocess.run(argv,capture_output=True,text=True,check=False)
-        row=dict(argv=argv,exit=result.returncode,stdout=result.stdout,stderr=result.stderr,
-                 uptime_before=before,uptime_after=subprocess.check_output(['uptime'],text=True).strip())
+        home=Path(tempfile.mkdtemp(prefix='independent-home-',dir=case))
+        (home/'.ida').mkdir(mode=0o700)
+        environment=dict(os.environ,HOME=str(home),IDA_CLI_HOME=str(home/'.ida'))
+        before=subprocess.check_output(['timeout','5s','uptime'],text=True).strip()
+        result=subprocess.run(argv,capture_output=True,text=True,check=False,env=environment)
+        row=dict(argv=argv,exit=result.returncode,stdout=result.stdout,stderr=result.stderr,home=str(home),
+                 uptime_before=before,uptime_after=subprocess.check_output(['timeout','5s','uptime'],text=True).strip())
         with (case/'runs.jsonl').open('a') as stream:stream.write(json.dumps(row)+'\n')
         return result
 

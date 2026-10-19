@@ -28,6 +28,118 @@ fn public_owner_birth_timestamp_survives_both_json_hops() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn helper_session_survives_the_router_process_groups_sighup() {
+    use ida_mcp::router::nexus_bridge::{test_output_child, test_spawn_child};
+    let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private signal root"));
+    if std::env::var("R6_HUP_CHILD").as_deref() == Ok("1") {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("owned SIGHUP receiver");
+        let router = RouterState::new().expect("child router");
+        let bridge = router
+            .connect_nexus(BridgeConfig {
+                python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("SDK")),
+                script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/support/r2_client_bridge.py"),
+                directory: root.join("signal-i"),
+                environment: std::env::vars().collect(),
+            })
+            .await
+            .expect("real Rust helper launcher");
+        let before = bridge
+            .test_finished_helper_heartbeat()
+            .await
+            .expect("ready helper");
+        std::fs::write(
+            root.join("signal-ready.json"),
+            serde_json::to_vec_pretty(&before).expect("JSON"),
+        )
+        .expect("publish ready");
+        tokio::time::timeout(Duration::from_secs(10), signal.recv())
+            .await
+            .expect("parent SIGHUP")
+            .expect("signal received");
+        let after = bridge
+            .test_finished_helper_heartbeat()
+            .await
+            .expect("helper survives actual router group HUP");
+        assert_eq!(
+            before["identity"], after["identity"],
+            "helper restarted after group HUP"
+        );
+        assert_ne!(after["identity"]["sid"], std::process::id());
+        bridge
+            .shutdown()
+            .await
+            .expect("bridge wait and surviving helper finish");
+        std::fs::write(
+            root.join("signal-result.json"),
+            serde_json::to_vec_pretty(
+                &json!({"before":before,"after":after,"received_sighup":true}),
+            )
+            .expect("JSON"),
+        )
+        .expect("signal evidence");
+        return;
+    }
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args([
+            "-c",
+            "trap '' HUP; exec timeout --foreground 30s \"$@\"",
+            "owned-hup-supervisor",
+        ])
+        .arg(std::env::current_exe().expect("test binary"));
+    command
+        .args([
+            "helper_session_survives_the_router_process_groups_sighup",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("R6_HUP_CHILD", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    // SAFETY: setsid is async-signal-safe; this creates a group containing only
+    // the exact owned test child and its future bridge, never the caller group.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let child = test_spawn_child(&mut command).expect("private process-group child");
+    let pid = child.id().expect("owned child pid");
+    wait_for(|| Ok(root.join("signal-ready.json").exists()))
+        .await
+        .expect("child initialized helper");
+    // SAFETY: the unreaped child PID is pinned by Child; verify its private
+    // group before delivering SIGHUP exclusively to that group.
+    unsafe {
+        assert_eq!(libc::getpgid(pid as i32), pid as i32);
+        assert_eq!(libc::kill(-(pid as i32), libc::SIGHUP), 0);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(40), test_output_child(child))
+        .await
+        .expect("bounded actual wait")
+        .expect("child wait");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let evidence: Value = serde_json::from_slice(
+        &std::fs::read(root.join("signal-result.json")).expect("signal evidence"),
+    )
+    .expect("JSON");
+    assert_eq!(evidence["received_sighup"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bridge_and_helper_loss_preserve_draining_owner_until_public_release() {
     use ida_mcp::preprocess::Preparation;
     use ida_mcp::router::nexus_bridge::{test_output_child, test_spawn_child};
@@ -72,6 +184,7 @@ async fn bridge_and_helper_loss_preserve_draining_owner_until_public_release() {
             })
             .await
             .expect("production independent bridge/helper");
+        let mut successor = None;
         let result:anyhow::Result<Value>=async {
             let (_,token)=router.ensure_worker_prepared(root.join("a/tiny.i64").to_str().expect("path"),None,None,
                 Preparation::new(Duration::from_secs(10))).await?;
@@ -89,6 +202,21 @@ async fn bridge_and_helper_loss_preserve_draining_owner_until_public_release() {
             }
             bridge.terminate().await?;
             std::fs::write(root.join("after-bridge.json"),serde_json::to_vec_pretty(&bridge.lifecycle_status())?)?;
+            if mode=="bridge-held" {
+                let next=RouterState::new()?;
+                let mut environment:BTreeMap<String,String>=std::env::vars().collect();
+                environment.insert("R6_CAPABILITY_TRACE".into(),root.join("next-sdk.jsonl").display().to_string());
+                let adapter=next.connect_nexus(BridgeConfig {
+                    python:PathBuf::from(std::env::var_os("R3A_PYTHON").expect("SDK")),
+                    script:PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/r2_client_bridge.py"),
+                    directory:root.join("next"),environment,
+                }).await?;
+                successor=Some((next,adapter.clone()));
+                let refused=gate_attempt(&adapter,&root.join("a/tiny.i64"),"held").await?;
+                anyhow::ensure!(refused["event"]!="opened" && !root.join("next-sdk.jsonl").exists(),
+                    "new router bypassed failed-owner-held gate: {refused}");
+                std::fs::write(root.join("next-held.json"),serde_json::to_vec_pretty(&refused)?)?;
+            }
             let fault=if helper_fault {Some(bridge.test_helper_fault(false).await?)} else {None};
             if !proof_first {
                 anyhow::ensure!(bridge.lifecycle_status()["resources"]==1,"bridge/helper death fabricated owner proof");
@@ -108,11 +236,22 @@ async fn bridge_and_helper_loss_preserve_draining_owner_until_public_release() {
                 "a dead bridge must not fabricate a retirement delivery ACK");
             let after=bridge.endpoint().transition(|s,_|s.status(&lease.client_id,&lease))?;
             anyhow::ensure!(after.phase==SessionPhase::Released && json!(after.control_delivery)==json!(acknowledged.control_delivery),"public lifetime rewrote exact ACK history: {after:?}");
+            if let Some((_,adapter))=&successor {
+                wait_for(||Ok(root.join("a/requests.json").exists())).await?;
+                let admitted=gate_attempt(adapter,&root.join("a/tiny.i64"),"after-proof").await?;
+                anyhow::ensure!(root.join("next-sdk.jsonl").exists() && adapter.lifecycle_status()["resources"]==0,
+                    "new router failed to consume exact target proof before its new SDK request: {admitted}");
+                std::fs::write(root.join("next-after-proof.json"),serde_json::to_vec_pretty(&admitted)?)?;
+            }
             Ok(json!({"mode":mode,"held":held,"after":bridge.lifecycle_status(),"session":after,"helper_fault":fault}))
         }.await;
         std::fs::write(root.join("a/owner-release"), b"")
             .expect("finally release owned native lifetime");
         let output = test_output_child(child).await.expect("actual owner wait");
+        let successor_shutdown = match successor {
+            Some((_, adapter)) => Some(adapter.shutdown().await),
+            None => None,
+        };
         let shutdown = bridge.shutdown().await;
         std::fs::write(root.join("draining-result.json"),serde_json::to_vec_pretty(&json!({"result":result.as_ref().ok(),
             "error":result.as_ref().err().map(ToString::to_string),"owner_exit":output.status.code(),
@@ -123,8 +262,50 @@ async fn bridge_and_helper_loss_preserve_draining_owner_until_public_release() {
             String::from_utf8_lossy(&output.stderr)
         );
         shutdown.expect("failed bridge and exact helper naturally collected");
+        if let Some(stopped) = successor_shutdown {
+            stopped.expect("new router/helper naturally collected");
+        }
         result.expect("real bridge/helper crashes cannot replace public owner proof");
     }
+}
+
+async fn gate_attempt(
+    bridge: &ida_mcp::router::nexus_bridge::NexusBridge,
+    path: &std::path::Path,
+    name: &str,
+) -> anyhow::Result<Value> {
+    let mut events = bridge.subscribe();
+    let client = ClientId::new(format!("r6-new-{name}"))?;
+    bridge.endpoint().transition(|s, t| {
+        s.open(
+            &client,
+            AcceptedRequest::new(
+                &SystemClock,
+                RequestId::new(name)?,
+                None,
+                "open",
+                json!({"timeout_secs":3}),
+            )?,
+            OpenSpec {
+                operation_id: OperationId::new(name)?,
+                path: path.display().to_string(),
+                options: json!({"spawn":false}),
+            },
+            t,
+        )
+    })?;
+    Ok(tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await?;
+            if matches!(
+                event["event"].as_str(),
+                Some("opened" | "failed" | "not_sent" | "uncertain")
+            ) {
+                break Ok::<_, anyhow::Error>(event);
+            }
+        }
+    })
+    .await??)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
