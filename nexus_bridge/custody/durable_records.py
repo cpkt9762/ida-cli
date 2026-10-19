@@ -62,11 +62,15 @@ def exact_unlink(directory, name, info):
 def read_owner(directory, name):
     from target_coordination import MAX_RECORD
     info, data = raw(directory, name+'.new.owner')
-    value = json.loads(data)
+    try:
+        value = json.loads(data)
+    except (json.JSONDecodeError,UnicodeDecodeError) as error:
+        raise RuntimeError('DurableWriteBlocked: interrupted durable write ownership is corrupt; evidence retained') from error
     if (type(value) is not dict or set(value) != {'schema','writer','target','directory','new','previous','immutable'}
             or type(value['schema']) is not int or value['schema'] != 1
             or value['writer'] != 'ida-cli-durable-v2' or value['target'] != name
             or value['directory'] != directory.identity or type(value['immutable']) is not bool
+            or type(value['directory']) is not list or any(type(n) is not int for n in value['directory'])
             or type(value['new']) is not dict or set(value['new']) != {'identity','sha256','size'}
             or type(value['new']['size']) is not int or not 0 <= value['new']['size'] <= MAX_RECORD
             or type(value['new']['sha256']) is not str or len(value['new']['sha256']) != 64
