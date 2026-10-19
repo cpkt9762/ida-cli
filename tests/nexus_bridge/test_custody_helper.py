@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import stat
 import time
 import unittest
 import uuid
@@ -17,6 +18,7 @@ from proof_helper import Observer, request
 from r0_transport import Boundary
 from target_coordination import Target
 from target_journal import Journal
+from helper_readiness import bind_window_case
 
 
 class HelperCustody(unittest.TestCase):
@@ -44,6 +46,18 @@ class HelperCustody(unittest.TestCase):
         directory = directory or self.root
         directory.mkdir(mode=0o700, exist_ok=True)
         endpoint = directory / 'h'
+        previous_inode = None
+        try:
+            previous = endpoint.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            previous_inode = (previous.st_dev, previous.st_ino)
+            owned_exit = any(getattr(child, '_fixture_endpoint', None) == (endpoint, previous_inode)
+                             and child.poll() is not None for child in self.children)
+            if (not stat.S_ISSOCK(previous.st_mode) or previous.st_uid != os.getuid()
+                    or stat.S_IMODE(previous.st_mode) != 0o600 or not owned_exit):
+                raise RuntimeError('untrusted helper startup preexisting endpoint')
         log = (directory / 'helper.log').open('ab')
         environment = dict(os.environ, PYTHONPATH='')
         if state is not None:
@@ -56,20 +70,120 @@ class HelperCustody(unittest.TestCase):
         log.close()
         self.children.append(child)
         deadline = time.monotonic() + 2
+        published_inode = None
         while True:
             if child.poll() is not None or time.monotonic() >= deadline:
                 self.fail('helper startup failed: ' + (directory / 'helper.log').read_text())
             try:
-                status = request(endpoint, self.identity, {'kind':'heartbeat'})
-                break
-            except OSError:
+                info = endpoint.lstat()
+            except FileNotFoundError:
+                if published_inode is not None:
+                    raise RuntimeError('helper startup endpoint disappeared')
                 time.sleep(.002)
+                continue
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+                raise RuntimeError('untrusted helper startup endpoint type or uid')
+            inode = (info.st_dev, info.st_ino)
+            if inode == previous_inode:
+                time.sleep(.002)  # Only the exact exited fixture child may be rebound.
+                continue
+            if published_inode is not None and inode != published_inode:
+                raise RuntimeError('helper startup endpoint replaced')
+            published_inode = inode
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                # bind precedes chmod/listen. Only this owned child's pinned
+                # socket may still be publishing; request remains fully strict.
+                time.sleep(.002)
+                continue
+            try:
+                status = request(endpoint, self.identity, {'kind':'heartbeat'},
+                                 timeout=max(.001, deadline-time.monotonic()))
+            except ConnectionRefusedError:
+                time.sleep(.002)  # chmod may precede listen on the same inode.
+                continue
+            after = endpoint.lstat()
+            if ((after.st_dev, after.st_ino) != published_inode
+                    or not stat.S_ISSOCK(after.st_mode) or after.st_uid != os.getuid()
+                    or stat.S_IMODE(after.st_mode) != 0o600):
+                raise RuntimeError('helper startup endpoint changed after heartbeat')
+            break
         if state is None:
             self.assertEqual(status['state_root'], state_identity())
         else:
             self.assertEqual(status['state_root']['path'],str(state.resolve()))
         self.assertEqual(status['identity']['sid'], child.pid, 'helper must have its own session')
+        self.assertEqual(status['identity']['pid'], child.pid, 'ready peer must be this owned helper')
+        child._fixture_endpoint = (endpoint, published_inode)
         return endpoint
+
+    def test_bind_publication_window_waits_for_trusted_same_helper(self):
+        """Actual start_helper/request/main; pipe and lstat scheduling only."""
+        self.bind_window_case()
+
+    def test_bind_publication_replaced_inode_is_not_a_readiness_retry(self):
+        self.bind_window_case('replace')
+
+    def test_bind_publication_wrong_uid_metadata_is_not_a_readiness_retry(self):
+        # UID input is controlled; no privileged chown or peer impersonation.
+        self.bind_window_case('uid')
+
+    def test_bind_publication_regular_file_is_not_a_readiness_retry(self):
+        self.bind_window_case('file')
+
+    def bind_window_case(self, fault=None):
+        bind_window_case(self, fault)
+
+    def test_readiness_peer_and_incarnation_errors_are_not_retried(self):
+        from unittest.mock import patch
+        real_request = request
+        for fault in ('id', 'pe'):
+            with self.subTest(fault=fault):
+                directory = self.root/fault
+                endpoint = directory/'h'
+                rejected = []
+                def invalid_peer(path, incarnation, value, **options):
+                    try:
+                        if fault == 'id':
+                            return real_request(path, 'wrong-helper', value, **options)
+                        with patch('proof_helper.peer_uid', return_value=os.getuid()+1):
+                            return real_request(path, incarnation, value, **options)
+                    except RuntimeError as error:
+                        rejected.append(str(error))
+                        raise
+                try:
+                    expected = 'response identity' if fault == 'id' else 'replaced or wrong peer'
+                    with patch.dict(globals(), request=invalid_peer):
+                        with self.assertRaisesRegex(RuntimeError, expected):
+                            self.start_helper(directory=directory)
+                    self.assertEqual(len(rejected), 1, 'protocol errors must escape the first real RPC')
+                finally:
+                    real_request(endpoint, self.identity, {'kind':'finish'})
+                    self.assertEqual(self.children[-1].wait(timeout=3), 0)
+
+    def test_preexisting_live_or_unowned_socket_is_never_adopted(self):
+        import socket
+        endpoint = self.start_helper(directory=self.root/'lv')
+        try:
+            before = endpoint.lstat()
+            with self.assertRaisesRegex(RuntimeError, 'preexisting endpoint'):
+                self.start_helper(directory=self.root/'lv')
+            self.assertEqual(len(self.children), 1, 'no second child for a live endpoint')
+            self.assertEqual(endpoint.lstat().st_ino, before.st_ino)
+        finally:
+            request(endpoint, self.identity, {'kind':'finish'})
+            self.assertEqual(self.children[-1].wait(timeout=3), 0)
+        directory = self.root/'fo'
+        directory.mkdir(mode=0o700)
+        endpoint = directory/'h'
+        with socket.socket(socket.AF_UNIX) as foreign:
+            foreign.bind(str(endpoint))
+            endpoint.chmod(0o600)
+            inode = endpoint.lstat().st_ino
+            with self.assertRaisesRegex(RuntimeError, 'preexisting endpoint'):
+                self.start_helper(directory=directory)
+            self.assertEqual(len(self.children), 1, 'unknown endpoints cannot gain fixture custody')
+            self.assertEqual(endpoint.lstat().st_ino, inode)
+        endpoint.unlink()  # The substitute was created in this test above.
 
     def test_compaction_io_failure_allows_existing_public_proof_and_closures(self):
         """Actual SDK/helper/writer; only the old routine closure is a fixture."""
