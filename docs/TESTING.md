@@ -1442,3 +1442,18 @@ recovery; missing/foreign/conflicted/null/corrupt inputs preserve journal, paylo
 and controlled manifest references. Ordinary recovery and legal cleanup remain
 positive controls. Its completed epoch flags and reference manifests are explicit
 file-boundary fixtures, not N1/helper/public-owner proofs.
+
+The fix4 `nexus_r3b_fix4` regression runs the ordinary close entry with the
+production guard returning close_safe=true and a nonempty save refusal. It waits
+for exact public proof/closure and removal of the retirement ACK before the real
+target writer refuses its bounded summary write. Caller and top-level status
+retain that known refusal while N1 keeps the original typed NotSent command
+error and an independent observation_error. The native Root input is controlled;
+the SDK, N1, installed bridge/helper/writer and guard execution are real.
+
+Accepted release terminals now retain nonempty save diagnostics in the existing
+exact-lease table even when sideband persistence fails. Empty/null later fields
+do not clear them. Rust/N1/control-reader contract tests separately cover typed
+nested causes, subsequent observations, foreign identities and rejected/duplicate
+terminals; supplied wire fields in those tests do not replace production guard
+evidence. Protocol versions and fixed SDK modules/patches are unchanged.
