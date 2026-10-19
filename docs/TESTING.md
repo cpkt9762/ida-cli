@@ -1539,3 +1539,10 @@ creation also serializes with accounting. Publishers never wait for target EX
 inside that lock. A real publisher exit releases only the directory lock:
 pending bytes still block accounting and remain preserved. The fact payload
 in this deterministic test is synthetic, not a public owner proof.
+
+The library's `live_helper_rpc_never_reads_a_mutable_finish_inode` schedules an
+actual helper registry replacement between Rust's open and metadata read.
+Normal live RPCs use the helper protocol; only an exactly exited child permits
+the durable finish-tombstone inspection before restart. The existing accepted
+finish/lost-reply test remains a separate control, and neither child exit nor
+the registry grants a public owner proof.

@@ -291,6 +291,8 @@ impl Helper {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
+        #[cfg(all(test, feature = "nexus-test-support"))]
+        tests::after_registry_open();
         let before = file.metadata()?;
         // SAFETY: geteuid has no arguments or memory preconditions.
         let uid = unsafe { libc::geteuid() };
@@ -339,15 +341,18 @@ impl Helper {
 
     async fn reconnect(&self) -> anyhow::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
+        let mut child = self.child.lock().await;
+        let Some(status) = child.try_wait()? else {
+            // The live helper owns a mutable registry and enforces its own
+            // durable finishing fence. Inspect a finish tombstone only after
+            // this exact writer has exited, before any possible restart.
+            return Ok(());
+        };
         if self.finish_accepted()? {
             self.finished
                 .store(true, std::sync::atomic::Ordering::Release);
             anyhow::bail!("ObservationClosed: durable helper finish forbids reconnect");
         }
-        let mut child = self.child.lock().await;
-        let Some(status) = child.try_wait()? else {
-            return Ok(());
-        };
         let count = self.restarts.load(std::sync::atomic::Ordering::Acquire);
         anyhow::ensure!(count < 3, "ObservationRecoveryBlocked: helper restart budget exhausted; durable obligations retained");
         tracing::warn!(%status, restart=count + 1, root=?self.state_root,
@@ -525,6 +530,109 @@ impl Helper {
 mod tests {
     use super::*;
     use tokio::io::AsyncBufReadExt;
+
+    thread_local! {
+        static REGISTRY_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn after_registry_open() {
+        let hook = REGISTRY_OPEN_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn raw_parent_request(endpoint: &Path, incarnation: &str, kind: &str) -> Value {
+        use std::io::{BufRead, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(endpoint)
+            .expect("independent real helper connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bounded helper response");
+        let bytes = serde_json::to_vec(&json!({"protocol":2,"helper":incarnation,
+            "kind":kind,"parent":"registry-read-boundary"}))
+        .expect("production control frame");
+        stream.write_all(&bytes).expect("write real helper control");
+        stream.write_all(b"\n").expect("complete helper frame");
+        let mut reply = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut reply)
+            .expect("actual helper reply");
+        let reply: Value = serde_json::from_str(&reply).expect("actual helper response JSON");
+        assert_eq!(
+            reply["ok"], true,
+            "producer must actually persist its new registry"
+        );
+        reply
+    }
+
+    #[tokio::test]
+    async fn live_helper_rpc_never_reads_a_mutable_finish_inode() {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private case"))
+            .join("live-registry-boundary");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("private helper root");
+        let installation = root.join("installation");
+        crate::router::nexus_bridge::installation::create(&installation)
+            .expect("closed installation");
+        let mut config = BridgeConfig {
+            python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("fixed SDK interpreter")),
+            script: installation.join("bridge.py"),
+            directory: root.clone(),
+            environment: std::env::vars().collect(),
+        };
+        config.environment.insert(
+            "IDA_NEXUS_STATE_DIR".into(),
+            root.join("state").display().to_string(),
+        );
+        let helper = Helper::start(&mut config, &installation)
+            .await
+            .expect("actual independent helper");
+        let initial = helper
+            .call(json!({"kind":"heartbeat"}))
+            .await
+            .expect("helper ready");
+        let endpoint = helper.endpoint.clone();
+        let incarnation = helper.incarnation.clone();
+        let registry = root.join("helper-state.json");
+        let before = std::fs::metadata(&registry)
+            .expect("initial registry inode")
+            .ino();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = fired.clone();
+        REGISTRY_OPEN_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                raw_parent_request(&endpoint, &incarnation, "reserve_parent");
+                observed.store(true, std::sync::atomic::Ordering::Release);
+            }))
+        });
+        let heartbeat = helper.call(json!({"kind":"heartbeat"})).await;
+        REGISTRY_OPEN_HOOK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        // Retire only the exact test reservation. Always naturally finish the
+        // helper before the decisive assertion, including the frozen red.
+        raw_parent_request(&helper.endpoint, &helper.incarnation, "retire_parent");
+        let stopped = helper.finish().await;
+        std::fs::write(root.join("registry-boundary.json"),serde_json::to_vec_pretty(&json!({
+            "initial":initial,"heartbeat":heartbeat.as_ref().ok(),
+            "error":heartbeat.as_ref().err().map(ToString::to_string),
+            "publication_between_open_and_metadata":fired.load(std::sync::atomic::Ordering::Acquire),
+            "before_inode":before,"after_inode":std::fs::metadata(&registry).expect("final registry").ino(),
+            "shutdown":format!("{stopped:?}"),"forced":false,
+            "scope":"actual Rust/helper writer; no owner or public-proof fixture"})).expect("encode evidence"))
+            .expect("write boundary evidence before assertion");
+        stopped.expect("helper naturally finishes even for the baseline red");
+        heartbeat.expect("a live helper RPC must not interpret a retired finish-record inode");
+        assert_eq!(
+            helper.restarts.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn accepted_finish_lost_ipc_reply_is_durably_fenced() {
