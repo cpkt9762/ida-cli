@@ -348,30 +348,16 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                 helper.journal(json!({"action":"no_attach","watch":watch,"target":event["target"],
                     "coord_key":event["coord_key"],"consumer":event["consumer"],"bridge_consumer":event["bridge_consumer"],
                     "custody_accepted":true})).await?;
-                helper
-                    .call(
-                        json!({"kind":"retire","watch":watch,"sha256":event["consumer"]["sha256"]}),
-                    )
-                    .await?;
-                helper.journal(json!({"action":"settle","target":event["target"],"coord_key":event["coord_key"]})).await?;
-                state
-                    .startups
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(watch);
-                state
-                    .retired_open_resources
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(acquisition.parent.operation_id.clone());
-                state
-                    .custody_retirements
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        watch.into(),
-                        json!({"acquisition":acquisition,"lease":null,"watch":watch}),
-                    );
+                // The verified target receipt must survive helper retirement,
+                // including a later writer failure or lost custody reply.
+                {
+                    let mut startups = state.startups.lock().unwrap_or_else(|e| e.into_inner());
+                    let retained = startups
+                        .get_mut(watch)
+                        .ok_or_else(|| anyhow::anyhow!("no-attach responsibility disappeared"))?;
+                    retained["pending_no_attach"] = event.clone();
+                }
+                finish_no_attach(state, helper, event).await?;
             } else {
                 anyhow::ensure!(
                     state
@@ -1019,6 +1005,7 @@ pub(super) async fn proofs(state: &Arc<State>, writer: &Writer) -> anyhow::Resul
         });
         let old_boot = &launch["origin_binding"]["creator"]["boot_id"];
         let result = if !has_successor
+            && launch.get("pending_no_attach").is_none()
             && !old_boot.is_null()
             && *old_boot != heartbeat["identity"]["boot_id"]
         {
@@ -1324,6 +1311,42 @@ fn observation_result(state: &State, watch: &str, result: anyhow::Result<()>) {
     }
 }
 
+async fn finish_no_attach(
+    state: &State,
+    helper: &helper::Helper,
+    event: &Value,
+) -> anyhow::Result<()> {
+    let watch = event["watch"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("pending no-attach watch missing"))?;
+    let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
+    helper
+        .call(json!({"kind":"retire","watch":watch,"sha256":event["consumer"]["sha256"]}))
+        .await?;
+    #[cfg(feature = "nexus-test-support")]
+    super::test_barriers::fail_once("no_attach_settle", event.clone())?;
+    helper
+        .journal(json!({"action":"settle","target":event["target"],"coord_key":event["coord_key"]}))
+        .await?;
+    helper
+        .call(json!({"kind":"retire_parent","parent":acquisition.parent}))
+        .await?;
+    state
+        .startups
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(watch);
+    state
+        .retired_open_resources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(acquisition.parent.operation_id.clone());
+    let closed = settle_unleased_acquisition(state, &acquisition, false)?;
+    state.custody_retirements.lock().unwrap_or_else(|e|e.into_inner()).insert(watch.into(),
+        json!({"acquisition":acquisition,"lease":null,"watch":watch,"acquisition_closed":closed}));
+    Ok(())
+}
+
 async fn observe_launch(
     state: &Arc<State>,
     writer: &Writer,
@@ -1331,6 +1354,20 @@ async fn observe_launch(
     resources: &[Resource],
     launch: Value,
 ) -> anyhow::Result<()> {
+    if let Some(pending) = launch.get("pending_no_attach") {
+        let inflight = pending["nonce"].as_str().is_some_and(|nonce| {
+            state
+                .custody_replies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(nonce)
+                .is_some_and(|(_, reply)| reply.is_null())
+        });
+        if !inflight {
+            finish_no_attach(state, helper, pending).await?;
+        }
+        return Ok(());
+    }
     let successor = resources.iter().find(|r| {
         r.watch == launch["watch"].as_str().unwrap_or("")
             || (!launch["launch"].is_null()
@@ -1657,34 +1694,44 @@ async fn startup_proof(
     }
     #[cfg(feature = "nexus-test-support")]
     super::test_barriers::asynchronous("proof_before_retire", launch.clone()).await?;
-    // Public lifetime can precede the final typed attach facts. Cache the
-    // producer-closed helper view, rather than the earlier proof snapshot,
-    // before retirement makes this exact watch unavailable to lookup.
-    let latest = helper.call(json!({"kind":"lookup","watch":watch})).await?;
-    // The helper retains its original public observation when the target has
-    // already selected another authorized source. Its producer closure uses
-    // custody_proof in that case; validate and cache that exact same receipt.
-    let selected_proof = latest["item"]
-        .get("custody_proof")
-        .unwrap_or(&latest["item"]["proof"]);
-    anyhow::ensure!(
-        latest["state_root"] == helper.state_root
-            && latest["item"]["acquisition"] == launch["acquisition"]
-            && latest["item"]["owner"] == launch["owner"]
-            && *selected_proof == launch["proof"]
-            && latest["item"]["consumer"] == launch["consumer"],
-        "retiring startup helper facts changed identity or proof"
-    );
-    let mut latest_item = latest["item"].clone();
-    latest_item["proof"] = selected_proof.clone();
-    state
-        .startup_proofs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(watch.clone(), latest_item);
+    if launch["retirement_ready"] != true {
+        // Public lifetime can precede the final typed attach facts. Cache the
+        // producer-closed helper view, rather than the earlier proof snapshot,
+        // before retirement makes this exact watch unavailable to lookup.
+        let latest = helper.call(json!({"kind":"lookup","watch":watch})).await?;
+        // The helper retains its original public observation when the target has
+        // already selected another authorized source. Its producer closure uses
+        // custody_proof in that case; validate and cache that exact same receipt.
+        let selected_proof = latest["item"]
+            .get("custody_proof")
+            .unwrap_or(&latest["item"]["proof"]);
+        anyhow::ensure!(
+            latest["state_root"] == helper.state_root
+                && latest["item"]["acquisition"] == launch["acquisition"]
+                && latest["item"]["owner"] == launch["owner"]
+                && *selected_proof == launch["proof"]
+                && latest["item"]["consumer"] == launch["consumer"],
+            "retiring startup helper facts changed identity or proof"
+        );
+        let mut latest_item = latest["item"].clone();
+        latest_item["proof"] = selected_proof.clone();
+        state
+            .startup_proofs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(watch.clone(), latest_item);
+        launch["retirement_ready"] = json!(true);
+        state
+            .startups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(watch.clone(), launch.clone());
+    }
     helper
         .call(json!({"kind":"retire","watch":watch,"sha256":launch["consumer"]["sha256"]}))
         .await?;
+    #[cfg(feature = "nexus-test-support")]
+    super::test_barriers::fail_once("startup_settle", launch.clone())?;
     helper
         .journal(
             json!({"action":"settle","target":launch["target"],"coord_key":launch["coord_key"]}),

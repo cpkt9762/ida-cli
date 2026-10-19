@@ -406,14 +406,7 @@ class Custodian:
                 self.obtained(handle, context)
             handle.claim_acquired()
         self.outcome = outcome
-        try:
-            self.reconcile_outcome(outcome)
-            if handle is None:
-                self.finish_without_handle()
-        except Exception as cleanup_error:
-            if outcome.get('cause') is not None:
-                raise RuntimeError('acquisition cleanup unconfirmed: ' + str(cleanup_error)) from outcome['cause']
-            raise
+        self.reconcile_finished_outcome(outcome,'acquisition')
         if outcome.get('cause') is not None:
             raise outcome['cause']
         if handle is None:
@@ -476,6 +469,28 @@ class Custodian:
         outcome['prior_outcome'] = previous
         return outcome
 
+    def reconcile_finished_outcome(self,outcome,kind):
+        """SDK completion and observation cleanup are independent facts."""
+        try:
+            self.reconcile_outcome(outcome)
+        except Exception as cleanup_error:
+            if outcome.get('handle') is None:
+                try:self.finish_without_handle()
+                except Exception as completion_error:
+                    cause=outcome.get('cause')
+                    raise RuntimeError(kind+' cleanup unconfirmed: '+str(cleanup_error)
+                        +'; SDK completion unconfirmed: '+str(completion_error)) from (
+                            cause if cause is not None else cleanup_error)
+            if outcome.get('cause') is not None:
+                raise RuntimeError(kind+' cleanup unconfirmed: '+str(cleanup_error)) from outcome['cause']
+            raise
+        try:
+            if outcome.get('handle') is None:self.finish_without_handle()
+        except Exception as completion_error:
+            if outcome.get('cause') is not None:
+                raise RuntimeError(kind+' cleanup unconfirmed: '+str(completion_error)) from outcome['cause']
+            raise
+
     def obtain_attach(self, Handle, instance, options, context, *, cleanup=False):
         self.stage('Resolved', instance)
         self.sdk_entered = True
@@ -487,14 +502,7 @@ class Custodian:
             if self.decision is None:
                 self.obtained(handle, context)
             handle.claim_acquired()
-        try:
-            self.reconcile_outcome(outcome)
-            if handle is None:
-                self.finish_without_handle()
-        except Exception as cleanup_error:
-            if outcome.get('cause') is not None:
-                raise RuntimeError('attach cleanup unconfirmed: ' + str(cleanup_error)) from outcome['cause']
-            raise
+        self.reconcile_finished_outcome(outcome,'attach')
         if outcome.get('cause') is not None:
             raise outcome['cause']
         if handle is None or (self.decision['disposition'] != 'prepare' and not cleanup):

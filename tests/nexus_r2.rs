@@ -1431,7 +1431,25 @@ async fn late_real_ack_after_boot_retirement_never_rewrites_target() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn post_exit_attach_attempt_ack_deadline_sends_zero_attach_and_settles_notsent() {
+    attach_ack_case(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_attach_settlement_failure_after_helper_retirement_keeps_exact_custody() {
+    attach_ack_case(Some("no_attach_settle")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_proof_settlement_failure_after_helper_retirement_resumes_exact_cache() {
+    attach_ack_case(Some("startup_settle")).await;
+}
+
+async fn attach_ack_case(inject_settlement_failure: Option<&str>) {
     let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root"));
+    if let Some(fault) = inject_settlement_failure {
+        std::fs::write(root.join(format!("{fault}.fail")), b"")
+            .expect("arm exact settlement fault");
+    }
     let router = RouterState::new().expect("router");
     let mut environment: BTreeMap<String, String> = std::env::vars().collect();
     environment.insert("R3A_SCENARIO".into(), "post-exit-attach-ack".into());
@@ -1506,7 +1524,7 @@ async fn post_exit_attach_attempt_ack_deadline_sends_zero_attach_and_settles_not
             && v["reply"]["consumer"]["record"]["attempts"]["3"]["state"]=="not_sent"),
             "real NotSent must durably supersede may_send before watch closure: {facts:?}");
         tokio::time::timeout(Duration::from_secs(3),async {
-            while bridge.lifecycle_status()["resources"]!=0 || bridge.lifecycle_status()["startup_and_pre_attach"]!=0 {
+            while !absent_acquisition_finished(&bridge.lifecycle_status()) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await?;
@@ -1516,22 +1534,43 @@ async fn post_exit_attach_attempt_ack_deadline_sends_zero_attach_and_settles_not
     std::fs::write(root.join("attach-ack.release"), b"").expect("finally release exact ACK");
     std::fs::write(root.join("owner-release"), b"").expect("finally release owned lifetime");
     let settled = tokio::time::timeout(Duration::from_secs(8), async {
-        while bridge.lifecycle_status()["resources"] != 0
-            || bridge.lifecycle_status()["startup_and_pre_attach"] != 0
-        {
+        while !absent_acquisition_finished(&bridge.lifecycle_status()) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await;
+    let before_shutdown = bridge.lifecycle_status();
     let shutdown = bridge.shutdown().await;
     std::fs::write(
         root.join("attach-ack-result.json"),
         serde_json::to_vec_pretty(&json!({"result":format!("{result:?}"),
-        "settled":settled.is_ok(),"shutdown":format!("{shutdown:?}")}))
+        "settled":settled.is_ok(),"before_shutdown":before_shutdown,"shutdown":format!("{shutdown:?}")}))
         .expect("encode"),
     )
     .expect("evidence");
+    if let Some(fault) = inject_settlement_failure {
+        assert!(
+            root.join(format!("{fault}.fired")).exists(),
+            "exact post-retirement fault was not reached"
+        );
+    }
     settled.expect("all custody naturally settled");
     shutdown.expect("natural helper/bridge shutdown");
     result.expect("final helper acknowledgment deadline/NotSent contract");
+}
+
+fn absent_acquisition_finished(status: &Value) -> bool {
+    let parents = status["acquisitions"]["parents"]
+        .as_array()
+        .expect("real parent status");
+    let acquisitions = parents[0]["acquisitions"]
+        .as_array()
+        .expect("real acquisitions");
+    parents.len() == 1
+        && acquisitions.len() == 1
+        && status["resources"] == 0
+        && status["startup_and_pre_attach"] == 0
+        && acquisitions[0]["physical_slot"] == false
+        && acquisitions[0]["sdk_acquisition_finished"] == true
+        && acquisitions[0]["settled"] == true
 }

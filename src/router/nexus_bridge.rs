@@ -1351,6 +1351,15 @@ async fn event_received(
             });
             return Ok(());
         }
+        if event["action"] == "no_attach" {
+            // The ordinary receiver owns this exact nonce until its terminal;
+            // the proof pump may then resume a retained signed closure.
+            state
+                .custody_replies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(nonce.into(), (event.clone(), Value::Null));
+        }
         let result = custody_wire::receive(&event, state).await;
         let reply = match result {
             Ok(value) => value,

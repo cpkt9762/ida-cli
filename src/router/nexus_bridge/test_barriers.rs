@@ -1,6 +1,21 @@
 //! Test-only scheduling points. They never change a production predicate.
 use serde_json::Value;
 use std::{path::PathBuf, time::Duration};
+pub(super) fn fail_once(name: &str, value: Value) -> anyhow::Result<()> {
+    let Some(root) = std::env::var_os("R3F2_BARRIER_ROOT").map(PathBuf::from) else {
+        return Ok(());
+    };
+    let arm = root.join(format!("{name}.fail"));
+    if arm.is_file() {
+        std::fs::rename(&arm, root.join(format!("{name}.consumed")))?;
+        std::fs::write(
+            root.join(format!("{name}.fired")),
+            serde_json::to_vec(&value)?,
+        )?;
+        anyhow::bail!("controlled {name} failure after exact helper retirement");
+    }
+    Ok(())
+}
 fn armed(name: &str, value: Value) -> anyhow::Result<Option<PathBuf>> {
     let Some(root) = std::env::var_os("R3F2_BARRIER_ROOT").map(PathBuf::from) else {
         return Ok(None);
