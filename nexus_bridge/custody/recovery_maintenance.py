@@ -40,10 +40,81 @@ def content(value):
     return {k:value[k] for k in ('size','sha256','mode')}
 
 
+def scratch_inventory(target):
+    """Read all owner/checkpoint references before proposing scratch removal."""
+    from recovery_files import preparation_name
+    candidates, references, objects = [], set(), set()
+    scanned=[0]
+    def referenced(value):
+        if type(value) is dict:
+            # A valid accepted permission contains a deletion inventory, not
+            # an owner binding. Other records and malformed grants stay visible.
+            if (set(value)=={'schema','plan_sha256','plan','applied_at'}
+                    and type(value['schema']) is int and value['schema']==1
+                    and type(value['plan']) is dict and value['plan'].get('kind')=='manual_offline_recovery'
+                    and digest(value['plan'])==value['plan_sha256']):
+                return
+            if type(value.get('device')) is int and type(value.get('inode')) is int:
+                objects.add((value['device'],value['inode']))
+            for key,item in value.items():
+                if key in ('identity','inode') and type(item) is list and len(item) in (2,3) and all(type(n) is int for n in item):
+                    objects.add(tuple(item[:2]))
+                referenced(item)
+        elif type(value) is list:
+            for item in value:referenced(item)
+        elif type(value) is str and preparation_name(Path(value).name):
+            references.add(Path(value).name)
+    def scan(directory, depth=0):
+        if depth>8 or len(candidates)>4096:
+            raise RuntimeError('MaintenanceBlocked: scratch inventory exceeds bound')
+        for name in sorted(os.listdir(directory.fd)):
+            scanned[0]+=1
+            if scanned[0]>4096:
+                raise RuntimeError('MaintenanceBlocked: scratch namespace exceeds bound')
+            info=os.stat(name,dir_fd=directory.fd,follow_symlinks=False)
+            if __import__('stat').S_ISDIR(info.st_mode):
+                child=directory.child(name,create=False)
+                try:scan(child,depth+1)
+                finally:child.close()
+            elif preparation_name(name):
+                candidates.append(dict(path=str(directory.path/name),directory=directory.identity,
+                    **file_info(directory,name)))
+            elif name.endswith(('.json','.new','.new.owner')):
+                try:value,_,_=directory.read(name)
+                except (ValueError,UnicodeError) as error:
+                    raise RuntimeError('MaintenanceBlocked: cannot establish scratch references: '+str(directory.path/name)) from error
+                referenced(value)
+    scan(target.directory)
+    return [item for item in candidates if Path(item['path']).name not in references
+            and (item['device'],item['inode']) not in objects]
+
+
+def remove_scratch(target, approved):
+    """Called only under target EX, after the exact reviewed plan is accepted."""
+    if target.target_fd is None:
+        raise RuntimeError('MaintenanceBlocked: scratch deletion requires target EX')
+    current={item['path']:item for item in scratch_inventory(target)}
+    if any(current.get(item['path']) != item for item in approved):
+        raise RuntimeError('MaintenanceBlocked: scratch identity or references changed')
+    for item in approved:
+        path=Path(item['path'])
+        directory=Directory(path.parent)
+        try:
+            directory.inherit_volume(target.directory)
+            actual=dict(path=str(path),directory=directory.identity,**file_info(directory,path.name))
+            if actual != item:
+                raise RuntimeError('MaintenanceBlocked: scratch changed before unlink')
+            directory.verify()
+            os.unlink(path.name,dir_fd=directory.fd)
+            os.fsync(directory.fd)
+        finally:directory.close()
+
+
 def validate_evidence(evidence, target, transaction, components, retained):
     required={'schema','operator','host','window','target','coord_key','directory','root_binding',
               'transaction','components','retained','stopped_openers','state_roots','offline_scope','backup','approved_plan_sha256'}
-    if (type(evidence) is not dict or set(evidence) != required
+    if (type(evidence) is not dict or set(evidence) not in (required,required|{'cleanup_unpublished'})
+            or type(evidence.get('cleanup_unpublished',False)) is not bool
             or type(evidence['schema']) is not int or evidence['schema'] != 1
             or type(evidence['operator']) is not dict
             or set(evidence['operator']) != {'uid','name','confirmation'}
@@ -144,6 +215,8 @@ def make_plan(target,recovery_id,evidence,components,retained,record_hash,action
         'stopped_openers':evidence['stopped_openers'],'offline_scope':evidence['offline_scope'],
         'state_roots':evidence['state_roots'],
         'backup':evidence['backup'],
+        'unpublished_scratch':scratch_inventory(target),
+        'cleanup_unpublished':evidence.get('cleanup_unpublished',False),
         'action':action}
     return plan,digest(plan)
 
@@ -190,6 +263,8 @@ def apply(target,transaction,plan,plan_hash):
     else:transaction.archive('authorized offline no-failure archive')
     from target_journal import Journal
     Journal(target).complete_manual(permission)
+    if plan.get('cleanup_unpublished',False):
+        remove_scratch(target,plan['unpublished_scratch'])
     return transaction.status()
 
 

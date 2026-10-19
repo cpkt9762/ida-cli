@@ -52,6 +52,120 @@ def action(root,kind,crash):
 
 
 class UnpublishedCreation(unittest.TestCase):
+    def test_installed_maintenance_deletes_only_the_approved_unpublished_identity(self):
+        from test_recovery_preview import Preview,evidence_for,fingerprints
+        from target_coordination import Target
+        root=Path(tempfile.mkdtemp(prefix='scratch-installed-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
+        path=root/'tiny.i64';path.write_bytes(b'private installed maintenance target');path.chmod(0o600)
+        with Target(path) as target,target.locked():
+            scratch=target.directory.path/('.ida-cli-unpublished-'+'d'*32)
+            scratch.write_bytes(b'exact orphan scratch');scratch.chmod(0o600)
+        recovery_id='e'*32
+        evidence=evidence_for(root,path,recovery_id)
+        evidence['cleanup_unpublished']=True
+        before=fingerprints(scratch.parent)
+        caller=Preview()
+        failure,result=caller.invoke(root,path,recovery_id,evidence,installed=True)
+        self.assertIsNone(failure,repr(failure))
+        self.assertEqual(fingerprints(scratch.parent),before,'installed preview mutated coordination')
+        self.assertEqual([v['path'] for v in result['plan']['unpublished_scratch']],[str(scratch)])
+        evidence['approved_plan_sha256']=result['plan_sha256']
+        failure,result=caller.invoke(root,path,recovery_id,evidence,dry=False,installed=True)
+        self.assertIsNone(failure,repr(failure))
+        self.assertFalse(scratch.exists())
+        self.assertEqual(path.read_bytes(),b'private installed maintenance target')
+
+    def test_maintenance_previews_and_explicitly_deletes_only_unreferenced_exact_scratch(self):
+        from unittest.mock import patch
+        from test_recovery_preview import evidence_for
+        from target_coordination import Target
+        import recovery_maintenance as maintenance
+        root=Path(tempfile.mkdtemp(prefix='scratch-maint-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
+        (root/'payload').mkdir(mode=0o700)
+        path=root/'payload/input.i64';path.write_bytes(b'private maintenance target');path.chmod(0o600)
+        with Target(path) as target,target.locked():
+            scratch=target.directory.path/('.ida-cli-unpublished-'+'a'*32)
+            scratch.write_bytes(b'unbound creation bytes');scratch.chmod(0o600)
+        recovery_id='b'*32
+        evidence=evidence_for(root,path,recovery_id)
+        with Target(path,create=False) as target,target.locked(recover=False), \
+                patch.object(maintenance,'occupancy',return_value=None):
+            plan,_=maintenance.snapshotless_preview(target,recovery_id,evidence)
+            self.assertEqual([item['path'] for item in plan['unpublished_scratch']],[str(scratch)])
+            self.assertEqual(plan['unpublished_scratch'][0]['size'],len(b'unbound creation bytes'))
+            self.assertTrue(scratch.exists(),'preview must not delete scratch')
+        evidence['cleanup_unpublished']=True
+        from contextlib import redirect_stdout
+        import io
+        permission=root/'operator.json'
+        def invoke(dry_run):
+            permission.write_text(json.dumps(evidence));permission.chmod(0o600)
+            argv=['maintenance','--maintenance','--offline-evidence',str(permission),
+                '--target',str(path),'--transaction',recovery_id]
+            if dry_run:argv.append('--dry-run')
+            output=io.StringIO()
+            with patch.object(sys,'argv',argv),redirect_stdout(output), \
+                    patch.object(maintenance,'occupancy',return_value=None):
+                self.assertEqual(maintenance.main(),0)
+            return json.loads(output.getvalue())
+        result=invoke(True)
+        evidence['approved_plan_sha256']=result['plan_sha256']
+        self.assertTrue(scratch.exists())
+        invoke(False)
+        self.assertFalse(scratch.exists(),'approved apply must remove exact unbound scratch')
+        self.assertEqual(path.read_bytes(),b'private maintenance target')
+
+    def test_maintenance_retains_referenced_and_rejects_changed_scratch(self):
+        from target_coordination import Target
+        import recovery_maintenance as maintenance
+        for variant in ('inode','bytes','permissions','reference','inode-reference','symlink'):
+            with self.subTest(variant=variant):
+                root=Path(tempfile.mkdtemp(prefix='scratch-ref-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
+                path=root/'tiny.i64';path.write_bytes(b'private target');path.chmod(0o600)
+                with Target(path) as target,target.locked():
+                    scratch=target.directory.path/('.ida-cli-unpublished-'+'c'*32)
+                    scratch.write_bytes(b'original scratch');scratch.chmod(0o600)
+                    approved=maintenance.scratch_inventory(target)
+                    if variant=='inode':
+                        other=root/'other';other.write_bytes(scratch.read_bytes());other.chmod(0o600)
+                        os.replace(other,scratch)
+                    elif variant=='bytes':scratch.write_bytes(b'replaced scratch')
+                    elif variant=='permissions':scratch.chmod(0o666)
+                    elif variant=='symlink':
+                        scratch.unlink();scratch.symlink_to(path)
+                    elif variant=='reference':
+                        # Actual owner/checkpoint publication binds a previously
+                        # unreferenced name; deletion must recheck references.
+                        target.directory.durable('checkpoint.json',{'prepared':scratch.name})
+                        self.assertNotIn(str(scratch),[v['path'] for v in maintenance.scratch_inventory(target)])
+                    else:
+                        info=scratch.stat()
+                        target.directory.durable('checkpoint.json',{'identity':[info.st_dev,info.st_ino,info.st_uid]})
+                        self.assertNotIn(str(scratch),[v['path'] for v in maintenance.scratch_inventory(target)])
+                    with self.assertRaises((RuntimeError,OSError)):
+                        maintenance.remove_scratch(target,approved)
+                    self.assertTrue(scratch.exists())
+                    self.assertEqual(path.read_bytes(),b'private target')
+                # No public owner proof or N1 phase is fabricated by this file-boundary test.
+
+    def test_maintenance_retains_real_pending_owner_preparation(self):
+        from unittest.mock import patch
+        from target_coordination import Target
+        import recovery_maintenance as maintenance
+        root=Path(tempfile.mkdtemp(prefix='scratch-owner-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
+        path=root/'tiny.i64';path.write_bytes(b'private target');path.chmod(0o600)
+        with Target(path) as target,target.locked():
+            def stop(_directory,name,stage):
+                if name=='checkpoint.json' and stage=='owner_published':
+                    raise RuntimeError('real durable owner published boundary')
+            with patch('durable_records.boundary',stop),self.assertRaisesRegex(RuntimeError,'real durable owner'):
+                target.directory.durable('checkpoint.json',{'complete':'pending data'})
+            owner=target.directory.read('checkpoint.json.new.owner')[0]
+            bound=target.directory.path/owner['prepared']
+            self.assertTrue(bound.is_file())
+            self.assertNotIn(str(bound),[v['path'] for v in maintenance.scratch_inventory(target)])
+            self.assertTrue(bound.is_file())
+
     def scene(self):
         root=Path(tempfile.mkdtemp(prefix='creation-boundary-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
         for folder in ('destination','source'):(root/folder).mkdir(mode=0o700)
