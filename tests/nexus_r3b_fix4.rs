@@ -1,3 +1,5 @@
+//! Production guard and mandatory helper test hooks require the custody test feature.
+#![cfg(feature = "nexus-test-support")]
 use ida_mcp::{
     nexus::*,
     preprocess::Preparation,
