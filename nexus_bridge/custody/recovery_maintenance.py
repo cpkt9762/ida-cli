@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from origin import creation_scope
 from recovery_files import file_info, inventory, visible_names
 from recovery_transaction import Transaction, recovery_name
-from target_coordination import Directory, Target, digest, encoded
+from target_coordination import Directory, Target, MAX_RECORD, digest, encoded
 
 
 def boundary(_stage,_detail):
@@ -45,6 +45,23 @@ def scratch_inventory(target):
     from recovery_files import preparation_name
     candidates, references, objects = [], set(), set()
     scanned=[0]
+    def reference_record(directory,name):
+        # Archived v1 checkpoints are immutable evidence (often 0400), not
+        # live 0600 authority. Read their exact bytes without changing modes;
+        # malformed or changing evidence still blocks reference discovery.
+        expected=file_info(directory,name)
+        if expected['size']>MAX_RECORD:
+            raise RuntimeError('MaintenanceBlocked: oversized scratch reference record')
+        fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=directory.fd)
+        try:
+            data=os.read(fd,MAX_RECORD+1)
+            actual=os.fstat(fd)
+            if (directory.object_identity(actual)[:2]!=[expected['device'],expected['inode']]
+                    or len(data)!=expected['size'] or digest(data)!=expected['sha256']
+                    or file_info(directory,name)!=expected):
+                raise RuntimeError('MaintenanceBlocked: scratch reference record changed')
+            return json.loads(data)
+        finally:os.close(fd)
     def referenced(value):
         if type(value) is dict:
             # A valid accepted permission contains a deletion inventory, not
@@ -80,7 +97,7 @@ def scratch_inventory(target):
                 candidates.append(dict(path=str(directory.path/name),directory=directory.identity,
                     **file_info(directory,name)))
             elif name.endswith(('.json','.new','.new.owner')):
-                try:value,_,_=directory.read(name)
+                try:value=reference_record(directory,name)
                 except (ValueError,UnicodeError) as error:
                     raise RuntimeError('MaintenanceBlocked: cannot establish scratch references: '+str(directory.path/name)) from error
                 referenced(value)

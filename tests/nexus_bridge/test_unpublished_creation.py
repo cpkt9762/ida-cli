@@ -118,7 +118,7 @@ class UnpublishedCreation(unittest.TestCase):
     def test_maintenance_retains_referenced_and_rejects_changed_scratch(self):
         from target_coordination import Target
         import recovery_maintenance as maintenance
-        for variant in ('inode','bytes','permissions','reference','inode-reference','symlink'):
+        for variant in ('inode','bytes','permissions','reference','immutable-reference','inode-reference','symlink'):
             with self.subTest(variant=variant):
                 root=Path(tempfile.mkdtemp(prefix='scratch-ref-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
                 path=root/'tiny.i64';path.write_bytes(b'private target');path.chmod(0o600)
@@ -133,10 +133,16 @@ class UnpublishedCreation(unittest.TestCase):
                     elif variant=='permissions':scratch.chmod(0o666)
                     elif variant=='symlink':
                         scratch.unlink();scratch.symlink_to(path)
-                    elif variant=='reference':
+                    elif variant in ('reference','immutable-reference'):
                         # Actual owner/checkpoint publication binds a previously
                         # unreferenced name; deletion must recheck references.
-                        target.directory.durable('checkpoint.json',{'prepared':scratch.name})
+                        if variant=='immutable-reference':
+                            archived=target.directory.child('legacy-source-root')
+                            try:
+                                archived.durable('recovery.json',{'prepared':scratch.name})
+                                (archived.path/'recovery.json').chmod(0o400)
+                            finally:archived.close()
+                        else:target.directory.durable('checkpoint.json',{'prepared':scratch.name})
                         self.assertNotIn(str(scratch),[v['path'] for v in maintenance.scratch_inventory(target)])
                     else:
                         info=scratch.stat()
