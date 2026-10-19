@@ -49,6 +49,10 @@ impl Drop for Temporary {
 
 const SOURCES: &[(&str, &[u8])] = &[
     (
+        "durable_records.py",
+        include_bytes!("../../../nexus_bridge/custody/durable_records.py"),
+    ),
+    (
         "owner_modules.py",
         include_bytes!("../../../nexus_bridge/owner_modules.py"),
     ),

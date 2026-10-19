@@ -123,39 +123,12 @@ class Directory:
             os.close(fd)
 
     def durable(self, name, value, *, immutable=False):
-        """A fixed pending slot; unknown partial writes block without deletion."""
-        data = encoded(value)
-        if len(data) > MAX_RECORD:
-            raise RuntimeError('CoordinationBlocked: record byte budget exceeded')
-        temporary = name + '.new'
-        try:
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                         0o600, dir_fd=self.fd)
-        except FileExistsError:
-            raise RuntimeError('CoordinationBlocked: unfinished durable write; preserve scene') from None
-        try:
-            checked(fd)
-            view = memoryview(data)
-            while view:
-                count = os.write(fd, view)
-                if count <= 0:
-                    raise OSError('short durable write')
-                view = view[count:]
-            os.fsync(fd)
-            self.verify()
-            if immutable:
-                # link is a non-overwriting publication of the exact durable inode.
-                os.link(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd, follow_symlinks=False)
-                os.unlink(temporary, dir_fd=self.fd)
-            else:
-                try:
-                    self.read(name)
-                except FileNotFoundError:
-                    pass
-                os.replace(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
-            os.fsync(self.fd)
-        finally:
-            os.close(fd)
+        from durable_records import write
+        write(self, name, value, immutable=immutable)
+
+    def recover_record(self, name, *, validate=None):
+        from durable_records import resume
+        return resume(self, name, validate=validate)
 
     def retry_immutable(self, name, value, *, immutable=True):
         """Resume only this producer's durably reserved exact immutable slot."""
@@ -351,17 +324,23 @@ class Target:
                 raise RuntimeError('CoordinationBlocked: live payload identity changed')
 
     @contextmanager
-    def locked(self, *, deadline=None, nb=False):
+    def locked(self, *, deadline=None, nb=False, recover=True):
         fd = self.directory.lock(deadline=deadline, nb=nb)
         self.target_fd = fd
         try:
+            if recover:
+                self.directory.recover_record('target.json')
             expected = {'schema':SCHEMA, 'coord_key':self.key, 'target':self.original,
                         'generation':self.binding, 'lock_identity':identity(os.fstat(fd))}
             try:
                 value, _, _ = self.directory.read('target.json')
                 if self.root is not None and self.binding is None:
                     expected['generation'] = value.get('generation')
-                if value != expected or (self.root is not None and not expected['generation']):
+                if (recover and encoded(value) == encoded(dict(expected, creation_intent=True))
+                        and set(os.listdir(self.directory.fd)) == {'lock','target.json'}):
+                    self.directory.durable('target.json', expected)
+                    value = expected
+                if encoded(value) != encoded(expected) or (self.root is not None and not expected['generation']):
                     raise RuntimeError('CoordinationBlocked: target identity mismatch')
             except FileNotFoundError:
                 if self.root is not None and self.binding is None:

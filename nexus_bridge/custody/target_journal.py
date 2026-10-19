@@ -60,6 +60,8 @@ class Journal:
         if target.target_fd is None:
             raise RuntimeError('target authority requires stable target EX')
         self.target = target
+        if recover:
+            target.directory.recover_record('custody.json')
         try:
             self.value, self.info, self.raw = target.directory.read('custody.json')
         except FileNotFoundError:
@@ -67,20 +69,20 @@ class Journal:
                           'closed_through':0, 'entries':{}, 'summary':[], 'closed_after_holes':[],
                           'compaction':None}
             self.info = self.raw = None
-        v = self.value
-        if (v.get('schema') != 1 or v.get('coord_key') != target.key or type(v.get('revision')) is not int
-                or type(v.get('next_epoch')) is not int or type(v.get('closed_through')) is not int
-                or v['next_epoch'] <= v['closed_through'] or not isinstance(v.get('entries'), dict)
-                or len(v['entries']) > LIMIT*8 or not isinstance(v.get('summary'), list)
-                or len(v['summary']) > SUMMARY_LIMIT or len(encoded(v['summary'])) > SUMMARY_BYTES
-                or not isinstance(v.get('closed_after_holes'), list)):
-            raise RuntimeError('CoordinationBlocked: unknown/corrupt custody journal')
         self.validate()
         if recover:
             self.resume_compaction()
 
     def validate(self):
         v = self.value
+        if (type(v) is not dict or type(v.get('schema')) is not int or v['schema'] != 1
+                or encoded(v.get('coord_key')) != encoded(self.target.key) or type(v.get('revision')) is not int
+                or type(v.get('next_epoch')) is not int or type(v.get('closed_through')) is not int
+                or v['next_epoch'] <= v['closed_through'] or not isinstance(v.get('entries'), dict)
+                or len(v['entries']) > LIMIT*8 or not isinstance(v.get('summary'), list)
+                or len(v['summary']) > SUMMARY_LIMIT or len(encoded(v['summary'])) > SUMMARY_BYTES
+                or not isinstance(v.get('closed_after_holes'), list)):
+            raise RuntimeError('CoordinationBlocked: unknown/corrupt custody journal')
         maximum = (1 << 64)-1
         if not (0 <= v['revision'] <= maximum and 0 <= v['closed_through'] < v['next_epoch'] <= maximum):
             raise RuntimeError('CoordinationBlocked: invalid epoch/revision range')
@@ -888,6 +890,17 @@ def require_verification_scope(target,parent):
         raise RuntimeError('VerificationCleanupBlocked: copy ownership changed')
     if journal.value.get('verification_cleanup_conflict'):
         raise RuntimeError('VerificationCleanupBlocked: newer journal responsibility retained')
+    def validate_pending(data):
+        from copy import copy
+        value = json.loads(data)
+        candidate = copy(journal)
+        candidate.value = value
+        candidate.validate()
+        scope = validate_verification_scope(value.get('verification_scope'),target)
+        if scope['parent'] != parent or value.get('verification_cleanup_conflict',False):
+            raise RuntimeError('VerificationCleanupBlocked: pending copy authority changed')
+    if target.directory.recover_record('custody.json', validate=validate_pending):
+        journal = Journal(target,recover=False)
     journal.resume_compaction()
     return journal
 
@@ -997,7 +1010,8 @@ def main():
             print(json.dumps({'ok':True, 'epoch':item['epoch'], 'revision':journal['revision'],
                               'origin_binding':item['origin_binding']}))
             return
-        with target.locked(deadline=time.monotonic()+1.5):
+        with target.locked(deadline=time.monotonic()+1.5,
+                           recover=value['action'] != 'verification_probe_cleanup'):
             action = value['action']
             # Cleanup must validate its existing authority before even a
             # constructor can resume a durable deletion intent.
