@@ -780,28 +780,29 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
         "cleanup_status" => {
             let lease: SessionLease = decode(event["lease"].clone())?;
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
-            let resources = state
-                .custody_resources
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(resource) = resources.get(&lease.lease_id) {
-                anyhow::ensure!(
-                    resource.lease == lease && resource.acquisition == acquisition,
-                    "cleanup status binding mismatch"
-                );
-            } else {
-                let acquired = state
+            let status = {
+                let resources = state
+                    .custody_resources
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(resource) = resources.get(&lease.lease_id) {
+                    anyhow::ensure!(
+                        resource.lease == lease && resource.acquisition == acquisition,
+                        "cleanup status binding mismatch"
+                    );
+                } else {
+                    let acquired = state
+                        .endpoint
+                        .transition(|s, _| s.acquisition_lease(&acquisition))?;
+                    anyhow::ensure!(
+                        acquired.as_ref() == Some(&lease),
+                        "settled cleanup parent mismatch"
+                    );
+                }
+                state
                     .endpoint
-                    .transition(|s, _| s.acquisition_lease(&acquisition))?;
-                anyhow::ensure!(
-                    acquired.as_ref() == Some(&lease),
-                    "settled cleanup parent mismatch"
-                );
-            }
-            let status = state
-                .endpoint
-                .transition(|s, _| s.status(&lease.client_id, &lease))?;
-            drop(resources);
+                    .transition(|s, _| s.status(&lease.client_id, &lease))?
+            };
             let retired = state
                 .endpoint
                 .transition(|s, _| s.resource_retirement(&lease))?;
@@ -839,6 +840,56 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
             response["outcome"] = facts["outcome"].clone();
             response["command_error"] = facts["command_error"].clone();
             if ready {
+                if let Some(recovery_id) = event["recovery_id"].as_str() {
+                    anyhow::ensure!(
+                        recovery_id.len() == 32
+                            && recovery_id
+                                .bytes()
+                                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                        "invalid exact file RecoveryId"
+                    );
+                    if retired.is_none() {
+                        anyhow::ensure!(
+                            public && ack,
+                            "file recovery requires original ACK and public proof"
+                        );
+                        let attempt: DeliveryAttempt = decode(facts["attempt"].clone())?;
+                        anyhow::ensure!(
+                            attempt.target
+                                == DeliveryTarget::Release {
+                                    lease: lease.clone()
+                                },
+                            "file recovery release attempt mismatch"
+                        );
+                        state.endpoint.transition(|s, _| {
+                            let delivery = s.delivery_status(&lease.client_id, &attempt)?;
+                            if delivery.state != DeliveryState::Confirmed {
+                                return Err(invalid("file recovery ACK delivery is not confirmed"));
+                            }
+                            Ok::<_, NexusError>(())
+                        })?;
+                        let proof = state
+                            .owner_proofs
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&lease.lease_id)
+                            .filter(|(exact, _)| exact == &lease)
+                            .map(|(_, value)| value.clone())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("file recovery exact public proof missing")
+                            })?;
+                        anyhow::ensure!(
+                            proof["record"]["acquisition"] == json!(acquisition),
+                            "file recovery public proof acquisition mismatch"
+                        );
+                        helper.journal(json!({"action":"recovery_permission",
+                            "target":proof["record"]["owner"]["canonical_idb_path"],
+                            "coord_key":proof["record"]["coord_key"],
+                            "watch":proof["record"]["watch"],"epoch":proof["record"]["subscription_epoch"],
+                            "owner":proof["record"]["owner"],"lease":lease,"acquisition":acquisition,
+                            "recovery_id":recovery_id,"attempt":attempt,"outcome":facts["outcome"]})).await?;
+                    }
+                }
                 state
                     .endpoint
                     .transition(|s, _| s.acquisition_settled(&acquisition, &lease))?;

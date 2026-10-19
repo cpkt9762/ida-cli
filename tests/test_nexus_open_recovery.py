@@ -15,6 +15,13 @@ from cache_store import Store
 
 
 class OpenTests(unittest.TestCase):
+    def snapshots(self):
+        # v2 authority/evidence belongs to the actual target, not this HOME.
+        from target_coordination import Target
+        with Target(self.target) as target:
+            return sorted(path for path in target.directory.path.iterdir()
+                          if path.is_dir() and (path/'recovery.json').is_file())
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -144,7 +151,7 @@ class OpenTests(unittest.TestCase):
             self.run_open()
         self.assertFalse(self.target.exists())
         self.assertEqual(self.target.with_suffix('.id0').read_bytes(), b'original component')
-        snapshots = list((self.root/'home/idb/recovery').iterdir())
+        snapshots = self.snapshots()
         self.assertEqual(len(snapshots), 1)
         saved = snapshots[0]/'snapshot/input.id0'
         self.assertEqual(saved.stat().st_mode & 0o777, 0o400)
@@ -158,7 +165,7 @@ class OpenTests(unittest.TestCase):
         self.make_crashed()
         self.losses = 1
         self.assertEqual(self.run_open()[2], 2)
-        data = json.loads(next((self.root/'home/idb/recovery').glob('*/recovery.json')).read_text())
+        data = json.loads((self.snapshots()[0]/'recovery.json').read_text())
         self.assertEqual(data['status'], 'opened')
         self.assertEqual(len(data['attempts']), 1)
 
@@ -267,10 +274,14 @@ class OpenTests(unittest.TestCase):
 
     def test_gc_and_root_lock_preserve_snapshots(self):
         self.make_crashed()
-        recovery.Snapshot(self.root/'home/idb', self.target, time.monotonic()+5)
+        snapshot = recovery.Snapshot(self.root/'home/idb', self.target, time.monotonic()+5)
         cache = self.root/'home/idb'
         result = Store(cache, probe=lambda _: None).collect(0)
-        self.assertTrue(any('recovery snapshots' in row['reason'] for row in result['rejected']))
+        saved = snapshot.path/'snapshot/input.id0'
+        self.assertEqual(saved.read_bytes(), b'original component')
+        self.assertEqual(saved.stat().st_mode & 0o777, 0o400)
+        self.assertFalse((cache/'recovery').exists(), 'HOME must not become the file authority')
+        self.assertEqual((result['evicted_groups'],result['evicted_files'],result['evicted_bytes']),(0,0,0))
         with recovery.open_locks(cache, self.target, time.monotonic()+5):
             result = Store(cache, probe=lambda _: None).collect(0)
             self.assertTrue(any('cache lock' in row['reason'] for row in result['rejected']))

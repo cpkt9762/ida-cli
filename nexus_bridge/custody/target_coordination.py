@@ -198,9 +198,11 @@ class Directory:
         finally:
             os.close(fd)
 
-    def lock(self, name='lock', *, shared=False, deadline=None, nb=False):
+    def lock(self, name='lock', *, shared=False, deadline=None, nb=False, create=True):
         created = False
         try:
+            if not create:
+                raise FileExistsError()
             fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                          0o600, dir_fd=self.fd)
             created = True
@@ -238,23 +240,45 @@ def folded(path):
 
 
 class Target:
-    def __init__(self, target, *, root_locked=False):
+    def __copy__(self):
+        raise TypeError('target ownership cannot be copied; move it')
+
+    def __deepcopy__(self, _memo):
+        raise TypeError('target ownership cannot be copied; move it')
+
+    def __init__(self, target, *, root_locked=False, create=True):
         self.target = Path(canonical(target))
+        self.root_locked = root_locked
+        self.create = create
         self.root = None
         self.directories = []
         self.root_fd = self.target_fd = None
+        self.target_guard = None
+        self.transferred = False
+        self.evidence_path = None
         try:
-            # Evidence paths cannot silently become ordinary business targets.
-            if any(part.startswith('.ida-cli-txn-') or part == '.nexus-coordination'
-                   for part in self.target.parts):
-                raise RuntimeError('CoordinationBlocked: evidence is not a business target')
+            locator=self.evidence_locator(self.target)
+            if locator is not None:
+                directory=Directory(locator)
+                try:
+                    record,_,_=directory.read('target.json')
+                    original=record.get('target')
+                    if type(original) is not str or self.evidence_locator(Path(original)) is not None:
+                        raise RuntimeError('CoordinationBlocked: invalid evidence back-reference')
+                    requested=self.target
+                    self.__init__(original,root_locked=root_locked,create=False)
+                    if self.directory.identity != directory.identity or encoded(self.key) != encoded(record.get('coord_key')):
+                        raise RuntimeError('CoordinationBlocked: evidence back-reference authority mismatch')
+                    self.evidence_path=requested
+                    return
+                finally:directory.close()
             container = self.target.parent.parent
             self.binding = None
             if container.name in ('generations', 'quarantine'):
                 self.root = Directory(container.parent, private=False)
                 self.directories.append(self.root)
                 if not root_locked:
-                    self.root_fd = self.root.lock('.cache.lock', shared=True)
+                    self.root_fd = self.root.lock('.cache.lock', shared=True, create=create)
                 gid = self.target.parent.name
                 if not gid or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in gid):
                     raise RuntimeError('CoordinationBlocked: invalid generation identity')
@@ -286,23 +310,30 @@ class Target:
                     finally:
                         os.close(fd)
                 parent = self.root
-                coordination = self.root.child('.nexus-coordination')
+                coordination = self.root.child('.nexus-coordination',create=create)
                 self.directories.append(coordination)
-                generations = coordination.child('generations')
+                generations = coordination.child('generations',create=create)
                 self.directories.append(generations)
-                self.directory = generations.child(gid, create=bool(existing))
+                self.directory = generations.child(gid, create=create and bool(existing))
                 self.key = {'kind':'generation', 'root':self.root.identity, 'gid':gid}
                 self.original = str(container.parent / 'generations' / gid / 'input.i64')
             else:
                 parent = Directory(self.target.parent, private=False)
                 self.directories.append(parent)
                 key = digest(folded(self.target).encode())
-                self.directory = parent.child('.ida-cli-txn-' + key)
+                self.directory = parent.child('.ida-cli-txn-' + key,create=create)
                 self.key = {'kind':'direct', 'parent':parent.identity, 'identity_key':key}
                 self.original = str(self.target)
             self.directories.append(self.directory)
             if self.directory.identity[0] != parent.identity[0]:
                 raise RuntimeError('CoordinationBlocked: coordination crosses target volume')
+            # Managed targets share the actual store's root guard. A direct
+            # database has no managed payload root: its stable coordination
+            # directory is the file-recovery resource root, independent of HOME.
+            self.resource_root = self.root or self.directory
+            self.resource_lock = '.cache.lock' if self.root is not None else 'root.lock'
+            if self.root is None:
+                self.root_fd = self.directory.lock(self.resource_lock, shared=True, create=create)
         except BaseException:
             self.close()
             raise
@@ -311,6 +342,8 @@ class Target:
         """Evidence/GC access keeps its identity; business may only use live payload."""
         if self.target_fd is None:
             raise RuntimeError('business admission requires target EX')
+        if self.evidence_path is not None:
+            raise RuntimeError('CoordinationBlocked: evidence is not a business target; authority='+str(self.directory.path))
         if self.root is not None:
             live = self.root.path / 'generations' / self.key['gid']
             isolated = self.root.path / 'quarantine' / self.key['gid']
@@ -323,9 +356,46 @@ class Target:
             if identity(os.stat(live, follow_symlinks=False)) != self.binding['group']:
                 raise RuntimeError('CoordinationBlocked: live payload identity changed')
 
+    @staticmethod
+    def evidence_locator(path):
+        parts=path.parts
+        for index,part in enumerate(parts):
+            if part.startswith('.ida-cli-txn-'):
+                return Path(*parts[:index+1])
+            if part=='.nexus-coordination':
+                if len(parts) <= index+2 or parts[index+1] != 'generations':
+                    raise RuntimeError('CoordinationBlocked: malformed managed evidence path')
+                return Path(*parts[:index+3])
+        return None
+
+    def recovery_root_binding(self):
+        if self.root_fd is None:
+            if self.root is None or not self.root_locked:
+                raise RuntimeError('RecoveryBlocked: no owned root guard for executor')
+            fd = os.open(self.resource_lock,os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=self.resource_root.fd)
+            try:
+                lock_identity = identity(checked(fd))
+            finally:
+                os.close(fd)
+        else:
+            info = checked(self.root_fd)
+            lock_identity = identity(info)
+            current = os.stat(self.resource_lock,dir_fd=self.resource_root.fd,follow_symlinks=False)
+            if identity(current) != lock_identity:
+                raise RuntimeError('RecoveryBlocked: stable resource root lock replaced')
+        self.resource_root.verify()
+        return {'path':str(self.resource_root.path),'directory':self.resource_root.identity,
+                'lock':self.resource_lock,'lock_identity':lock_identity}
+
     @contextmanager
-    def locked(self, *, deadline=None, nb=False, recover=True):
-        fd = self.directory.lock(deadline=deadline, nb=nb)
+    def locked(self, *, deadline=None, nb=False, recover=True, _received=None):
+        if self.target_guard is not None:
+            raise RuntimeError('CoordinationBlocked: target guard already owned')
+        guard = _received or TransferredTargetGuard(self.directory.lock(deadline=deadline, nb=nb, create=self.create))
+        fd = guard.fd
+        self.target_guard = guard
+        self.transferred = _received is not None
         self.target_fd = fd
         try:
             if recover:
@@ -336,16 +406,19 @@ class Target:
                 value, _, _ = self.directory.read('target.json')
                 if self.root is not None and self.binding is None:
                     expected['generation'] = value.get('generation')
+                initial = {'lock','target.json'} | ({'root.lock'} if self.root is None else set())
                 if (recover and encoded(value) == encoded(dict(expected, creation_intent=True))
-                        and set(os.listdir(self.directory.fd)) == {'lock','target.json'}):
+                        and set(os.listdir(self.directory.fd)) == initial):
                     self.directory.durable('target.json', expected)
                     value = expected
                 if encoded(value) != encoded(expected) or (self.root is not None and not expected['generation']):
                     raise RuntimeError('CoordinationBlocked: target identity mismatch')
             except FileNotFoundError:
+                if not self.create:
+                    raise RuntimeError('CoordinationBlocked: read-only target identity missing') from None
                 if self.root is not None and self.binding is None:
                     raise RuntimeError('CoordinationBlocked: missing payload has no stable identity') from None
-                if set(os.listdir(self.directory.fd)) != {'lock'}:
+                if set(os.listdir(self.directory.fd)) != ({'lock','root.lock'} if self.root is None else {'lock'}):
                     raise RuntimeError('CoordinationBlocked: missing target identity with existing responsibilities') from None
                 # A crash at either durable boundary preserves an explicit
                 # uncommitted identity instead of blessing a partial namespace.
@@ -354,9 +427,33 @@ class Target:
             yield self
         finally:
             self.target_fd = None
-            os.close(fd)
+            self.target_guard = None
+            guard.close()
+
+    def move_guard(self):
+        if self.target_guard is None:
+            raise RuntimeError('HandoffBlocked: no owned target guard')
+        guard = self.target_guard.move()
+        self.target_fd = None
+        return guard
+
+    def move(self):
+        """Same-process unique move; the old context/future can only close."""
+        if self.target_guard is None or self.root_fd is None:
+            raise RuntimeError('HandoffBlocked: complete target/root ownership required')
+        moved=object.__new__(Target)
+        moved.__dict__=dict(self.__dict__)
+        moved.target_guard=self.move_guard()
+        moved.target_fd=moved.target_guard.fd
+        moved.transferred=True  # A move is not an independent OFD recovery fence.
+        self.root_fd=None
+        self.directories=[]
+        return moved
 
     def close(self):
+        if self.target_guard is not None:
+            self.target_guard.close()
+            self.target_fd=None
         if self.root_fd is not None:
             os.close(self.root_fd)
             self.root_fd = None
@@ -368,4 +465,31 @@ class Target:
         return self
 
     def __exit__(self, *_):
+        self.close()
+
+
+class TransferredTargetGuard:
+    """Unique close-only ownership of a flock OFD, including surplus rights."""
+    def __init__(self, fd):
+        self.fd = fd
+
+    def __copy__(self):
+        raise TypeError('target guard is move-only')
+
+    def __deepcopy__(self, _memo):
+        raise TypeError('target guard is move-only')
+
+    def move(self):
+        if self.fd is None:
+            raise RuntimeError('HandoffBlocked: target guard already moved')
+        result = TransferredTargetGuard(self.fd)
+        self.fd = None
+        return result
+
+    def close(self):
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            os.close(fd)  # Never LOCK_UN: other received/in-flight OFD refs may exist.
+
+    def __del__(self):
         self.close()

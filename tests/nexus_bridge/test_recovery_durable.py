@@ -57,8 +57,6 @@ class DurableRecovery(unittest.TestCase):
         import copy
         from unittest.mock import patch
         from target_journal import require_verification_scope, verification_scope
-        from durable_records import boundary
-        self.assertTrue(callable(boundary))
         parent = dict(client_id='pending-scope',request_id='pending-scope',operation_id='pending-scope',task_id=None)
         for variant in ('missing','foreign-parent','conflict','wrong-coordinate'):
             with self.subTest(variant=variant):

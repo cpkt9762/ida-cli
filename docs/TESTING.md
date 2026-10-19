@@ -1457,3 +1457,35 @@ do not clear them. Rust/N1/control-reader contract tests separately cover typed
 nested causes, subsequent observations, foreign identities and rejected/duplicate
 terminals; supplied wire fields in those tests do not replace production guard
 evidence. Protocol versions and fixed SDK modules/patches are unchanged.
+
+### R4 file transaction implementation (in progress)
+
+R3b has independent acceptance through `5d8a215`; the historical paragraphs above
+describe their original delivery state. The R4 adapter now requires open3,
+custody5, target_gate2 and `file_recovery_ack_v1`; fixed SDK bytes stay unchanged.
+R4 is not yet accepted. Stage results and all failures are preserved in the
+external `n7a-refactor/r4-implementation/` directory.
+
+`test_recovery_publication.py` is the same partial-final assertion for frozen
+baseline and current production. `test_recovery_transaction.py` runs actual
+copy/rename/phase exits and fresh-process recovery, with an explicit absent-owner
+input. `test_recovery_transfer.py` separately tests unique in-process move,
+SCM_RIGHTS, ACK loss, crashes, duplicate rights and in-flight sender exit.
+`test_recovery_resources.py` checks routine pins and retained source certificates.
+`test_recovery_backups.py` invokes the fixed SDK's actual backup producer; its
+file states are private inputs, not a native IDA recovery claim.
+
+The existing exact R3b cancelled-parent restore case also uses the new installed
+job through real Rust/N1, fixed SDK, bridge/helper and target writer. Its native
+Root input remains controlled. The library's exact
+`router::nexus_bridge::installation::tests::installed_maintenance_modes_offline_preview_and_apply`
+uses a new test target and an explicit private offline test operator. It invokes
+the installed absolute `open_recovery.py` via `maintenance-launch`, checks four
+Python launch modes, no-write preview, rejected plans and apply. No real user
+database or owner is an authorized maintenance target.
+
+Use a fresh private HOME/state/tmp/IPC and `R3A_CASE_ROOT`; the maintenance test
+also needs the prepared `R3A_PYTHON` and disposable `R3F1_SAMPLE`. File matrices
+allow shell timeout120s; stage compilation allows180s, stated before execution.
+Product barrier budgets are unchanged. Full transfer, v1, quota, maintenance and
+U6 product acceptance matrices remain required before claiming R4 complete.

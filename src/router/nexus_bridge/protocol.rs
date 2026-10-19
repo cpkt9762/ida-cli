@@ -42,11 +42,11 @@ impl Protocol {
             wire: 2,
             schema: 1,
             release: 4,
-            open: 2,
+            open: 3,
             owner_observation: 1,
-            custody: 4,
+            custody: 5,
             helper: 2,
-            target_gate: 1,
+            target_gate: 2,
             same_boot_exit: 0,
             boot_retirement: 1,
             client_hash: CLIENT_HASH.into(),
@@ -60,6 +60,7 @@ impl Protocol {
                 "ack_cleanup_v1",
                 "acquisition_outcome_v1",
                 "durable_public_proof_v1",
+                "file_recovery_ack_v1",
                 "final_preparing_v1",
                 "internal_grant_v1",
                 "k2_acquisitions_v1",
@@ -153,6 +154,25 @@ mod tests {
                 "partial cleanup upgrade accepted"
             );
         }
+    }
+
+    #[test]
+    fn r4_file_ack_contract_rejects_old_or_partial_peers() {
+        let current = serde_json::to_value(Protocol::current()).expect("protocol JSON");
+        for (field, value) in [("open", 2), ("custody", 4), ("target_gate", 1)] {
+            let mut old = current.clone();
+            old[field] = serde_json::json!(value);
+            assert!(Protocol::validate(old).is_err(), "old {field} accepted");
+        }
+        let mut partial = current;
+        partial["capabilities"]
+            .as_array_mut()
+            .expect("capabilities")
+            .retain(|value| value != "file_recovery_ack_v1");
+        assert!(
+            Protocol::validate(partial).is_err(),
+            "partial file authority accepted"
+        );
     }
 
     #[test]

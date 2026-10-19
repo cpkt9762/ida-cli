@@ -86,7 +86,8 @@ TOOL_SOURCE += ("\n_tools_metadata = {}\n"
                 + "install_tools(_tools_metadata)\n")
 RELEASE_SOURCE = module_source('lifecycle.py')
 SLICE_GATE_SOURCES = {name: module_source(name + '.py', custody=True) for name in (
-    'target_coordination', 'custody_process_identity', 'origin', 'owner_identity', 'target_journal')}
+    'target_coordination', 'custody_process_identity', 'origin', 'owner_identity', 'target_journal',
+    'durable_records', 'recovery_files', 'recovery_transaction')}
 SLICE_SOURCE = ("import sys, types\n"
     + f"_target_gate_sources = {SLICE_GATE_SOURCES!r}\n"
     "if '_ida_cli_release_protocol_v1' not in sys.modules:\n"
@@ -434,11 +435,16 @@ class Bridge(LifetimeListener):
                     'owner_proof_consumed':getattr(c, 'verification_retired', False),
                     'next_action':'inspect_copy_occupancy_and_file_gate' if getattr(c, 'verification_cleanup_error', None)
                                   else 'wait_exact_owner_proof'} for path,c in self.verification_probes.items()]
-                recoveries = [{'acquisition':c.acquisition, 'path':str(c.recovery_snapshot[0].path),
-                    'status':c.recovery_snapshot[0].data['status'], 'cause':c.recovery_error,
-                    'blocked':c.recovery_blocked, 'next_action':'inspect_retained_scene' if c.recovery_blocked
-                        else 'wait_exact_cleanup_then_restore'} for c in self.acquisitions.values()
-                    if c.recovery_snapshot is not None]
+                recovery_refs = [(c.acquisition,c.recovery_snapshot[0],c.recovery_error,c.recovery_blocked)
+                                 for c in self.acquisitions.values() if c.recovery_snapshot is not None]
+            recoveries=[]
+            for acquisition,snapshot,cause,blocked in recovery_refs:
+                try:actual=snapshot.status()
+                except Exception as error:
+                    actual={'job_id':snapshot.recovery_id,'transaction':str(snapshot.path),
+                            'status_error':type(error).__name__+': '+str(error)}
+                recoveries.append(dict(actual,acquisition=acquisition,cause=cause,blocked=blocked,
+                    next_action='inspect_retained_scene' if blocked else 'wait_exact_cleanup_then_restore'))
             channel.send({"event": "local_status", "id": message["local_status"],
                           "held": held, "owners": owners, "verification_probes": verifications,
                           "verification_cleanup":verification_cleanup,

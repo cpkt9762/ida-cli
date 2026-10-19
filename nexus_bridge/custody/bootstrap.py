@@ -8,7 +8,11 @@ if os is None or os.__spec__.origin != 'frozen' or os.path.__spec__.origin != 'f
     raise RuntimeError('trusted frozen os and path required')
 
 # A closed installation, including the complete current bridge module closure.
-REQUIRED = frozenset(('acquisition.py', 'analysis_tools.py', 'bootstrap.py', 'bridge.py', 'bridge_observer.py', 'cache_store.py', 'config.py', 'durable_records.py', 'edit_tools.py', 'lifecycle.py', 'lifetime.py', 'metadata.py', 'open_recovery.py', 'owner_modules.py', 'owner_release.py', 'origin.py', 'owner_identity.py', 'custody_process_identity.py', 'proof_helper.py', 'protocol.py', 'query_tools.py', 'save_guard.py', 'search_tools.py', 'slices.py', 'struct_tools.py', 'target_coordination.py', 'target_journal.py', 'tools.py', 'type_tools.py'))
+REQUIRED = frozenset(('acquisition.py', 'analysis_tools.py', 'bootstrap.py', 'bridge.py', 'bridge_observer.py', 'cache_store.py', 'config.py', 'durable_records.py', 'edit_tools.py', 'lifecycle.py', 'lifetime.py', 'metadata.py', 'open_recovery.py', 'owner_modules.py', 'owner_release.py', 'origin.py', 'owner_identity.py', 'custody_process_identity.py', 'proof_helper.py', 'protocol.py', 'query_tools.py', 'recovery_files.py', 'recovery_transaction.py', 'save_guard.py', 'search_tools.py', 'slices.py', 'struct_tools.py', 'target_coordination.py', 'target_journal.py', 'tools.py', 'type_tools.py'))
+
+
+REQUIRED |= frozenset(('recovery_job.py','recovery_transfer.py','recovery_maintenance.py','recovery_probe.py'))
+ASSETS = frozenset(('maintenance-launch',))
 
 
 def load_entry():
@@ -78,7 +82,7 @@ def load_entry():
     raw, _mode = verified_read('manifest.json')
     manifest = json.loads(raw)
     if (set(manifest) != {'schema', 'files'} or type(manifest['schema']) is not int
-            or manifest['schema'] != 1 or set(manifest['files']) != REQUIRED):
+            or manifest['schema'] != 1 or set(manifest['files']) != REQUIRED | ASSETS):
         raise RuntimeError('incomplete installation manifest schema/closure')
     if {name for name in os.listdir(root) if name.endswith('.py')} != REQUIRED:
         raise RuntimeError('unexpected executable source member')
@@ -93,7 +97,7 @@ def load_entry():
             raise RuntimeError('manifest permissions mismatch')
         if hashlib.sha256(data).hexdigest() != expected['sha256']:
             raise RuntimeError('manifest mismatch')
-        if name != 'bootstrap.py':
+        if name != 'bootstrap.py' and name.endswith('.py'):
             verified[name[:-3]] = (os.path.join(root, name), compile(data, os.path.join(root, name), 'exec'), data.decode('utf-8'))
 
     class VerifiedSource(importlib.abc.MetaPathFinder, importlib.abc.Loader):
@@ -118,7 +122,7 @@ def load_entry():
     # member executes the in-memory bytes read and hashed through the same FD.
     sys.meta_path.insert(0, VerifiedSource())
     entry = sys.argv.pop(1)
-    if entry not in ('bridge', 'proof_helper', 'cache_store', 'target_journal'):
+    if entry not in ('bridge', 'proof_helper', 'cache_store', 'target_journal', 'recovery_job', 'open_recovery', 'recovery_probe'):
         raise RuntimeError('unrecognized verified entry')
     return __import__(entry)
 

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Clear injection variables BEFORE the prepared interpreter initializes site.
+set -eu
+if [ "$#" -lt 3 ]; then exit 64; fi
+prepared_python=$1
+bridge_dir=$2
+mode=$3
+shift 3
+case "$prepared_python:$bridge_dir" in /*:/*) ;; *) exit 64 ;; esac
+case "$mode" in
+  isolated) set -- -I "$bridge_dir/open_recovery.py" "$@" ;;
+  ordinary) set -- "$bridge_dir/open_recovery.py" "$@" ;;
+  safe) set -- -P "$bridge_dir/open_recovery.py" "$@" ;;
+  envsafe) exec /usr/bin/env -i PATH=/opt/homebrew/bin:/usr/bin:/bin HOME="$bridge_dir" PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 "$prepared_python" -B "$bridge_dir/open_recovery.py" "$@" ;;
+  *) exit 64 ;;
+esac
+exec /usr/bin/env -i PATH=/opt/homebrew/bin:/usr/bin:/bin HOME="$bridge_dir" PYTHONNOUSERSITE=1 "$prepared_python" -B "$@"

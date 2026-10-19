@@ -237,6 +237,8 @@ pub struct NexusBridge {
     lifetime: AsyncMutex<Option<ChildStdin>>,
     control: Writer,
     directory: PathBuf,
+    prepared_python: PathBuf,
+    installation: PathBuf,
     pub pid: u32,
 }
 // F2/P2-b: acquired before bind/spawn, retained across every startup await.
@@ -321,6 +323,8 @@ impl NexusBridge {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         json!({"resources":resources.len(),"startup_and_pre_attach":startups.len(),
+            "bridge_dir":self.installation,"prepared_python":self.prepared_python,
+            "maintenance_launcher":self.installation.join("maintenance-launch"),
             "resource_details":resources,"startup_details":startups,"blocked":blocked,"acquisitions":acquisitions,
             "retirement_acks":state.custody_retirements.lock().unwrap_or_else(|e|e.into_inner()).len(),
             "helper":state.helper.as_ref().map(|h|h.status_snapshot()),
@@ -697,6 +701,8 @@ impl NexusBridge {
             lifetime: AsyncMutex::new(lifetime),
             control: cw,
             directory: config.directory,
+            prepared_python: config.python,
+            installation: installation_path.canonicalize()?,
             pid,
         })
     }

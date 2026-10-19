@@ -996,3 +996,18 @@ R3b fix2定向实现（待独立复验/评审）：verification scope仅在获�
 不依赖旧ordinal退休ACK继续存在；普通final重试无副本删除权。实际独立正常caller已证实
 原closure检查/发布间隙可进入新目标责任，现将检查、input发布及精确清理置于同一目标EX。
 固定SDK、custody4及sameboot Unsupported保持；不由这些定向修复验收R3b或推进R4。
+
+R3b正式验收（R4输入）：编排者44ad已接受到`5d8a215f92b4405e6db99af8e7f86c72ae95861f`，
+独立根`/tmp/n3f4v.BUb4kt`100条终态记录全0，6344出生身份/520锁无残留；d629复审4
+关闭RR3-F1，无新增P0/P1/P2。完整接受范围与历史限制见外部
+`n7a-refactor/r3b-acceptance.json`（SHA256
+`da4d56a512d8d430f8477639269f00a078d7f02821d03ee66b65f4e778028e06`）和
+`r3b-rereview4/report.md`。仅接受R3b作为R4输入，不是N7a或Nexus-only总验收。
+先前各轮失败、Unknown、birth/cause/forced缺口不由新绿追认；sameboot仍Unsupported。
+
+R4当前实施中：文件执行器移到目标协调区，使用同卷snapshot/staging/quarantine、
+精确文件intent和非覆盖rename；接入唯一epoch、close-only目标guard、独立已安装文件job，
+N1原ACK与公共proof单独签收文件责任。新接线要求open3/custody5/target_gate2和
+`file_recovery_ack_v1`，固定SDK不变。维护入口的offline operator证据不产生公共proof，
+preview/apply分别取同序锁。这里仅登记阶段实现，完整v1/移交/配额/平台与最终矩阵仍需R4交付，
+不得据此自行验收R4或启动R6；当前阶段证据在`n7a-refactor/r4-implementation/`。

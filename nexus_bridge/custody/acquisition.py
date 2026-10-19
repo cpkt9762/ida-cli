@@ -665,7 +665,8 @@ class Custodian:
         # accepted N1 release and a failed snapshot retain their own custody.
         while True:
             reply = self.transact('cleanup_status', acquisition=self.acquisition,
-                lease=self.lease, require_ack=require_ack, owner_required=owner_required)
+                lease=self.lease, require_ack=require_ack, owner_required=owner_required,
+                recovery_id=getattr(self,'file_recovery_id',None))
             if reply['ready']:
                 break
             if time.monotonic() >= self.deadline or reply.get('parent_terminal'):
@@ -705,29 +706,26 @@ class Custodian:
     def retain_restore(self, snapshot, observed):
         # Keep the existing Snapshot and a fresh root SH/target reference, not a
         # second lease state machine. The current gate closes on caller return.
+        if self.recovery_snapshot is not None:
+            if self.recovery_snapshot[0] is not snapshot:
+                raise RuntimeError('RecoveryBlocked: conflicting retained file job')
+            self.bridge.proof_wakeup.set()
+            return
         target = Target(self.target_path)
-        from target_coordination import Directory
-        root = Directory(canonical(snapshot.path.parent.parent), private=False)
-        try:
-            root_guard = root.lock('.cache.lock', shared=True)
-        except BaseException:
-            root.close()
-            target.close()
-            raise
         snapshot.coordination = target
-        self.recovery_snapshot = (snapshot, observed, target, root, root_guard)
+        self.recovery_snapshot = (snapshot, observed, target)
         self.bridge.proof_wakeup.set()
 
     def advance_restore(self):
         # One bounded observation per fair turn. Waiting for a target or owner
         # never occupies a business worker or spins in a preflight worker.
-        import os
         try:
             reply = self.transact('cleanup_status', acquisition=self.acquisition,
-                lease=self.lease, require_ack=True, owner_required=True)
+                lease=self.lease, require_ack=True, owner_required=True,
+                recovery_id=getattr(self,'file_recovery_id',None))
             if not reply['ready']:
                 return
-            snapshot, observed, target, root, root_guard = self.recovery_snapshot
+            snapshot, observed, target = self.recovery_snapshot
             with target.locked(nb=True):
                 journal = Journal(target)
                 journal.recover_public_proofs()
@@ -737,13 +735,11 @@ class Custodian:
                 try:
                     snapshot.rollback(observed)
                 except Exception:
-                    # Existing v1 rollback is not a crash-transaction replay
-                    # engine. Retain its exact scene after any write failure.
+                    # The durable v2 job remains recoverable at the next gate;
+                    # this failed observation does not undo accepted file work.
                     self.recovery_blocked = True
                     raise
             target.close()
-            os.close(root_guard)
-            root.close()
             self.recovery_snapshot = None
             self.recovery_error = None
         except Exception as exc:

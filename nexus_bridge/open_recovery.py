@@ -1,4 +1,75 @@
 """Bounded initial-open retries and conservative, post-recovery rollback."""
+import sys
+
+
+def _verified_maintenance_entry():
+    # This is the absolute script entry, before ANY path-based business import.
+    native = sys.modules.get('os')
+    if native is None or native.__spec__.origin != 'frozen' or native.path.__spec__.origin != 'frozen':
+        raise RuntimeError('MaintenanceBlocked: frozen os/path required')
+    version = f'python{sys.version_info.major}.{sys.version_info.minor}'
+    base, prefix = native.path.realpath(sys.base_prefix), native.path.realpath(sys.prefix)
+    stdlib = native.path.join(base,sys.platlibdir,version)
+    if not sys._stdlib_dir or native.path.realpath(sys._stdlib_dir) != stdlib:
+        raise RuntimeError('MaintenanceBlocked: unrecognized prepared interpreter')
+    allowed = (stdlib,native.path.join(stdlib,'lib-dynload'),native.path.join(prefix,'lib',version,'site-packages'))
+    for directory in allowed:
+        anchor = prefix if directory.startswith(prefix+native.sep) else base
+        current = directory
+        while True:
+            info = native.lstat(current)
+            if info.st_mode & 0o170000 != 0o040000 or info.st_uid not in (0,native.getuid()) or info.st_mode & 0o022:
+                raise RuntimeError('MaintenanceBlocked: untrusted interpreter search directory')
+            if current == anchor:break
+            parent = native.path.dirname(current)
+            if parent == current:raise RuntimeError('MaintenanceBlocked: invalid interpreter anchor')
+            current = parent
+    sys.path[:] = list(allowed)
+    import hashlib
+    import json
+    root = native.path.dirname(native.path.abspath(__file__))
+    current = root
+    while current != '/':
+        info = native.lstat(current)
+        # A root-owned sticky temporary ancestor is a namespace boundary;
+        # descendants still must be exact no-follow private installation paths.
+        sticky = info.st_uid == 0 and info.st_mode & 0o1000
+        if info.st_mode & 0o170000 != 0o040000 or info.st_uid not in (0,native.getuid()) or (info.st_mode & 0o022 and not sticky):
+            raise RuntimeError('MaintenanceBlocked: untrusted installation path chain')
+        current = native.path.dirname(current)
+    def read(name):
+        path = native.path.join(root,name)
+        fd = native.open(path,native.O_RDONLY | native.O_NOFOLLOW | native.O_CLOEXEC)
+        try:
+            before = native.fstat(fd)
+            if (before.st_mode & 0o170000 != 0o100000 or before.st_uid != native.getuid()
+                    or before.st_nlink != 1 or before.st_mode & 0o022 or before.st_size > 4*1024*1024):
+                raise RuntimeError('MaintenanceBlocked: untrusted entry/manifest identity')
+            chunks=[]
+            while data := native.read(fd,1024*1024):chunks.append(data)
+            after, at_path = native.fstat(fd), native.lstat(path)
+            signature=lambda v:(v.st_dev,v.st_ino,v.st_size,v.st_mtime_ns,v.st_ctime_ns)
+            if signature(before) != signature(after) or signature(before) != signature(at_path):
+                raise RuntimeError('MaintenanceBlocked: entry changed during same-FD verification')
+            return b''.join(chunks), before.st_mode & 0o777
+        finally:native.close(fd)
+    manifest=json.loads(read('manifest.json')[0])
+    if set(manifest) != {'schema','files'} or type(manifest['schema']) is not int or manifest['schema'] != 1:
+        raise RuntimeError('MaintenanceBlocked: invalid installation manifest')
+    entries={name:read(name) for name in ('open_recovery.py','bootstrap.py')}
+    for name,(data,mode) in entries.items():
+        if manifest['files'].get(name) != {'sha256':hashlib.sha256(data).hexdigest(),'mode':mode}:
+            raise RuntimeError('MaintenanceBlocked: bootstrap/entry manifest mismatch')
+    bootstrap={'__name__':'_verified_maintenance_bootstrap','__file__':native.path.join(root,'bootstrap.py')}
+    exec(compile(entries['bootstrap.py'][0],bootstrap['__file__'],'exec'),bootstrap)
+    sys.argv.insert(1,'open_recovery')
+    module=bootstrap['load_entry']()
+    return module.maintenance_main()
+
+
+if __name__ == '__main__':
+    raise SystemExit(_verified_maintenance_entry())
+
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -9,10 +80,14 @@ from pathlib import Path
 from config import ida_cli_home
 import stat
 import time
-import uuid
 
-from cache_store import atomic_json, public_owner_probe, rename_group, sync_directory
+from cache_store import public_owner_probe
 from lifecycle import release_handle
+
+
+def maintenance_main():
+    from recovery_maintenance import main
+    return main()
 
 
 def remaining(deadline):
@@ -138,48 +213,68 @@ def inventory(directory, deadline, coordination=None):
 
 class Snapshot:
     def __init__(self, root, target, deadline, *, owner_probe=None, coordination=None):
+        from recovery_transaction import Transaction
         self.target, self.deadline = target, deadline
         self.coordination = coordination
         self.owner_probe = owner_probe or public_owner_probe
         self.names = {target.name, *(target.with_suffix(ext).name
             for ext in ('.id0', '.id1', '.id2', '.nam', '.til'))}
+        self.token = None
+        self.path = None
+        self.active = None
         self.check_owner()
-        root.mkdir(parents=True, exist_ok=True)
-        container = root/'recovery'
-        if container.is_symlink():
-            raise RuntimeError('symlink recovery container refused')
-        container.mkdir(mode=0o700, exist_ok=True)
-        self.path = container/uuid.uuid4().hex
-        self.path.mkdir(mode=0o700)
-        (self.path/'snapshot').mkdir(mode=0o700)
-        self.parent_identity = stable_stat(target.parent.lstat())[:3]
-        self.before = self.inventory()
-        self.data = {'version': 1, 'target': str(target), 'status': 'snapshotting',
-                     'before': self.before, 'parent_identity': self.parent_identity,
-                     'files': {}, 'snapshot_files': {}, 'attempts': []}
-        self.journal()
-        for name, value in self.before.items():
-            if name not in self.names:
-                continue
-            if not stat.S_ISREG(value['mode']):
-                raise RuntimeError('non-regular recovery component refused')
-            self.copy(target.parent/name, self.path/'snapshot'/name, value, 0o400)
-            self.data['snapshot_files'][name] = identity(self.path/'snapshot'/name, deadline)
-            self.data['files'][name] = value
-        self.check_owner()
-        self.expect(self.before)
-        self.data['status'] = 'ready'
-        self.journal()
+        with self.file_gate() as actual:
+            def started(transaction):
+                self.active = transaction
+                self.path = transaction.directory.path
+                transaction.owner_probe = self.owner_probe
+                transaction.copy_hook = self.copy_hook
+            self.recovery_id, self.token = Transaction.create(actual,on_begin=started)
+            self.active = None
+            with Transaction(actual,self.recovery_id,token=self.token) as transaction:
+                self.data = transaction.data
+                self.before = self.data['before']
+
+    @contextmanager
+    def file_gate(self):
+        from target_coordination import Target
+        if self.coordination is not None and self.coordination.target_fd is not None:
+            yield self.coordination
+        else:
+            with Target(self.target) as target, target.locked():
+                yield target
+
+    @contextmanager
+    def transaction(self):
+        from recovery_transaction import Transaction
+        with self.file_gate() as target:
+            with Transaction(target,self.recovery_id,token=self.token) as transaction:
+                executor=transaction.data['executor']
+                if (not self.token.valid or executor['actor'] != self.token.actor
+                        or executor['epoch'] != self.token.epoch):
+                    self.token=transaction.resume_executor()
+                transaction.owner_probe = self.owner_probe
+                transaction.copy_hook = self.copy_hook
+                self.active = transaction
+                try:
+                    yield transaction
+                finally:
+                    self.data = transaction.data
+                    self.active = None
 
     def journal(self):
-        atomic_json(self.path/'recovery.json', self.data)
-        if self.coordination is not None:
-            from target_journal import Journal
-            Journal(self.coordination).file_intent(self.path/'recovery.json', self.data['status'], self.data['attempts'])
+        with self.transaction() as transaction:
+            transaction.data = self.data
+            transaction.save()
 
     def inventory(self):
-        return inventory(self.target.parent, self.deadline,
-                         self.coordination.directory if self.coordination is not None else None)
+        from recovery_files import inventory as inspect
+        from target_coordination import Directory
+        directory = Directory(self.target.parent,private=False)
+        try:
+            return inspect(directory,self.coordination.directory if self.coordination is not None else None)
+        finally:
+            directory.close()
 
     def check_owner(self):
         remaining(self.deadline)
@@ -194,93 +289,99 @@ class Snapshot:
             raise RuntimeError('recovery rollback refused: ' + reason + '; snapshot/scene retained')
 
     def expect(self, expected):
-        if stable_stat(self.target.parent.lstat())[:3] != self.parent_identity:
-            raise RuntimeError('recovery parent directory identity changed; scene retained')
         if self.inventory() != expected:
             raise RuntimeError('recovery file identity/directory changed; snapshot/scene retained')
 
+    def copy_hook(self, source, name, destination, expected, mode):
+        return self.copy(source.path/name,destination.path/name,expected,mode)
+
     def copy(self, source, destination, expected, mode):
-        actual = identity(source, self.deadline)
-        # Snapshot files have a different inode/mode; content must still match.
-        if (actual['size'], actual.get('sha256')) != (expected['size'], expected['sha256']):
-            raise RuntimeError('recovery snapshot content changed; scene retained')
-        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        with os.fdopen(fd, 'rb') as stream, destination.open('xb') as output:
-            opened = os.fstat(stream.fileno())
-            if opened.st_ino != actual['inode'] or opened.st_dev != actual['device']:
-                raise RuntimeError('recovery source identity changed before copy')
-            while chunk := stream.read(1024*1024):
-                remaining(self.deadline)
-                output.write(chunk)
-            output.flush()
-            os.fsync(output.fileno())
-        destination.chmod(mode)
-        copied = identity(destination, self.deadline)
-        if copied['sha256'] != expected['sha256'] or copied['size'] != expected['size']:
-            raise RuntimeError('recovery snapshot copy verification failed')
-        if identity(source, self.deadline) != actual:
-            raise RuntimeError('recovery source changed during copy; scene retained')
+        from target_coordination import Directory
+        if self.active is None or source.name != destination.name or self.path not in destination.parents:
+            raise RuntimeError('RecoveryBlocked: copy is restricted to the active private transaction')
+        input_directory = Directory(source.parent,private=False)
+        output_directory = Directory(destination.parent)
+        try:
+            return self.active.copy_file(input_directory,source.name,output_directory,expected,mode)
+        finally:
+            output_directory.close()
+            input_directory.close()
 
     def failed(self, attempt):
-        """Record owner-produced identities before allowing the owner to close."""
-        observed = self.inventory()
-        for name, value in observed.items():
-            if name not in self.names and self.before.get(name) != value:
-                raise RuntimeError('unexpected new/changed recovery directory entry: ' + name)
-        if any(name not in observed for name in self.before if name not in self.names):
-            raise RuntimeError('unrelated recovery directory entry disappeared')
-        self.data['attempts'].append({'attempt': attempt, 'failed': observed})
-        # KILL can remove owner components on close. Preserve their failed bytes
-        # as well as the original snapshot before obtaining the release proof.
-        failed_files = self.path/('failed-files-' + str(attempt))
-        failed_files.mkdir(mode=0o700)
-        for name in observed.keys() & self.names:
-            self.copy(self.target.parent/name, failed_files/name, observed[name], 0o400)
-        self.expect(observed)
-        self.data['status'] = 'failed-owner-held'
-        self.journal()
-        return observed
+        with self.transaction() as transaction:
+            custodian = getattr(self,'custodian',None)
+            if custodian is not None:
+                from target_journal import Journal
+                journal = Journal(transaction.target)
+                fields = ('watch','epoch','acquisition','owner','lease','origin_binding')
+                self.requirements = [{key:item.get(key) for key in fields}
+                    for item in journal.value['entries'].values()
+                    if item['acquisition'] == custodian.acquisition]
+                if not self.requirements:
+                    raise RuntimeError('RecoveryBlocked: failed acquisition has no exact durable resource source')
+            observed = transaction.capture_failure(attempt,getattr(self,'requirements',()))
+            from target_journal import Journal
+            Journal(transaction.target).file_intent(self.path/'recovery.json',transaction.data['status'],transaction.data['attempts'])
+            return observed
 
     def rollback(self, observed):
         """Only after lease AND public owner lifetime release were proved."""
-        self.check_owner()
-        current = self.inventory()
-        for name, value in current.items():
-            if observed.get(name) != value:
-                raise RuntimeError('recovery file identity changed after close: ' + name)
-        # TEMP|KILL may remove components. Missing unrelated files/packed are unsafe.
-        for name in observed.keys() - current.keys():
-            if name not in self.names or name == self.target.name:
-                raise RuntimeError('recovery file unexpectedly removed: ' + name)
-        self.data['status'] = 'rolling-back'
-        self.journal()
-        isolated = self.path/('quarantine-' + str(len(self.data['attempts'])))
-        isolated.mkdir(mode=0o700)
-        for name in sorted(current.keys() & self.names):
-            self.check_owner()
-            self.expect(current)
-            rename_group(self.target.parent/name, isolated/name)
-            current.pop(name)
-            sync_directory(self.target.parent)
-            sync_directory(isolated)
-        for name, value in self.data['files'].items():
-            if identity(self.path/'snapshot'/name, self.deadline) != self.data['snapshot_files'][name]:
-                raise RuntimeError('recovery snapshot content changed or identity replaced; scene retained')
-            self.check_owner()
-            self.expect(current)
-            self.copy(self.path/'snapshot'/name, self.target.parent/name,
-                      value, stat.S_IMODE(value['mode']))
-            current[name] = identity(self.target.parent/name, self.deadline)
-            sync_directory(self.target.parent)
-        self.check_owner()
-        self.expect(current)
-        self.data['attempts'][-1]['restored'] = current
-        self.data['status'] = 'restored'
-        self.journal()
+        with self.transaction() as transaction:
+            from recovery_files import compatible, file_info
+            snapshot = transaction.child('snapshot')
+            try:
+                for name, expected in transaction.data['snapshot_files'].items():
+                    if not compatible(file_info(snapshot,name),expected):
+                        raise RuntimeError('RecoveryBlocked: snapshot content changed or identity replaced')
+            finally:
+                snapshot.close()
+            if not transaction.data['attempts']:
+                raise RuntimeError('RecoveryBlocked: no failed attempt authorizes rollback')
+            if observed != transaction.data['attempts'][-1]['failed']:
+                raise RuntimeError('RecoveryBlocked: rollback does not match exact failed attempt')
+            if transaction.data['status'] in ('restored','opened','archived'):
+                return
+            if getattr(self,'custodian',None) is not None:
+                # File work is accepted independently of the open future. Its
+                # receiver opens its own root SH and receives this exact target
+                # OFD; neither caller timeout nor bridge EOF cancels it.
+                transaction.require_resources()
+                from recovery_job import start
+                try:
+                    start(transaction)
+                except Exception:
+                    self.custodian.retain_restore(self,observed)
+                    raise
+                transaction.data, transaction.info, transaction.raw = transaction.directory.read('recovery.json')
+                return
+            transaction.restore()
+            from target_journal import Journal
+            Journal(transaction.target).file_intent(self.path/'recovery.json',transaction.data['status'],transaction.data['attempts'])
 
     def complete(self):
-        self.data['status'] = 'opened'
-        self.journal()
+        with self.transaction() as transaction:
+            transaction.register_backups()
+            transaction.complete()
+
+    def status(self):
+        from target_coordination import Directory
+        directory=Directory(self.path)
+        try:
+            record,_,_=directory.read('recovery.json')
+            if (record.get('recovery_id') != self.recovery_id or record.get('directory') != directory.identity
+                    or record.get('target') != self.data['target']):
+                raise RuntimeError('RecoveryBlocked: status transaction identity changed')
+            return {'job_id':self.recovery_id,'transaction':str(directory.path),'phase':record['status'],
+                    'job':record.get('job'),'executor':record['executor'],'progress':record['progress'],
+                    'cause':record.get('cause'),'last_error':record.get('last_error')}
+        finally:directory.close()
+
+    def resolver_failed(self, *, no_acquisition):
+        with self.transaction() as transaction:
+            transaction.register_backups()
+            current=transaction.expect_unrelated(transaction.data['before'],exact_components=True)
+            if no_acquisition and current:
+                transaction.archive('resolver failed without acquisition; verified original bytes and retained backups')
 
 
 def failure_state(handle, deadline):
@@ -307,6 +408,10 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
         coordination = custodian.target if custodian else locking.target
         state = probe_database_state(path, output_database=options.get('output_database'))
         snapshot = Snapshot(root, target, deadline, coordination=coordination) if state['state'] in ('crashed', 'unpacked') else None
+        if snapshot is not None:
+            snapshot.custodian = custodian
+            if custodian is not None:
+                custodian.file_recovery_id = snapshot.recovery_id
         for number in range(1, 4):
             logging.getLogger('ida_cli.open').debug('open attempt %d/3: %s', number, target)
             attempt_context = dict(context, open_attempt=number, deadline=deadline)
@@ -318,12 +423,22 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                 Journal(locking.target).gate(state_identity())
             starting()
             current_options = dict(options, startup_timeout=remaining(deadline))
-            if custodian:
-                handle = custodian.obtain(Handle, Options, path, current_options, attempt_context)
-            else:
-                handle = Handle.open(path, options=Options(**current_options))
-                acquired(handle, attempt_context)
-                locking.unlock()
+            try:
+                if custodian:
+                    handle = custodian.obtain(Handle, Options, path, current_options, attempt_context)
+                else:
+                    handle = Handle.open(path, options=Options(**current_options))
+                    acquired(handle, attempt_context)
+                    locking.unlock()
+            except BaseException as original:
+                if snapshot:
+                    try:
+                        with custodian.file_gate(recovery=True) if custodian else locking.file_gate():
+                            snapshot.resolver_failed(no_acquisition=custodian.known_no_acquisition() if custodian else False)
+                    except Exception as evidence_error:
+                        raise RuntimeError('RecoveryBlocked: resolver failure '+str(original)
+                                           +'; file/backup responsibility: '+str(evidence_error)) from original
+                raise
             attempt_context['record_id'] = handle.instance.record_id
             try:
                 code = guarded_source('import ida_kernwin\nresult = ida_kernwin.get_kernel_version()', attempt_context)

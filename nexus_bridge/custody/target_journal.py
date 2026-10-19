@@ -112,6 +112,7 @@ class Journal:
                 raise RuntimeError('CoordinationBlocked: malformed active observation')
             watches.add(item['watch'])
             self.retirement(item)
+            self.manual_closed(item)
             for reference in item['facts']:
                 self.validate_reference(reference)
             closed = item['epoch'] <= v['closed_through'] or any(a <= item['epoch'] <= b for a,b in ranges)
@@ -130,7 +131,8 @@ class Journal:
         for key,item in intents.items():
             if (not isinstance(item, dict) or not isinstance(item.get('path'), str)
                     or not Path(item['path']).is_absolute() or len(key) != 64
-                    or item.get('status') not in ('snapshotting', 'failed-owner-held', 'rolling-back')):
+                    or item.get('status') not in ('snapshotting', 'failed-owner-held', 'rolling-back',
+                                                  'staging','prepared','isolating','publishing')):
                 raise RuntimeError('RecoveryBlocked: malformed retained file intent')
 
     def validate_reference(self, entry):
@@ -146,10 +148,10 @@ class Journal:
 
     def accounting(self):
         self.validate()
-        totals = {'live_refs':sum(not i.get('resource_retirement') for i in self.value['entries'].values()),
+        totals = {'live_refs':sum(not i.get('resource_retirement') and not self.manual_closed(i) for i in self.value['entries'].values()),
                   'routine_bytes':len(encoded(self.value['summary'])),
                   'retained_evidence_bytes':sum(len(encoded(i)) for i in self.value['entries'].values()
-                                               if i.get('resource_retirement')),
+                                               if i.get('resource_retirement') or self.manual_closed(i)),
                   'namespace_bytes':0, 'routine_files':0}
         scanned = [0]
         def scan(directory, namespace, depth=0):
@@ -183,7 +185,7 @@ class Journal:
                 scan(directory, name)
             finally:
                 directory.close()
-        for name in ('lock', 'target.json'):
+        for name in ('lock', 'root.lock', 'target.json'):
             try:
                 totals['namespace_bytes'] += os.stat(name, dir_fd=self.target.directory.fd, follow_symlinks=False).st_size
             except FileNotFoundError:
@@ -205,15 +207,28 @@ class Journal:
         _, self.info, self.raw = self.target.directory.read('custody.json')
 
     def gate(self, state_root=None, acquisition=None, *, cleanup_owner=None):
+        from recovery_transaction import inspect_transactions, recovery_name, finish_creation, resume_at_gate
+        if not self.target.root_locked:
+            finish_creation(self.target)
         # Unknown .new and unrecognized recovery files are never ignored.
         for name in os.listdir(self.target.directory.fd):
             if name.endswith('.new'):
                 raise RuntimeError('CoordinationBlocked: interrupted durable write retained: ' + name)
-            if name not in ('lock', 'target.json', 'custody.json', 'proofs', 'observations', 'retained'):
+            allowed = {'lock','target.json','custody.json','proofs','observations','retained'}
+            if self.target.root is None:
+                allowed.add('root.lock')
+            if recovery_name(name):
+                continue
+            if name not in allowed:
                 raise RuntimeError('RecoveryBlocked: unsupported target coordination entry: ' + name)
         self.recover_public_proofs()
+        resume_at_gate(self.target)
+        for transaction in inspect_transactions(self.target):
+            if transaction['phase'] not in ('snapshotting','ready','restored','opened','archived'):
+                raise RuntimeError('RecoveryBlocked: accepted file job '+transaction['job_id']
+                                   +' requires recovery at '+transaction['transaction'])
         for item in self.value['entries'].values():
-            if self.retirement(item):
+            if self.retirement(item) or self.manual_closed(item):
                 continue
             cleanup = (cleanup_owner is not None and acquisition is not None
                        and acquisition.get('purpose') == 'auxiliary'
@@ -289,7 +304,7 @@ class Journal:
         """Adopt authorized durable facts without closing any old producer."""
         self.retire_old_boot()
         for item in list(self.value['entries'].values()):
-            if self.retirement(item):
+            if self.retirement(item) or self.manual_closed(item):
                 continue
             if item.get('launch') and not item.get('owner'):
                 authorized = self.authorized_producers(item, ('SpawnIntent', 'Spawned'))
@@ -337,7 +352,7 @@ class Journal:
     def file_intent(self, path, status, attempts):
         intents = self.value.setdefault('file_intents', {})
         key = digest(str(path).encode())
-        if status in ('opened', 'restored') or (status == 'ready' and not attempts):
+        if status in ('opened', 'restored', 'archived') or (status == 'ready' and not attempts):
             intents.pop(key, None)
         else:
             info = path.lstat()
@@ -348,7 +363,7 @@ class Journal:
     def check_owner(self, owner):
         for item in self.value['entries'].values():
             if (item.get('owner') and not item.get('proof') and not self.retirement(item)
-                    and not item.get('transferred_to')
+                    and not item.get('transferred_to') and not self.manual_closed(item)
                     and item['owner'] != owner):
                 raise RuntimeError('ObservationRecoveryBlocked: different owner without exact lifetime proof')
 
@@ -372,7 +387,7 @@ class Journal:
         return evidence
 
     def require_live(self, item):
-        if self.retirement(item):
+        if self.retirement(item) or self.manual_closed(item):
             raise RuntimeError('ObservationClosed: retired boot epoch cannot change historical facts')
         # Ordinary same-boot callbacks need only a native boot recheck. Full
         # machine/volume qualification is required when that boot differs;
@@ -386,7 +401,7 @@ class Journal:
         current = creation_scope(self.target.directory.path, 'resource-consumer')
         changed = False
         for item in self.value['entries'].values():
-            if self.retirement(item):
+            if self.retirement(item) or self.manual_closed(item):
                 continue
             binding = item['origin_binding']
             if binding.get('creator', {}).get('boot_id') == current['creator']['boot_id']:
@@ -513,6 +528,33 @@ class Journal:
         item['detach_outcome'] = outcome
         self.save()
         return {'epoch':item['epoch'], 'revision':self.value['revision']}
+
+    def recovery_permission(self, value):
+        """N1's exact original ACK joins public proof for this file obligation."""
+        from recovery_transaction import Transaction
+        with Transaction(self.target,value['recovery_id']) as transaction:
+            item = self.item(value['watch'],value['epoch'])
+            requirement = next((r for r in transaction.data['requirements']
+                                if r['watch']==item['watch'] and r['epoch']==item['epoch']),None)
+            fields = ('acquisition','owner','lease')
+            observation = item.get('release_observation')
+            if (requirement is None or any(encoded(item.get(k)) != encoded(value.get(k))
+                    or encoded(requirement.get(k)) != encoded(value.get(k)) for k in fields)
+                    or not item.get('proof') or self.retirement(item)
+                    or not observation or observation['attempt'] != value['attempt']
+                    or value['attempt']['target'] != {'kind':'release','lease':value['lease']}
+                    or value['outcome'].get('lease_released') is not True
+                    or value['outcome'].get('ack_kind') not in ('last','nonlast')):
+                raise RuntimeError('RecoveryBlocked: N1 file ACK permission binding mismatch')
+            permission = {k:value[k] for k in ('recovery_id','attempt','outcome','acquisition','owner','lease','watch','epoch')}
+            old = item.get('file_recovery_ack')
+            if old is not None:
+                if encoded(old) != encoded(permission):
+                    raise RuntimeError('RecoveryBlocked: conflicting N1 file ACK permission')
+                return {'revision':self.value['revision']}
+            item['file_recovery_ack'] = permission
+            self.save()
+            return {'revision':self.value['revision']}
 
     def launch_signed(self, receipt):
         record = receipt['record']
@@ -739,13 +781,20 @@ class Journal:
     def settle(self):
         if self.value.get('file_intents'):
             return
+        from recovery_transaction import pinned_epochs
+        pinned = pinned_epochs(self.target)
+        if pinned is None:
+            return
         eligible = [item for item in self.value['entries'].values()
                     if item['producer_closed'] and item['consumer_closed'] and item['detached']
                     and item.get('bridge_closed')
-                    and not item['unacked_events'] and not item.get('failure') and not item.get('launch')]
+                    and not item['unacked_events'] and not item.get('failure') and not item.get('launch')
+                    and not item.get('manual_offline_recovery')
+                    and item['epoch'] not in pinned]
         closed_epochs = {i['epoch'] for i in eligible}
         eligible += [i for i in self.value['entries'].values() if i.get('transferred_to') in closed_epochs
-                     and i['producer_closed'] and i['consumer_closed'] and not i['unacked_events']]
+                     and i['producer_closed'] and i['consumer_closed'] and not i['unacked_events']
+                     and not i.get('manual_offline_recovery') and i['epoch'] not in pinned]
         if not eligible:
             return
         # The durable deletion manifest and its recovery verifier use the
@@ -778,6 +827,73 @@ class Journal:
         self.value['compaction'] = {'epochs':epochs, 'files':files}
         self.save()  # Summary and complete deletion manifest precede every unlink.
         self.resume_compaction()
+
+    def manual_closed(self, item):
+        permission=item.get('manual_offline_recovery')
+        if permission is None:
+            return False
+        if type(permission) is not dict or set(permission) != {'name','sha256'}:
+            raise RuntimeError('MaintenanceBlocked: invalid manual resource certificate')
+        if permission['name'] != permission['sha256']+'.json':
+            raise RuntimeError('MaintenanceBlocked: invalid manual resource certificate name')
+        retained=self.target.directory.child('retained',create=False)
+        directory=None
+        try:
+            directory=retained.child('manual',create=False)
+            record,_,raw=directory.read(permission['name'])
+            original={k:v for k,v in item.items() if k != 'manual_offline_recovery'}
+            if (digest(raw) != permission['sha256'] or record.get('schema') != 1
+                    or record.get('kind') != 'manual_offline_recovery'
+                    or encoded(record.get('coord_key')) != encoded(self.target.key)
+                    or record.get('target') != self.target.original
+                    or encoded(record.get('resource')) != encoded(original)):
+                raise RuntimeError('MaintenanceBlocked: manual resource/target changed')
+            plan=record['permission']['plan']
+            if (digest(plan) != record['permission']['plan_sha256']
+                    or plan['operator']['uid'] != os.getuid()
+                    or plan['operator']['confirmation'] != 'I established and maintain this exclusive offline window'
+                    or not plan['window']['started_at'] <= record['permission']['applied_at'] < plan['window']['expires_at']):
+                raise RuntimeError('MaintenanceBlocked: invalid historical offline operator authorization')
+            return True
+        finally:
+            if directory is not None:directory.close()
+            retained.close()
+
+    def complete_manual(self, permission):
+        # Called only after the accepted file transaction has restored/archived.
+        # The old ACK, operation and public-proof fields are retained verbatim.
+        from recovery_transaction import Transaction
+        with Transaction(self.target,permission['plan']['transaction'],recover=False) as transaction:
+            transaction.validate_manual_permission(permission)
+            if transaction.data['status'] not in ('restored','opened','archived'):
+                raise RuntimeError('MaintenanceBlocked: file work has not completed')
+        expected=permission['plan']['stopped_openers']
+        retained=self.target.directory.child('retained')
+        directory=None
+        try:
+            directory=retained.child('manual')
+            for identity in expected:
+                item=self.value['entries'].get(str(identity['epoch']))
+                if item is None or item['watch'] != identity['watch']:
+                    raise RuntimeError('MaintenanceBlocked: offline resource disappeared')
+                if any(encoded(item.get(k)) != encoded(v) for k,v in identity.items()):
+                    raise RuntimeError('MaintenanceBlocked: resource changed before offline completion')
+                if self.manual_closed(item):continue
+                record={'schema':1,'kind':'manual_offline_recovery','target':self.target.original,
+                        'coord_key':self.target.key,'resource':__import__('copy').deepcopy(item),'permission':permission}
+                checksum=digest(record)
+                name=checksum+'.json'
+                directory.recover_record(name)
+                try:stored,_,_=directory.read(name)
+                except FileNotFoundError:directory.durable(name,record,immutable=True)
+                else:
+                    if encoded(stored) != encoded(record):
+                        raise RuntimeError('MaintenanceBlocked: offline certificate conflict')
+                item['manual_offline_recovery']={'name':name,'sha256':checksum}
+                self.save()
+        finally:
+            if directory is not None:directory.close()
+            retained.close()
 
     def resume_compaction(self):
         intent = self.value.get('compaction')
@@ -1026,6 +1142,8 @@ def main():
                 result = journal.release_observation(value)
             elif action == 'detach_outcome':
                 result = journal.detach_outcome(value)
+            elif action == 'recovery_permission':
+                result = journal.recovery_permission(value)
             elif action == 'retire_old_boot':
                 result = journal.retire_old_boot()
             elif action == 'proof':

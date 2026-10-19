@@ -49,6 +49,34 @@ impl Drop for Temporary {
 
 const SOURCES: &[(&str, &[u8])] = &[
     (
+        "recovery_probe.py",
+        include_bytes!("../../../nexus_bridge/custody/recovery_probe.py"),
+    ),
+    (
+        "maintenance-launch",
+        include_bytes!("../../../nexus_bridge/custody/maintenance-launch"),
+    ),
+    (
+        "recovery_maintenance.py",
+        include_bytes!("../../../nexus_bridge/custody/recovery_maintenance.py"),
+    ),
+    (
+        "recovery_job.py",
+        include_bytes!("../../../nexus_bridge/custody/recovery_job.py"),
+    ),
+    (
+        "recovery_transfer.py",
+        include_bytes!("../../../nexus_bridge/custody/recovery_transfer.py"),
+    ),
+    (
+        "recovery_files.py",
+        include_bytes!("../../../nexus_bridge/custody/recovery_files.py"),
+    ),
+    (
+        "recovery_transaction.py",
+        include_bytes!("../../../nexus_bridge/custody/recovery_transaction.py"),
+    ),
+    (
         "durable_records.py",
         include_bytes!("../../../nexus_bridge/custody/durable_records.py"),
     ),
@@ -169,9 +197,18 @@ pub(super) fn create(directory: &Path) -> anyhow::Result<()> {
     let mut files = serde_json::Map::new();
     for (name, bytes) in SOURCES {
         write_new(&directory.join(name), bytes)?;
+        let mode = if *name == "maintenance-launch" {
+            0o700
+        } else {
+            0o600
+        };
+        if mode != 0o600 {
+            std::fs::set_permissions(directory.join(name), std::fs::Permissions::from_mode(mode))?;
+            File::open(directory.join(name))?.sync_all()?;
+        }
         files.insert(
             (*name).into(),
-            serde_json::json!({"sha256":format!("{:x}", Sha256::digest(bytes)), "mode":0o600}),
+            serde_json::json!({"sha256":format!("{:x}", Sha256::digest(bytes)), "mode":mode}),
         );
     }
     write_new(
@@ -198,4 +235,33 @@ fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "nexus-test-support"))]
+mod tests {
+    #[test]
+    fn installed_maintenance_modes_offline_preview_and_apply() {
+        let root =
+            std::path::PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root"));
+        let installation = root.join("maintenance-installation");
+        super::create(&installation).expect("current closed installation");
+        let output = std::process::Command::new("timeout")
+            .args(["30s"])
+            .arg(std::env::var_os("R3A_PYTHON").expect("private prepared SDK Python"))
+            .arg("-B")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/support/r4_maintenance.py"
+            ))
+            .arg(installation)
+            .output()
+            .expect("actual private operator driver");
+        std::fs::write(root.join("maintenance.stdout"), &output.stdout).expect("stdout evidence");
+        std::fs::write(root.join("maintenance.stderr"), &output.stderr).expect("stderr evidence");
+        assert!(
+            output.status.success(),
+            "maintenance failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
