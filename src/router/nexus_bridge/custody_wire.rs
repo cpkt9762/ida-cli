@@ -1661,19 +1661,27 @@ async fn startup_proof(
     // producer-closed helper view, rather than the earlier proof snapshot,
     // before retirement makes this exact watch unavailable to lookup.
     let latest = helper.call(json!({"kind":"lookup","watch":watch})).await?;
+    // The helper retains its original public observation when the target has
+    // already selected another authorized source. Its producer closure uses
+    // custody_proof in that case; validate and cache that exact same receipt.
+    let selected_proof = latest["item"]
+        .get("custody_proof")
+        .unwrap_or(&latest["item"]["proof"]);
     anyhow::ensure!(
         latest["state_root"] == helper.state_root
             && latest["item"]["acquisition"] == launch["acquisition"]
             && latest["item"]["owner"] == launch["owner"]
-            && latest["item"]["proof"] == launch["proof"]
+            && *selected_proof == launch["proof"]
             && latest["item"]["consumer"] == launch["consumer"],
         "retiring startup helper facts changed identity or proof"
     );
+    let mut latest_item = latest["item"].clone();
+    latest_item["proof"] = selected_proof.clone();
     state
         .startup_proofs
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(watch.clone(), latest["item"].clone());
+        .insert(watch.clone(), latest_item);
     helper
         .call(json!({"kind":"retire","watch":watch,"sha256":launch["consumer"]["sha256"]}))
         .await?;

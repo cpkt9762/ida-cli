@@ -1353,11 +1353,12 @@ async fn post_exit_final_signed_resolved_deadline_sends_zero_attach() {
         }
     })
     .await;
+    let before_shutdown = bridge.lifecycle_status();
     let shutdown = bridge.shutdown().await;
     std::fs::write(
         root.join("deadline-result.json"),
         serde_json::to_vec_pretty(&json!({"result":format!("{result:?}"),
-        "settled":settled.is_ok(),"shutdown":format!("{shutdown:?}")}))
+        "settled":settled.is_ok(),"before_shutdown":before_shutdown,"shutdown":format!("{shutdown:?}")}))
         .expect("encode"),
     )
     .expect("evidence");

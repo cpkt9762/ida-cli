@@ -294,7 +294,7 @@ async fn gate_attempt(
             t,
         )
     })?;
-    Ok(tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.recv().await?;
             if matches!(
@@ -305,7 +305,7 @@ async fn gate_attempt(
             }
         }
     })
-    .await??)
+    .await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
