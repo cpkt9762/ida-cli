@@ -7,6 +7,8 @@ import subprocess
 import sys
 import time
 import uuid
+import threading
+import atexit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from process_identity import identity
@@ -17,6 +19,7 @@ def install():
     if not ledger_path or getattr(subprocess.Popen, '_r2_ledger', False):
         return
     original = subprocess.Popen
+    waiters=[]
 
     def record(value):
         data = (json.dumps(dict(value, parent=os.getpid(), observed_unix_ns=time.time_ns(),
@@ -40,6 +43,14 @@ def install():
             captured = identity(self.pid)
             record({'kind':'started', 'intent':self._r2_intent, 'pid':self.pid,
                     'identity':captured, 'already_exited':self.poll() is not None})
+            # A retained SDK launcher can outlive run/communicate's caller.
+            # Wait on the actual Popen, under CPython's waitpid lock. This is
+            # test telemetry only; it neither signals nor grants public proof.
+            def collect():
+                original.wait(self)
+            waiter=threading.Thread(target=collect,daemon=True)
+            waiters.append(waiter)
+            waiter.start()
 
         def wait(self, *args, **options):
             result = super().wait(*args, **options)
@@ -61,6 +72,11 @@ def install():
                 self._r2_polled = True
 
     subprocess.Popen = Recorded
+    def finish_observers():
+        deadline=time.monotonic()+1
+        for waiter in waiters:
+            waiter.join(max(0,deadline-time.monotonic()))
+    atexit.register(finish_observers)
 
 
 if __name__ == '__main__':
