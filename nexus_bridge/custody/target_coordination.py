@@ -169,6 +169,10 @@ class Directory:
         from durable_records import resume
         return resume(self, name, validate=validate)
 
+    def inspect_record(self, name):
+        from durable_records import inspect
+        return inspect(self, name)
+
     def retry_immutable(self, name, value, *, immutable=True):
         """Resume only this producer's durably reserved exact immutable slot."""
         data = encoded(value)

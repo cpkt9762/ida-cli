@@ -250,7 +250,7 @@ class Journal:
         except FileNotFoundError:
             if self.info is not None:raise
         self.validate()
-        for transaction in inspect_transactions(self.target):
+        for transaction in inspect_transactions(self.target,recover=False):
             if transaction['phase'] not in ('snapshotting','ready','restored','opened','archived'):
                 raise RuntimeError('RecoveryBlocked: accepted file job '+transaction['job_id']
                                    +' requires recovery at '+transaction['transaction'])
@@ -426,6 +426,8 @@ class Journal:
                 raise RuntimeError('ObservationClosed: retired boot epoch cannot change historical facts')
 
     def retire_old_boot(self):
+        if not self.value['entries']:
+            return {'retirements':[]}  # No resource exists to qualify or retire.
         current = creation_scope(self.target.directory.path, 'resource-consumer')
         changed = False
         for item in self.value['entries'].values():

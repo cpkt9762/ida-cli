@@ -83,6 +83,44 @@ def read_owner(directory, name):
     return value, info
 
 
+def inspect(directory, name):
+    """Read the exact committed or reserved value without publishing/unlinking.
+
+    This is a prospective view, not permission to recover. It binds both slots
+    and the previous destination exactly like resume; an incomplete slot stays
+    an error. Callers still need their normal authorization before resuming.
+    """
+    from target_coordination import digest, identity
+    try:
+        owner, _ = read_owner(directory, name)
+    except FileNotFoundError:
+        if os.path.lexists(directory.path/(name+'.new')):
+            raise RuntimeError('DurableWriteBlocked: pending bytes lack durable ownership') from None
+        info, data = raw(directory, name)
+        return json.loads(data), info, data
+    expected = owner['new']
+    try:
+        pending = os.stat(name+'.new', dir_fd=directory.fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if version(directory, name) != expected:
+            raise RuntimeError('DurableWriteBlocked: published write identity/content conflict') from None
+        info, data = raw(directory, name)
+    else:
+        linked = owner['immutable'] and pending.st_nlink == 2
+        info, data = raw(directory, name+'.new', links=2 if linked else 1)
+        actual = {'identity':directory.object_identity(info), 'sha256':digest(data), 'size':len(data)}
+        if actual != expected:
+            raise RuntimeError('DurableWriteBlocked: partial/foreign pending bytes retained')
+        if linked:
+            final, contents = raw(directory, name, links=2)
+            if identity(final) != identity(info) or contents != data:
+                raise RuntimeError('DurableWriteBlocked: immutable publication link conflict')
+        elif version(directory, name) != owner['previous']:
+            raise RuntimeError('DurableWriteBlocked: destination changed before publication')
+    directory.verify()
+    return json.loads(data), info, data
+
+
 def resume(directory, name, *, validate=None):
     """Complete a fully bound write. The caller must hold this writer's lock."""
     from target_coordination import digest, identity

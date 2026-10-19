@@ -17,6 +17,17 @@ from target_journal import Journal
 
 
 class BootRetirement(unittest.TestCase):
+    def test_empty_epoch_table_needs_no_resource_retirement_probe(self):
+        with Target(self.path) as target,target.locked():
+            journal=Journal(target)
+            with patch('target_journal.creation_scope',side_effect=AssertionError('no resource exists')):
+                self.assertEqual(journal.retire_old_boot(),{'retirements':[]})
+            journal.begin({'parent':'nonempty-scope','purpose':'final','ordinal':1},'live-watch')
+            before=(target.directory.path/'custody.json').read_bytes()
+            with patch('target_journal.creation_scope',side_effect=RuntimeError('controlled source unavailable')):
+                with self.assertRaisesRegex(RuntimeError,'controlled source unavailable'):journal.retire_old_boot()
+            self.assertEqual((target.directory.path/'custody.json').read_bytes(),before)
+
     def setUp(self):
         self.root=Path(tempfile.mkdtemp(dir=os.environ['R3A_CASE_ROOT'],prefix='boot-scope-'))
         self.path=self.root/'tiny.i64'

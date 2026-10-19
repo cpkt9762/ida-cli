@@ -60,6 +60,11 @@ def consume(case, fault):
         if action+'.'+stage==fault:os._exit(97)
     recovery_legacy.boundary=boundary
     recovery_files.boundary=boundary
+    if fault.startswith('pointer:'):
+        import durable_records
+        def pointer(directory,name,stage):
+            if name=='imported-v2.json' and stage==fault.removeprefix('pointer:'):os._exit(97)
+        durable_records.boundary=pointer
     with Target(reference['target']) as target,target.locked():
         if fault=='gate':
             from target_journal import Journal
@@ -77,6 +82,87 @@ def consume(case, fault):
 
 
 class LegacyImport(unittest.TestCase):
+    def test_archive_pointer_each_internal_boundary_resumes_same_source_and_id(self):
+        root=Path(tempfile.mkdtemp(prefix='legacy-pointer-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
+        coverage=[]
+        for phase in ('ready','failed-owner-held','rolling-back'):
+            for stage in ('temp_written','file_fsynced','before_rename','after_rename','directory_fsynced'):
+                with self.subTest(phase=phase,boundary=stage):
+                    case=root/(phase+'-'+stage);case.mkdir(mode=0o700)
+                    result=self.child(case,'--produce',phase)
+                    self.assertEqual(result.returncode,96 if phase=='rolling-back' else 0,result.stderr)
+                    reference=json.loads((case/'reference.json').read_text());source=Path(reference['source'])
+                    before={str(p.relative_to(source)):p.read_bytes() for p in source.rglob('*') if p.is_file()}
+                    payload=Path(reference['target']).read_bytes()
+                    result=self.child(case,'--consume','pointer:'+stage)
+                    self.assertEqual(result.returncode,97,result.stderr)
+                    result=self.child(case,'--consume','gate')
+                    self.assertEqual(result.returncode,0,result.stderr)
+                    status=json.loads((case/'import-result.json').read_text())
+                    self.assertEqual(status['job_id'],reference['recovery_id'])
+                    value=json.loads((Path(status['transaction'])/'recovery.json').read_text())
+                    self.assertEqual(value['imported_v1']['state'],'Complete')
+                    self.assertEqual(value['status'],'archived' if phase=='ready' else 'failed-owner-held')
+                    self.assertEqual(status['gate_error'] is None,phase=='ready')
+                    self.assertEqual(Path(reference['target']).read_bytes(),payload)
+                    self.assertEqual({str(p.relative_to(source)):p.read_bytes() for p in source.rglob('*')
+                        if p.is_file() and p.name!='imported-v2.json'},before)
+                    pointer=json.loads((source/'imported-v2.json').read_text())
+                    self.assertEqual(pointer['source'],value['imported_v1']['source'])
+                    self.assertEqual(pointer['recovery_id'],reference['recovery_id'])
+                    self.assertTrue(pointer['never_replay_old_open'])
+                    coverage.append(dict(phase=phase,stage=stage,case=str(case),crash=97,gate=0))
+                    (root/'coverage.json').write_text(json.dumps(coverage,indent=2))
+
+    def test_pointer_corrupt_foreign_or_replaced_slots_are_never_consumed(self):
+        from test_recovery_preview import fingerprints
+        root=Path(tempfile.mkdtemp(prefix='legacy-pointer-refuse-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
+        for variant in ('writer','directory','inode','hash','permissions','json','owner-json',
+                        'foreign-new','source-inode','source-content','foreign-binding','owner-schema'):
+            with self.subTest(variant=variant):
+                case=root/variant;case.mkdir(mode=0o700)
+                self.assertEqual(self.child(case,'--produce','ready').returncode,0)
+                result=self.child(case,'--consume','pointer:before_rename')
+                self.assertEqual(result.returncode,97,result.stderr)
+                reference=json.loads((case/'reference.json').read_text());source=Path(reference['source'])
+                pending=source/'imported-v2.json.new';owner=source/'imported-v2.json.new.owner'
+                if variant in ('writer','directory','owner-schema'):
+                    value=json.loads(owner.read_text())
+                    if variant=='writer':value['writer']='foreign'
+                    elif variant=='directory':value['directory'][1]+=1
+                    else:value['schema']=True
+                    owner.write_text(json.dumps(value))
+                elif variant=='inode':
+                    data=pending.read_bytes();pending.unlink();pending.write_bytes(data);pending.chmod(0o600)
+                elif variant=='hash':pending.write_bytes(pending.read_bytes()+b' ')
+                elif variant=='permissions':pending.chmod(0o666)
+                elif variant=='json':pending.write_bytes(b'{')
+                elif variant=='owner-json':owner.write_bytes(b'{')
+                elif variant=='foreign-new':(source/'foreign.new').write_bytes(b'foreign evidence')
+                elif variant=='foreign-binding':
+                    value=json.loads(pending.read_text());value['recovery_id']='0'*32
+                    from target_coordination import encoded,digest
+                    data=encoded(value);pending.write_bytes(data)
+                    value=json.loads(owner.read_text());value['new']['sha256']=digest(data);value['new']['size']=len(data)
+                    owner.write_bytes(encoded(value))
+                elif variant=='source-inode':
+                    path=source/'recovery.json';replacement=case/'replacement-journal'
+                    replacement.write_bytes(path.read_bytes());replacement.chmod(0o600)
+                    self.assertNotEqual(replacement.stat().st_ino,path.stat().st_ino)
+                    os.replace(replacement,path)
+                else:
+                    changed=source/'snapshot/input.i64';changed.chmod(0o600)
+                    changed.write_bytes(b'changed retained source')
+                coordination=next(Path(reference['target']).parent.glob('.ida-cli-txn-*'))
+                before=(fingerprints(source),fingerprints(coordination),Path(reference['target']).read_bytes())
+                result=self.child(case,'--consume','gate')
+                if result.returncode==0:
+                    status=json.loads((case/'import-result.json').read_text())
+                    self.assertIsNotNone(status['gate_error'],'untrusted slots must not pass the product gate')
+                value=json.loads((coordination/reference['recovery_id']/'recovery.json').read_text())
+                self.assertEqual(value['imported_v1']['state'],'Published','refusal must retain the exact old obligation')
+                self.assertEqual((fingerprints(source),fingerprints(coordination),Path(reference['target']).read_bytes()),before)
+
     def child(self,case,mode,value):
         argv=['timeout','12s',sys.executable,'-B',__file__,mode,str(case),value]
         before=subprocess.check_output(['uptime'],text=True).strip()

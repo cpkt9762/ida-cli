@@ -41,11 +41,14 @@ def legacy_record(source):
     return value,info
 
 
-def sources(source, target):
+def sources(source, target, *, archive_pointer=None):
     result={'root':{}}
     allowed=component_names(target.target)
     for name in sorted(os.listdir(source.fd)):
-        if name=='imported-v2.json':continue
+        if name in ('imported-v2.json','imported-v2.json.new','imported-v2.json.new.owner'):
+            if archive_pointer is None:
+                raise RuntimeError('RecoveryBlocked: unbound legacy archive pointer retained: '+name)
+            continue
         if name=='recovery.json' or re.fullmatch(r'\.recovery\.json\.[0-9a-f]{32}',name):
             result['root'][name]=file_info(source,name)
             continue
@@ -61,11 +64,46 @@ def sources(source, target):
     return result
 
 
-def publish_pointer(source, binding, target, recovery_id):
-    pointer={'schema':1,'kind':'legacy_file_evidence_archived','source':binding,
+def pointer_record(binding, target, recovery_id):
+    return {'schema':1,'kind':'legacy_file_evidence_archived','source':binding,
              'recovery_id':recovery_id,'transaction':str(target.directory.path/recovery_id),
              'coord_key':target.key,'target':target.original,'never_replay_old_open':True}
-    source.recover_record('imported-v2.json')
+
+
+def bound_pointer(source, target, record_info):
+    """Only the published same-ID v2 source binding can name archive slots.
+
+    Validate pending ownership/content before excluding these exact names from
+    the source manifest. This inspection does not consume a slot or trust a
+    caller-supplied source manifest.
+    """
+    names=set(os.listdir(source.fd)) & {'imported-v2.json','imported-v2.json.new','imported-v2.json.new.owner'}
+    if not names:return None
+    with Transaction(target,source.path.name,recover=False,pending_view=True) as transaction:
+        imported=transaction.data.get('imported_v1')
+        binding=imported.get('source') if type(imported) is dict else None
+        if (type(imported) is not dict or imported.get('state') not in ('Published','Complete') or type(binding) is not dict
+                or binding.get('path') != str(source.path) or binding.get('directory') != source.identity
+                or encoded(binding.get('journal')) != encoded(record_info)):
+            raise RuntimeError('RecoveryBlocked: archive slots lack the exact published v1 source binding')
+        expected=pointer_record(binding,target,source.path.name)
+        stored,_,raw=source.inspect_record('imported-v2.json')
+        if stored != expected or raw != encoded(expected):
+            raise RuntimeError('RecoveryBlocked: legacy archive pointer content/source conflict')
+        if 'imported-v2.json.new.owner' in names:
+            from durable_records import read_owner
+            owner,_=read_owner(source,'imported-v2.json')
+            if not owner['immutable'] or owner['previous'] is not None:
+                raise RuntimeError('RecoveryBlocked: legacy archive pointer ownership conflict')
+        return expected
+
+
+def publish_pointer(source, binding, target, recovery_id):
+    pointer=pointer_record(binding,target,recovery_id)
+    def validate(raw):
+        if raw != encoded(pointer):
+            raise RuntimeError('RecoveryBlocked: legacy archive pointer pending content conflict')
+    source.recover_record('imported-v2.json',validate=validate)
     try:stored,_,_=source.read('imported-v2.json')
     except FileNotFoundError:source.durable('imported-v2.json',pointer,immutable=True)
     else:
@@ -128,7 +166,8 @@ def import_v1(target, path):
                     or identity != [actual.st_ino,current_parent.identity[0],actual.st_mode]):
                 raise RuntimeError('RecoveryBlocked: legacy parent identity changed')
         finally:current_parent.close()
-        manifest=sources(source,target)
+        pointer=bound_pointer(source,target,record_info)
+        manifest=sources(source,target,archive_pointer=pointer)
         binding={'path':str(path),'directory':source.identity,'journal':record_info,'manifest':manifest}
         failed=value['status'] in ('failed-owner-held','rolling-back')
         from target_journal import Journal

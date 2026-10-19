@@ -72,7 +72,9 @@ class ExecutorToken:
 
 
 class Transaction(ResourceCustody):
-    def __init__(self, target, recovery_id, *, token=None, recover=True):
+    def __init__(self, target, recovery_id, *, token=None, recover=True, pending_view=False):
+        if pending_view and recover:
+            raise ValueError('prospective inspection cannot also recover a transaction')
         if target.target_fd is None or not recovery_name(recovery_id):
             raise RuntimeError('RecoveryBlocked: target EX and exact RecoveryId required')
         self.target, self.recovery_id, self.token = target, recovery_id, token
@@ -81,7 +83,8 @@ class Transaction(ResourceCustody):
         try:
             if recover:
                 self.directory.recover_record('recovery.json')
-            self.data, self.info, self.raw = self.directory.read('recovery.json')
+            read = self.directory.inspect_record if pending_view else self.directory.read
+            self.data, self.info, self.raw = read('recovery.json')
             self.validate()
         except BaseException:
             self.close()
@@ -639,15 +642,17 @@ def accounting(target):
             'recovery_transactions':transactions,'recovery_finish_reserve':FINISH_RESERVE}
 
 
-def inspect_transactions(target):
+def inspect_transactions(target, *, recover=False):
     """Read target-side locators; completed/ready snapshots never cause rollback."""
     result = []
     for name in os.listdir(target.directory.fd):
         if not recovery_name(name):
             continue
-        with Transaction(target,name,recover=not target.root_locked) as transaction:
-            if target.root_locked and any(part.endswith(('.new','.new.owner')) for part in os.listdir(transaction.directory.fd)):
-                raise RuntimeError('RecoveryBlocked: GC does not resume a pending file writer')
+        if recover and target.root_locked:
+            raise RuntimeError('RecoveryBlocked: GC does not resume a pending file writer')
+        with Transaction(target,name,recover=recover) as transaction:
+            if not recover and any(part.endswith(('.new','.new.owner')) for part in os.listdir(transaction.directory.fd)):
+                raise RuntimeError('RecoveryBlocked: read-only inspection retains a pending file writer')
             result.append(transaction.status())
     return result
 

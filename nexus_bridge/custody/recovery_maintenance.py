@@ -152,7 +152,7 @@ def snapshotless_preview(target,recovery_id,evidence):
     from target_journal import Journal
     from recovery_transaction import inspect_transactions
     if Journal(target,recover=False).value.get('file_intents') or any(
-            item['phase'] not in ('restored','opened','archived') for item in inspect_transactions(target)):
+            item['phase'] not in ('restored','opened','archived') for item in inspect_transactions(target,recover=False)):
         raise RuntimeError('MaintenanceBlocked: unresolved file transaction requires its exact RecoveryId')
     parent=Directory(target.target.parent,private=False)
     parent.inherit_volume(target.directory)
@@ -167,6 +167,17 @@ def snapshotless_preview(target,recovery_id,evidence):
 
 
 def apply(target,transaction,plan,plan_hash):
+    # The fresh locked preview and approved hash bind the entire pending tree.
+    # Only now may that exact prospective record become the committed record.
+    expected=transaction.raw
+    def validate(raw):
+        if raw != expected:
+            raise RuntimeError('MaintenanceBlocked: approved pending record changed')
+    transaction.directory.recover_record('recovery.json',validate=validate)
+    transaction.data,transaction.info,transaction.raw=transaction.directory.read('recovery.json')
+    if transaction.raw != expected:
+        raise RuntimeError('MaintenanceBlocked: approved transaction changed')
+    transaction.validate()
     transaction.resume_executor()
     permission=transaction.data.get('manual_offline_recovery')
     if permission is None or permission['plan_sha256'] != plan_hash:
@@ -250,7 +261,7 @@ def main():
                     result['status']=apply(target,transaction,plan,plan_hash)
             print(json.dumps(result,sort_keys=True))
             return 0
-        with Transaction(target,args.transaction,recover=False) as transaction:
+        with Transaction(target,args.transaction,recover=False,pending_view=True) as transaction:
             plan,plan_hash=accepted_preview(target,transaction,evidence)
             result={'dry_run':args.dry_run,'plan':plan,'plan_sha256':plan_hash,
                     'bridge_dir':str(Path(__file__).parent),'prepared_python':sys.executable,
