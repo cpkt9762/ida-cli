@@ -52,6 +52,39 @@ def action(root,kind,crash):
 
 
 class UnpublishedCreation(unittest.TestCase):
+    def test_preview_never_inventories_a_live_publishers_unbound_scratch(self):
+        import threading
+        from unittest.mock import patch
+        from target_coordination import Target
+        import recovery_maintenance as maintenance
+        from target_journal import ObservationPending
+        root=Path(tempfile.mkdtemp(prefix='scratch-live-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
+        path=root/'tiny.i64';path.write_bytes(b'private publisher target');path.chmod(0o600)
+        arrived,proceed=threading.Event(),threading.Event()
+        failures=[]
+        with Target(path) as target,target.locked():
+            directory=target.directory.child('publisher')
+            def boundary(_directory,name,stage):
+                if name=='checkpoint.json' and stage=='unbound_created':
+                    arrived.set()
+                    if not proceed.wait(3):raise TimeoutError('publisher test barrier')
+            def publish():
+                try:
+                    with directory.fact_view():
+                        directory.durable('checkpoint.json',{'complete':'owned checkpoint'},immutable=True)
+                except BaseException as error:failures.append(error)
+            thread=threading.Thread(target=publish)
+            with patch('durable_records.boundary',boundary):
+                thread.start()
+                try:
+                    self.assertTrue(arrived.wait(2),'actual create-before-binding boundary')
+                    with self.assertRaises(ObservationPending):maintenance.scratch_inventory(target)
+                finally:
+                    proceed.set();thread.join(3)
+                    directory.close()
+            self.assertFalse(thread.is_alive());self.assertEqual(failures,[])
+            self.assertEqual(maintenance.scratch_inventory(target),[])
+
     def test_installed_maintenance_deletes_only_the_approved_unpublished_identity(self):
         from test_recovery_preview import Preview,evidence_for,fingerprints
         from target_coordination import Target

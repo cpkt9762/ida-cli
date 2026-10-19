@@ -82,6 +82,9 @@ def scratch_inventory(target):
         elif type(value) is str and preparation_name(Path(value).name):
             references.add(Path(value).name)
     def scan(directory, depth=0):
+        with directory.fact_view(shared=True):
+            scan_locked(directory,depth)
+    def scan_locked(directory,depth):
         if depth>8 or len(candidates)>4096:
             raise RuntimeError('MaintenanceBlocked: scratch inventory exceeds bound')
         for name in sorted(os.listdir(directory.fd)):
