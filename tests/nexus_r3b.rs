@@ -1,5 +1,6 @@
 //! K2 acquisition contracts. Cross-layer cases use the production adapter below.
 use ida_mcp::nexus::*;
+#[cfg(feature = "nexus-test-support")]
 use ida_mcp::process_spawn::AsyncOutputFenced;
 use serde_json::json;
 
