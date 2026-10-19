@@ -106,6 +106,35 @@ struct State {
     stop: tokio_util::sync::CancellationToken,
 }
 impl State {
+    /// Known save refusal is independent of sideband persistence and physical
+    /// release. Call only after the exact observation/terminal is authorized.
+    fn remember_save_guard_error(
+        &self,
+        lease: &SessionLease,
+        value: &Value,
+    ) -> Result<(), NexusError> {
+        let Some(message) = value.as_str().filter(|message| !message.is_empty()) else {
+            return Ok(());
+        };
+        let mut errors = self
+            .release_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = errors
+            .entry(lease.lease_id.clone())
+            .or_insert_with(|| (lease.clone(), String::new()));
+        if entry.0 != *lease {
+            return Err(invalid("save diagnostic lease mismatch"));
+        }
+        if !entry.1.contains(message) {
+            if !entry.1.is_empty() {
+                entry.1.push_str("; ");
+            }
+            entry.1.push_str(message);
+        }
+        Ok(())
+    }
+
     fn open_reply(
         &self,
         id: &OperationId,
@@ -1658,13 +1687,6 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
                     return Err(invalid("duplicate release terminal"));
                 }
                 if let DeliveryTarget::Release { lease } = &attempt.target {
-                    if let Some(message) = event["save_guard_error"].as_str() {
-                        state
-                            .release_errors
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(lease.lease_id.clone(), (lease.clone(), message.into()));
-                    }
                     if let Some(message) = event["local_cleanup_error"].as_str() {
                         let mut errors = state
                             .release_errors
@@ -1779,6 +1801,7 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
             "released" | "uncertain" | "not_sent" | "failed" | "remote_error"
         ) {
             if let DeliveryTarget::Release { lease } = &attempt.target {
+                state.remember_save_guard_error(lease, &event["save_guard_error"])?;
                 let mut facts = state
                     .release_facts
                     .lock()

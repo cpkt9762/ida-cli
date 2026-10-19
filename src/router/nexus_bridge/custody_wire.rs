@@ -304,13 +304,7 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                 "epoch":binding["subscription_epoch"],"owner":event["owner"],
                 "attempt":attempt,"observation_id":nonce,"outcome":event["outcome"]}))
                 .await?;
-            if let Some(message) = event["outcome"]["save_guard_error"].as_str() {
-                state
-                    .release_errors
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(lease.lease_id.clone(), (lease.clone(), message.into()));
-            }
+            state.remember_save_guard_error(&lease, &event["outcome"]["save_guard_error"])?;
             let mut facts = state
                 .release_facts
                 .lock()

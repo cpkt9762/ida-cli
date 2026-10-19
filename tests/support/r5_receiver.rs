@@ -687,3 +687,138 @@ async fn r2_duplicate_release_failure_cannot_replace_original_diagnostics() {
         "original cause"
     );
 }
+
+// These are actual Rust/N1/control-reader contract tests with supplied terminal
+// fields. The production guard + SDK/helper/writer case lives in nexus_r3b_fix4.
+#[tokio::test]
+async fn rr3_accepted_terminal_keeps_guard_across_empty_observations_and_typed_errors() {
+    let mut rig = Rig::new();
+    let (lease, _) = rig.open("rr3-fields").await;
+    let error = NexusError::caused_by(
+        NexusErrorCode::OperationFailed,
+        "original command cause",
+        NexusError::new(NexusErrorCode::ExecutionTimeout, "original nested cause"),
+    );
+    let observation_error =
+        json!({"code":"operation_failed","message":"independent writer failure"});
+    let mut evidence = Vec::new();
+    for guard in [
+        json!("known save refusal"),
+        json!(""),
+        Value::Null,
+        json!("second save refusal"),
+    ] {
+        let attempt = rig.release(&lease).await;
+        rig.control
+            .send(json!({"event":"not_sent","attempt":attempt,"error":error,
+            "save_guard_error":guard,"observation_error":observation_error,
+            "outcome":{"stage":"preflight","detach_called":false,"save_guard_error":guard}}))
+            .await;
+        rig.event("not_sent").await;
+        let status = rig
+            .state
+            .endpoint
+            .transition(|s, _| s.status(&lease.client_id, &lease))
+            .expect("exact N1 status");
+        let delivery = status.control_delivery.expect("original delivery");
+        assert_eq!(delivery.attempt, attempt);
+        assert_eq!(delivery.state, DeliveryState::NotSent);
+        assert_eq!(delivery.error, Some(error.clone()));
+        let saved =
+            rig.state.release_errors.lock().expect("save diagnostics")[&lease.lease_id].clone();
+        assert_eq!(saved.0, lease);
+        assert!(
+            saved.1.contains("known save refusal"),
+            "later empty observation cleared known refusal"
+        );
+        if guard == "second save refusal" {
+            assert!(saved.1.contains("second save refusal"));
+        }
+        let facts = rig.state.release_facts.lock().expect("release facts")[&lease.lease_id].clone();
+        assert_eq!(facts.0, lease);
+        assert_eq!(facts.1["attempt"], json!(attempt));
+        assert_eq!(facts.1["command_error"], json!(error));
+        assert_eq!(facts.1["observation_error"], observation_error);
+        assert_eq!(facts.1["preflight"]["save_guard_error"], guard);
+        assert_eq!(
+            facts.1["original_preflight"]["save_guard_error"],
+            "known save refusal"
+        );
+        evidence
+            .push(json!({"attempt":attempt,"error":error,"guard_field":guard,"retained":saved.1}));
+    }
+    if let Some(root) = std::env::var_os("R5_ROOT") {
+        std::fs::write(
+            PathBuf::from(root).join("rr3-field-contract.json"),
+            serde_json::to_vec_pretty(&evidence).expect("contract JSON"),
+        )
+        .expect("contract evidence");
+    }
+}
+
+#[tokio::test]
+async fn rr3_rejected_and_duplicate_terminals_cannot_poison_save_diagnostics() {
+    let mut rig = Rig::new();
+    let (a, _) = rig.open("rr3-a").await;
+    let (b, _) = rig.open("rr3-b").await;
+    let attempt = rig.release(&a).await;
+    let valid = json!({"event":"not_sent","attempt":attempt,"save_guard_error":"known refusal",
+        "error":{"code":"operation_failed","message":"original error"},
+        "outcome":{"stage":"preflight","detach_called":false,"save_guard_error":"known refusal"}});
+    for variant in ["lease", "generation", "instance", "attempt", "rejected-ack"] {
+        let mut event = valid.clone();
+        match variant {
+            "lease" => event["attempt"]["target"]["lease"] = json!(b),
+            "generation" => {
+                event["attempt"]["target"]["lease"]["generation"] = json!(a.generation + 1)
+            }
+            "instance" => {
+                event["attempt"]["target"]["lease"]["instance_id"] = json!("foreign-instance")
+            }
+            "attempt" => event["attempt"]["sequence"] = json!(attempt.sequence.get() + 1),
+            _ => {
+                event["event"] = json!("released");
+                event["outcome"]["lease_released"] = json!(false);
+            }
+        }
+        event["save_guard_error"] = json!("foreign save diagnosis");
+        rig.control.send(event).await;
+        rig.event("event_rejected").await;
+        assert!(
+            rig.state
+                .release_errors
+                .lock()
+                .expect("diagnostics")
+                .is_empty(),
+            "{variant} poisoned diagnostics"
+        );
+        assert!(
+            rig.state.release_facts.lock().expect("facts").is_empty(),
+            "{variant} poisoned facts"
+        );
+    }
+    rig.control.send(valid.clone()).await;
+    rig.event("not_sent").await;
+    let errors = rig
+        .state
+        .release_errors
+        .lock()
+        .expect("diagnostics")
+        .clone();
+    let facts = rig.state.release_facts.lock().expect("facts").clone();
+    let mut duplicate = valid;
+    duplicate["save_guard_error"] = json!("duplicate save diagnosis");
+    duplicate["error"]["message"] = json!("duplicate command error");
+    rig.control.send(duplicate).await;
+    rig.event("event_rejected").await;
+    assert_eq!(
+        *rig.state.release_errors.lock().expect("diagnostics"),
+        errors
+    );
+    assert_eq!(*rig.state.release_facts.lock().expect("facts"), facts);
+    assert!(
+        !errors.contains_key(&b.lease_id),
+        "another lease acquired diagnostic history"
+    );
+    rig.b_query(&b).await;
+}
