@@ -130,6 +130,8 @@ notifyOnFinish=true；同仓库workspaceId默认省略，真实工作目录写�
 
 所有派单记录应包含 agent ID、实际模型/档位、worktree、输入 SHA、产出 SHA、测试结果和证据目录。
 
+编排者按定时巡检跟进在途 worker：2026-10-20 起每 30 分钟一次（替代原 15 分钟巡检）；最后一条命令结束后超过 5 分钟无可核实进展，向原 worker 发一次继续，不取消、不换人。
+
 ### 3.3 每次委托的角色前言
 
 编排者按当前profile notes，从 `~/.paseo-solarb/roles/` 读取对应完整角色卡，原样放在initialPrompt开头，再接七字段委托单；实现用dev角色卡，只读审查用review角色卡，本阶段Claude交叉复审保留已批准配置。不得修改实际角色卡/全局配置，也不得再复制旧计划里Sol/xhigh的自造实现或审查前言。
@@ -151,9 +153,9 @@ notifyOnFinish=true；同仓库workspaceId默认省略，真实工作目录写�
 
 | 顺序 | 任务 | 开发内容（委托） | 验收（编排者） |
 |---|---|---|---|
-| 1 | R4-fix4 | 修编排者复审的 RV-1（Rust 中转收到的目标锁 FD 须在任何并发 spawn 前置 CLOEXEC）、RV-2（旧 v1 恢复目录逐条隔离，坏条目不阻断无关目标）、RV-3（自建临时/副本文件先持久预留再创建）；补齐原生子进程退出证据，无法映射的明确列为未验证 | 审 diff、复现原反例转绿、全新环境完整矩阵 |
+| 1 | R4-fix4 | 修编排者复审的 RV-1（Rust 中转收到的目标锁 FD 须在任何并发 spawn 前置 CLOEXEC）、RV-2（旧 v1 恢复目录逐条隔离，坏条目不阻断无关目标）、RV-3（自建临时/副本文件先持久预留再创建）；补齐原生子进程退出证据，无法映射的明确列为未验证 | 已完成（2026-10-20 验收 `0ff512b`，见文末 R4 验收记录） |
 | 2 | R6 | 按协议 §11.2 补剩余可达轨迹与清理；O1：macOS 非 APFS/网络卷可打开（仅无 U6 能力）；O2：无未结义务时允许按原生卷 UUID 与协调目录身份重绑定设备号，有义务仍阻断 | 同上；O2 规则如用户另有裁定则改 |
-| 3 | R7 | N7a-R 最终验收包：>100MB 真实库保存/恢复/共享 E2E、全部门禁；U6 真实整机重启产品验证需用户同意并安排一次本机重启，未做则明确列为未验证 | 同一最终 SHA 独立复验 |
+| 3 | R7 | N7a-R 最终验收包：>100MB 真实库保存/恢复/共享 E2E、全部门禁；需要重启或重新挂载的验证在 macOS 系统虚拟机（Virtualization.framework）或 Docker 中做，不重启宿主机，挂载类可用本机磁盘映像；虚拟机内 U6 产品链需测试专用能力注入，真实硬件 U6 明确列为未验证 | 同一最终 SHA 独立复验 |
 | 4 | N7b / N7c | 可在两个独立 worktree 并行：N7b 真实 sBPF/DSC（E24/E25）；N7c 独立 GUI 实例附加（E23），无法自动化时交付人工验证步骤 | 分别验收后由编排者合并 |
 | 5 | N8 前置裁定 | 旧平铺缓存治理是否实现 dry-run 迁移/离线清理工具，需用户裁定 | — |
 | 6 | N8 | 同一候选产物 E00–E28、N0 对照、旧版本回退演练 | 独立复验全部结果 |
@@ -1049,3 +1051,14 @@ R4 fix2定向返修（未验收）：串行r9/verification后继预留先等待�
 bootstrap完整核hash闭包后按实际import编译已读源码，避免每个短writer重复编译无关工具。
 完整128/字节界限与产品期限不改；中性native采集补实际wait/kill-cached/waitpid，
 历史缺口不追认。证据在`n7a-refactor/r4-fix2/`；物理U6/remount及独立审查仍是独立未结门禁。
+
+R4验收（2026-10-20，R6输入）：编排者亲自审查`77fa727..0ff512b`，RV-1（收到的目标锁FD在
+任何并发spawn前置CLOEXEC，进程级spawn/recv栅栏）、RV-2（旧v1恢复目录逐条诊断，坏条目不阻断
+无关目标）、RV-3（字节与owner先写unpublished名，再非覆盖发布）均关闭，测试未放宽断言。
+全新私有根`/tmp/n4k.8tA13u`（新空Cargo target冷编译、新SDK/HOME/state/IPC）在冻结SHA上顺序执行
+129项入口全部exit0，完整库三轮各583 passed/2 ignored；资源审计0存活/0未知出生/0忙锁。
+原生终态：20430出生中20421有实际wait/poll，3仅lifetime，6未匹配（逃逸管道fixture子进程3、
+SDK launcher 2、preprocess后代1），与作者分类一致，保留为未验证，不以absence补终态。
+验收记录见外部`n7a-refactor/r4-acceptance.json`（SHA256
+`09c594158af7f94c3147212796b5575a00d415102b86d06a7a812c55658acc1b`）。物理重启/remount U6移R7（虚拟机或Docker），
+sameboot仍Unsupported；O1非APFS卷、O2设备号重绑定及unpublished scratch维护出路进入R6。
