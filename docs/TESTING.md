@@ -1326,7 +1326,7 @@ still completes; duplicates cannot block the control reader's custody RPC reply.
 
 ### N7a-R R3b K2 orchestration (implementation, awaiting independent review)
 
-The current adapter contract is wire2/schema1, release3/open2/custody4/helper2,
+The current adapter contract is wire2/schema1, release4/open2/custody4/helper2,
 SDK boundary2 and target_gate1. The fixed SDK modules and four patches are
 unchanged; partial installations and mismatched capability sets are rejected.
 `nexus_r3b` exercises actual N1, installed bridge/helper and the fixed SDK over
@@ -1419,3 +1419,26 @@ facts: only both can return an unleased startup reservation, so an intermediate
 owner exit cannot free a slot while the SDK still resolves. A late disposed
 callback remains cleanup-only. The old transport fixtures use explicit boundary
 doubles and cannot provide production custody/proof evidence.
+
+The fix3 `nexus_r3b_fix3` tests retain the ordinary `nexus_close_token` path.
+They wait for the primary public proof, producer/consumer closure and retirement
+ACK removal before resuming the original preflight, and compare the caller, N1
+attempt and status's structured cause/NotSent facts. Each case needs its own
+private root and `--exact`. Foreign lease/generation/ordinal/owner/watch/attempt
+inputs and a real target-writer summary quota refusal are separate negative cases.
+The test continuously consumes lifecycle events without enlarging the broadcast.
+
+Release4 requires `retired_release_observation_v1` on both installed peers.
+An exact public-proof tombstone plus N1's original acquisition/lease validates
+a late observation; the target's bounded summary retains its complete binding
+and nonce/attempt outcome without recreating resource references. Old summaries
+cannot acquire missing authority. A failed observation write returns NotSent
+before detach and exposes `observation_error` independently of the original cause.
+SDK versions, three module hashes and four patches remain unchanged.
+
+`test_writer_authorization.py` invokes the actual independent target writer with
+real Target EX. Cleanup validates its existing scope before any default Journal
+recovery; missing/foreign/conflicted/null/corrupt inputs preserve journal, payload
+and controlled manifest references. Ordinary recovery and legal cleanup remain
+positive controls. Its completed epoch flags and reference manifests are explicit
+file-boundary fixtures, not N1/helper/public-owner proofs.
