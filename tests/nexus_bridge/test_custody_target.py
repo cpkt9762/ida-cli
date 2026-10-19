@@ -18,6 +18,49 @@ from acquisition import Custodian
 
 
 class TargetCustody(unittest.TestCase):
+    def test_capabilities_are_measured_before_coordination_and_cleanup_on_refusal(self):
+        from target_coordination import preflight_capabilities
+        import recovery_files
+        original_link=os.link
+        for fault in ('rename','hardlink','write'):
+            with self.subTest(fault=fault):
+                code=errno.ENOTSUP if fault!='write' else errno.ENOSPC
+                def refuse(*_args,**_kwargs):
+                    raise OSError(code,'actual filesystem exception injection')
+                def link(*args,**kwargs):
+                    return refuse() if fault=='hardlink' else original_link(*args,**kwargs)
+                with patch.object(recovery_files,'rename_noreplace',refuse) if fault=='rename' else patch.object(os,'link',link), \
+                        patch.object(os,'write',refuse) if fault=='write' else patch.object(os,'pread',os.pread):
+                    with self.assertRaisesRegex(RuntimeError,'FilesystemCapabilitiesRefused') as caught:
+                        preflight_capabilities(self.path)
+                diagnostic=json.loads(str(caught.exception).split(': ',1)[1])
+                self.assertFalse(diagnostic['supported'])
+                self.assertEqual(diagnostic['cleanup_errors'],[])
+                self.assertEqual(diagnostic.get('probe_error',{}).get('errno') if fault=='write'
+                    else diagnostic['no_replace_rename' if fault=='rename' else 'hardlink']['errno'],code)
+                self.assertEqual(set(self.root.iterdir()),{self.path})
+                self.assertEqual(self.path.read_bytes(),b'private target input')
+
+    def test_darwin_case_alias_uses_disk_spelling_and_one_stable_exclusion(self):
+        if sys.platform!='darwin':
+            from target_coordination import folded
+            self.assertEqual(folded(self.root/'Foo.i64')==folded(self.root/'foo.i64'),os.name=='nt')
+            return
+        physical=self.root/'Foo.i64';physical.write_bytes(b'private case alias');physical.chmod(0o600)
+        lower=self.root/'foo.i64'
+        with Target(lower) as first,first.locked():
+            self.assertEqual(first.target.name,'Foo.i64')
+            identity=os.fstat(first.target_fd).st_ino
+            key=first.key
+            with Target(physical) as second:
+                self.assertEqual(second.key,key)
+                with self.assertRaises(BlockingIOError):
+                    with second.locked(nb=True):self.fail('case alias obtained a different lock')
+        with Target(lower) as target,target.locked():
+            self.assertEqual(target.key,key)
+            self.assertEqual(os.fstat(target.target_fd).st_ino,identity)
+            self.assertEqual(target.target.name,'Foo.i64')
+
     def setUp(self):
         base = Path(os.environ['R3A_CASE_ROOT'])
         base.mkdir(parents=True, exist_ok=True)

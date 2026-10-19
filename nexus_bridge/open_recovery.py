@@ -135,7 +135,7 @@ class OpenGate:
         from target_journal import Journal
         from owner_identity import state_identity
         try:
-            self.target = Target(self.path)  # Actual managed root SH precedes home locks.
+            self.target = Target(self.path,for_open=True)  # Actual managed root SH precedes home locks.
             self.legacy = open_locks(self.root, self.path, self.deadline)
             self.legacy.__enter__()
             self.lock()

@@ -366,7 +366,9 @@ impl NexusBridge {
             .values().map(|r|json!({"watch":r.watch,"target":r.target,"owner":r.owner,
                 "lease":r.lease,"acquisition":r.acquisition,"public_proof_adopted":r.proof.is_some(),
                 "producer_closed":r.consumer.is_some(),"bridge_closed":r.bridge_proof_ack,
-                "boot_retirement_scope":r.origin_binding["boot_retirement_capability"]})).collect();
+                "boot_retirement_scope":r.origin_binding["boot_retirement_capability"],
+                "boot_retirement_reason":r.origin_binding["unsupported_reason"],
+                "permission_scope":r.origin_binding["permission_scope"]})).collect();
         let startups: Vec<_> = state
             .startups
             .lock()
@@ -376,7 +378,9 @@ impl NexusBridge {
                 json!({"watch":r["watch"],"target":r["target"],"owner":r["owner"],
                 "acquisition":r["acquisition"],"launch":r["launch"],
                 "public_proof_adopted":r.get("proof").is_some(),
-                "boot_retirement_scope":r["origin_binding"]["boot_retirement_capability"]})
+                "boot_retirement_scope":r["origin_binding"]["boot_retirement_capability"],
+                "boot_retirement_reason":r["origin_binding"]["unsupported_reason"],
+                "permission_scope":r["origin_binding"]["permission_scope"]})
             })
             .collect();
         let blocked = state

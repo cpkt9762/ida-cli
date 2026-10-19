@@ -52,6 +52,105 @@ def rename_noreplace(source, name, destination, destination_name):
         raise OSError(code, 'RecoveryBlocked: non-overwriting rename failed')
 
 
+def probe_capabilities(parent, mounted):
+    """Exercise only fresh owned names; never substitute an overwriting rename."""
+    from target_coordination import Directory, identity
+    result={'filesystem':mounted['filesystem'],'mount':mounted,
+        'no_replace_rename':{'supported':False,'errno':None},
+        'hardlink':{'supported':False,'errno':None},
+        'permission_policy':'private-mode equivalence requires both capabilities'}
+    name='.ida-cli-cap-probe-'+uuid.uuid4().hex
+    directory=None
+    descriptors=[]
+    created=False
+    created_identity=None
+    cleanup=[]
+    try:
+        parent.verify()
+        os.mkdir(name,0o700,dir_fd=parent.fd)
+        created=True
+        created_identity=identity(os.stat(name,dir_fd=parent.fd,follow_symlinks=False))
+        fd=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent.fd)
+        directory=Directory(parent.path/name,private=False,_fd=fd)
+        if (directory.native_identity!=created_identity or directory.native_identity[0]!=parent.native_identity[0]
+                or os.fstat(fd).st_uid!=os.getuid()):
+            raise RuntimeError('capability probe directory identity changed')
+        def create(slot,data):
+            fd=os.open(slot,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600,dir_fd=directory.fd)
+            descriptors.append(fd)
+            if os.write(fd,data)!=len(data):raise OSError(errno.EIO,'short capability probe write')
+            return fd
+        source=create('source',b'x')
+        blocker=create('blocker',b'y')
+        moved=False
+        try:
+            rename_noreplace(directory,'source',directory,'moved')
+        except OSError as error:result['no_replace_rename']['errno']=error.errno
+        else:
+            moved=True
+            try:rename_noreplace(directory,'blocker',directory,'moved')
+            except FileExistsError:
+                if (identity(os.stat('moved',dir_fd=directory.fd,follow_symlinks=False))==identity(os.fstat(source))
+                        and identity(os.stat('blocker',dir_fd=directory.fd,follow_symlinks=False))==identity(os.fstat(blocker))
+                        and os.pread(source,2,0)==b'x' and os.pread(blocker,2,0)==b'y'):
+                    result['no_replace_rename']={'supported':True,'errno':0,'collision_errno':errno.EEXIST}
+            except OSError as error:result['no_replace_rename']['errno']=error.errno
+        source_name='moved' if moved else 'source'
+        try:
+            os.link(source_name,'linked',src_dir_fd=directory.fd,dst_dir_fd=directory.fd,follow_symlinks=False)
+        except OSError as error:result['hardlink']['errno']=error.errno
+        else:
+            try:os.link(source_name,'linked',src_dir_fd=directory.fd,dst_dir_fd=directory.fd,follow_symlinks=False)
+            except FileExistsError:
+                if identity(os.stat('linked',dir_fd=directory.fd,follow_symlinks=False))==identity(os.fstat(source)):
+                    result['hardlink']={'supported':True,'errno':0,'collision_errno':errno.EEXIST}
+            except OSError as error:result['hardlink']['errno']=error.errno
+    except (OSError,RuntimeError) as error:
+        result['probe_error']={'message':str(error),'errno':getattr(error,'errno',None)}
+    finally:
+        if directory is not None:
+            owned=[]
+            for fd in descriptors:
+                try:owned.append(identity(os.fstat(fd)))
+                except OSError as error:cleanup.append(str(error))
+            try:slots=os.listdir(directory.fd)
+            except OSError as error:
+                cleanup.append(str(error))
+                slots=[]
+            for slot in slots:
+                try:
+                    info=os.stat(slot,dir_fd=directory.fd,follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode) or identity(info) not in owned:
+                        cleanup.append('unrecognized probe entry retained: '+str(directory.path/slot))
+                        continue
+                    os.unlink(slot,dir_fd=directory.fd)
+                except OSError as error:cleanup.append(str(error))
+            try:
+                parent.verify()
+                if identity(os.stat(name,dir_fd=parent.fd,follow_symlinks=False))!=directory.native_identity:
+                    cleanup.append('probe directory replacement retained')
+                elif not cleanup:os.rmdir(name,dir_fd=parent.fd)
+            except (OSError,RuntimeError) as error:cleanup.append(str(error))
+            try:directory.close()
+            except OSError as error:cleanup.append(str(error))
+        elif created:
+            try:
+                parent.verify()
+                if identity(os.stat(name,dir_fd=parent.fd,follow_symlinks=False))!=created_identity:
+                    cleanup.append('unverified probe directory replacement retained')
+                else:os.rmdir(name,dir_fd=parent.fd)
+            except (OSError,RuntimeError) as error:cleanup.append(str(error))
+        for fd in descriptors:
+            try:os.close(fd)
+            except OSError as error:cleanup.append(str(error))
+    result['cleanup_errors']=cleanup
+    result['supported']=all(result[key]['supported'] for key in ('no_replace_rename','hardlink')) and not cleanup
+    unsupported={errno.ENOTSUP,errno.EOPNOTSUPP,errno.ENOSYS}
+    result['missing_capabilities']=[key+('_unsupported' if result[key]['errno'] in unsupported else '_unverified')
+                                  for key in ('no_replace_rename','hardlink') if not result[key]['supported']]
+    return result
+
+
 def boundary(action, stage, detail):
     """Process-exit/OS-error test hook; no production action."""
 
@@ -129,6 +228,13 @@ def maybe_info(directory, name):
 
 
 def inventory(directory, coordination=None):
+    # Capability probes use only this parent-directory lock and release it
+    # before target EX. Snapshots cannot record their transient private names.
+    with directory.fact_view(shared=True):
+        return inventory_locked(directory,coordination)
+
+
+def inventory_locked(directory, coordination=None):
     result = {}
     directory.verify()
     names=visible_names(directory) if directory.private else os.listdir(directory.fd)

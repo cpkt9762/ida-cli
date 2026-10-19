@@ -1,5 +1,6 @@
 """Creation scope for durable obligations; never grants OS retirement authority."""
 import hashlib
+import logging
 import os
 from pathlib import Path
 import plistlib
@@ -14,7 +15,64 @@ _scopes = {}
 _lock = threading.Lock()
 
 
-def creation_scope(path, incarnation):
+def native_scope(directory, device):
+    """Collect optional retirement identity without disabling ordinary custody."""
+    reasons = []
+    scope = {'device': device, 'same_boot_eligibility': False,
+        'boot_retirement_capability': 'UnsupportedBootScope'}
+    def query(label, argv, decode=lambda data: data):
+        try:
+            return decode(subprocess.check_output(['timeout', '2s', *argv], stderr=subprocess.PIPE))
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, IndexError) as error:
+            reasons.append(label + ' unavailable: ' + type(error).__name__)
+            return None
+    hardware = query('native machine identity',
+        ['/usr/sbin/ioreg', '-rd1', '-c', 'IOPlatformExpertDevice', '-a'], plistlib.loads)
+    mounted = query('mount identity', ['/bin/df', '-P', str(directory)],
+        lambda data: data.decode().splitlines()[-1].split()[0])
+    volume = query('diskutil volume identity', ['/usr/sbin/diskutil', 'info', '-plist', mounted],
+        plistlib.loads) if mounted else None
+    machine = (hardware[0].get('IOPlatformUUID') if isinstance(hardware, list) and hardware
+        and isinstance(hardware[0], dict) else None)
+    volume = volume if isinstance(volume, dict) else {}
+    native_volume = volume.get('VolumeUUID')
+    for name, value, source in (('machine', machine, 'IOPlatformExpertDevice.IOPlatformUUID'),
+            ('volume', native_volume, 'diskutil.VolumeUUID')):
+        if isinstance(value, str) and value:
+            scope[name+'_source'] = source
+            scope[name+'_sha256'] = hashlib.sha256(value.encode()).hexdigest()
+        else:
+            reasons.append('missing native '+name+' identity')
+    virtualized = query('host virtualization identity', ['/usr/sbin/sysctl', '-n', 'kern.hv_vmm_present'])
+    scope.update(method='IOPlatformUUID/APFS-VolumeUUID/bootsessionuuid-v1',
+        host_domain='Darwin-host-kernel-no-PID-or-time-namespaces',
+        virtualized=(virtualized.strip() != b'0') if virtualized is not None else None,
+        local_internal=volume.get('Internal') is True)
+    from target_coordination import permission_scope
+    descriptor=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:
+        try:scope['permission_scope']=permission_scope(descriptor)
+        except (OSError,RuntimeError) as error:
+            reasons.append('mounted permission scope unavailable: '+type(error).__name__)
+        else:
+            if scope['permission_scope']['relaxed']:
+                reasons.append('permissionless_local_volume')
+    finally:os.close(descriptor)
+    if volume.get('FilesystemType') != 'apfs':
+        reasons.append('filesystem '+str(volume.get('FilesystemType', 'unknown'))+' has no validated U6 capability')
+    if scope['virtualized'] is not False:
+        reasons.append('physical host scope is not established')
+    if not scope['local_internal']:
+        reasons.append('local internal volume scope is not established')
+    if reasons:
+        scope['unsupported_reason'] = '; '.join(reasons)
+        logging.getLogger(__name__).warning('UnsupportedBootScope: %s',scope['unsupported_reason'])
+    else:
+        scope['boot_retirement_capability'] = 'physical_local_apfs_host_v1'
+    return scope
+
+
+def creation_scope(path, incarnation, *, refresh=False):
     directory = Path(path)
     device = directory.stat().st_dev
     if sys.platform != 'darwin':
@@ -27,31 +85,13 @@ def creation_scope(path, incarnation):
             'boot_retirement_capability':'UnsupportedBootScope',
             'unsupported_reason':'creation binding platform not validated'}
     with _lock:
-        if device not in _scopes:
-            def output(argv):
-                return subprocess.check_output(['timeout', '2s', *argv], stderr=subprocess.PIPE)
-            hardware = plistlib.loads(output(['/usr/sbin/ioreg', '-rd1', '-c', 'IOPlatformExpertDevice', '-a']))
-            mounted = output(['/bin/df', '-P', str(directory)]).decode().splitlines()[-1].split()[0]
-            volume = plistlib.loads(output(['/usr/sbin/diskutil', 'info', '-plist', mounted]))
-            machine = hardware[0].get('IOPlatformUUID')
-            native_volume = volume.get('VolumeUUID')
-            if not machine or not native_volume or volume.get('FilesystemType') != 'apfs':
-                raise RuntimeError('UnsupportedBootScope: incomplete local creation identity')
-            _scopes[device] = {'method':'IOPlatformUUID/APFS-VolumeUUID/bootsessionuuid-v1',
-                'machine_source':'IOPlatformExpertDevice.IOPlatformUUID',
-                'machine_sha256':hashlib.sha256(machine.encode()).hexdigest(),
-                'volume_source':'diskutil.VolumeUUID',
-                'volume_sha256':hashlib.sha256(native_volume.encode()).hexdigest(),
-                'device':device, 'host_domain':'Darwin-host-kernel-no-PID-or-time-namespaces',
-                'virtualized':output(['/usr/sbin/sysctl', '-n', 'kern.hv_vmm_present']).strip() != b'0',
-                'local_internal':volume.get('Internal') is True}
+        if refresh or device not in _scopes:
+            _scopes[device] = native_scope(directory, device)
         scope = dict(_scopes[device])
     info = directory.stat()
     scope.update(incarnation=incarnation, creator=capture(os.getpid()),
                  file_id=info.st_ino, uid=info.st_uid,
-                 same_boot_eligibility=False,
-                 boot_retirement_capability=('physical_local_apfs_host_v1'
-                     if not scope['virtualized'] and scope['local_internal'] else 'UnsupportedBootScope'))
+                 same_boot_eligibility=False)
     return scope
 
 

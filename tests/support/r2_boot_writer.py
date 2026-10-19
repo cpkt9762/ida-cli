@@ -10,8 +10,8 @@ from pathlib import Path
 import runpy
 import sys
 
-def observed_scope(native_scope, path, incarnation):
-    current = native_scope(path, incarnation)
+def observed_scope(native_scope, path, incarnation, **options):
+    current = native_scope(path, incarnation, **options)
     source = Path(os.environ['R2_BOOT_SOURCE_INPUT'])
     if source.exists():
         overrides = json.loads(source.read_text())
@@ -41,6 +41,6 @@ if __name__ == '__main__':
     # one injected OS input, while native actor birth/FDs remain unchanged.
     import origin
     native_scope=origin.creation_scope
-    origin.creation_scope=lambda path, incarnation:observed_scope(native_scope,path,incarnation)
+    origin.creation_scope=lambda path, incarnation, **options:observed_scope(native_scope,path,incarnation,**options)
     if hasattr(entry,'creation_scope'):entry.creation_scope=origin.creation_scope
     entry.main()

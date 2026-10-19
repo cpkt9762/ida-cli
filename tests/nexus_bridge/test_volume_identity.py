@@ -35,8 +35,8 @@ def inputs(old=False,overrides=None):
     else:
         import origin
         actual_scope=origin.creation_scope
-        def scope(path,incarnation):
-            value=actual_scope(path,incarnation)
+        def scope(path,incarnation,**options):
+            value=actual_scope(path,incarnation,**options)
             if not (overrides or {}).get('sameboot'):
                 value['creator']=dict(value['creator'],boot_id='00000000-0000-4000-8000-000000000001')
             for key,item in (overrides or {}).items():
@@ -85,7 +85,132 @@ def consume(case,overrides):
     assert hashlib.sha256(Path(reference['target']).read_bytes()).hexdigest()==reference['original_sha256']
 
 
+def quiescent_scene(case,variant):
+    inputs(old=True)
+    from target_coordination import Target
+    from target_journal import Journal
+    path=case/'tiny.i64';path.write_bytes(b'quiescent target bytes');path.chmod(0o600)
+    with Target(path) as target,target.locked():
+        if variant in ('acquisition','helper','startup'):
+            Journal(target).begin({'parent':{'operation_id':'r6-private'},'purpose':'final','ordinal':1},
+                'r6-unclosed',owner={'record_id':'r6-owner'} if variant=='helper' else None,
+                launch={'suffix':'r6-private-launch'} if variant=='startup' else None)
+        elif variant=='pending':
+            from unittest.mock import patch
+            def stop(_directory,name,stage):
+                if name=='custody.json' and stage=='before_rename':raise RuntimeError('retain real pending write')
+            with patch('durable_records.boundary',stop):
+                try:target.directory.durable('custody.json',Journal(target).value)
+                except RuntimeError as error:assert 'retain real pending' in str(error)
+                else:raise AssertionError('pending boundary missed')
+        (case/'quiescent.json').write_text(json.dumps({'target':str(path),'key':target.key,
+            'lock_inode':os.fstat(target.target_fd).st_ino,'directory':str(target.directory.path),
+            'target_record':(target.directory.path/'target.json').read_text()}))
+
+
+def reopen_quiescent(case,options):
+    inputs(overrides={'sameboot':True,**options.get('scope',{})})
+    from target_coordination import Target
+    if options.get('crash'):
+        import durable_records
+        def stop(_directory,name,stage):
+            if name=='volume.json' and stage==options['crash']:os._exit(97)
+        durable_records.boundary=stop
+    ref=json.loads((case/'quiescent.json').read_text())
+    with Target(ref['target']) as target,target.locked():
+        assert target.key==ref['key']
+        assert os.fstat(target.target_fd).st_ino==ref['lock_inode']
+        assert (target.directory.path/'target.json').read_text()==ref['target_record']
+        binding=target.directory.read('volume.json')[0]
+        assert binding['schema']==2 and binding['mapped_device']==os.fstat(target.target_fd).st_dev
+        assert binding['device']!=binding['mapped_device']
+    assert Path(ref['target']).read_bytes()==b'quiescent target bytes'
+
+
 class VolumeEpoch(unittest.TestCase):
+    def test_permission_equivalence_requires_local_mount_owner_file_owner_and_allowlisted_type(self):
+        from unittest.mock import patch
+        import stat
+        import types
+        import target_coordination as coordination
+        root=Path(tempfile.mkdtemp(prefix='mount-policy-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
+        path=root/'private-file';path.write_bytes(b'permission decision input');path.chmod(0o666)
+        descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
+        real=os.fstat(descriptor)
+        variants=[('exfat',0x1000,os.getuid(),os.getuid(),True),
+            ('exfat',0,os.getuid(),os.getuid(),False),
+            ('exfat',0x1000,os.getuid()+1,os.getuid(),False),
+            ('exfat',0x1000,os.getuid(),os.getuid()+1,False),
+            *[(fs,0x1000,os.getuid(),os.getuid(),False) for fs in ('apfs','hfs','smbfs','nfs','afpfs')]]
+        try:
+            for fs,flags,mounter,owner,accepted in variants:
+                with self.subTest(filesystem=fs,flags=flags,mounter=mounter,owner=owner):
+                    observed=types.SimpleNamespace(st_mode=stat.S_IFREG|0o666,st_uid=owner,
+                        st_nlink=1,st_dev=real.st_dev)
+                    mount=dict(filesystem=fs,flags=flags,owner=mounter,fsid=[123,456])
+                    with patch.object(coordination,'native_mount',return_value=mount), \
+                            patch.object(coordination,'capability_status',return_value={'supported':True}), \
+                            patch.object(os,'fstat',return_value=observed):
+                        if accepted:self.assertIs(coordination.checked(descriptor),observed)
+                        else:
+                            with self.assertRaisesRegex(RuntimeError,'CoordinationBlocked'):
+                                coordination.checked(descriptor)
+            self.assertEqual(path.stat().st_ino,real.st_ino)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode),0o666,'classification must be read-only')
+        finally:os.close(descriptor)
+
+    def test_sameboot_quiescent_rebinding_is_durable_before_effect_and_resumes_after_exit(self):
+        for fault in (None,'owner_published','before_rename','after_rename','directory_fsynced'):
+            with self.subTest(fault=fault):
+                case=Path(tempfile.mkdtemp(prefix='quiescent-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
+                self.assertEqual(self.child(case,'--quiescent-produce',{'variant':'clean'}).returncode,0)
+                if fault:
+                    result=self.child(case,'--quiescent-consume',{'crash':fault})
+                    self.assertEqual(result.returncode,97,result.stderr)
+                result=self.child(case,'--quiescent-consume')
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(self.child(case,'--quiescent-consume').returncode,0,'persisted mapping must reopen')
+
+    def test_sameboot_rebinding_keeps_each_unsettled_obligation_and_missing_uuid_blocked(self):
+        for variant,options in [('acquisition',{}),('helper',{}),('startup',{}),('pending',{}),
+                ('clean',{'scope':{'volume_sha256':None}}),('clean',{'scope':{'volume_sha256':'0'*64}})]:
+            with self.subTest(variant=variant,options=options):
+                case=Path(tempfile.mkdtemp(prefix='rebind-block-',dir=os.environ['R3A_CASE_ROOT'])).resolve()
+                result=self.child(case,'--quiescent-produce',{'variant':variant})
+                self.assertEqual(result.returncode,0,result.stderr)
+                directory=Path(json.loads((case/'quiescent.json').read_text())['directory'])
+                before={str(p):p.read_bytes() for p in directory.rglob('*') if p.is_file()}
+                result=self.child(case,'--quiescent-consume',options)
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('UnsupportedBootScope',result.stderr)
+                self.assertEqual({str(p):p.read_bytes() for p in directory.rglob('*') if p.is_file()},before)
+
+    def test_unavailable_or_non_apfs_native_scope_is_explicitly_unsupported(self):
+        from unittest.mock import patch
+        import plistlib
+        import origin
+        for variant in ('exfat','hfs','smbfs','nfs','diskutil','machine','volume','mount'):
+            with self.subTest(variant=variant):
+                def output(argv,**_options):
+                    if '/usr/sbin/ioreg' in argv:
+                        return plistlib.dumps([{} if variant=='machine' else {'IOPlatformUUID':'private-native-machine'}])
+                    if '/bin/df' in argv:
+                        return b'' if variant=='mount' else b'Filesystem Used Available Capacity Mounted\n/private-device 1 2 3 /private\n'
+                    if '/usr/sbin/diskutil' in argv:
+                        if variant=='diskutil':raise subprocess.CalledProcessError(1,argv)
+                        return plistlib.dumps(dict(FilesystemType=variant if variant in ('exfat','hfs','smbfs','nfs') else 'apfs',
+                            **({} if variant=='volume' else {'VolumeUUID':'private-native-volume'}),Internal=True))
+                    if '/usr/sbin/sysctl' in argv:return b'0\n'
+                    raise AssertionError(argv)
+                with patch.object(origin.subprocess,'check_output',side_effect=output), \
+                        self.assertLogs('origin',level='WARNING') as diagnostics:
+                    scope=origin.native_scope(Path(os.environ['R3A_CASE_ROOT']),123)
+                self.assertEqual(scope['boot_retirement_capability'],'UnsupportedBootScope')
+                self.assertTrue(scope['unsupported_reason'])
+                self.assertIn(scope['unsupported_reason'],diagnostics.output[0])
+                with self.assertRaisesRegex(RuntimeError,'UnsupportedBootScope'):
+                    origin.boot_change(scope,scope)
+
     def child(self,case,mode,overrides=None):
         environment=dict(os.environ)
         if mode=='--legacy-produce':
@@ -132,7 +257,9 @@ class VolumeEpoch(unittest.TestCase):
 
 
 if __name__=='__main__':
-    if len(sys.argv)>1 and sys.argv[1]=='--produce':produce(Path(sys.argv[2]))
+    if len(sys.argv)>1 and sys.argv[1]=='--quiescent-produce':quiescent_scene(Path(sys.argv[2]),json.loads(sys.argv[3])['variant'])
+    elif len(sys.argv)>1 and sys.argv[1]=='--quiescent-consume':reopen_quiescent(Path(sys.argv[2]),json.loads(sys.argv[3]))
+    elif len(sys.argv)>1 and sys.argv[1]=='--produce':produce(Path(sys.argv[2]))
     elif len(sys.argv)>1 and sys.argv[1]=='--produce-managed':produce(Path(sys.argv[2]),True)
     elif len(sys.argv)>1 and sys.argv[1]=='--consume':consume(Path(sys.argv[2]),json.loads(sys.argv[3]))
     elif len(sys.argv)>1 and sys.argv[1] in ('--partial-import','--resume-import'):

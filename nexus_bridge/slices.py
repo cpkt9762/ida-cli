@@ -59,7 +59,7 @@ def attach_cleanup(instance):
     Target = isolated_import('target_coordination').Target
     Journal = isolated_import('target_journal').Journal
     identity = isolated_import('owner_identity')
-    with Target(instance.idb_path) as target:
+    with Target(instance.idb_path,for_open=True) as target:
         with target.locked(deadline=time.monotonic()+5):
             target.business_admission()
             journal = Journal(target)

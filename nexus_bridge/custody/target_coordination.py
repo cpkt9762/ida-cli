@@ -19,6 +19,75 @@ RESERVE = 8
 SUMMARY_LIMIT = 64
 SUMMARY_BYTES = 16384
 MAX_RECORD = 1024 * 1024
+_permission_diagnostics = set()
+_capabilities = {}
+
+
+def capability_key(fd, mounted):
+    return (os.fstat(fd).st_dev,mounted['filesystem'],mounted['flags'],mounted['owner'],tuple(mounted['fsid']))
+
+
+def capability_status(fd, mounted=None):
+    mounted=mounted or native_mount(fd)
+    value=_capabilities.get(capability_key(fd,mounted),{'supported':False,'reason':'not_measured'})
+    return json.loads(encoded(value))
+
+
+def native_mount(fd):
+    """Darwin SDK sys/mount.h __DARWIN_STRUCT_STATFS64, queried by FD."""
+    import ctypes
+    if sys.platform != 'darwin':
+        return {'filesystem':'unvalidated','flags':0,'owner':-1,'fsid':[]}
+    class Statfs(ctypes.Structure):
+        _fields_=[('bsize',ctypes.c_uint32),('iosize',ctypes.c_int32),
+            ('counts',ctypes.c_uint64*5),('fsid',ctypes.c_int32*2),
+            ('owner',ctypes.c_uint32),('type',ctypes.c_uint32),
+            ('flags',ctypes.c_uint32),('subtype',ctypes.c_uint32),
+            ('filesystem',ctypes.c_char*16),('mounted_on',ctypes.c_char*1024),
+            ('mounted_from',ctypes.c_char*1024),('flags_ext',ctypes.c_uint32),
+            ('reserved',ctypes.c_uint32*7)]
+    if ctypes.sizeof(Statfs)!=2168 or Statfs.owner.offset!=56 or Statfs.filesystem.offset!=72:
+        raise RuntimeError('CoordinationBlocked: unvalidated native statfs ABI')
+    value=Statfs()
+    function=ctypes.CDLL(None,use_errno=True).fstatfs
+    function.argtypes=(ctypes.c_int,ctypes.POINTER(Statfs))
+    function.restype=ctypes.c_int
+    if function(fd,ctypes.byref(value)):
+        code=ctypes.get_errno()
+        raise OSError(code,'native mounted-volume identity unavailable')
+    return {'filesystem':bytes(value.filesystem).decode('ascii'),
+            'flags':value.flags,'owner':value.owner,'fsid':list(value.fsid)}
+
+
+def permission_scope(fd):
+    """Only current-user mounted, local permissionless filesystems qualify."""
+    mounted=native_mount(fd)
+    info=os.fstat(fd)
+    candidate=(mounted['filesystem'] in ('exfat','msdos','msdosfs','fat')
+        and type(mounted['flags']) is int and bool(mounted['flags'] & 0x1000)
+        and type(mounted['owner']) is int and mounted['owner']==os.getuid()
+        and info.st_uid==os.getuid())
+    capabilities=capability_status(fd,mounted)
+    relaxed=candidate and capabilities.get('supported') is True
+    result=dict(mounted,relaxed=relaxed,
+        reason=('permissionless_local_volume' if relaxed else
+                'filesystem_capabilities_not_verified' if candidate else 'strict_unix_mode'),
+        capabilities=capabilities,
+        basis='statfs filesystem allowlist + MNT_LOCAL + f_owner + st_uid',
+        chmod_probe='not run: filesystem type policy; inspection is read-only')
+    if candidate:
+        import logging
+        key=(info.st_dev,tuple(mounted['fsid']),mounted['owner'],mounted['filesystem'],relaxed)
+        if key not in _permission_diagnostics:
+            _permission_diagnostics.add(key)
+            logging.getLogger(__name__).warning('permissionless_local_volume: %s',encoded(result).decode())
+    return result
+
+
+def private_mode(fd, value, *, directory=False):
+    if stat.S_IMODE(value.st_mode)==(0o700 if directory else 0o600):
+        return True
+    return permission_scope(fd)['relaxed']
 
 
 def encoded(value):
@@ -37,7 +106,7 @@ def checked(fd, directory=False):
     value = os.fstat(fd)
     expected = stat.S_ISDIR if directory else stat.S_ISREG
     if (not expected(value.st_mode) or value.st_uid != os.getuid()
-            or stat.S_IMODE(value.st_mode) != (0o700 if directory else 0o600)
+            or not private_mode(fd,value,directory=directory)
             or (not directory and value.st_nlink != 1)):
         raise RuntimeError('CoordinationBlocked: untrusted type/uid/mode/link identity')
     return value
@@ -283,6 +352,69 @@ def folded(path):
     return value.casefold() if sys.platform == 'darwin' else os.path.normcase(value) if os.name == 'nt' else value
 
 
+def physical_case(parent, target):
+    """Keep the disk spelling of an existing Darwin case alias."""
+    if sys.platform != 'darwin':
+        return target
+    try:fd=os.open(target.name,os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent.fd)
+    except FileNotFoundError:return target
+    try:
+        info=os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError('CoordinationBlocked: target is not a regular database')
+        # Darwin SDK fcntl.h F_GETPATH; no database bytes are read.
+        name=Path(os.fsdecode(fcntl.fcntl(fd,50,bytes(1024)).split(b'\0',1)[0])).name
+        if name.casefold()==target.name.casefold():
+            if identity(os.stat(name,dir_fd=parent.fd,follow_symlinks=False))!=identity(info):
+                raise RuntimeError('CoordinationBlocked: physical case alias changed')
+            return target.with_name(name)
+        return target  # Preserve the declared Nexus key for non-case Unicode differences.
+    finally:os.close(fd)
+
+
+def preflight_capabilities(path):
+    """Before business admission, probe outside the stable coordination tree."""
+    from recovery_files import probe_capabilities
+    target=Path(canonical(path))
+    parent=Directory(target.parent,private=False)
+    root=None
+    try:
+        probe=parent
+        if target.parent.parent.name in ('generations','quarantine'):
+            root=Directory(target.parent.parent.parent,private=False)
+            if root.native_identity[0]!=parent.native_identity[0]:
+                raise RuntimeError('CoordinationBlocked: managed payload crosses its resource-root volume')
+            probe=root
+        mounted=native_mount(probe.fd)
+        with probe.fact_view():
+            result=probe_capabilities(probe,mounted)
+        _capabilities[capability_key(probe.fd,mounted)]=result
+        if not result['supported']:
+            import logging
+            message='FilesystemCapabilitiesRefused: '+encoded(result).decode()
+            logging.getLogger(__name__).warning('%s',message)
+            raise RuntimeError(message)
+        return result
+    finally:
+        if root is not None:root.close()
+        parent.close()
+
+
+def case_authority(authority, requested):
+    """Nexus case identity cannot merge two distinct existing database files."""
+    if type(authority) is not str or Path(authority).parent!=Path(requested).parent:
+        return False
+    if authority==str(requested):return True
+    if folded(authority)!=folded(requested):return False
+    observed=[]
+    for path in (authority,requested):
+        try:observed.append(identity(os.stat(path,follow_symlinks=False)))
+        except FileNotFoundError:observed.append(None)
+    if all(observed) and observed[0]!=observed[1]:
+        raise RuntimeError('CoordinationBlocked: distinct databases share the Nexus case identity')
+    return True
+
+
 class Target:
     def __copy__(self):
         raise TypeError('target ownership cannot be copied; move it')
@@ -290,7 +422,7 @@ class Target:
     def __deepcopy__(self, _memo):
         raise TypeError('target ownership cannot be copied; move it')
 
-    def __init__(self, target, *, root_locked=False, create=True):
+    def __init__(self, target, *, root_locked=False, create=True, for_open=False):
         self.target = Path(canonical(target))
         self.root_locked = root_locked
         self.create = create
@@ -317,6 +449,8 @@ class Target:
                     self.evidence_path=requested
                     return
                 finally:directory.close()
+            if for_open:
+                preflight_capabilities(self.target)
             container = self.target.parent.parent
             self.binding = None
             if container.name in ('generations', 'quarantine'):
@@ -365,6 +499,7 @@ class Target:
             else:
                 parent = Directory(self.target.parent, private=False)
                 self.directories.append(parent)
+                self.target=physical_case(parent,self.target)
                 key = digest(folded(self.target).encode())
                 self.directory = parent.child('.ida-cli-txn-' + key,create=create)
                 self.key = {'kind':'direct', 'parent':parent.identity, 'identity_key':key}
@@ -454,6 +589,11 @@ class Target:
                         'generation':self.binding, 'lock_identity':self.directory.object_identity(os.fstat(fd))}
             try:
                 value, _, _ = self.directory.read('target.json')
+                if type(value) is dict and case_authority(value.get('target'),self.target):
+                    candidate=dict(expected,target=value['target'])
+                    if encoded(value) in (encoded(candidate),encoded(dict(candidate,creation_intent=True))):
+                        self.original=value['target']
+                        expected=candidate
                 if self.root is not None and self.binding is None:
                     expected['generation'] = value.get('generation')
                 initial = {'lock','target.json'} | ({'root.lock'} if self.root is None else set())

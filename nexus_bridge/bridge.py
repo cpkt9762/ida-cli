@@ -733,7 +733,7 @@ class Bridge(LifetimeListener):
                     self.verification_probes[verification] = custodian
                 from target_coordination import Target
                 from target_journal import verification_scope
-                with Target(verification) as copy_target, copy_target.locked(deadline=deadline):
+                with Target(verification,for_open=True) as copy_target, copy_target.locked(deadline=deadline):
                     verification_scope(copy_target,custodian.acquisition['parent'])
                 original = Path(command["path"])
                 copy_hash = hashlib.sha256(Path(verification).read_bytes()).digest()

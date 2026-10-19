@@ -14,12 +14,12 @@ def boundary(directory, name, stage):
 
 
 def raw(directory, name, *, links=1):
-    from target_coordination import MAX_RECORD, identity
+    from target_coordination import MAX_RECORD, identity, private_mode
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory.fd)
     try:
         before = os.fstat(fd)
         if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
-                or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != links
+                or not private_mode(fd,before) or before.st_nlink != links
                 or before.st_size > MAX_RECORD):
             raise RuntimeError('DurableWriteBlocked: untrusted pending record')
         pieces, size = [], 0

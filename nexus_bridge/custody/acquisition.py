@@ -101,7 +101,7 @@ class Custodian:
 
     @contextmanager
     def gate(self, target):
-        self.target = Target(target)
+        self.target = Target(target,for_open=True)
         self.target.file_job_prepare = self.prepare_file_job
         try:
             self.target_path, self.coord_key = str(self.target.target), self.target.key
