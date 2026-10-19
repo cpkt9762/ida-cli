@@ -91,6 +91,12 @@ impl Helper {
         command.arg("-I").arg("-B");
         super::python_ledger(&mut command);
         #[cfg(feature = "nexus-test-support")]
+        if config.environment.contains_key("R4_HELPER_TRACE") {
+            command.arg(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/r4_helper_trace.py"),
+            );
+        }
+        #[cfg(feature = "nexus-test-support")]
         if config.environment.contains_key("R2_BOOT_SOURCE_INPUT") {
             command
                 .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/r2_boot_writer.py"));
@@ -527,7 +533,7 @@ impl Helper {
         if let Some(status) = super::try_wait_child(&mut child)? {
             return Ok(json!({"pid":pid,"already_exited":status.to_string()}));
         }
-        child.kill().await?;
+        super::kill_child(&mut child).await?;
         let status = super::wait_child(&mut child).await?;
         Ok(json!({"pid":pid,"injected_signal":"SIGKILL","status":status.to_string()}))
     }

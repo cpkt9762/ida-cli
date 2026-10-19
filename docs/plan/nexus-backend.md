@@ -1022,3 +1022,10 @@ R4继续实施：volume.json在实际目标锁内绑定原生host/volume/object�
 结果字节不改。受控OS输入的直接/受管N1链已执行，不能代真实物理boot/平台资格。
 snapshot构造失败在SDK前精确归档自有无失败证据，未知组件保现场/status；排队旧token、
 迟到Ready cache和routine I/O下的既有proof/closure分别验证。完整最终SHA矩阵与审计仍待完成。
+
+R4 fix2定向返修（未验收）：串行r9/verification后继预留先等待同parent的本地观察退休，
+防旧retire_parent删除新helper预算；非owner-required清理仍保持原detach范围，不新增ACK要求。
+恢复后resolver失败核同RecoveryId已发布restored的精确身份，原snapshot和失败证据不改；
+bootstrap完整核hash闭包后按实际import编译已读源码，避免每个短writer重复编译无关工具。
+完整128/字节界限与产品期限不改；中性native采集补实际wait/kill-cached/waitpid，
+历史缺口不追认。证据在`n7a-refactor/r4-fix2/`；物理U6/remount及独立审查仍是独立未结门禁。

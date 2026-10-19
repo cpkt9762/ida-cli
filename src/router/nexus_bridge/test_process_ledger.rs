@@ -25,6 +25,7 @@ fn append(value: &Value) -> anyhow::Result<()> {
     observed["observed_unix_ns"] = json!(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos());
+    observed["case"] = json!(std::env::var("R2_CASE_ROOT").ok());
     let mut bytes = serde_json::to_vec(&observed)?;
     bytes.push(b'\n');
     file.write_all(&bytes)?;
@@ -121,7 +122,7 @@ pub(super) fn spawn_std(
     let child = command.spawn()?;
     let evidence = match identity(child.id()) {
         Ok(identity) => {
-            json!({"kind":"started","intent":intent,"pid":child.id(),"identity":identity})
+            json!({"kind":"started","intent":intent,"parent":std::process::id(),"pid":child.id(),"identity":identity})
         }
         Err(error) => {
             json!({"kind":"capture_failed","intent":intent,"pid":child.id(),"error":error.to_string()})

@@ -236,8 +236,18 @@ impl Drop for OwnedChild {
             if !reaped {
                 loop {
                     // SAFETY: this thread exclusively inherits wait ownership.
-                    let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                    let mut status = 0;
+                    let result = unsafe { libc::waitpid(pid, &mut status, 0) };
                     if result == pid {
+                        #[cfg(feature = "nexus-test-support")]
+                        {
+                            use std::os::unix::process::ExitStatusExt;
+                            crate::router::nexus_bridge::test_record_child_exit(
+                                pid as u32,
+                                &std::process::ExitStatus::from_raw(status),
+                                "waitpid.emergency_owned_child",
+                            );
+                        }
                         break;
                     }
                     let error = std::io::Error::last_os_error();
@@ -462,6 +472,12 @@ async fn supervise(
             })
         }
     };
+    #[cfg(feature = "nexus-test-support")]
+    crate::router::nexus_bridge::test_record_child_exit(
+        pid,
+        &status,
+        "Child.wait.offline_supervisor",
+    );
     owner.reaped = true;
     let read_stdout = tokio::time::timeout(Duration::from_secs(3), &mut drains.stdout).await;
     let read_stderr = tokio::time::timeout(Duration::from_secs(3), &mut drains.stderr).await;

@@ -276,6 +276,11 @@ mod tests {
         let output = child
             .wait_with_output()
             .expect("actual private operator driver terminal");
+        super::super::test_record_child_exit(
+            pid,
+            &output.status,
+            "Child.wait_with_output.maintenance_driver",
+        );
         std::fs::write(root.join("maintenance-exit.json"),serde_json::to_vec_pretty(&serde_json::json!({
             "pid":pid,"exit":output.status.code(),"signal":output.status.signal(),"success":output.status.success(),
             "aggregate_timeout_seconds":120,"per_entry_timeout_seconds":15

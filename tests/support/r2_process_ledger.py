@@ -19,7 +19,8 @@ def install():
     original = subprocess.Popen
 
     def record(value):
-        data = (json.dumps(dict(value, parent=os.getpid(), observed_unix_ns=time.time_ns()))+'\n').encode()
+        data = (json.dumps(dict(value, parent=os.getpid(), observed_unix_ns=time.time_ns(),
+                                case=os.environ.get('R2_CASE_ROOT')))+'\n').encode()
         descriptor = os.open(ledger_path, os.O_WRONLY | os.O_APPEND)
         try:
             if os.write(descriptor, data) != len(data):
@@ -47,13 +48,17 @@ def install():
                 self._r2_reaped = True
             return result
 
-        def poll(self, *args, **options):
-            result = super().poll(*args, **options)
-            if result is not None and not getattr(self, '_r2_polled', False):
+        def _handle_exitstatus(self, status, *args, **options):
+            # CPython's _cleanup/__del__ may bypass public poll(). This hook
+            # receives an actual waitpid status, unlike _internal_poll's
+            # synthetic ECHILD/deadstate returns. Merely calling poll never
+            # supplies terminal evidence.
+            super()._handle_exitstatus(status, *args, **options)
+            if not getattr(self, '_r2_polled', False):
                 record({'kind':'polled_exit', 'intent':self._r2_intent,
-                        'pid':self.pid, 'exit':result, 'method':'Popen.poll'})
+                        'pid':self.pid, 'exit':self.returncode, 'raw_wait_status':status,
+                        'method':'Popen._handle_exitstatus'})
                 self._r2_polled = True
-            return result
 
     subprocess.Popen = Recorded
 

@@ -831,11 +831,31 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                     DeliveryState::Confirmed | DeliveryState::NotSent | DeliveryState::Uncertain
                 )
             });
-            let ready = retired.is_some()
-                || (status.phase == SessionPhase::Released
-                    && (event["owner_required"] == false || public)
-                    && terminal
-                    && (event["require_ack"] != true || ack));
+            // Public lifetime ends the physical resource, but its independent
+            // helper retirement may still be in flight. Do not free the serial
+            // acquisition slot until every predecessor observer for this exact
+            // parent has finished: a late retire_parent could otherwise erase
+            // the successor's newly reserved helper budget before subscribe.
+            // This is local custody closure, not a retirement ACK or a new
+            // lifetime/command result, and it never authorizes another detach.
+            let observers_closed = state
+                .custody_resources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .all(|r| r.acquisition.parent != acquisition.parent)
+                && state
+                    .startups
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .all(|item| item["acquisition"]["parent"] != json!(acquisition.parent));
+            let ready = (event["owner_required"] == false || observers_closed)
+                && (retired.is_some()
+                    || (status.phase == SessionPhase::Released
+                        && (event["owner_required"] == false || public)
+                        && terminal
+                        && (event["require_ack"] != true || ack)));
             response["ready"] = json!(ready);
             response["parent_terminal"] = json!(state
                 .endpoint
@@ -1486,6 +1506,11 @@ async fn observe_resource(
             json!({"action":"settle", "target":resource.target,"coord_key":resource.coord_key}),
         )
         .await?;
+    #[cfg(feature = "nexus-test-support")]
+    if std::env::var("R4_PARENT_TARGET").ok().as_deref() == resource.target.as_str() {
+        super::test_barriers::asynchronous("helper_parent_retire", json!(resource.acquisition))
+            .await?;
+    }
     helper
         .call(json!({"kind":"retire_parent","parent":resource.acquisition.parent}))
         .await?;

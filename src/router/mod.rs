@@ -952,14 +952,14 @@ impl RouterState {
             drop(inner);
             worker.connection.close();
             let mut child = worker.child;
-            child.kill().await?;
+            nexus_bridge::kill_child(&mut child).await?;
             return Err(anyhow::anyhow!("worker limit reached during spawn"));
         }
         if let Some(existing) = inner.path_to_handle.get(&worker_key).cloned() {
             drop(inner);
             worker.connection.close();
             let mut child = worker.child;
-            child.kill().await?;
+            nexus_bridge::kill_child(&mut child).await?;
             let token = self.issue_ref_for_client(&existing, client).await;
             return Ok((existing, Some(token)));
         }
@@ -1195,9 +1195,7 @@ impl RouterState {
                 }
             }
             worker.connection.close();
-            worker
-                .child
-                .kill()
+            nexus_bridge::kill_child(&mut worker.child)
                 .await
                 .map_err(|e| crate::error::ToolError::IdaError(format!("worker cleanup: {e}")))?;
             info!("Closed worker {}", handle);

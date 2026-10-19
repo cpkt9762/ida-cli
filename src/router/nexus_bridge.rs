@@ -80,6 +80,29 @@ fn record_child_exit(pid: Option<u32>, status: &std::process::ExitStatus, method
     let _ = (pid, status, method);
 }
 
+#[cfg(feature = "nexus-test-support")]
+pub(crate) fn test_record_child_exit(pid: u32, status: &std::process::ExitStatus, method: &str) {
+    record_child_exit(Some(pid), status, method);
+}
+
+pub(crate) async fn kill_child(child: &mut Child) -> std::io::Result<()> {
+    #[cfg(feature = "nexus-test-support")]
+    let pid = child.id();
+    child.kill().await?;
+    // Tokio kill() already waits. Capture its cached, actual status with the
+    // PID saved before reaping; Child::id() becomes None after that point.
+    #[cfg(feature = "nexus-test-support")]
+    match child.try_wait() {
+        Ok(Some(status)) => record_child_exit(pid, &status, "Child.kill.await.cached_status"),
+        other => tracing::error!(
+            ?pid,
+            ?other,
+            "test ledger could not collect killed child's status"
+        ),
+    }
+    Ok(())
+}
+
 fn try_wait_child(child: &mut Child) -> std::io::Result<Option<std::process::ExitStatus>> {
     let pid = child.id();
     let status = child.try_wait()?;
@@ -849,7 +872,7 @@ impl NexusBridge {
                 status?;
             }
             Err(_) => {
-                child.kill().await?;
+                kill_child(&mut child).await?;
                 wait_child(&mut child).await?;
                 remove_lifetime_socket(&self.directory)?;
                 anyhow::bail!(
@@ -872,7 +895,7 @@ impl NexusBridge {
     /// Test supervisor may terminate this exact child; no process-name scans.
     pub async fn terminate(&self) -> anyhow::Result<()> {
         let mut child = self.child.lock().await;
-        child.kill().await?;
+        kill_child(&mut child).await?;
         wait_child(&mut child).await?;
         remove_lifetime_socket(&self.directory)?;
         self.state.fail("bridge terminated");

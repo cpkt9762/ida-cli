@@ -177,10 +177,23 @@ async fn verification_owner_proof_precedes_copy_cleanup_and_final_acquisition() 
     .await;
     let stopped = bridge.shutdown().await;
     std::fs::write(root.join("verification-result.json"),serde_json::to_vec_pretty(&json!({
-        "result":format!("{result:?}"),"settled":settled.is_ok(),"shutdown":format!("{stopped:?}")})).expect("encode")).expect("evidence");
+        "result":format!("{result:?}"),"actual":result.as_ref().ok(),"settled":settled.is_ok(),"shutdown":format!("{stopped:?}")})).expect("encode")).expect("evidence");
     settled.expect("all exact resources consume independent public proof");
     stopped.expect("natural shutdown");
     result.expect("actual SDK/Rust/N1/production bridge verification");
+    if std::env::var_os("R4_PARENT_SCHEDULE").is_some() {
+        let reserved: Value = serde_json::from_slice(
+            &std::fs::read(root.join("successor-reserved.json"))
+                .expect("scheduled successor evidence"),
+        )
+        .expect("structured reservation evidence");
+        assert_eq!(
+            reserved["retirement_still_paused"], false,
+            "successor reserved before predecessor helper retirement"
+        );
+        assert_eq!(reserved["acquisition"]["ordinal"], 2);
+        assert_eq!(reserved["acquisition"]["purpose"], "final");
+    }
 }
 
 #[test]

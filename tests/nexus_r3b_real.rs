@@ -325,9 +325,22 @@ async fn real_ida95_r9_file_job_restores_exact_components_before_retry_and_new_r
     })
     .await;
     let stopped = bridge.shutdown().await;
-    std::fs::write(root.join("real-r4-result.json"),serde_json::to_vec_pretty(&json!({"result":format!("{result:?}"),
+    std::fs::write(root.join("real-r4-result.json"),serde_json::to_vec_pretty(&json!({"result":format!("{result:?}"),"actual":result.as_ref().ok(),
         "settled":format!("{settled:?}"),"shutdown":format!("{stopped:?}"),"lifecycle":bridge.lifecycle_status()})).expect("JSON")).expect("evidence");
     settled.expect("native ownership/job natural closure");
     stopped.expect("actual native/helper natural shutdown");
     result.expect("actual native r9 file restore and fresh read");
+    if std::env::var_os("R4_PARENT_SCHEDULE").is_some() {
+        let reserved: Value = serde_json::from_slice(
+            &std::fs::read(root.join("successor-reserved.json"))
+                .expect("scheduled successor evidence"),
+        )
+        .expect("structured reservation evidence");
+        assert_eq!(
+            reserved["retirement_still_paused"], false,
+            "retry reserved before predecessor helper retirement"
+        );
+        assert_eq!(reserved["acquisition"]["ordinal"], 2);
+        assert_eq!(reserved["acquisition"]["purpose"], "initial_root_retry");
+    }
 }

@@ -332,6 +332,7 @@ with socket.socket(fileno=int(sys.argv[1])) as channel:
             }
             let mut child = crate::router::nexus_bridge::test_spawn_std_child(&mut command)
                 .expect("record the exact producer intent and birth");
+            let child_pid = child.id();
             drop(child_channel);
             let received = ReceivedTransfer::receive(&parent);
             assert!(
@@ -350,7 +351,13 @@ with socket.socket(fileno=int(sys.argv[1])) as channel:
                 let successor =
                     ReceivedTransfer::receive(&receiver).expect("unique relay receiver");
                 parent.send(b"finish").expect("source close marker");
-                assert!(child.wait().expect("natural source exit").success());
+                let status = child.wait().expect("natural source exit");
+                crate::router::nexus_bridge::test_record_child_exit(
+                    child_pid,
+                    &status,
+                    "Child.wait.transfer_source",
+                );
+                assert!(status.success());
                 assert!(
                     independently_blocked(&root),
                     "source Drop cannot unlock receiver"
@@ -361,10 +368,13 @@ with socket.socket(fileno=int(sys.argv[1])) as channel:
                 parent
                     .send(b"finish")
                     .expect("source close after rejection");
-                assert!(child
-                    .wait()
-                    .expect("natural rejected-source exit")
-                    .success());
+                let status = child.wait().expect("natural rejected-source exit");
+                crate::router::nexus_bridge::test_record_child_exit(
+                    child_pid,
+                    &status,
+                    "Child.wait.rejected_transfer_source",
+                );
+                assert!(status.success());
             }
             assert!(
                 !independently_blocked(&root),

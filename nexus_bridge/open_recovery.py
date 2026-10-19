@@ -415,7 +415,15 @@ class Snapshot:
     def resolver_failed(self, *, no_acquisition):
         with self.transaction() as transaction:
             transaction.register_backups()
-            current=transaction.expect_unrelated(transaction.data['before'],exact_components=True)
+            expected = transaction.data['before']
+            if transaction.data['status'] == 'restored':
+                # A previous attempt published new staged inodes. Compare the
+                # exact durable scene of this same transaction, not its original
+                # pre-restore inodes and not merely the restored content hashes.
+                expected = transaction.data['attempts'][-1]['restored']
+                if not expected:
+                    raise RuntimeError('RecoveryBlocked: restored transaction lacks exact published scene')
+            current=transaction.expect_unrelated(expected,exact_components=True)
             if no_acquisition and current:
                 transaction.archive('resolver failed without acquisition; verified original bytes and retained backups')
 

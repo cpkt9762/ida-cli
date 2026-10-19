@@ -1558,3 +1558,17 @@ intent/reservation/completion boundary. These fixtures use one chunk per file
 and explicit absent-owner input, without claiming physical power-loss/boot.
 Final evidence must include three full same-SHA library runs and all actual
 inputs in each source snapshot; unchanged input bytes do not repair old gaps.
+
+R4 fix2 retains the same 128-round, CoordKey, 32768-byte and product deadline
+assertions. The verified bootstrap still hashes every installation member before
+loading any member; it compiles only the already verified bytes actually imported,
+without source reopening or bytecode caching. `R4_PARENT_SCHEDULE` is a test-only
+caller/retirement scheduling input for the existing verification and real r9
+tests. Their successor reservation must follow exact predecessor observer
+retirement, independently of public proof, command ACK and caller result.
+`test_recovery_backups.py` checks resolver failure against the same transaction's
+published restored scene, including inode/metadata, and rejects same-byte inode
+replacement. Actual wait, emergency waitpid and cached status after Tokio kill
+are collected separately from public database lifetime. Evidence and remaining
+physical boot/remount and independent-review gates are in `r4-fix2/`; these tests
+do not accept R4 or start R6.

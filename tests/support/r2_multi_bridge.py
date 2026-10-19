@@ -10,6 +10,7 @@ import threading
 import time
 
 from r2_process_ledger import install
+from r4_helper_schedule import install as schedule_parent
 install()
 
 
@@ -191,6 +192,8 @@ else:
             threading.Thread.start = start_thread
         sys.argv = [str(installation/'bootstrap.py'), 'bridge', *sys.argv[1:]]
         runtime = runpy.run_path(sys.argv[0], run_name='verified_multi_input')['load_entry']()
+        from acquisition import Custodian
+        schedule_parent(Custodian)
         if os.environ.get('R3B_CASE') == 'late-auxiliary-fault':
             original_drop = runtime.Bridge.drop_lifetime
             def expose_owner_cleanup_context(self, lease_id):

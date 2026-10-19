@@ -75,6 +75,36 @@ class Backups(unittest.TestCase):
         self.assertEqual(target.read_bytes(),before)
         self.assertTrue(backup.is_dir())
 
+    def test_resolver_failure_after_restore_uses_same_transaction_published_identity(self):
+        _, target, snapshot = self.scene()
+        recovery_id = snapshot.recovery_id
+        original = target.read_bytes()
+        old_inode = target.stat().st_ino
+        observed = snapshot.failed(1)
+        snapshot.rollback(observed)
+        restored_inode = target.stat().st_ino
+        self.assertNotEqual(old_inode, restored_inode, 'restore must publish staged components')
+        snapshot.resolver_failed(no_acquisition=True)
+        self.assertEqual(snapshot.recovery_id, recovery_id)
+        self.assertEqual(snapshot.data['status'], 'archived')
+        self.assertEqual(target.stat().st_ino, restored_inode)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(len(snapshot.data['attempts']), 1)
+
+    def test_resolver_failure_after_restore_rejects_same_bytes_replaced_inode(self):
+        _, target, snapshot = self.scene()
+        observed = snapshot.failed(1)
+        snapshot.rollback(observed)
+        replacement = target.with_name('outside-replacement')
+        replacement.write_bytes(target.read_bytes())
+        replacement.chmod(target.stat().st_mode & 0o777)
+        replacement.replace(target)
+        before = (snapshot.path/'recovery.json').read_bytes()
+        with self.assertRaisesRegex(RuntimeError, 'outside exact component intent'):
+            snapshot.resolver_failed(no_acquisition=True)
+        self.assertEqual((snapshot.path/'recovery.json').read_bytes(), before)
+        self.assertEqual(snapshot.data['status'], 'restored')
+
     def test_actual_sdk_lock_on_own_quarantined_id0_blocks_further_publication(self):
         _,target,snapshot=self.scene()
         observed=snapshot.failed(1)
