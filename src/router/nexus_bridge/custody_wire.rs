@@ -49,6 +49,62 @@ fn join_acquisition_completion(
     })?)
 }
 
+/// Resource proof and command delivery have independent lifetimes. The public
+/// proof tombstone survives retirement ACK removal; only its exact N1 lease and
+/// acquisition can authorize a late command observation, never another attach.
+fn release_observation_binding(
+    state: &State,
+    event: &Value,
+    lease: &SessionLease,
+) -> anyhow::Result<Value> {
+    let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
+    let resource = state
+        .custody_resources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&lease.lease_id)
+        .cloned();
+    let binding = if let Some(resource) = resource {
+        anyhow::ensure!(
+            resource.lease == *lease,
+            "release observation lease mismatch"
+        );
+        json!({"owner":resource.owner,"watch":resource.watch,"acquisition":resource.acquisition,
+            "target":resource.target,"coord_key":resource.coord_key,
+            "subscription_epoch":resource.receipt["record"]["subscription_epoch"]})
+    } else {
+        let proof = state
+            .owner_proofs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&lease.lease_id)
+            .filter(|(exact, _)| exact == lease)
+            .map(|(_, proof)| proof.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!("release observation has no exact public proof custody")
+            })?;
+        state.endpoint.transition(|s, _| {
+            if s.acquisition_lease(&acquisition)?.as_ref() != Some(lease)
+                || !s.acquisition_closed(&acquisition)?
+                || s.resource_retirement(lease)?.is_some()
+            {
+                return Err(invalid("release observation resource closure mismatch"));
+            }
+            Ok::<_, NexusError>(())
+        })?;
+        let mut binding = proof["record"].clone();
+        binding["target"] = binding["owner"]["canonical_idb_path"].clone();
+        binding
+    };
+    anyhow::ensure!(
+        binding["owner"] == event["owner"]
+            && binding["watch"] == event["watch"]
+            && binding["acquisition"] == json!(acquisition),
+        "release observation physical identity mismatch"
+    );
+    Ok(binding)
+}
+
 pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result<Value> {
     let nonce = event["nonce"]
         .as_str()
@@ -241,24 +297,11 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
             state
                 .endpoint
                 .transition(|s, _| s.delivery_status(&lease.client_id, &attempt))?;
-            let resource = state
-                .custody_resources
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&lease.lease_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("release observation has no custody"))?;
-            anyhow::ensure!(
-                resource.lease == lease
-                    && resource.owner == event["owner"]
-                    && resource.watch == event["watch"]
-                    && serde_json::to_value(&resource.acquisition)? == event["acquisition"],
-                "release observation physical identity mismatch"
-            );
+            let binding = release_observation_binding(state, event, &lease)?;
             helper
-                .journal(json!({"action":action, "target":resource.target,
-                "coord_key":resource.coord_key,"lease":lease,"watch":resource.watch,
-                "epoch":resource.receipt["record"]["subscription_epoch"],"owner":resource.owner,
+                .journal(json!({"action":action, "target":binding["target"],
+                "coord_key":binding["coord_key"],"lease":lease,"watch":event["watch"],"acquisition":event["acquisition"],
+                "epoch":binding["subscription_epoch"],"owner":event["owner"],
                 "attempt":attempt,"observation_id":nonce,"outcome":event["outcome"]}))
                 .await?;
             if let Some(message) = event["outcome"]["save_guard_error"].as_str() {
@@ -275,7 +318,7 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
             let entry = facts.entry(lease.lease_id.clone()).or_insert_with(|| {
                 (
                     lease,
-                    json!({"owner":resource.owner,"watch":resource.watch}),
+                    json!({"owner":event["owner"],"watch":event["watch"]}),
                 )
             });
             entry.1["preflight"] = event["outcome"].clone();

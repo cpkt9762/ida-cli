@@ -41,7 +41,7 @@ impl Protocol {
         Self {
             wire: 2,
             schema: 1,
-            release: 3,
+            release: 4,
             open: 2,
             owner_observation: 1,
             custody: 4,
@@ -67,6 +67,7 @@ impl Protocol {
                 "lifetime_handshake_v1",
                 "receiver_isolation_v1",
                 "release_observation_v1",
+                "retired_release_observation_v1",
                 "single_resolution_outcome_v1",
                 "target_gate_base_v1",
                 "two_phase_release_v1",
@@ -110,6 +111,26 @@ mod tests {
                 "accepts mismatched {name}"
             );
         }
+    }
+
+    #[test]
+    fn release_v4_requires_closed_observation_authority() {
+        let current = serde_json::to_value(Protocol::current()).expect("protocol JSON");
+        let mut old = current.clone();
+        old["release"] = serde_json::json!(3);
+        assert!(
+            Protocol::validate(old).is_err(),
+            "old writer cannot authorize closed observations"
+        );
+        let mut partial = current;
+        partial["capabilities"]
+            .as_array_mut()
+            .expect("capabilities")
+            .retain(|v| v != "retired_release_observation_v1");
+        assert!(
+            Protocol::validate(partial).is_err(),
+            "partial writer upgrade accepted"
+        );
     }
 
     #[test]

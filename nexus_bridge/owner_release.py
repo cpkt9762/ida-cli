@@ -4,6 +4,7 @@ import threading
 import time
 
 from lifecycle import release_handle, release_state
+from acquisition import failure_details
 
 
 class FairReleases:
@@ -74,15 +75,23 @@ def ordinary_release(bridge, channel, attempt, lease, handle, custody, deadline,
             'detach_called':False, 'owner_pending':True, 'cleanup_blocked':blocked}
         # This must precede detach even for a healthy guard. ACK loss reuses the
         # exact transaction nonce; target authority and Rust retain the facts.
-        custody.transact('release_observation', _deadline=deadline-2,
-            acquisition=custody.acquisition, lease=lease, watch=custody.watch,
-            owner=custody.owner, attempt=attempt, outcome=observation)
+        sideband_error = None
+        try:
+            custody.transact('release_observation', _deadline=deadline-2,
+                acquisition=custody.acquisition, lease=lease, watch=custody.watch,
+                owner=custody.owner, attempt=attempt, outcome=observation)
+        except Exception as exc:
+            # No detach has been invoked. A failed fact write is independently
+            # visible and must not replace the original preflight exception.
+            sideband_error = failure_details(exc)
+            if failure is None:
+                failure = exc
         if failure is not None:
             # This child is already cleanup-only in N1; its own fair release
             # lane continues even when primary's preflight is NotSent.
             channel.send({'event':'not_sent', 'attempt':attempt, 'outcome':observation,
                 'save_guard_error':observation['save_guard_error'],
-                'error':{'code':'operation_failed', 'message':str(failure)}})
+                'error':failure_details(failure), 'observation_error':sideband_error})
             return
         detach_deadline = min(deadline, time.monotonic()+2)
         if detach_deadline <= time.monotonic():

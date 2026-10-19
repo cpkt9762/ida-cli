@@ -115,6 +115,13 @@ class Journal:
             closed = item['epoch'] <= v['closed_through'] or any(a <= item['epoch'] <= b for a,b in ranges)
             if closed and (not v.get('compaction') or item['epoch'] not in v['compaction'].get('epochs', [])):
                 raise RuntimeError('CoordinationBlocked: closed epoch has an active reference')
+        for entry in v['summary']:
+            if entry.get('release_binding') is not None:
+                if (type(entry.get('epoch')) is not int or not 0 < entry['epoch'] < v['next_epoch']
+                        or type(entry['release_binding']) is not str or len(entry['release_binding']) != 64
+                        or any(c not in '0123456789abcdef' for c in entry['release_binding'])
+                        or type(entry.get('proof')) is not str or len(entry['proof']) != 64):
+                    raise RuntimeError('CoordinationBlocked: corrupt closed release binding')
         intents = v.get('file_intents', {})
         if not isinstance(intents, dict) or len(intents) > LIMIT:
             raise RuntimeError('RecoveryBlocked: invalid file intent table')
@@ -451,11 +458,28 @@ class Journal:
         return {'epoch':item['epoch'], 'revision':self.value['revision']}
 
     def release_observation(self, value):
-        item = self.item(value['watch'], value['epoch'])
-        if (item['lease'] != value['lease'] or item['owner'] != value['owner']
-                or value['attempt']['target'] != {'kind':'release', 'lease':item['lease']}
+        if (type(value.get('epoch')) is not int or value['epoch'] < 1
+                or type(value.get('observation_id')) is not str or not 1 <= len(value['observation_id']) <= 128
+                or type(value['attempt'].get('sequence')) is not int or value['attempt']['sequence'] < 1):
+            raise RuntimeError('CoordinationBlocked: malformed release observation identity')
+        if (value['attempt']['target'] != {'kind':'release', 'lease':value['lease']}
                 or value['outcome'].get('detach_called') is not False):
             raise RuntimeError('CoordinationBlocked: release observation identity/stage mismatch')
+        item = self.value['entries'].get(str(value['epoch']))
+        if item is not None:
+            item = self.item(value['watch'], value['epoch'])
+            if (item['lease'] != value['lease'] or item['owner'] != value['owner']
+                    or item['acquisition'] != value['acquisition']):
+                raise RuntimeError('CoordinationBlocked: release observation physical identity mismatch')
+        else:
+            # A closed target reference is never recreated. The bounded summary
+            # retains only a binding made by this authority before compaction;
+            # old summaries without it cannot grant a late writer permission.
+            binding = digest({key:value[key] for key in ('lease','owner','watch','acquisition')})
+            item = next((entry for entry in self.value['summary']
+                         if entry['epoch'] == value['epoch'] and entry.get('release_binding') == binding), None)
+            if item is None or not item.get('proof'):
+                raise RuntimeError('ObservationClosed: exact closed release binding missing')
         observation = {k:value[k] for k in ('observation_id', 'attempt', 'outcome')}
         old = item.get('release_observation')
         if old is not None:
@@ -466,10 +490,12 @@ class Journal:
             if old['attempt']['sequence'] >= observation['attempt']['sequence']:
                 raise RuntimeError('CoordinationBlocked: stale release observation')
         item['release_observation'] = observation
-        if value['outcome'].get('save_guard_error'):
+        if len(encoded(self.value['summary'])) > SUMMARY_BYTES:
+            raise RuntimeError('RetainedEvidenceFull: late release summary byte budget')
+        if value['outcome'].get('save_guard_error') and 'facts' in item:
             item['failure'] = value['outcome']['save_guard_error']
         self.save()
-        return {'epoch':item['epoch'], 'revision':self.value['revision']}
+        return {'epoch':value['epoch'], 'revision':self.value['revision']}
 
     def detach_outcome(self, value):
         item = self.item(value['watch'], value['epoch'])
@@ -725,7 +751,10 @@ class Journal:
         eligible.sort(key=lambda item:item['epoch'])
         summary = self.value['summary'] + [{'epoch':i['epoch'], 'owner':digest(i['owner']),
                                            'proof':i.get('proof', {}).get('sha256'),
-                                           'transferred_to':i.get('transferred_to')} for i in eligible]
+                                           'transferred_to':i.get('transferred_to'),
+                                           'release_binding':digest({k:i[k] for k in ('lease','owner','watch','acquisition')})
+                                               if i.get('lease') and i.get('proof') else None,
+                                           'release_observation':i.get('release_observation')} for i in eligible]
         summary = summary[-SUMMARY_LIMIT:]
         while len(encoded(summary)) > SUMMARY_BYTES:
             summary.pop(0)
@@ -969,8 +998,14 @@ def main():
                               'origin_binding':item['origin_binding']}))
             return
         with target.locked(deadline=time.monotonic()+1.5):
-            journal = Journal(target)
             action = value['action']
+            # Cleanup must validate its existing authority before even a
+            # constructor can resume a durable deletion intent.
+            if action == 'verification_probe_cleanup':
+                result = verification_probe_cleanup(target,value['state_root'],value['parent'])
+                print(json.dumps({'ok':True, **result}))
+                return
+            journal = Journal(target)
             if action == 'adopt':
                 result = journal.adopt(value)
             elif action == 'release_observation':
@@ -996,8 +1031,6 @@ def main():
             elif action == 'settle':
                 journal.settle()
                 result = {}
-            elif action == 'verification_probe_cleanup':
-                result = verification_probe_cleanup(target,value['state_root'],value['parent'])
             elif action == 'accounting':
                 result = journal.accounting()
             else:

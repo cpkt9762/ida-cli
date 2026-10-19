@@ -1794,6 +1794,15 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
                         entry.1["cleanup_state"] = json!("CleanupBlocked");
                     }
                 }
+                if let Some(error) = event.get("observation_error").filter(|e| !e.is_null()) {
+                    entry.1["observation_error"] = error.clone();
+                }
+                if name == "not_sent" && event["outcome"]["stage"] == "preflight" {
+                    entry.1["preflight"] = event["outcome"].clone();
+                    if entry.1["original_preflight"].is_null() {
+                        entry.1["original_preflight"] = event["outcome"].clone();
+                    }
+                }
                 if let Some(error) = event.get("error") {
                     entry.1["command_error"] = error.clone();
                     if entry.1["original_error"].is_null() {
