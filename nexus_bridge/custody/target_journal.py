@@ -166,6 +166,10 @@ class Journal:
                   'namespace_bytes':0, 'routine_files':0}
         scanned = [0]
         def scan(directory, namespace, depth=0):
+            with directory.fact_view(shared=True):
+                scan_locked(directory, namespace, depth)
+
+        def scan_locked(directory, namespace, depth):
             if depth > 2:
                 raise RuntimeError('RetainedEvidenceFull: coordination namespace depth budget')
             for name in os.listdir(directory.fd):
@@ -305,19 +309,20 @@ class Journal:
             except FileNotFoundError:
                 return []
             try:
-                names = os.listdir(directory.fd)
-                if len(names) > 4096:
-                    raise RuntimeError('ObservationRecoveryBlocked: fact namespace budget')
-                result = []
-                for name in names:
-                    if name.endswith('.new'):
-                        raise ObservationPending('ObservationRecoveryBlocked: pending immutable fact retained')
-                    try:
-                        record, _, data = directory.read(name)
-                    except FileNotFoundError as exc:
-                        raise ObservationPending('ObservationRecoveryBlocked: fact publication changed during scan') from exc
-                    result.append({'path':str(directory.path/name), 'sha256':digest(data), 'record':record})
-                return result
+                with directory.fact_view(shared=True):
+                    names = os.listdir(directory.fd)
+                    if len(names) > 4096:
+                        raise RuntimeError('ObservationRecoveryBlocked: fact namespace budget')
+                    result = []
+                    for name in names:
+                        if name.endswith('.new'):
+                            raise ObservationPending('ObservationRecoveryBlocked: pending immutable fact retained')
+                        try:
+                            record, _, data = directory.read(name)
+                        except FileNotFoundError as exc:
+                            raise ObservationPending('ObservationRecoveryBlocked: fact publication changed during scan') from exc
+                        result.append({'path':str(directory.path/name), 'sha256':digest(data), 'record':record})
+                    return result
             finally:
                 directory.close()
         finally:

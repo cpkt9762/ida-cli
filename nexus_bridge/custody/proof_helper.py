@@ -256,14 +256,16 @@ class Observer:
                 raise RuntimeError('ObservationFailed: target identity changed')
             container = target.directory.child('proofs' if kind == 'PublicOwnerLifetime' else 'observations')
             try:
-                producer = container.child(digest(item['owner']) if kind == 'PublicOwnerLifetime' else digest(item['watch'].encode()))
-                try:
-                    name = record['observation_id'] + '.json'
-                    producer.retry_immutable(name, record)
-                    pending.pop(slot)
-                    return {'path':str(producer.path / name), 'sha256':digest(record), 'record':record}
-                finally:
-                    producer.close()
+                with container.fact_view():
+                    producer = container.child(digest(item['owner']) if kind == 'PublicOwnerLifetime' else digest(item['watch'].encode()))
+                    try:
+                        name = record['observation_id'] + '.json'
+                        with producer.fact_view():
+                            producer.retry_immutable(name, record)
+                        pending.pop(slot)
+                        return {'path':str(producer.path / name), 'sha256':digest(record), 'record':record}
+                    finally:
+                        producer.close()
             finally:
                 container.close()
 

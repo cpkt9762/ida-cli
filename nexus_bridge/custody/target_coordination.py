@@ -139,6 +139,32 @@ class Directory:
         from durable_records import write
         write(self, name, value, immutable=immutable)
 
+    @contextmanager
+    def fact_view(self, *, shared=False):
+        """Serialize a producer's publication with namespace readers.
+
+        This directory OFD is independent of root/target locks. Producers must
+        never acquire target EX while holding it; readers may already hold EX.
+        No stable lock name is created or removed. A crashed publisher releases
+        this lock but leaves its exact pending bytes for the usual rejection.
+        """
+        deadline = time.monotonic() + .25
+        while True:
+            try:
+                fcntl.flock(self.fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    from target_journal import ObservationPending
+                    raise ObservationPending('ObservationPending: immutable publication still active') from None
+                time.sleep(.001)
+        try:
+            self.verify()
+            yield
+            self.verify()
+        finally:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+
     def recover_record(self, name, *, validate=None):
         from durable_records import resume
         return resume(self, name, validate=validate)

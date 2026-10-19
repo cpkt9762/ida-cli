@@ -1531,3 +1531,11 @@ The native `real_ida95_r9_file_job_restores_exact_components_before_retry_and_ne
 case uses an actual IDA 9.5 small database and one injected Root observation;
 it verifies exact component hashes before retry and a fresh request's saved-data
 read. This supplies no natural-corruption or real-boot qualification.
+
+`test_fact_publication.py` pauses an independent production Observer at its
+immutable link boundary. Namespace accounting and fact scanning share the
+producer directory OFD while publication holds it exclusively; namespace
+creation also serializes with accounting. Publishers never wait for target EX
+inside that lock. A real publisher exit releases only the directory lock:
+pending bytes still block accounting and remain preserved. The fact payload
+in this deterministic test is synthetic, not a public owner proof.
