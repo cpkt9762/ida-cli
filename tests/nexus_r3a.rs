@@ -213,7 +213,8 @@ async fn bridge_and_helper_loss_preserve_draining_owner_until_public_release() {
                 }).await?;
                 successor=Some((next,adapter.clone()));
                 let refused=gate_attempt(&adapter,&root.join("a/tiny.i64"),"held").await?;
-                anyhow::ensure!(refused["event"]!="opened" && !root.join("next-sdk.jsonl").exists(),
+                let calls=request_sdk_calls(&root.join("next-sdk.jsonl"))?;
+                anyhow::ensure!(refused["event"]!="opened" && calls.is_empty(),
                     "new router bypassed failed-owner-held gate: {refused}");
                 std::fs::write(root.join("next-held.json"),serde_json::to_vec_pretty(&refused)?)?;
             }
@@ -239,7 +240,9 @@ async fn bridge_and_helper_loss_preserve_draining_owner_until_public_release() {
             if let Some((_,adapter))=&successor {
                 wait_for(||Ok(root.join("a/requests.json").exists())).await?;
                 let admitted=gate_attempt(adapter,&root.join("a/tiny.i64"),"after-proof").await?;
-                anyhow::ensure!(root.join("next-sdk.jsonl").exists() && adapter.lifecycle_status()["resources"]==0,
+                let calls=request_sdk_calls(&root.join("next-sdk.jsonl"))?;
+                anyhow::ensure!(calls.iter().any(|call|call["sdk_call"]=="probe_database_state")
+                    && calls.iter().any(|call|call["sdk_call"]=="open_outcome") && adapter.lifecycle_status()["resources"]==0,
                     "new router failed to consume exact target proof before its new SDK request: {admitted}");
                 std::fs::write(root.join("next-after-proof.json"),serde_json::to_vec_pretty(&admitted)?)?;
             }
@@ -320,8 +323,9 @@ async fn filesystem_capability_refusal_precedes_public_sdk_calls() {
     );
     std::fs::create_dir(&parent).expect("fresh target parent");
     let path = parent.join("tiny.i64");
-    let bytes = b"private capability refusal input; must remain unchanged";
-    std::fs::write(&path, bytes).expect("private input");
+    let bytes = std::fs::read(std::env::var_os("R3F1_SAMPLE").expect("actual private IDA seed"))
+        .expect("valid IDB copy");
+    std::fs::write(&path, &bytes).expect("private input");
     let before = std::fs::metadata(&path).expect("input identity");
     let trace = root.join("sdk-calls.jsonl");
     let mut environment: BTreeMap<String, String> = std::env::vars().collect();
@@ -1594,4 +1598,20 @@ async fn r9_late_ordinal_retirement_and_public_proof_before_release_return() {
         result.expect("r9 production barrier assertions");
         shutdown.expect("natural bridge/helper exit");
     }
+}
+
+fn request_sdk_calls(path: &std::path::Path) -> anyhow::Result<Vec<Value>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let calls = text
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(calls
+        .into_iter()
+        .filter(|call| call["origin"] == "request")
+        .collect())
 }

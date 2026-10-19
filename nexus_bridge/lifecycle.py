@@ -4,7 +4,7 @@ import time
 import threading
 
 
-def database_diagnostics(path):
+def database_diagnostics(path, *, include_owners=True):
     from ida_nexus import discover_databases, wait_database_released
     target = Path(path).resolve()
     if target.suffix not in ('.i64', '.idb'):
@@ -21,6 +21,9 @@ def database_diagnostics(path):
                                              'mtime_ns': info.st_mtime_ns})
     except OSError as exc:
         result['components_error'] = type(exc).__name__
+    if not include_owners:
+        result['lifetime']='not_queried_before_admission'
+        return result
     try:
         for item in discover_databases(timeout=0.2):
             if Path(item.instance.idb_path).resolve() == target:

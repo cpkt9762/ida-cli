@@ -383,15 +383,11 @@ def preflight_capabilities(path):
     """Before business admission, probe outside the stable coordination tree."""
     from recovery_files import probe_capabilities
     target=Path(canonical(path))
-    parent=Directory(target.parent,private=False)
-    root=None
+    managed=target.parent.parent.name in ('generations','quarantine')
+    probe=Directory(target.parent.parent.parent if managed else target.parent,private=False)
     try:
-        probe=parent
-        if target.parent.parent.name in ('generations','quarantine'):
-            root=Directory(target.parent.parent.parent,private=False)
-            if root.native_identity[0]!=parent.native_identity[0]:
-                raise RuntimeError('CoordinationBlocked: managed payload crosses its resource-root volume')
-            probe=root
+        # Managed payload selection remains under the constructor's stable
+        # root SH, so GC may rename/delete payloads without racing this probe.
         mounted=native_mount(probe.fd)
         with probe.fact_view():
             result=probe_capabilities(probe,mounted)
@@ -403,8 +399,7 @@ def preflight_capabilities(path):
             raise failure
         return result
     finally:
-        if root is not None:root.close()
-        parent.close()
+        probe.close()
 
 
 def case_authority(authority, requested):
@@ -478,6 +473,8 @@ class Target:
                 if existing:
                     parent = Directory(existing[0], private=False)
                     self.directories.append(parent)
+                    if parent.native_identity[0]!=self.root.native_identity[0]:
+                        raise RuntimeError('CoordinationBlocked: managed payload crosses its resource-root volume')
                     fd = os.open('generation.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent.fd)
                     try:
                         info = os.fstat(fd)

@@ -536,7 +536,8 @@ class Bridge(LifetimeListener):
                 if isinstance(exc,FilesystemCapabilityError):
                     details['diagnostics']={'target':diagnostic_target,
                         'filesystem_capabilities':exc.details}
-                else:details['diagnostics'] = database_diagnostics(diagnostic_target)
+                else:details['diagnostics'] = database_diagnostics(diagnostic_target,
+                    include_owners=custody is not None and custody.file_gate_admitted)
                 if custody is None and not public_started[0]:
                     channel.send({'event':'not_sent','attempt':attempt,
                         'error':failure_details(exc), **details})
