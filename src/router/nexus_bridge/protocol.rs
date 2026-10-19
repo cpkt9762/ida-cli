@@ -161,12 +161,24 @@ mod tests {
     #[test]
     fn r4_file_ack_contract_rejects_old_or_partial_peers() {
         let current = serde_json::to_value(Protocol::current()).expect("protocol JSON");
-        for (field, value) in [("open", 2), ("open", 3), ("custody", 4), ("target_gate", 1)] {
+        for (field, value) in [
+            ("open", 2),
+            ("open", 3),
+            ("open", 4),
+            ("open", 5),
+            ("custody", 4),
+            ("target_gate", 1),
+            ("target_gate", 2),
+        ] {
             let mut old = current.clone();
             old[field] = serde_json::json!(value);
             assert!(Protocol::validate(old).is_err(), "old {field} accepted");
         }
-        for capability in ["file_recovery_ack_v1", "file_job_relay_v1"] {
+        for capability in [
+            "file_recovery_ack_v1",
+            "file_job_relay_v2",
+            "stable_volume_rebinding_v1",
+        ] {
             let mut partial = current.clone();
             partial["capabilities"]
                 .as_array_mut()
@@ -177,6 +189,16 @@ mod tests {
                 "partial file authority accepted"
             );
         }
+        let mut old_relay = current.clone();
+        let capabilities = old_relay["capabilities"]
+            .as_array_mut()
+            .expect("capabilities");
+        capabilities.retain(|value| value != "file_job_relay_v2");
+        capabilities.push(serde_json::json!("file_job_relay_v1"));
+        assert!(
+            Protocol::validate(old_relay).is_err(),
+            "old full-status datagram relay accepted"
+        );
     }
 
     #[test]
