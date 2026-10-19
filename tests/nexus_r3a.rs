@@ -697,6 +697,7 @@ async fn routine(managed: bool) {
     let result = async {
         use std::os::unix::fs::MetadataExt;
         let mut stable = None;
+        let mut stable_namespace=None;
         for round in 0..128 {
             case(&bridge, &root, "healthy", round, &mut evidence).await?;
             let owner_event = evidence.iter().rev().find(|e|e["event"] == "owner_released")
@@ -715,8 +716,28 @@ async fn routine(managed: bool) {
             let mut files = Vec::new();
             collect_files(coord, &mut files)?;
             let bytes: u64 = files.iter().map(|p|std::fs::metadata(p).map(|m|m.len())).collect::<std::io::Result<Vec<_>>>()?.iter().sum();
-            anyhow::ensure!(files.len() == 3 && bytes < 32768, "healthy target records grew: files={} bytes={bytes}", files.len());
-            stats.push(json!({"round":round+1,"files":files.len(),"bytes":bytes,"lock":[identity.0,identity.1],"summary":journal["summary"].as_array().map(Vec::len)}));
+            let names=if managed {vec!["lock","target.json","volume.json"]}
+                else {vec!["lock","root.lock","target.json","volume.json"]};
+            let mut expected:std::collections::BTreeSet<PathBuf>=names.iter().map(PathBuf::from).collect();
+            expected.insert(PathBuf::from("custody.json"));
+            let actual=files.iter().map(|p|p.strip_prefix(coord).map(PathBuf::from))
+                .collect::<Result<std::collections::BTreeSet<_>,_>>()?;
+            anyhow::ensure!(actual==expected,"healthy target has unknown/unsettled routine records: {actual:?}");
+            let namespace=names.iter().map(|name| {
+                let path=coord.join(name);
+                let meta=std::fs::symlink_metadata(&path)?;
+                anyhow::ensure!(meta.is_file() && meta.nlink()==1 && meta.mode()&0o777==0o600,"namespace identity/mode changed");
+                Ok::<_,anyhow::Error>(json!({"name":name,"device":meta.dev(),"inode":meta.ino(),"bytes":meta.len(),
+                    "hash":blake3::hash(&std::fs::read(path)?).to_hex().to_string()}))
+            }).collect::<Result<Vec<_>,_>>()?;
+            if let Some(previous)=&stable_namespace {anyhow::ensure!(previous==&namespace,"stable namespace bytes/inodes changed across healthy epochs");}
+            stable_namespace=Some(namespace.clone());
+            let namespace_bytes:u64=namespace.iter().map(|v|v["bytes"].as_u64().expect("namespace size")).sum();
+            anyhow::ensure!(bytes < 32768 && bytes==namespace_bytes+std::fs::metadata(coord.join("custody.json"))?.len(),
+                "healthy records grew outside the original byte bound: files={} bytes={bytes}",files.len());
+            stats.push(json!({"round":round+1,"files":files.len(),"bytes":bytes,"namespace":namespace,
+                "routine_files":1,"routine_bytes":bytes-namespace_bytes,"lock":[identity.0,identity.1],
+                "summary":journal["summary"].as_array().map(Vec::len)}));
             if managed {
                 gc(&root, round+1, u64::MAX, 1000+round).await?;
             }

@@ -11,6 +11,10 @@ from unittest.mock import patch
 
 class GuardTests(unittest.TestCase):
     def setUp(self):
+        original_path=list(sys.path)
+        directory=Path(__file__).resolve().parents[1]/'nexus_bridge'
+        sys.path[:0]=[str(directory),str(directory/'custody')]
+        self.addCleanup(sys.path.__setitem__,slice(None),original_path)
         path = Path(__file__).resolve().parents[1] / 'nexus_bridge/save_guard.py'
         spec = importlib.util.spec_from_file_location('_ida_cli_save_guard_v1', path)
         self.guard = importlib.util.module_from_spec(spec)
