@@ -148,7 +148,7 @@ impl Helper {
                     break;
                 }
                 Err(error) => {
-                    if helper.child.lock().await.try_wait()?.is_some() {
+                    if super::try_wait_child(&mut *helper.child.lock().await)?.is_some() {
                         anyhow::bail!("helper exited before readiness: {error}");
                     }
                     if tokio::time::Instant::now() >= deadline {
@@ -198,7 +198,7 @@ impl Helper {
                 let before = match std::fs::symlink_metadata(&self.endpoint) {
                     Ok(before) => before,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        if self.child.lock().await.try_wait()?.is_some() {
+                        if super::try_wait_child(&mut *self.child.lock().await)?.is_some() {
                             return Err(error.into());
                         }
                         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -220,7 +220,7 @@ impl Helper {
                             std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
                         ) =>
                     {
-                        if self.child.lock().await.try_wait()?.is_some() {
+                        if super::try_wait_child(&mut *self.child.lock().await)?.is_some() {
                             return Err(error.into());
                         }
                         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -342,7 +342,7 @@ impl Helper {
     async fn reconnect(&self) -> anyhow::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         let mut child = self.child.lock().await;
-        let Some(status) = child.try_wait()? else {
+        let Some(status) = super::try_wait_child(&mut child)? else {
             // The live helper owns a mutable registry and enforces its own
             // durable finishing fence. Inspect a finish tombstone only after
             // this exact writer has exited, before any possible restart.
@@ -432,7 +432,7 @@ impl Helper {
         input.write_all(b"\n").await?;
         drop(input);
         let output =
-            tokio::time::timeout(Duration::from_secs(2), child.wait_with_output()).await??;
+            tokio::time::timeout(Duration::from_secs(2), super::output_child(child)).await??;
         anyhow::ensure!(
             output.status.success(),
             "target journal: {}",
@@ -478,8 +478,11 @@ impl Helper {
         // accepted, a late caller must not turn the clean exit into recovery.
         self.finished
             .store(true, std::sync::atomic::Ordering::Release);
-        let status =
-            tokio::time::timeout(Duration::from_secs(2), self.child.lock().await.wait()).await??;
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::wait_child(&mut *self.child.lock().await),
+        )
+        .await??;
         anyhow::ensure!(status.success(), "helper did not exit cleanly");
         Ok(())
     }
@@ -491,7 +494,8 @@ impl Helper {
             .store(true, std::sync::atomic::Ordering::Release);
         let mut child = self.child.lock().await;
         let pid = child.id();
-        let status = tokio::time::timeout(Duration::from_secs(3), child.wait()).await??;
+        let status =
+            tokio::time::timeout(Duration::from_secs(3), super::wait_child(&mut child)).await??;
         anyhow::ensure!(
             status.success(),
             "injected orphan helper did not exit naturally"
@@ -502,7 +506,10 @@ impl Helper {
     #[cfg(feature = "nexus-test-support")]
     pub async fn inject_pause(&self) -> anyhow::Result<Value> {
         let mut child = self.child.lock().await;
-        anyhow::ensure!(child.try_wait()?.is_none(), "own helper already exited");
+        anyhow::ensure!(
+            super::try_wait_child(&mut child)?.is_none(),
+            "own helper already exited"
+        );
         let pid = child
             .id()
             .ok_or_else(|| anyhow::anyhow!("own helper PID missing"))?;
@@ -517,11 +524,11 @@ impl Helper {
     pub async fn inject_crash(&self) -> anyhow::Result<Value> {
         let mut child = self.child.lock().await;
         let pid = child.id();
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = super::try_wait_child(&mut child)? {
             return Ok(json!({"pid":pid,"already_exited":status.to_string()}));
         }
         child.kill().await?;
-        let status = child.wait().await?;
+        let status = super::wait_child(&mut child).await?;
         Ok(json!({"pid":pid,"injected_signal":"SIGKILL","status":status.to_string()}))
     }
 }
@@ -728,10 +735,13 @@ mod tests {
             accepted
         });
         let finish_result = helper.finish().await;
-        tokio::time::timeout(Duration::from_secs(2), helper.child.lock().await.wait())
-            .await
-            .expect("exact helper exit bound")
-            .expect("exact helper exit");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            super::super::wait_child(&mut *helper.child.lock().await),
+        )
+        .await
+        .expect("exact helper exit bound")
+        .expect("exact helper exit");
         let accepted = relay.await.expect("fault relay completed");
         assert_eq!(accepted["ok"], true);
         let late = helper.call(json!({"kind":"heartbeat"})).await;
@@ -788,10 +798,11 @@ mod tests {
             .kill_on_drop(true);
         let child = crate::router::nexus_bridge::spawn_child(&mut restart)
             .expect("register and spawn exact finished observer");
-        let status = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
-            .await
-            .expect("bounded restart")
-            .expect("restart exact finished observer");
+        let status =
+            tokio::time::timeout(Duration::from_secs(2), super::super::output_child(child))
+                .await
+                .expect("bounded restart")
+                .expect("restart exact finished observer");
         assert!(
             status.status.success(),
             "{}",

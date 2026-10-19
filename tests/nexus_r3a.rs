@@ -388,7 +388,7 @@ finally:
                     .env("HOME", root.join("home")).kill_on_drop(true);
                 command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
                 let child=ida_mcp::router::nexus_bridge::test_spawn_child(&mut command)?;
-                let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await??;
+                let output = tokio::time::timeout(Duration::from_secs(5), ida_mcp::router::nexus_bridge::test_output_child(child)).await??;
                 std::fs::write(root.join("second-opener.json"), &output.stdout)?;
                 anyhow::ensure!(output.status.success(), "second opener failed: {}", String::from_utf8_lossy(&output.stderr));
                 let fault = bridge.test_helper_fault(false).await?;
@@ -700,6 +700,9 @@ async fn routine(managed: bool) {
         let mut stable_namespace=None;
         for round in 0..128 {
             case(&bridge, &root, "healthy", round, &mut evidence).await?;
+            let framing:Value=serde_json::from_slice(&std::fs::read(root.join("http-framing.json"))?)?;
+            anyhow::ensure!(framing["tcp_nodelay_enabled"]==true && framing["protocol"]=="HTTP/1.1",
+                "fixed-epoch fixture transport must not add Nagle/delayed-ACK stalls");
             let owner_event = evidence.iter().rev().find(|e|e["event"] == "owner_released")
                 .ok_or_else(||anyhow::anyhow!("public owner event missing"))?;
             let path = PathBuf::from(owner_event["proof"]["path"].as_str().ok_or_else(||anyhow::anyhow!("proof path missing"))?);

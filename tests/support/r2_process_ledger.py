@@ -5,6 +5,7 @@ from pathlib import Path
 import runpy
 import subprocess
 import sys
+import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -18,7 +19,7 @@ def install():
     original = subprocess.Popen
 
     def record(value):
-        data = (json.dumps(dict(value, parent=os.getpid()))+'\n').encode()
+        data = (json.dumps(dict(value, parent=os.getpid(), observed_unix_ns=time.time_ns()))+'\n').encode()
         descriptor = os.open(ledger_path, os.O_WRONLY | os.O_APPEND)
         try:
             if os.write(descriptor, data) != len(data):
@@ -44,6 +45,14 @@ def install():
             if not getattr(self, '_r2_reaped', False):
                 record({'kind':'reaped', 'intent':self._r2_intent, 'pid':self.pid, 'exit':result})
                 self._r2_reaped = True
+            return result
+
+        def poll(self, *args, **options):
+            result = super().poll(*args, **options)
+            if result is not None and not getattr(self, '_r2_polled', False):
+                record({'kind':'polled_exit', 'intent':self._r2_intent,
+                        'pid':self.pid, 'exit':result, 'method':'Popen.poll'})
+                self._r2_polled = True
             return result
 
     subprocess.Popen = Recorded

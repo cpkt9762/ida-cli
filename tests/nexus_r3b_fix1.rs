@@ -545,8 +545,11 @@ async fn issue_marker(directory: &std::path::Path) -> anyhow::Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = ida_mcp::router::nexus_bridge::test_spawn_child(&mut command)?;
-    let output =
-        tokio::time::timeout(std::time::Duration::from_secs(4), child.wait_with_output()).await??;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        ida_mcp::router::nexus_bridge::test_output_child(child),
+    )
+    .await??;
     std::fs::write(
         directory.parent().expect("case").join("issuer.stdout"),
         &output.stdout,

@@ -34,6 +34,13 @@ pub fn test_spawn_child(
 }
 
 #[cfg(feature = "nexus-test-support")]
+pub async fn test_output_child(
+    child: tokio::process::Child,
+) -> std::io::Result<std::process::Output> {
+    output_child(child).await
+}
+
+#[cfg(feature = "nexus-test-support")]
 pub(crate) fn test_spawn_std_child(
     command: &mut std::process::Command,
 ) -> anyhow::Result<std::process::Child> {
@@ -65,6 +72,36 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 type Writer = Arc<AsyncMutex<OwnedWriteHalf>>;
+
+fn record_child_exit(pid: Option<u32>, status: &std::process::ExitStatus, method: &str) {
+    #[cfg(feature = "nexus-test-support")]
+    test_process_ledger::terminal(pid, status, method);
+    #[cfg(not(feature = "nexus-test-support"))]
+    let _ = (pid, status, method);
+}
+
+fn try_wait_child(child: &mut Child) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let pid = child.id();
+    let status = child.try_wait()?;
+    if let Some(status) = &status {
+        record_child_exit(pid, status, "Child.try_wait");
+    }
+    Ok(status)
+}
+
+async fn wait_child(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    let pid = child.id();
+    let status = child.wait().await?;
+    record_child_exit(pid, &status, "Child.wait");
+    Ok(status)
+}
+
+async fn output_child(child: Child) -> std::io::Result<std::process::Output> {
+    let pid = child.id();
+    let output = child.wait_with_output().await?;
+    record_child_exit(pid, &output.status, "Child.wait_with_output");
+    Ok(output)
+}
 #[derive(Clone)]
 pub struct BridgeConfig {
     pub python: PathBuf,
@@ -261,7 +298,7 @@ impl Drop for StartupGuard {
             }
             std::thread::spawn(move || {
                 loop {
-                    match child.try_wait() {
+                    match try_wait_child(&mut child) {
                         Ok(Some(_)) => break,
                         Ok(None) => std::thread::sleep(Duration::from_millis(5)),
                         Err(error) => {
@@ -627,7 +664,7 @@ impl NexusBridge {
                 if state.observer_stop.is_cancelled() {
                     break;
                 }
-                match observed_child.lock().await.try_wait() {
+                match try_wait_child(&mut *observed_child.lock().await) {
                     Ok(Some(status)) => {
                         *state.bridge_exit.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(json!({"pid":pid,"status":status.to_string()}));
@@ -807,13 +844,13 @@ impl NexusBridge {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.lifetime.lock().await.take();
         let mut child = self.child.lock().await;
-        match tokio::time::timeout(Duration::from_secs(12), child.wait()).await {
+        match tokio::time::timeout(Duration::from_secs(12), wait_child(&mut child)).await {
             Ok(status) => {
                 status?;
             }
             Err(_) => {
                 child.kill().await?;
-                child.wait().await?;
+                wait_child(&mut child).await?;
                 remove_lifetime_socket(&self.directory)?;
                 anyhow::bail!(
                     "bridge cleanup deadline expired; own bridge killed, owner stop unconfirmed"
@@ -836,7 +873,7 @@ impl NexusBridge {
     pub async fn terminate(&self) -> anyhow::Result<()> {
         let mut child = self.child.lock().await;
         child.kill().await?;
-        child.wait().await?;
+        wait_child(&mut child).await?;
         remove_lifetime_socket(&self.directory)?;
         self.state.fail("bridge terminated");
         Ok(())

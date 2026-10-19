@@ -133,7 +133,7 @@ print(json.dumps({'owner_released':outcome['owner_released']}))
             command.args(["-I","-B","-c",code,target.to_str().ok_or_else(||anyhow::anyhow!("target UTF8"))?,launch["launch"]["suffix"].as_str().ok_or_else(||anyhow::anyhow!("suffix"))?])
                 .env("IDA_NEXUS_STATE_DIR",envroot.join("state")).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
             let child=ida_mcp::router::nexus_bridge::test_spawn_child(&mut command)?;
-            let output=tokio::time::timeout(Duration::from_secs(12),child.wait_with_output()).await??;
+            let output=tokio::time::timeout(Duration::from_secs(12),ida_mcp::router::nexus_bridge::test_output_child(child)).await??;
             std::fs::write(root.join("external-close.json"),&output.stdout)?;
             anyhow::ensure!(output.status.success(),"late public close failed: {}",String::from_utf8_lossy(&output.stderr));
         }

@@ -37,6 +37,12 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
     original_get = handler.do_GET
     original_post = handler.do_POST
     scenario = os.environ.get('R3A_SCENARIO', 'healthy')
+    if scenario == 'healthy':
+        # The fixture writes HTTP headers and body separately. Nagle plus a
+        # delayed ACK adds artificial per-RPC stalls to the fixed 128 epochs;
+        # use ordinary low-latency loopback framing without changing any input,
+        # response, owner barrier or product deadline.
+        handler.disable_nagle_algorithm = True
     if scenario == 'r9-restore-held':
         boundary.release_owner()
         boundary.path.with_suffix('.id0').write_bytes(bytes(18)+b'\x01B-tree v2original component')
@@ -122,6 +128,12 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
     handler.do_GET, handler.do_POST = get_input, post_input
     original_reply = handler.reply
     def analysis_response(request, payload, status=200):
+        if scenario == 'healthy' and not (root/'http-framing.json').exists():
+            (root/'http-framing.json').write_text(json.dumps({
+                'protocol':handler.protocol_version,
+                'tcp_nodelay_raw':request.connection.getsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY),
+                'tcp_nodelay_enabled':bool(request.connection.getsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY)),
+                'split_headers_body':True}))
         failed_releases = sum(r['endpoint'] == '/release_lease' for r in boundary.requests)
         if request.path == '/release_lease' and scenario == 'r9-gui':
             payload['result']['shutdown_pending'] = False

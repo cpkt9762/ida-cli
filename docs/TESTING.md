@@ -1546,3 +1546,15 @@ Normal live RPCs use the helper protocol; only an exactly exited child permits
 the durable finish-tombstone inspection before restart. The existing accepted
 finish/lost-reply test remains a separate control, and neither child exit nor
 the registry grants a public owner proof.
+
+R4 fix1 adds `test_recovery_preview.py`: explicit read-only scans, another
+terminal/active transaction's pending record, installed four-mode rejection,
+approved exact pending recovery, and changed-plan/input/opener refusal.
+`test_recovery_legacy.py` covers the archive pointer's five actual durable
+boundaries for ready/failed/rolling-back sources plus exact-slot corruption.
+`test_recovery_component_boundaries.py` runs each of six component methods
+separately with shell120s; its coverage JSON names each reached copy/move and
+intent/reservation/completion boundary. These fixtures use one chunk per file
+and explicit absent-owner input, without claiming physical power-loss/boot.
+Final evidence must include three full same-SHA library runs and all actual
+inputs in each source snapshot; unchanged input bytes do not repair old gaps.

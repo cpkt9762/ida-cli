@@ -1012,6 +1012,11 @@ N1原ACK与公共proof单独签收文件责任。新接线要求open6/custody5/t
 preview/apply分别取同序锁。这里仅登记阶段实现，完整v1/移交/配额/平台与最终矩阵仍需R4交付，
 不得据此自行验收R4或启动R6；当前阶段证据在`n7a-refactor/r4-implementation/`。
 
+R4首次独立审查要求F1/F2返修：维护扫描须显式只读，批准计划后才恢复精确pending；
+v1已绑定归档指针的合法pending须在同RecoveryId/完整source与所有权核验下接续。
+返修证据写`n7a-refactor/r4-fix1/`，另补逐component边界、最终三轮lib、完整输入快照与
+native监督映射。物理U6/remount仍未验证，sameboot Unsupported，不由返修自行验收或启动R6。
+
 R4继续实施：volume.json在实际目标锁内绑定原生host/volume/object；只有合格boot-change
 才将当前st_dev映射回原逻辑身份，SCM与Rust根guard仍核当前真实FD/inode，旧proof及历史
 结果字节不改。受控OS输入的直接/受管N1链已执行，不能代真实物理boot/平台资格。

@@ -213,7 +213,7 @@ pub(super) async fn prepare(
         Err(error) => {
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(error) = child.wait().await {
+                if let Err(error) = super::wait_child(&mut child).await {
                     tracing::error!(%error,"file-job failed-start reap unconfirmed");
                 }
             });
@@ -231,7 +231,7 @@ pub(super) async fn prepare(
     {
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = child.wait().await {
+            if let Err(error) = super::wait_child(&mut child).await {
                 tracing::error!(%error,"file-job rejected-start reap unconfirmed");
             }
         });
@@ -260,7 +260,7 @@ pub(super) async fn prepare(
         }
         // Never signal or cancel an accepted child. Its file intents survive
         // bridge/router EOF; waiting here merely reaps the original process.
-        if let Err(error) = child.wait().await {
+        if let Err(error) = super::wait_child(&mut child).await {
             tracing::error!(%error, "file-job process reap unconfirmed");
         }
     });
@@ -290,7 +290,7 @@ async fn message(
             let length = result??;
             Ok(serde_json::from_slice(&bytes[..length])?)
         }
-        exit = child.wait() => anyhow::bail!("file-job child exited before message: {:?}; stderr={}; {}",
+        exit = super::wait_child(child) => anyhow::bail!("file-job child exited before message: {:?}; stderr={}; {}",
             exit?,diagnostics.path.display(),diagnostics.tail()),
     }
 }
@@ -305,7 +305,7 @@ async fn supervise(
     let received = tokio::select! {
         biased;
         value = tokio::time::timeout(Duration::from_secs(8), receive(endpoint)) => value??,
-        exit = child.wait() => anyhow::bail!("file-job receiver ended before rights: {:?}; stderr={}; {}",
+        exit = super::wait_child(child) => anyhow::bail!("file-job receiver ended before rights: {:?}; stderr={}; {}",
             exit?,diagnostics.path.display(),diagnostics.tail()),
     };
     let binding: Value = serde_json::from_slice(received.payload())?;

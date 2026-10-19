@@ -272,7 +272,7 @@ print(json.dumps({'owner_released':outcome['owner_released'],'lease_released':ou
                 .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
                 .kill_on_drop(true);
             let child=ida_mcp::router::nexus_bridge::test_spawn_child(&mut command)?;
-            let output=tokio::time::timeout(Duration::from_secs(15),child.wait_with_output()).await??;
+            let output=tokio::time::timeout(Duration::from_secs(15),ida_mcp::router::nexus_bridge::test_output_child(child)).await??;
             std::fs::write(root.join("external-close.json"),&output.stdout)?;
             anyhow::ensure!(output.status.success(),"private late worker close failed: {}",String::from_utf8_lossy(&output.stderr));
             tokio::time::timeout(Duration::from_secs(8),async {

@@ -5,12 +5,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+pub(super) fn terminal(pid: Option<u32>, status: &std::process::ExitStatus, method: &str) {
+    use std::os::unix::process::ExitStatusExt;
+    let Some(pid) = pid else { return };
+    if let Err(error) = append(&json!({"kind":"terminal","parent":std::process::id(),
+        "pid":pid,"method":method,"exit_code":status.code(),"signal":status.signal(),
+        "success":status.success()}))
+    {
+        tracing::error!(%error,"test native terminal ledger append failed");
+    }
+}
+
 fn append(value: &Value) -> anyhow::Result<()> {
     let Some(path) = std::env::var_os("R2_LEDGER") else {
         return Ok(());
     };
     let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
-    let mut bytes = serde_json::to_vec(value)?;
+    let mut observed = value.clone();
+    observed["observed_unix_ns"] = json!(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos());
+    let mut bytes = serde_json::to_vec(&observed)?;
     bytes.push(b'\n');
     file.write_all(&bytes)?;
     file.sync_all()?;
