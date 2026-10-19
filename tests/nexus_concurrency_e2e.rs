@@ -4,6 +4,7 @@
 mod env;
 use env::*;
 use ida_mcp::nexus::*;
+use ida_mcp::process_spawn::StdOutputFenced;
 use ida_mcp::router::nexus_bridge::NexusBridge;
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
@@ -774,7 +775,7 @@ fn n5_batch_and_search_match_fixed_legacy_binary() {
         .arg(env!("CARGO_BIN_EXE_ida-cli"))
         .env_clear()
         .envs(variables())
-        .status()
+        .status_fenced()
         .unwrap();
     assert!(status.success(), "N5 strict comparison: {status}");
     let evidence: Value = serde_json::from_str(

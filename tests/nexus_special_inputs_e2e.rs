@@ -1,4 +1,5 @@
 //! N7a: real Nexus cache owners and real router preprocessing cancellation.
+use ida_mcp::process_spawn::StdOutputFenced;
 use std::path::PathBuf;
 
 fn special(case: &str) {
@@ -24,7 +25,7 @@ fn special(case: &str) {
         .arg(case)
         .env_clear()
         .envs(variables)
-        .status()
+        .status_fenced()
         .expect("start real special-input driver");
     assert!(
         status.success(),

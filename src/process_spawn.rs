@@ -59,6 +59,29 @@ pub trait StdOutputFenced {
     fn status_fenced(&mut self) -> io::Result<std::process::ExitStatus>;
 }
 
+pub trait AsyncOutputFenced {
+    fn output_fenced(
+        &mut self,
+    ) -> impl std::future::Future<Output = io::Result<std::process::Output>> + Send;
+}
+
+impl AsyncOutputFenced for tokio::process::Command {
+    async fn output_fenced(&mut self) -> io::Result<std::process::Output> {
+        self.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = self.spawn_fenced()?;
+        #[cfg(feature = "nexus-test-support")]
+        {
+            crate::router::nexus_bridge::test_output_child(child).await
+        }
+        #[cfg(not(feature = "nexus-test-support"))]
+        {
+            child.wait_with_output().await
+        }
+    }
+}
+
 impl StdOutputFenced for std::process::Command {
     fn output_fenced(&mut self) -> io::Result<std::process::Output> {
         self.stdin(std::process::Stdio::null())

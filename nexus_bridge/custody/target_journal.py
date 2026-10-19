@@ -164,6 +164,7 @@ class Journal:
                   'retained_evidence_bytes':sum(len(encoded(i)) for i in self.value['entries'].values()
                                                if i.get('resource_retirement') or self.manual_closed(i)),
                   'namespace_bytes':0, 'routine_files':0}
+        totals['legacy_diagnostics']=getattr(self.target,'legacy_diagnostics',[])
         from recovery_files import unpublished
         root_preparations=unpublished(self.target.directory)
         totals['unpublished_preparations']=sorted(root_preparations)

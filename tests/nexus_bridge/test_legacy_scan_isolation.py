@@ -12,6 +12,7 @@ sys.path[:0] = [str(REPO/'nexus_bridge/custody'), str(REPO/'nexus_bridge')]
 from acquisition import Custodian
 from open_recovery import OpenGate
 from owner_identity import state_identity
+from target_journal import Journal
 
 
 class LegacyScan(unittest.TestCase):
@@ -33,13 +34,13 @@ class LegacyScan(unittest.TestCase):
         path.chmod(0o600)
         statuses = []
         with OpenGate(home, path, time.monotonic()+3) as gate:
-            statuses.append(gate.target.legacy_diagnostics)
+            statuses.append(Journal(gate.target).accounting()['legacy_diagnostics'])
         custody = Custodian.__new__(Custodian)
         custody.deadline = time.monotonic()+3
         custody.helper = {'state_root': state_identity()}
         custody.acquisition = None
         with custody.gate(path) as target:
-            statuses.append(target.legacy_diagnostics)
+            statuses.append(Journal(target).accounting()['legacy_diagnostics'])
         self.assertEqual({str(p): (p.stat().st_ino, p.read_bytes()) for p in recovery.rglob('*') if p.is_file()}, before)
         for status in statuses:
             self.assertEqual({item['kind'] for item in status},

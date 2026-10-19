@@ -3,6 +3,7 @@
 mod env;
 use env::*;
 use ida_mcp::nexus::*;
+use ida_mcp::process_spawn::StdOutputFenced;
 use serde_json::{json, Value};
 use std::{path::PathBuf, time::Duration};
 
@@ -22,7 +23,7 @@ fn scenario(case: &str) {
         .arg(case)
         .env_clear()
         .envs(variables())
-        .status()
+        .status_fenced()
         .expect("launch bounded N6 real driver");
     assert!(status.success(), "{case}: {status}");
     let result: Value = serde_json::from_str(

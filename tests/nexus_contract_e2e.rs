@@ -1,5 +1,6 @@
 //! Real N4 acceptance through the actual CLI and both MCP transports.
 //! The Python driver uses only the fixed binary baseline, never old source.
+use ida_mcp::process_spawn::StdOutputFenced;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -27,7 +28,7 @@ fn contract(case: &str) {
         .arg(case)
         .env_clear()
         .envs(variables)
-        .status()
+        .status_fenced()
         .expect("launch real contract driver with shell timeout");
     assert!(
         status.success(),

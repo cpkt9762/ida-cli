@@ -18,6 +18,7 @@
 //! to that file.
 
 use ida_mcp::process_spawn::SpawnFenced;
+use ida_mcp::process_spawn::StdOutputFenced;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -152,7 +153,7 @@ impl Daemon {
             .arg(self.rpc_socket())
             .args(args)
             .stdin(Stdio::null())
-            .output()
+            .output_fenced()
             .expect("run ida-cli")
     }
 
@@ -308,7 +309,7 @@ fn build_fixture(dir: &Path, name: &str, body: &str) -> PathBuf {
         .args(["-O0", "-o"])
         .arg(&binary)
         .arg(&source)
-        .output()
+        .output_fenced()
         .unwrap_or_else(|e| panic!("cannot run {compiler}: {e}"));
     assert!(
         output.status.success(),

@@ -1,5 +1,6 @@
 //! K2 acquisition contracts. Cross-layer cases use the production adapter below.
 use ida_mcp::nexus::*;
+use ida_mcp::process_spawn::AsyncOutputFenced;
 use serde_json::json;
 
 #[allow(dead_code)]
@@ -1212,7 +1213,7 @@ async fn device_epoch_n1_case(managed: bool) {
             "--produce"
         })
         .arg(&root)
-        .output()
+        .output_fenced()
         .await
         .expect("old device input process");
     std::fs::write(root.join("producer.stdout"), &produced.stdout).expect("producer evidence");
@@ -1854,7 +1855,7 @@ async fn retained_file_job_case(fault: Option<&str>) {
                 )
                 .arg(root.join("i/installation"))
                 .arg(&target)
-                .output()
+                .output_fenced()
                 .await?;
             std::fs::write(root.join("fresh-gate.stdout"), &output.stdout)?;
             std::fs::write(root.join("fresh-gate.stderr"), &output.stderr)?;
