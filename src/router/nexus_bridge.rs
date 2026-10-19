@@ -1184,11 +1184,22 @@ async fn event_received(
         let nonce = event["nonce"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("custody receipt nonce missing"))?;
-        state
+        let removed = state
             .custody_replies
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(nonce);
+        #[cfg(feature = "nexus-test-support")]
+        if let Some((request, _)) = &removed {
+            if request["action"] == "file_job_prepare" {
+                state.emit(
+                    json!({"event":"file_job_reply_consumed","job_nonce":request["job_nonce"],
+                    "recovery_id":request["recovery_id"],"nonce":nonce}),
+                );
+            }
+        }
+        #[cfg(not(feature = "nexus-test-support"))]
+        let _ = removed;
         return Ok(());
     }
     if event["event"] == "released" && event["outcome"]["lease_released"] == true {
@@ -1246,7 +1257,17 @@ async fn event_received(
             let owned_state = state.clone();
             let owned_writer = writer.clone();
             tokio::spawn(async move {
-                let result = custody_wire::receive(&event, &owned_state).await;
+                let result = async {
+                    let value = custody_wire::receive(&event, &owned_state).await?;
+                    #[cfg(feature = "nexus-test-support")]
+                    test_barriers::asynchronous(
+                        "file_job_ready_reply",
+                        json!({"request":event,"response":value}),
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>(value)
+                }
+                .await;
                 let reply = match result {
                     Ok(value) => value,
                     Err(error) => {
@@ -1438,6 +1459,11 @@ fn apply_event(mut event: Value, state: &State) -> anyhow::Result<()> {
         return Ok(());
     }
     if event["event"] == "local_status" {
+        event["custody_replies_pending"] = json!(state
+            .custody_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len());
         event["n1_acquisitions"] = state
             .endpoint
             .transition(|s, _| Ok::<_, NexusError>(s.acquisition_status()))?;

@@ -71,6 +71,87 @@ class HelperCustody(unittest.TestCase):
         self.assertEqual(status['identity']['sid'], child.pid, 'helper must have its own session')
         return endpoint
 
+    def test_compaction_io_failure_allows_existing_public_proof_and_closures(self):
+        """Actual SDK/helper/writer; only the old routine closure is a fixture."""
+        from unittest.mock import patch
+        from target_coordination import digest
+        import errno
+        with Boundary(self.root/'owner') as boundary:
+            endpoint=self.start_helper()
+            owner=owner_key(boundary.instance)
+            acquisition={'parent':'routine-emergency','purpose':'final','ordinal':1}
+            request(endpoint,self.identity,{'kind':'reserve_parent','parent':'routine-emergency'})
+            with Target(boundary.path) as target,target.locked():
+                journal=Journal(target)
+                epoch=journal.begin(acquisition,'live-cleanup',owner=owner)
+                value=dict(watch='live-cleanup',target=str(boundary.path),subscription_epoch=epoch,
+                    coord_key=target.key,owner=owner,acquisition=acquisition)
+            signed=request(endpoint,self.identity,dict(value,kind='subscribe'))['receipt']
+            with Target(boundary.path) as target,target.locked():
+                journal=Journal(target)
+                journal.owner_signed(signed)
+                old=journal.begin({'parent':'closed-fixture','purpose':'final','ordinal':1},'closed-fixture')
+                observations=target.directory.child('observations')
+                directory=observations.child('closed-fixture')
+                try:
+                    directory.durable('routine-denied.json',{'kind':'NoAttach','fixture':'no SDK/public proof claim'})
+                    _,info,raw=directory.read('routine-denied.json')
+                    reference={'path':str(directory.path/'routine-denied.json'),'sha256':digest(raw),
+                        'inode':[info.st_dev,info.st_ino],'kind':'NoAttach'}
+                finally:directory.close();observations.close()
+                journal.value['entries'][str(old)].update(facts=[reference],producer_closed=True,
+                    consumer_closed=True,detached=True,bridge_closed=True,unacked_events=False)
+                journal.save()
+                original=os.unlink
+                def deny(name,*args,**kwargs):
+                    if name=='routine-denied.json':raise OSError(errno.EACCES,'controlled routine refusal')
+                    return original(name,*args,**kwargs)
+                with patch('target_journal.os.unlink',deny):
+                    with self.assertRaisesRegex(OSError,'RoutineCompactionFailed'):journal.settle()
+            boundary.release_owner()
+            deadline=time.monotonic()+2
+            while True:
+                item=request(endpoint,self.identity,{'kind':'lookup','watch':'live-cleanup'})['item']
+                if item.get('proof'):break
+                self.assertLess(time.monotonic(),deadline,'actual public lifetime proof deadline')
+                time.sleep(.002)
+            proof=item['proof']
+            rows=[]
+            def writer(action,**fields):
+                message=dict(target=value['target'],coord_key=value['coord_key'],watch=value['watch'],action=action,**fields)
+                argv=['timeout','10s',sys.executable,'-B',str(REPO/'tests/support/r4_journal_io.py'),str(REPO)]
+                before=subprocess.check_output(['uptime'],text=True).strip()
+                result=subprocess.run(argv,input=json.dumps(message),capture_output=True,text=True,check=False)
+                rows.append(dict(argv=argv,action=action,exit=result.returncode,stdout=result.stdout,stderr=result.stderr,
+                    uptime_before=before,uptime_after=subprocess.check_output(['uptime'],text=True).strip()))
+                (self.root/'emergency-writer.json').write_text(json.dumps(rows,indent=2))
+                return result
+            denied=writer('accounting')
+            self.assertNotEqual(denied.returncode,0)
+            self.assertIn('RoutineCompactionFailed',denied.stderr)
+            accepted=writer('proof',proof=proof)
+            self.assertEqual(accepted.returncode,0,accepted.stderr)
+            consumer=request(endpoint,self.identity,{'kind':'proof_custody_ack','watch':value['watch'],
+                'path':proof['path'],'sha256':proof['sha256']})['consumer']
+            accepted=writer('producer_closed',consumer=consumer)
+            self.assertEqual(accepted.returncode,0,accepted.stderr)
+            publisher=Observer('bridge-emergency-'+self.identity,8)
+            closed=publisher.publish(value,'BridgeProducerClosed',proof=proof,previous_facts=[])
+            accepted=writer('bridge_closed',consumer=closed)
+            self.assertEqual(accepted.returncode,0,accepted.stderr)
+            self.assertTrue(Path(reference['path']).exists(),'routine failure must keep its original evidence')
+            with Target(boundary.path) as target,target.locked():
+                journal=Journal(target,compact=False)
+                live=journal.value['entries'][str(epoch)]
+                self.assertTrue(live['proof'] and live['producer_closed'] and live['consumer_closed'] and live['bridge_closed'])
+                self.assertIsNotNone(journal.value['compaction'])
+                resumed=Journal(target)
+                resumed.settle()
+                self.assertEqual(resumed.value['entries'],{})
+            request(endpoint,self.identity,{'kind':'retire','watch':'live-cleanup','sha256':consumer['sha256']})
+            request(endpoint,self.identity,{'kind':'retire_parent','parent':'routine-emergency'})
+            request(endpoint,self.identity,{'kind':'finish'})
+
     def recovery_case(self, released_before_crash):
         with Boundary(self.root / 'owner') as boundary:
             endpoint = self.start_helper()

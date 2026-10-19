@@ -213,10 +213,47 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
                     raise RuntimeError('controlled observation handoff NotSent after helper subscribe')
                 return original_transfer(self, action, **fields)
             Custodian.transact = fail_observation_once
+        if os.environ.get('R4_FILE_GATE_RELOCATE'):
+            from acquisition import Custodian
+            from r0_transport import install_ida_inputs
+            original_admit=Custodian.admit_target
+            def publish_only_after_gate(self,*args,**kwargs):
+                result=original_admit(self,*args,**kwargs)
+                wanted=Path(os.environ['R4_FILE_GATE_RELOCATE']).resolve()
+                if Path(self.target_path)!=wanted:
+                    raise AssertionError('device-gate fixture targeted an unexpected canonical path')
+                if Path(self.target_path)==wanted and not (root/'r4-device-gate-bound').exists():
+                    reference=json.loads((root/'reference.json').read_text())
+                    record=self.target.directory.path/reference['recovery_id']/'recovery.json'
+                    (root/'r4-device-before-attach.json').write_text(record.read_text())
+                    boundary.release_owner()
+                    boundary.path=wanted
+                    boundary.registration=InstanceRegistration(REGISTRY_DIR,
+                        InstanceIdentity(str(wanted),str(wanted),'idalib',True),token=secrets.token_hex(24))
+                    boundary.instance=boundary.registration.publish(boundary.server.server_port)
+                    boundary.released=False
+                    install_ida_inputs(wanted)
+                    (root/'r4-device-gate-bound').touch()
+                return result
+            Custodian.admit_target=publish_only_after_gate
         if scenario == 'r9-restore-held':
             import open_recovery
             from acquisition import Custodian
             from r0_transport import barrier
+            if os.environ.get('R4_SNAPSHOT_CONSTRUCTOR_FAILURE'):
+                def fail_snapshot_copy(self,*args,**kwargs):
+                    if os.environ['R4_SNAPSHOT_CONSTRUCTOR_FAILURE']=='changed-source':
+                        foreign=self.target.parent/'foreign-component'
+                        foreign.write_bytes(b'unknown component before SDK')
+                        foreign.chmod(0o600)
+                    if os.environ['R4_SNAPSHOT_CONSTRUCTOR_FAILURE']=='saved-component':
+                        replacement=self.target.parent/'saved-replacement'
+                        replacement.write_bytes(b'independent saved component before SDK')
+                        replacement.chmod(0o600)
+                        os.replace(replacement,self.target)
+                    (root/'snapshot-constructor-failed.json').write_text(json.dumps({'path':str(self.path)}))
+                    raise OSError('controlled snapshot constructor copy failure before SDK entry')
+                open_recovery.Snapshot.copy=fail_snapshot_copy
             if os.environ.get('R4_FILE_JOB_FAULT'):
                 install_file_fault=runpy.run_path(str(Path(__file__).with_name('r4_file_job_faults.py')))['install']
                 install_file_fault('source')
@@ -235,7 +272,7 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
             original_advance = Custodian.advance_restore
             def deferred_restore(self):
                 barrier(root, 'restore', seconds=8)
-                if os.environ.get('R4_U6_FILE_JOB') and (root/'r4-gate.request').exists() and self.recovery_snapshot:
+                if (os.environ.get('R4_U6_FILE_JOB') or os.environ.get('R4_RESUME_RETAINED_FILE')) and (root/'r4-gate.request').exists() and self.recovery_snapshot:
                     from target_coordination import Target
                     from target_journal import Journal
                     with Target(self.target_path) as target,target.locked(nb=True):

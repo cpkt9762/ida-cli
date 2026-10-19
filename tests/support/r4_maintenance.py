@@ -79,6 +79,10 @@ for variant in ('missing','changed','symlink','permissions','manifest','missing-
 empty_runtime=root/'missing-dependencies'
 result=call([sys.executable,'-m','venv','--without-pip',empty_runtime])
 assert result.returncode==0,result.stderr
+site=Path('lib')/f'python{sys.version_info.major}.{sys.version_info.minor}'/'site-packages'
+telemetry=Path(sys.prefix)/site/'r2_test_telemetry.pth'
+assert telemetry.is_file(),'prepared runtime must have the static test identity collector'
+shutil.copyfile(telemetry,empty_runtime/site/telemetry.name)
 result=call([launcher,empty_runtime/'bin/python',installation,'isolated','--help'],cwd=hostile,env=env)
 assert result.returncode!=0 and ('ida_nexus' in result.stderr or 'ida-nexus' in result.stderr),result.stderr
 

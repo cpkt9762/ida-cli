@@ -61,8 +61,9 @@ def file_info(directory, name):
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory.fd)
     try:
         before = os.fstat(fd)
-        regular(before, directory.identity[0])
+        regular(before, directory.native_identity[0])
         result = metadata(before)
+        result['device']=directory.object_identity(before)[0]
         h = hashlib.sha256()
         while chunk := os.read(fd, 1024*1024):
             h.update(chunk)
@@ -91,9 +92,9 @@ def inventory(directory, coordination=None):
         if stat.S_ISREG(info.st_mode):
             result[name] = file_info(directory, name)
         elif stat.S_ISDIR(info.st_mode):
-            if info.st_uid != os.getuid() or info.st_dev != directory.identity[0]:
+            if info.st_uid != os.getuid() or info.st_dev != directory.native_identity[0]:
                 raise RuntimeError('RecoveryBlocked: foreign directory in target parent')
-            result[name] = {'directory':[info.st_dev,info.st_ino,info.st_uid],
+            result[name] = {'directory':directory.object_identity(info),
                             'mode':stat.S_IMODE(info.st_mode)}
             if coordination is not None and name == coordination.path.name:
                 coordination.verify()
@@ -109,7 +110,7 @@ def rename_exact(source, source_name, destination, destination_name, expected, a
     """Only an exact already-journaled rename may be completed or recognized."""
     safe_name(source_name)
     safe_name(destination_name)
-    if source.identity[0] != destination.identity[0]:
+    if source.native_identity[0] != destination.native_identity[0]:
         raise OSError(errno.EXDEV, 'RecoveryBlocked: cross-volume publication refused')
     current = maybe_info(source, source_name)
     at_destination = maybe_info(destination, destination_name)
@@ -158,7 +159,7 @@ def copy_exact(source, name, destination, expected, mode, binding, checkpoint, a
     current = file_info(source, name)
     if not compatible(current, expected):
         raise RuntimeError('RecoveryBlocked: copy source identity/content changed')
-    if not external and source.identity[0] != destination.identity[0]:
+    if not external and source.native_identity[0] != destination.native_identity[0]:
         raise OSError(errno.EXDEV, 'RecoveryBlocked: copy destination is not on target volume')
     authorize()
     existing = maybe_info(destination, name)
@@ -176,7 +177,9 @@ def copy_exact(source, name, destination, expected, mode, binding, checkpoint, a
     source_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=source.fd)
     output = None
     try:
-        if metadata(os.fstat(source_fd)) != {k:v for k,v in expected.items() if k != 'sha256'}:
+        opened=metadata(os.fstat(source_fd))
+        opened['device']=source.object_identity(os.fstat(source_fd))[0]
+        if opened != {k:v for k,v in expected.items() if k != 'sha256'}:
             raise RuntimeError('RecoveryBlocked: source replaced before copy')
         try:
             output = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -186,13 +189,13 @@ def copy_exact(source, name, destination, expected, mode, binding, checkpoint, a
                 raise RuntimeError('RecoveryBlocked: unbound existing copy retained') from None
             output = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=destination.fd)
         else:
-            binding = {'identity':[os.fstat(output).st_dev,os.fstat(output).st_ino,os.getuid()]}
+            binding = {'identity':destination.object_identity(os.fstat(output))}
             checkpoint(binding)
             os.fsync(destination.fd)
             boundary('copy','created',{'destination':str(destination.path/name),'binding':binding})
         info = os.fstat(output)
-        regular(info, destination.identity[0])
-        if [info.st_dev,info.st_ino,info.st_uid] != binding['identity'] or info.st_size > expected['size']:
+        regular(info, destination.native_identity[0])
+        if destination.object_identity(info) != binding['identity'] or info.st_size > expected['size']:
             raise RuntimeError('RecoveryBlocked: interrupted copy identity changed')
         # Do not truncate or replace even a known partial copy.
         os.lseek(output, 0, os.SEEK_SET)

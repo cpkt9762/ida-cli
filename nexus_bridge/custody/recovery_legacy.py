@@ -113,17 +113,19 @@ def import_v1(target, path):
     if not recovery_name(path.name):
         raise RuntimeError('RecoveryBlocked: legacy RecoveryId must be retained exactly')
     source=Directory(path)
+    source.inherit_volume(target.directory)
     snapshot=None
     try:
         value,record_info=legacy_record(source)
         if value['target'] != target.original:
             raise RuntimeError('RecoveryBlocked: legacy target differs from fixed authority')
         current_parent=Directory(target.target.parent,private=False)
+        current_parent.inherit_volume(target.directory)
         try:
             actual=os.fstat(current_parent.fd)
             identity=value['parent_identity']
             if (type(identity) is not list or len(identity)!=3 or any(type(n) is not int for n in identity)
-                    or identity != [actual.st_ino,actual.st_dev,actual.st_mode]):
+                    or identity != [actual.st_ino,current_parent.identity[0],actual.st_mode]):
                 raise RuntimeError('RecoveryBlocked: legacy parent identity changed')
         finally:current_parent.close()
         manifest=sources(source,target)

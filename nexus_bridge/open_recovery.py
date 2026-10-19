@@ -216,10 +216,11 @@ def inventory(directory, deadline, coordination=None):
 
 
 class Snapshot:
-    def __init__(self, root, target, deadline, *, owner_probe=None, coordination=None):
+    def __init__(self, root, target, deadline, *, owner_probe=None, coordination=None, custodian=None):
         from recovery_transaction import Transaction
         self.target, self.deadline = target, deadline
         self.coordination = coordination
+        self.custodian = custodian
         self.owner_probe = owner_probe or public_owner_probe
         self.names = {target.name, *(target.with_suffix(ext).name
             for ext in ('.id0', '.id1', '.id2', '.nam', '.til'))}
@@ -231,10 +232,37 @@ class Snapshot:
             def started(transaction):
                 self.active = transaction
                 self.path = transaction.directory.path
+                self.recovery_id,self.token=transaction.recovery_id,transaction.token
+                self.data,self.before=transaction.data,transaction.data['before']
+                if custodian is not None:
+                    custodian.file_recovery_id=self.recovery_id
+                    custodian.file_snapshot=self
                 transaction.owner_probe = self.owner_probe
                 transaction.copy_hook = self.copy_hook
-            self.recovery_id, self.token = Transaction.create(actual,on_begin=started)
-            self.active = None
+            try:
+                self.recovery_id, self.token = Transaction.create(actual,on_begin=started)
+            except BaseException as original:
+                self.active=None
+                if self.path is not None:
+                    try:
+                        from acquisition import failure_details
+                        with self.transaction() as transaction:
+                            transaction.data['cause']=failure_details(original)
+                            transaction.save()
+                            # No resolver was entered. Retain our partial
+                            # snapshot without rolling back later valid saves;
+                            # unknown namespace/backup changes still refuse.
+                            transaction.register_backups()
+                            transaction.expect_unrelated(transaction.data['before'])
+                            transaction.archive('snapshot construction failed before resolver; partial evidence retained')
+                    except Exception as cleanup_error:
+                        if custodian is not None:
+                            custodian.recovery_error=type(cleanup_error).__name__+': '+str(cleanup_error)
+                            custodian.recovery_blocked=True
+                        raise RuntimeError('RecoveryBlocked: snapshot setup '+str(original)
+                            +'; independent file_archive_error: '+str(cleanup_error)) from original
+                raise
+            finally:self.active=None
             with Transaction(actual,self.recovery_id,token=self.token) as transaction:
                 self.data = transaction.data
                 self.before = self.data['before']
@@ -305,6 +333,8 @@ class Snapshot:
             raise RuntimeError('RecoveryBlocked: copy is restricted to the active private transaction')
         input_directory = Directory(source.parent,private=False)
         output_directory = Directory(destination.parent)
+        input_directory.inherit_volume(self.active.directory)
+        output_directory.inherit_volume(self.active.directory)
         try:
             return self.active.copy_file(input_directory,source.name,output_directory,expected,mode)
         finally:
@@ -368,17 +398,19 @@ class Snapshot:
             transaction.complete()
 
     def status(self):
-        from target_coordination import Directory
-        directory=Directory(self.path)
-        try:
-            record,_,_=directory.read('recovery.json')
-            if (record.get('recovery_id') != self.recovery_id or record.get('directory') != directory.identity
-                    or record.get('target') != self.data['target']):
-                raise RuntimeError('RecoveryBlocked: status transaction identity changed')
-            return {'job_id':self.recovery_id,'transaction':str(directory.path),'phase':record['status'],
-                    'job':record.get('job'),'executor':record['executor'],'progress':record['progress'],
-                    'cause':record.get('cause'),'last_error':record.get('last_error')}
-        finally:directory.close()
+        from target_coordination import Directory,Target
+        with Target(self.target,create=False) as target:
+            directory=Directory(self.path)
+            directory.inherit_volume(target.directory)
+            try:
+                record,_,_=directory.read('recovery.json')
+                if (record.get('recovery_id') != self.recovery_id or record.get('directory') != directory.identity
+                        or record.get('target') != self.data['target']):
+                    raise RuntimeError('RecoveryBlocked: status transaction identity changed')
+                return {'job_id':self.recovery_id,'transaction':str(directory.path),'phase':record['status'],
+                        'job':record.get('job'),'executor':record['executor'],'progress':record['progress'],
+                        'cause':record.get('cause'),'last_error':record.get('last_error')}
+            finally:directory.close()
 
     def resolver_failed(self, *, no_acquisition):
         with self.transaction() as transaction:
@@ -411,7 +443,7 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
     with locking:
         coordination = custodian.target if custodian else locking.target
         state = probe_database_state(path, output_database=options.get('output_database'))
-        snapshot = Snapshot(root, target, deadline, coordination=coordination) if state['state'] in ('crashed', 'unpacked') else None
+        snapshot = Snapshot(root, target, deadline, coordination=coordination,custodian=custodian) if state['state'] in ('crashed', 'unpacked') else None
         if snapshot is not None:
             snapshot.custodian = custodian
             if custodian is not None:

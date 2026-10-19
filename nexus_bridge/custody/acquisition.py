@@ -651,6 +651,10 @@ class Custodian:
                         if self.bridge.acquisitions.get(parent) is self:
                             self.bridge.acquisitions.pop(parent)
 
+    def has_file_obligation(self):
+        return (self.recovery_snapshot is not None or (self.file_snapshot is not None
+            and self.file_snapshot.data['status'] not in ('restored','opened','archived')))
+
     def known_no_acquisition(self):
         if self.absence_confirmed:
             return True
@@ -723,8 +727,10 @@ class Custodian:
         self.bridge.proof_wakeup.set()
 
     def prepare_file_job(self, transaction, reply, identity, nonce):
+        from recovery_job import readiness
         return self.transact('file_job_prepare',target=transaction.data['target'],
-            coord_key=transaction.target.key,directory=transaction.target.directory.identity,
+            coord_key=transaction.target.key,directory=transaction.target.directory.native_identity,
+            ready_sha256=digest(readiness(transaction.target,transaction.recovery_id)),
             root_binding=transaction.target.recovery_root_binding(),epoch=transaction.token.epoch,
             recovery_id=transaction.recovery_id,job_nonce=nonce,
             reply_endpoint=str(reply),reply_identity=list(identity))['job']
@@ -748,6 +754,7 @@ class Custodian:
                                 if certificate is None:
                                     raise RuntimeError('RecoveryBlocked: terminal file resource certificate missing')
                                 completed.validate_certificate(requirement,certificate)
+                        if terminal:snapshot.data=completed.data
                 if terminal:
                     target.close()
                     self.recovery_snapshot=None

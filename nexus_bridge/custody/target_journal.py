@@ -28,6 +28,12 @@ class ObservationPending(RuntimeError):
     """An immutable producer has not finished publishing its reserved fact."""
 
 
+class RoutineCompactionFailure(OSError):
+    """Preserve the underlying errno while naming the failed routine work."""
+    def __init__(self,error):
+        super().__init__(error.errno,'RoutineCompactionFailed: '+str(error))
+
+
 def fact(receipt, target, *, kind=None):
     path = Path(receipt['path'])
     relative = path.relative_to(target.directory.path)
@@ -52,7 +58,7 @@ def fact(receipt, target, *, kind=None):
             raise RuntimeError('CoordinationBlocked: immutable fact namespace/identity mismatch')
         if kind is not None and record['kind'] != kind:
             raise RuntimeError('CoordinationBlocked: receipt evidence type mismatch')
-        return {'path':str(path), 'sha256':digest(data), 'inode':[info.st_dev, info.st_ino], 'kind':record['kind']}
+        return {'path':str(path), 'sha256':digest(data), 'inode':producer.object_identity(info)[:2], 'kind':record['kind']}
     finally:
         if producer is not None:
             producer.close()
@@ -60,10 +66,11 @@ def fact(receipt, target, *, kind=None):
 
 
 class Journal:
-    def __init__(self, target, *, recover=True):
+    def __init__(self, target, *, recover=True, compact=True):
         if target.target_fd is None:
             raise RuntimeError('target authority requires stable target EX')
         self.target = target
+        self.compact_enabled=compact
         if recover:
             target.directory.recover_record('custody.json')
         try:
@@ -74,7 +81,7 @@ class Journal:
                           'compaction':None}
             self.info = self.raw = None
         self.validate()
-        if recover:
+        if recover and compact:
             self.resume_compaction()
 
     def validate(self):
@@ -189,7 +196,7 @@ class Journal:
                 scan(directory, name)
             finally:
                 directory.close()
-        for name in ('lock', 'root.lock', 'target.json'):
+        for name in ('lock', 'root.lock', 'target.json', 'volume.json'):
             try:
                 totals['namespace_bytes'] += os.stat(name, dir_fd=self.target.directory.fd, follow_symlinks=False).st_size
             except FileNotFoundError:
@@ -226,7 +233,7 @@ class Journal:
         for name in os.listdir(self.target.directory.fd):
             if name.endswith('.new'):
                 raise RuntimeError('CoordinationBlocked: interrupted durable write retained: ' + name)
-            allowed = {'lock','target.json','custody.json','proofs','observations','retained'}
+            allowed = {'lock','target.json','volume.json','custody.json','proofs','observations','retained'}
             if self.target.root is None:
                 allowed.add('root.lock')
             if recovery_name(name):
@@ -270,7 +277,7 @@ class Journal:
             directory = container.child(relative.parts[1], create=False)
             try:
                 record, info, data = directory.read(relative.name)
-                if digest(data) != reference['sha256'] or [info.st_dev, info.st_ino] != reference['inode']:
+                if digest(data) != reference['sha256'] or directory.object_identity(info)[:2] != reference['inode']:
                     raise RuntimeError('ObservationRecoveryBlocked: authorized source fact replaced')
                 fact({'path':reference['path'], 'record':record, 'sha256':reference['sha256']}, self.target)
                 return record
@@ -363,7 +370,7 @@ class Journal:
         item['unacked_events'] = False
         item['no_attach'] = True
         self.save()
-        self.settle()
+        if self.compact_enabled:self.settle()
 
     def file_intent(self, path, status, attempts):
         intents = self.value.setdefault('file_intents', {})
@@ -795,6 +802,13 @@ class Journal:
         return {}
 
     def settle(self):
+        try:return self.settle_closed()
+        except RoutineCompactionFailure:raise
+        except OSError as error:raise RoutineCompactionFailure(error) from error
+
+    def settle_closed(self):
+        if self.value.get('compaction'):
+            self.resume_compaction()
         if self.value.get('file_intents'):
             return
         from recovery_transaction import pinned_epochs
@@ -913,6 +927,11 @@ class Journal:
             retained.close()
 
     def resume_compaction(self):
+        try:return self.resume_compaction_locked()
+        except RoutineCompactionFailure:raise
+        except OSError as error:raise RoutineCompactionFailure(error) from error
+
+    def resume_compaction_locked(self):
         intent = self.value.get('compaction')
         if not intent:
             return
@@ -959,7 +978,7 @@ class Journal:
                     continue  # The durable exact intent authorizes only this name.
                 except (json.JSONDecodeError,UnicodeDecodeError) as error:
                     raise RuntimeError('RoutineCompactionFailed: immutable fact is corrupt; evidence retained') from error
-                if [info.st_dev, info.st_ino] != entry['inode'] or digest(data) != entry['sha256']:
+                if producer.object_identity(info)[:2] != entry['inode'] or digest(data) != entry['sha256']:
                     raise RuntimeError('RoutineCompactionFailed: immutable fact changed')
                 compaction_boundary('before_unlink',entry)
                 os.unlink(relative.name, dir_fd=producer.fd)
@@ -970,7 +989,7 @@ class Journal:
                 try:
                     if not os.listdir(producer.fd):
                         info = os.stat(relative.parts[1], dir_fd=container.fd, follow_symlinks=False)
-                        if [info.st_dev, info.st_ino, info.st_uid] != producer.identity:
+                        if producer.object_identity(info) != producer.identity:
                             raise RuntimeError('RoutineCompactionFailed: empty observation directory replaced')
                         container.verify()
                         os.rmdir(relative.parts[1], dir_fd=container.fd)
@@ -1162,7 +1181,7 @@ def main():
                     raise RuntimeError('StartupUnconfirmed: durable launch binding mismatch')
                 fact(value['receipt'], target)
             print(json.dumps({'ok':True, 'epoch':item['epoch'], 'revision':journal['revision'],
-                              'origin_binding':item['origin_binding']}))
+                              'origin_binding':item['origin_binding'],'native_coord_key':target.native_key}))
             return
         with target.locked(deadline=time.monotonic()+1.5,
                            recover=value['action'] != 'verification_probe_cleanup'):
@@ -1173,7 +1192,7 @@ def main():
                 result = verification_probe_cleanup(target,value['state_root'],value['parent'])
                 print(json.dumps({'ok':True, **result}))
                 return
-            journal = Journal(target)
+            journal = Journal(target,compact=action in ('settle','accounting'))
             if action == 'adopt':
                 result = journal.adopt(value)
             elif action == 'release_observation':

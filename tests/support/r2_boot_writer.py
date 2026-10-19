@@ -36,13 +36,11 @@ if __name__ == '__main__':
                 result['identity'] = dict(result['identity'], boot_id=marker.read_text())
             return result
         entry.Observer.receive = receive
-    elif hasattr(entry,'creation_scope'):
-        native_scope = entry.creation_scope
-        entry.creation_scope = lambda path, incarnation: observed_scope(native_scope, path, incarnation)
-    else:
-        # The independent file executor imports the same authority through
-        # origin; only the OS scope input changes, never its real actor birth.
-        import origin
-        native_scope=origin.creation_scope
-        origin.creation_scope=lambda path, incarnation:observed_scope(native_scope,path,incarnation)
+    # Scope consumers include Target's volume binding and retained file
+    # certificates as well as the entry's original import alias. All observe
+    # one injected OS input, while native actor birth/FDs remain unchanged.
+    import origin
+    native_scope=origin.creation_scope
+    origin.creation_scope=lambda path, incarnation:observed_scope(native_scope,path,incarnation)
+    if hasattr(entry,'creation_scope'):entry.creation_scope=origin.creation_scope
     entry.main()

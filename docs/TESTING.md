@@ -1461,8 +1461,9 @@ evidence. Protocol versions and fixed SDK modules/patches are unchanged.
 ### R4 file transaction implementation (in progress)
 
 R3b has independent acceptance through `5d8a215`; the historical paragraphs above
-describe their original delivery state. The R4 adapter now requires open4,
-custody5, target_gate2, `file_recovery_ack_v1` and `file_job_relay_v1`;
+describe their original delivery state. The R4 adapter now requires open6,
+custody5, target_gate3, `file_recovery_ack_v1`, `file_job_relay_v2` and
+`stable_volume_rebinding_v1`;
 fixed SDK bytes stay unchanged.
 R4 is not yet accepted. Stage results and all failures are preserved in the
 external `n7a-refactor/r4-implementation/` directory.
@@ -1504,5 +1505,29 @@ its 80/95/100 percent retained thresholds use actual file bytes.
 The installed maintenance driver covers snapshotless/two-target permissions,
 accepted-plan process-exit continuation, env-i/absolute entry/four launch modes,
 tampered members and missing dependencies. Final-SHA regressions, physical U6,
-device-number remapping and the remaining R4 gates are still required before
-claiming R4 complete.
+and the remaining R4 gates are still required before claiming R4 complete.
+`test_volume_identity.py` uses explicitly controlled device/boot inputs and real
+files/locks to test identity-preserving remapping and interrupted v1 import.
+The direct and managed Rust/N1 gate cases verify actual current SCM FD/root
+identities while keeping the original logical CoordKey; native IDA is controlled
+there. Neither layer supplies a real physical reboot or remount qualification.
+
+Snapshot-constructor I/O errors stay before the SDK. An unchanged or normally
+saved component set permits only a no-failure archive, preserving partial
+evidence and the original error; unknown new components retain the file gate and
+remain visible in status. Old queued file actions cannot inherit a new executor
+token after AbortOffer. Late Ready replies reclaim only their exact transport
+cache entry and never grant file execution or clear the caller's timeout.
+Routine unlink failures retain errno/cause and block new admission; accepted
+public proofs and producer/consumer closure writers continue independently.
+The expanded installed maintenance driver uses timeout120s as an aggregate of
+individually bounded 15s entries; this does not change any product barrier.
+File-job v2 datagrams carry bounded readiness/binding/completion digests. The
+receiver validates the full FrozenOffer from the same guarded transaction;
+the sender validates the full durable Accepted record and completion hash.
+`test_recovery_wire.py` tests large diagnostics, Unicode paths and receipt
+tampering with actual kernel SCM; owner absence is an explicit component input.
+The native `real_ida95_r9_file_job_restores_exact_components_before_retry_and_new_read`
+case uses an actual IDA 9.5 small database and one injected Root observation;
+it verifies exact component hashes before retry and a fresh request's saved-data
+read. This supplies no natural-corruption or real-boot qualification.

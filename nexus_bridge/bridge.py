@@ -3,6 +3,7 @@ import concurrent.futures
 import hashlib
 import importlib.metadata
 import json
+import logging
 import os
 from pathlib import Path
 import plistlib
@@ -87,7 +88,7 @@ TOOL_SOURCE += ("\n_tools_metadata = {}\n"
 RELEASE_SOURCE = module_source('lifecycle.py')
 SLICE_GATE_SOURCES = {name: module_source(name + '.py', custody=True) for name in (
     'target_coordination', 'custody_process_identity', 'origin', 'owner_identity', 'target_journal',
-    'durable_records', 'recovery_files', 'recovery_resources', 'recovery_transaction','recovery_legacy')}
+    'durable_records', 'recovery_files', 'recovery_resources', 'recovery_transaction','recovery_legacy','volume_identity')}
 SLICE_SOURCE = ("import sys, types\n"
     + f"_target_gate_sources = {SLICE_GATE_SOURCES!r}\n"
     "if '_ida_cli_release_protocol_v1' not in sys.modules:\n"
@@ -321,7 +322,7 @@ class Bridge(LifetimeListener):
                     for suffix, launch in list(custody.launches.items()):
                         if launch['watch'] == receipt['watch']:
                             custody.launches.pop(suffix)
-                    if not custody.running and not custody.originals and not custody.launches and custody.recovery_snapshot is None:
+                    if not custody.running and not custody.originals and not custody.launches and not custody.has_file_obligation():
                         self.acquisitions.pop(parent)
             if retired_verification is not None and not retired_verification.running:
                 self.schedule_verification_cleanup(retired_verification)
@@ -366,7 +367,7 @@ class Bridge(LifetimeListener):
                         self.metadata_contexts.pop(receipt['lease']['lease_id'], None)
                     parent = custody.acquisition['parent']['operation_id']
                     if (self.acquisitions.get(parent) is custody and custody.acquisition == receipt['acquisition']
-                            and not custody.originals and not custody.running and custody.recovery_snapshot is None
+                            and not custody.originals and not custody.running and not custody.has_file_obligation()
                             and not any(c.acquisition['parent'] == custody.acquisition['parent']
                                         for c in self.custodians.values())):
                         self.acquisitions.pop(parent)
@@ -379,7 +380,7 @@ class Bridge(LifetimeListener):
                     custody = self.acquisitions.get(parent)
                     if (custody is not None and custody.acquisition == receipt['acquisition']
                             and not custody.originals and (custody.handle is None or custody.retired) and not custody.running
-                            and custody.recovery_snapshot is None):
+                            and not custody.has_file_obligation()):
                         self.acquisitions.pop(parent)
             self.control.send({'event':'custody_retired_ack', 'receipt':receipt})
             self.backup_sources.retire(receipt['watch'])
@@ -395,11 +396,21 @@ class Bridge(LifetimeListener):
             self.helper_ready.set()
             return
         if 'custody_reply' in message:
+            nonce=message['custody_reply']
+            if type(nonce) is not str or not 1<=len(nonce)<=128:
+                raise ValueError('invalid custody reply nonce')
             with self.lock:
-                pending = self.custody_requests.get(message['custody_reply'])
+                pending = self.custody_requests.get(nonce)
                 if pending is not None:
                     pending[1].append(message)
                     pending[0].set()
+            if pending is None:
+                # A caller may already have reported its original timeout.
+                # Reclaim this exact transport cache entry only; the payload
+                # cannot grant custody, file I/O, detach ACK or business success.
+                self.control.send({'event':'custody_receipt','nonce':nonce})
+                logging.getLogger('ida_cli.custody').warning('late custody reply after caller completion: nonce=%s ok=%s error=%s',
+                    nonce,message.get('ok'),message.get('error'))
             return
         if "grant" in message:
             with self.lock:
@@ -433,9 +444,9 @@ class Bridge(LifetimeListener):
             recoveries=[]
             for acquisition,snapshot,cause,blocked in recovery_refs:
                 try:actual=snapshot.status()
-                except Exception as error:
+                except Exception as status_error:
                     actual={'job_id':snapshot.recovery_id,'transaction':str(snapshot.path),
-                            'status_error':type(error).__name__+': '+str(error)}
+                            'status_error':type(status_error).__name__+': '+str(status_error)}
                 recoveries.append(dict(actual,acquisition=acquisition,execution_error=cause,blocked=blocked,
                     next_action='inspect_retained_scene' if blocked else 'wait_exact_cleanup_then_restore'))
             channel.send({"event": "local_status", "id": message["local_status"],
@@ -561,7 +572,7 @@ class Bridge(LifetimeListener):
                         if getattr(custody, 'verification_path', None) and custody.verification_retired:
                             finished_verification = custody
                         if ((custody.handle is None or getattr(custody, 'retired', False)) and not custody.originals
-                                and not custody.launches and custody.recovery_snapshot is None):
+                                and not custody.launches and not custody.has_file_obligation()):
                             self.acquisitions.pop(parent)
                 if frame["payload"]["command"] == "execute":
                     operation_id = frame["payload"]["identity"]["operation_id"]

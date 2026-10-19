@@ -14,7 +14,7 @@ import time
 import uuid
 
 from custody_process_identity import capture
-from target_coordination import Directory, digest, encoded, identity
+from target_coordination import Directory, digest, encoded
 from recovery_files import (boundary, compatible, component_names, copy_exact,
                             file_info, inventory, rename_exact, validate_info)
 from recovery_resources import ResourceCustody
@@ -30,9 +30,13 @@ FINISH_RESERVE = 1024*1024
 def serialized(method):
     @wraps(method)
     def run(self, *args, **kwargs):
-        if self.token is None:
+        token=self.token
+        if token is None:
             raise RuntimeError('RecoveryExecutorStale: no local execution token')
-        with self.token.mutex:
+        with token.mutex:
+            if self.token is not token:
+                raise RuntimeError('RecoveryExecutorStale: queued file action belongs to an earlier token')
+            token.check()
             return method(self,*args,**kwargs)
     return run
 
@@ -94,6 +98,7 @@ class Transaction(ResourceCustody):
         if not recovery_name(recovery_id):
             raise RuntimeError('RecoveryBlocked: invalid allocation RecoveryId')
         parent = Directory(target.target.parent, private=False)
+        parent.inherit_volume(target.directory)
         try:
             before = inventory(parent,target.directory)
             files = {name:value for name,value in before.items() if name in component_names(target.target)}
@@ -198,6 +203,7 @@ class Transaction(ResourceCustody):
     def parent_directory(self):
         if self.parent is None:
             self.parent = Directory(self.target.target.parent,private=False)
+            self.parent.inherit_volume(self.target.directory)
         self.parent.verify()
         if encoded(self.parent.identity) != encoded(self.data['parent_identity']):
             raise RuntimeError('RecoveryBlocked: target parent identity changed')
@@ -207,8 +213,8 @@ class Transaction(ResourceCustody):
         if self.target.target_fd is None or self.target.root_fd is None or self.token is None:
             raise RuntimeError('RecoveryExecutorStale: no owned target guard/token')
         self.token.check()
-        held = identity(os.fstat(self.target.target_fd))
-        at_path = identity(os.stat('lock',dir_fd=self.target.directory.fd,follow_symlinks=False))
+        held = self.target.directory.object_identity(os.fstat(self.target.target_fd))
+        at_path = self.target.directory.object_identity(os.stat('lock',dir_fd=self.target.directory.fd,follow_symlinks=False))
         if held != at_path or self.target.recovery_root_binding() != self.data['root_binding']:
             raise RuntimeError('RecoveryExecutorStale: target/root lock identity changed')
         value, _, _ = self.directory.read('recovery.json')

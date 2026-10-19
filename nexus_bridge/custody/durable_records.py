@@ -41,12 +41,12 @@ def raw(directory, name, *, links=1):
 
 
 def version(directory, name):
-    from target_coordination import digest, identity
+    from target_coordination import digest
     try:
         info, data = raw(directory, name)
     except FileNotFoundError:
         return None
-    return {'identity':identity(info),'sha256':digest(data),'size':len(data)}
+    return {'identity':directory.object_identity(info),'sha256':digest(data),'size':len(data)}
 
 
 def exact_unlink(directory, name, info):
@@ -108,7 +108,7 @@ def resume(directory, name, *, validate=None):
     # was removed. Only these two names may share the reserved exact inode.
     linked = owner['immutable'] and temp_info.st_nlink == 2
     info, data = raw(directory, temporary, links=2 if linked else 1)
-    actual = {'identity':identity(info),'sha256':digest(data),'size':len(data)}
+    actual = {'identity':directory.object_identity(info),'sha256':digest(data),'size':len(data)}
     if actual != expected:
         raise RuntimeError('DurableWriteBlocked: partial/foreign pending bytes retained')
     if validate is not None:
@@ -124,7 +124,7 @@ def resume(directory, name, *, validate=None):
             raise RuntimeError('DurableWriteBlocked: destination changed before publication')
         fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory.fd)
         try:
-            if identity(os.fstat(fd)) != expected['identity']:
+            if directory.object_identity(os.fstat(fd)) != expected['identity']:
                 raise RuntimeError('DurableWriteBlocked: pending inode replaced')
             os.fsync(fd)
         finally:
@@ -152,7 +152,7 @@ def resume(directory, name, *, validate=None):
 
 
 def write(directory, name, value, *, immutable=False):
-    from target_coordination import MAX_RECORD, checked, digest, encoded, identity
+    from target_coordination import MAX_RECORD, checked, digest, encoded
     if not name or '/' in name or name in ('.','..') or name.endswith(('.new','.owner')):
         raise ValueError('invalid durable record name')
     data = encoded(value)
@@ -177,7 +177,7 @@ def write(directory, name, value, *, immutable=False):
     try:
         info = checked(fd)
         record = {'schema':1,'writer':'ida-cli-durable-v2','target':name,'directory':directory.identity,
-                  'new':{'identity':identity(info),'sha256':digest(data),'size':len(data)},
+                  'new':{'identity':directory.object_identity(info),'sha256':digest(data),'size':len(data)},
                   'previous':previous,'immutable':immutable}
         owner_fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                            0o600, dir_fd=directory.fd)

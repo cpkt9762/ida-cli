@@ -89,8 +89,8 @@ def validate_evidence(evidence, target, transaction, components, retained):
     if any(root not in roots for root in known):
         raise RuntimeError('MaintenanceBlocked: owner state root omitted from offline inventory')
     from recovery_probe import bind_state
-    for root in roots:bind_state(root)
-    bind_state(roots[0])
+    for root in roots:bind_state(root,target)
+    bind_state(roots[0],target)
     backup=evidence['backup']
     if type(backup) is not dict or set(backup) != {'path','directory'}:
         raise RuntimeError('MaintenanceBlocked: exact private evidence copy required')
@@ -155,6 +155,7 @@ def snapshotless_preview(target,recovery_id,evidence):
             item['phase'] not in ('restored','opened','archived') for item in inspect_transactions(target)):
         raise RuntimeError('MaintenanceBlocked: unresolved file transaction requires its exact RecoveryId')
     parent=Directory(target.target.parent,private=False)
+    parent.inherit_volume(target.directory)
     try:
         current=inventory(parent,target.directory)
         components={k:v for k,v in current.items() if k in __import__('recovery_files').component_names(target.target)}

@@ -11,17 +11,45 @@ import uuid
 
 from recovery_transaction import ExecutorToken, Transaction
 from recovery_transfer import FrozenOffer, accept, receive, receive_guard
-from target_coordination import Target, encoded
+from target_coordination import Target, digest, encoded
+
+
+def readiness(target,recovery_id):
+    return {'recovery_id':recovery_id,'target':target.original,'coord_key':target.key,
+        'directory':target.directory.native_identity,'root_binding':target.recovery_root_binding()}
 
 
 def validate_ready(hello, transaction, pid=None):
-    expected={'actor','recovery_id','target','coord_key','directory','root_binding'}
+    expected={'schema','actor','recovery_id','ready_sha256','directory'}
     if (set(hello) != expected or (pid is not None and hello['actor']['native']['pid'] != pid)
-            or hello['recovery_id'] != transaction.recovery_id or hello['target'] != transaction.data['target']
-            or encoded(hello['coord_key']) != encoded(transaction.target.key)
-            or encoded(hello['directory']) != encoded(transaction.target.directory.identity)
-            or encoded(hello['root_binding']) != encoded(transaction.target.recovery_root_binding())):
+            or type(hello['schema']) is not int or hello['schema']!=2
+            or hello['recovery_id'] != transaction.recovery_id
+            or encoded(hello['directory']) != encoded(transaction.target.directory.native_identity)
+            or hello['ready_sha256']!=digest(readiness(transaction.target,transaction.recovery_id))):
         raise RuntimeError('HandoffBlocked: receiver readiness physical identity mismatch')
+
+
+def completed(transaction,binding,result):
+    required={'schema','kind','recovery_id','transfer_id','epoch','binding_sha256',
+        'record_sha256','revision','phase','error'}
+    if (type(result) is not dict or set(result)!=required or type(result['schema']) is not int
+            or result['schema']!=2 or result['kind']!='completed'
+            or result['recovery_id']!=transaction.recovery_id or result['transfer_id']!=binding['transfer_id']
+            or type(result['epoch']) is not int or result['epoch']!=binding['epoch']
+            or result['binding_sha256']!=digest(binding) or type(result['error']) is not bool):
+        raise RuntimeError('HandoffBlocked: completion receipt identity/schema mismatch')
+    record,info,raw=transaction.directory.read('recovery.json')
+    if (digest(raw)!=result['record_sha256'] or type(result['revision']) is not int
+            or record['revision']!=result['revision'] or record['status']!=result['phase']
+            or record['executor']['state']!='Accepted' or record['executor']['actor']!=binding['receiver']
+            or record['executor']['transfer_id']!=binding or record['executor']['epoch']!=binding['epoch']
+            or record['job']['state']!=('Blocked' if result['error'] else 'Completed')):
+        raise RuntimeError('HandoffBlocked: exact durable completion record changed or lacks Accepted')
+    transaction.data,transaction.info,transaction.raw=record,info,raw
+    transaction.validate()
+    if result['error']:
+        raise RuntimeError(record.get('last_error') or 'RecoveryBlocked: missing independent file error')
+    return {'transfer_id':binding['transfer_id'],'status':transaction.status(),'error':None}
 
 
 def rust_start(transaction, prepare, timeout):
@@ -42,11 +70,14 @@ def rust_start(transaction, prepare, timeout):
         transaction.data['job']={'state':'SpawnIntent','job_nonce':nonce,'reply_endpoint':str(path),
             'reply_identity':list(owned),'python':sys.executable,'installation':str(installation),'actor':None}
         transaction.save()
+        import recovery_transfer
+        recovery_transfer.boundary('before_prepare',{'recovery_id':transaction.recovery_id,'epoch':transaction.token.epoch})
         prepared=prepare(transaction,path,owned,nonce)
         hello=prepared['hello']
         validate_ready(hello,transaction)
         transaction.data['job'].update(state='Prepared',actor=hello['actor'],stderr=prepared['stderr'])
         transaction.save()
+        recovery_transfer.boundary('after_prepare',{'recovery_id':transaction.recovery_id,'epoch':transaction.token.epoch})
         endpoint=Path(prepared['endpoint'])
         entry=endpoint.lstat()
         if (not stat.S_ISSOCK(entry.st_mode) or entry.st_uid != os.getuid()
@@ -61,10 +92,7 @@ def rust_start(transaction, prepare, timeout):
         result,_=receive(channel,0)
         if result.get('job_nonce')==nonce and result.get('error'):
             raise RuntimeError(result['error'])
-        if result.get('transfer_id') != offer.binding['transfer_id']:
-            raise RuntimeError('HandoffBlocked: relay completion transfer identity mismatch')
-        if result.get('error'):raise RuntimeError(result['error'])
-        return result
+        return completed(transaction,offer.binding,result)
     except BaseException as error:
         primary=error
         raise
@@ -113,11 +141,7 @@ def start(transaction, *, timeout=8):
         result, _ = receive(sender,0)
         if result.get('accepted') is True and result.get('transfer_id')==offer.binding['transfer_id']:
             result,_=receive(sender,0)
-        if result.get('transfer_id') != offer.binding['transfer_id']:
-            raise RuntimeError('HandoffBlocked: completion transfer identity mismatch')
-        if result.get('error'):
-            raise RuntimeError(result['error'])
-        return result
+        return completed(transaction,offer.binding,result)
     finally:
         receiver.close()
         sender.close()
@@ -127,8 +151,8 @@ def execute(channel, path, recovery_id):
     actor = ExecutorToken().actor
     with Target(path,create=False) as target:
         # Target opened its own root SH before any received target rights.
-        channel.send(encoded({'actor':actor,'recovery_id':recovery_id,'target':target.original,
-            'coord_key':target.key,'directory':target.directory.identity,'root_binding':target.recovery_root_binding()}))
+        channel.send(encoded({'schema':2,'actor':actor,'recovery_id':recovery_id,
+            'directory':target.directory.native_identity,'ready_sha256':digest(readiness(target,recovery_id))}))
         binding, guard = receive_guard(channel,target)
         with target.locked(_received=guard), Transaction(target,recovery_id) as transaction:
             accept(transaction,binding,actor)
@@ -145,13 +169,16 @@ def execute(channel, path, recovery_id):
                 transaction.restore()
                 transaction.data['job']['state'] = 'Completed'
                 transaction.save()
-                result = {'transfer_id':binding['transfer_id'],'status':transaction.status(),'error':None}
+                failed=False
             except Exception as error:
                 cause = type(error).__name__+': '+str(error)
                 transaction.data['last_error'] = cause
                 transaction.data['job']['state'] = 'Blocked'
                 transaction.save()
-                result = {'transfer_id':binding['transfer_id'],'status':transaction.status(),'error':cause}
+                failed=True
+            result={'schema':2,'kind':'completed','transfer_id':binding['transfer_id'],'recovery_id':recovery_id,
+                'epoch':binding['epoch'],'binding_sha256':digest(binding),'record_sha256':digest(transaction.raw),
+                'revision':transaction.data['revision'],'phase':transaction.data['status'],'error':failed}
         # Target EX is closed BEFORE reporting file completion. A resumed gate
         # must still establish its own NB OFD fence; completion is not a guard.
         try:

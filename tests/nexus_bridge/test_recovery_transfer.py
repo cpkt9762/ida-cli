@@ -10,8 +10,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import threading
+from unittest.mock import patch
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(os.environ.get('R4_PRODUCT_SOURCE',Path(__file__).resolve().parents[2]))
 sys.path[:0] = [str(REPO/'nexus_bridge/custody'),str(REPO/'nexus_bridge'),str(Path(__file__).parent)]
 from test_recovery_transaction import isolate_owner_input, no_owner_input, setup
 from recovery_transaction import ExecutorToken, Transaction
@@ -62,6 +64,117 @@ def blocked(path, *, root=False):
 class Transfer(unittest.TestCase):
     def setUp(self):
         isolate_owner_input(self)
+
+    def test_rejected_ancillary_parser_closes_later_rights_without_unlock(self):
+        """Synthetic header table, real owned FDs/locks; not kernel CMSG E2E."""
+        root=Path(tempfile.mkdtemp(prefix='ancillary-reject-',dir=os.environ['R3A_CASE_ROOT']))
+        path=root/'input.i64'
+        path.write_bytes(b'unchanged')
+        with Target(path) as target,target.locked():
+            fds=[os.dup(target.target_fd),os.dup(target.directory.fd)]
+        class InvalidHeaders:
+            def recvmsg(self,*_):
+                return b'{}',[(socket.SOL_SOCKET,0x7fffffff,b''),
+                    (socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',fds).tobytes())],0,None
+        owned=set(fds)
+        try:
+            with self.assertRaisesRegex(RuntimeError,'HandoffBlocked'):receive(InvalidHeaders(),2)
+            for fd in fds:
+                with self.assertRaises(OSError) as caught:os.fstat(fd)
+                self.assertEqual(caught.exception.errno,__import__('errno').EBADF)
+                owned.remove(fd)
+            self.assertFalse(blocked(path),'all received OFD references must close on rejection')
+        finally:
+            for fd in owned:os.close(fd)
+
+    def test_queued_old_epoch_file_action_cannot_inherit_aborted_offer_token(self):
+        root=Path(tempfile.mkdtemp(prefix='queued-epoch-',dir=os.environ['R3A_CASE_ROOT']))
+        setup(root)
+        reference=json.loads((root/'reference.json').read_text())
+        attempted=threading.Event()
+        errors=[]
+        lock=threading.RLock()
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread().name=='old-epoch-writer':attempted.set()
+                lock.acquire()
+            def __exit__(self,*_):lock.release()
+        with Target(reference['target']) as target,target.locked():
+            with Transaction(target,reference['recovery_id']) as transaction:
+                transaction.resume_executor()
+                previous=transaction.token
+                previous.mutex=ObservedLock()
+                def stale_write():
+                    try:transaction.save()
+                    except BaseException as error:errors.append(error)
+                thread=threading.Thread(target=stale_write,name='old-epoch-writer')
+                with previous.mutex:
+                    thread.start()
+                    self.assertTrue(attempted.wait(5),'old file action must be queued before the offer')
+                    offer=FrozenOffer(transaction,ExecutorToken().actor)
+                    offer.abort_unsent()
+                    before=(transaction.directory.path/'recovery.json').read_bytes()
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(len(errors),1,'queued old writer must not borrow the newly issued token')
+                self.assertIn('Stale',str(errors[0]))
+                self.assertEqual((transaction.directory.path/'recovery.json').read_bytes(),before)
+                with self.assertRaisesRegex(RuntimeError,'Stale'):previous.check()
+                transaction.restore()
+                self.assertEqual(transaction.data['status'],'restored')
+
+    def test_freeze_serializes_file_io_and_aborted_offer_cannot_move_live_guard(self):
+        root=Path(tempfile.mkdtemp(prefix='freeze-io-',dir=os.environ['R3A_CASE_ROOT']))
+        setup(root)
+        reference=json.loads((root/'reference.json').read_text())
+        paused,continue_copy,attempted=threading.Event(),threading.Event(),threading.Event()
+        offers,errors=[],[]
+        lock=threading.RLock()
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread().name=='offer-freezer':attempted.set()
+                lock.acquire()
+            def __exit__(self,*_):lock.release()
+        def boundary(action,stage,_detail):
+            if action=='copy' and stage=='created' and not paused.is_set():
+                paused.set()
+                if not continue_copy.wait(5):raise TimeoutError('controlled file copy barrier')
+        with Target(reference['target']) as target,target.locked():
+            with Transaction(target,reference['recovery_id']) as transaction:
+                transaction.resume_executor()
+                transaction.token.mutex=ObservedLock()
+                def copy_files():
+                    try:transaction.restore()
+                    except BaseException as error:errors.append(error)
+                def freeze():
+                    try:offers.append(FrozenOffer(transaction,ExecutorToken().actor))
+                    except BaseException as error:errors.append(error)
+                copying=threading.Thread(target=copy_files,name='copy-owner')
+                freezing=threading.Thread(target=freeze,name='offer-freezer')
+                with patch('recovery_files.boundary',boundary):
+                    copying.start()
+                    try:
+                        self.assertTrue(paused.wait(5),'copy must hold executor mutex at actual file boundary')
+                        freezing.start()
+                        self.assertTrue(attempted.wait(5),'freezer must attempt the same executor mutex')
+                        self.assertEqual(transaction.data['executor']['state'],'Resumed',
+                            'offer cannot mutate execution authority while an earlier file step owns the mutex')
+                        self.assertEqual(offers,[])
+                    finally:
+                        continue_copy.set()
+                        copying.join(5)
+                        if freezing.ident is not None:freezing.join(5)
+                self.assertFalse(copying.is_alive() or freezing.is_alive())
+                self.assertEqual(errors,[])
+                self.assertEqual(transaction.data['status'],'restored')
+                self.assertEqual(len(offers),1)
+                previous_fd=target.target_fd
+                offers[0].abort_unsent()
+                with socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM) as channel:
+                    with self.assertRaisesRegex(RuntimeError,'Stale|aborted'):
+                        offers[0].send(channel)
+                self.assertEqual(target.target_fd,previous_fd)
+                transaction.authorize()
 
     def test_same_process_move_survives_old_context_close_without_unlock(self):
         root=Path(tempfile.mkdtemp(prefix='local-move-',dir=os.environ['R3A_CASE_ROOT']))

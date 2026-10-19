@@ -117,6 +117,23 @@ class Compaction(unittest.TestCase):
                     self.assertEqual((coordination/'custody.json').read_bytes(),before)
                     self.assertEqual(Path(reference['path']).read_bytes(),fact_before)
 
+    def test_os_failure_keeps_errno_cause_and_names_routine_compaction(self):
+        import errno
+        from unittest.mock import patch
+        base=Path(tempfile.mkdtemp(prefix='compact-errno-',dir=os.environ['R3A_CASE_ROOT']))
+        path=base/'input.i64'
+        _,reference=setup(path)
+        original=OSError(errno.EACCES,'controlled exact routine unlink denial')
+        with Target(path) as target,target.locked():
+            journal=Journal(target)
+            with patch('target_journal.os.unlink',side_effect=original):
+                with self.assertRaisesRegex(OSError,'RoutineCompactionFailed') as caught:journal.settle()
+            self.assertEqual(caught.exception.errno,errno.EACCES)
+            self.assertIs(caught.exception.__cause__,original)
+            self.assertTrue(Path(reference['path']).exists())
+            resumed=Journal(target)
+            self.assertEqual(resumed.value['entries'],{})
+
 
 if __name__=='__main__':
     if len(sys.argv)==3:child(Path(sys.argv[1]),sys.argv[2])

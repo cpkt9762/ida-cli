@@ -554,6 +554,9 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                     && reserved.as_ref().is_none_or(|old| old == &lease),
                 "acquisition reservation binding mismatch"
             );
+            let mut verify = event.clone();
+            verify["action"] = json!("verify_adopt");
+            let verified = helper.journal(verify).await?;
             let cache_guard = {
                 use std::os::unix::fs::MetadataExt;
                 let root = if event["coord_key"]["kind"] == "generation" {
@@ -570,7 +573,8 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                     let metadata = std::fs::symlink_metadata(root)?;
                     anyhow::ensure!(
                         metadata.is_dir()
-                            && event["coord_key"]["root"]
+                            && verified["native_coord_key"]["kind"] == "generation"
+                            && verified["native_coord_key"]["root"]
                                 == json!([metadata.dev(), metadata.ino(), metadata.uid()]),
                         "actual cache root identity mismatch"
                     );
@@ -586,9 +590,6 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                     .await?,
                 )
             };
-            let mut verify = event.clone();
-            verify["action"] = json!("verify_adopt");
-            let verified = helper.journal(verify).await?;
             {
                 let _ordered = state.callbacks.lock().unwrap_or_else(|e| e.into_inner());
                 let mut resources = state

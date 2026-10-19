@@ -54,6 +54,8 @@ class Directory:
             elif not stat.S_ISDIR(value.st_mode) or value.st_uid not in (0, os.getuid()):
                 raise RuntimeError('CoordinationBlocked: target parent ownership')
             self.identity = identity(value)
+            self.native_identity = list(self.identity)
+            self.canonical_device = value.st_dev
         except BaseException:
             os.close(self.fd)
             raise
@@ -82,8 +84,18 @@ class Directory:
             self.fd = None
 
     def verify(self):
-        if identity(os.stat(self.path, follow_symlinks=False)) != self.identity:
+        if identity(os.stat(self.path, follow_symlinks=False)) != self.native_identity:
             raise RuntimeError('CoordinationBlocked: directory identity changed')
+
+    def object_identity(self, info):
+        value=identity(info)
+        if value[0] == self.native_identity[0]:value[0]=self.canonical_device
+        return value
+
+    def inherit_volume(self, other):
+        if self.native_identity[0] == other.native_identity[0]:
+            self.canonical_device=other.canonical_device
+            self.identity=[self.canonical_device,*self.native_identity[1:]]
 
     def child(self, name, *, create=True):
         if not name or Path(name).name != name or name in ('.', '..'):
@@ -97,6 +109,7 @@ class Directory:
         self.verify()
         fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
         result = Directory(self.path / name, _fd=fd)
+        result.inherit_volume(self)
         try:
             result.verify()
             self.verify()
@@ -267,6 +280,7 @@ class Target:
                         raise RuntimeError('CoordinationBlocked: invalid evidence back-reference')
                     requested=self.target
                     self.__init__(original,root_locked=root_locked,create=False)
+                    directory.inherit_volume(self.directory)
                     if self.directory.identity != directory.identity or encoded(self.key) != encoded(record.get('coord_key')):
                         raise RuntimeError('CoordinationBlocked: evidence back-reference authority mismatch')
                     self.evidence_path=requested
@@ -334,6 +348,9 @@ class Target:
             self.resource_lock = '.cache.lock' if self.root is not None else 'root.lock'
             if self.root is None:
                 self.root_fd = self.directory.lock(self.resource_lock, shared=True, create=create)
+            self.native_key=json.loads(encoded(self.key))
+            from volume_identity import load_binding
+            load_binding(self)
         except BaseException:
             self.close()
             raise
@@ -353,7 +370,7 @@ class Target:
                 raise RuntimeError('TargetRetired: payload is reserved for GC/evidence')
             if self.target.parent.parent.name == 'quarantine':
                 raise RuntimeError('TargetQuarantined: quarantine is not a business path')
-            if identity(os.stat(live, follow_symlinks=False)) != self.binding['group']:
+            if self.root.object_identity(os.stat(live, follow_symlinks=False)) != self.binding['group']:
                 raise RuntimeError('CoordinationBlocked: live payload identity changed')
 
     @staticmethod
@@ -375,14 +392,14 @@ class Target:
             fd = os.open(self.resource_lock,os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                          dir_fd=self.resource_root.fd)
             try:
-                lock_identity = identity(checked(fd))
+                lock_identity = self.resource_root.object_identity(checked(fd))
             finally:
                 os.close(fd)
         else:
             info = checked(self.root_fd)
-            lock_identity = identity(info)
+            lock_identity = self.resource_root.object_identity(info)
             current = os.stat(self.resource_lock,dir_fd=self.resource_root.fd,follow_symlinks=False)
-            if identity(current) != lock_identity:
+            if self.resource_root.object_identity(current) != lock_identity:
                 raise RuntimeError('RecoveryBlocked: stable resource root lock replaced')
         self.resource_root.verify()
         return {'path':str(self.resource_root.path),'directory':self.resource_root.identity,
@@ -402,7 +419,7 @@ class Target:
             if recover:
                 self.directory.recover_record('target.json')
             expected = {'schema':SCHEMA, 'coord_key':self.key, 'target':self.original,
-                        'generation':self.binding, 'lock_identity':identity(os.fstat(fd))}
+                        'generation':self.binding, 'lock_identity':self.directory.object_identity(os.fstat(fd))}
             try:
                 value, _, _ = self.directory.read('target.json')
                 if self.root is not None and self.binding is None:
@@ -425,6 +442,8 @@ class Target:
                 # uncommitted identity instead of blessing a partial namespace.
                 self.directory.durable('target.json', dict(expected, creation_intent=True), immutable=True)
                 self.directory.durable('target.json', expected)
+            from volume_identity import ensure_binding
+            if recover:ensure_binding(self)
             self.lock_binding=encoded(expected)
             yield self
         finally:

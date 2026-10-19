@@ -1007,7 +1007,13 @@ R3b正式验收（R4输入）：编排者44ad已接受到`5d8a215f92b4405e6db99a
 
 R4当前实施中：文件执行器移到目标协调区，使用同卷snapshot/staging/quarantine、
 精确文件intent和非覆盖rename；接入唯一epoch、close-only目标guard、独立已安装文件job，
-N1原ACK与公共proof单独签收文件责任。新接线要求open4/custody5/target_gate2和
-`file_recovery_ack_v1`/`file_job_relay_v1`，固定SDK不变。维护入口的offline operator证据不产生公共proof，
+N1原ACK与公共proof单独签收文件责任。新接线要求open6/custody5/target_gate3和
+`file_recovery_ack_v1`/`file_job_relay_v2`/`stable_volume_rebinding_v1`，固定SDK不变。维护入口的offline operator证据不产生公共proof，
 preview/apply分别取同序锁。这里仅登记阶段实现，完整v1/移交/配额/平台与最终矩阵仍需R4交付，
 不得据此自行验收R4或启动R6；当前阶段证据在`n7a-refactor/r4-implementation/`。
+
+R4继续实施：volume.json在实际目标锁内绑定原生host/volume/object；只有合格boot-change
+才将当前st_dev映射回原逻辑身份，SCM与Rust根guard仍核当前真实FD/inode，旧proof及历史
+结果字节不改。受控OS输入的直接/受管N1链已执行，不能代真实物理boot/平台资格。
+snapshot构造失败在SDK前精确归档自有无失败证据，未知组件保现场/status；排队旧token、
+迟到Ready cache和routine I/O下的既有proof/closure分别验证。完整最终SHA矩阵与审计仍待完成。

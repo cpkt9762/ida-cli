@@ -220,12 +220,14 @@ pub(super) async fn prepare(
             return Err(error);
         }
     };
-    if hello["actor"]["native"]["pid"].as_u64() != child.id().map(u64::from)
+    if hello["schema"].as_u64() != Some(2)
+        || hello["actor"]["native"]["pid"].as_u64() != child.id().map(u64::from)
         || hello["recovery_id"] != request["recovery_id"]
-        || hello["target"] != request["target"]
-        || hello["coord_key"] != request["coord_key"]
         || hello["directory"] != request["directory"]
-        || hello["root_binding"] != request["root_binding"]
+        || request["ready_sha256"]
+            .as_str()
+            .is_none_or(|s| s.len() != 64)
+        || hello["ready_sha256"] != request["ready_sha256"]
     {
         tokio::spawn(async move {
             let _permit = permit;
@@ -240,15 +242,7 @@ pub(super) async fn prepare(
         "endpoint_identity":[endpoint.get_ref().identity.0,endpoint.get_ref().identity.1]});
     tokio::spawn(async move {
         let _permit = permit;
-        let result = supervise(
-            &endpoint,
-            &parent,
-            &mut child,
-            &request,
-            &hello,
-            &diagnostics,
-        )
-        .await;
+        let result = supervise(&endpoint, &parent, &mut child, &request, &diagnostics).await;
         if let Err(error) = &result {
             tracing::error!(%error, recovery_id=%request["recovery_id"], "file-job relay uncertain; target journal retains authority");
             let reply = json!({"transfer_id":null,"job_nonce":request["job_nonce"],
@@ -306,7 +300,6 @@ async fn supervise(
     channel: &UnixDatagram,
     child: &mut Child,
     request: &Value,
-    hello: &Value,
     diagnostics: &Diagnostics,
 ) -> anyhow::Result<()> {
     let received = tokio::select! {
@@ -317,10 +310,13 @@ async fn supervise(
     };
     let binding: Value = serde_json::from_slice(received.payload())?;
     anyhow::ensure!(
-        binding["receiver"] == hello["actor"]
+        binding["schema"].as_u64() == Some(2)
             && binding["epoch"] == request["epoch"]
             && binding["recovery_id"] == request["recovery_id"]
-            && binding["coord_key"] == request["coord_key"],
+            && binding["directory"] == request["directory"]
+            && binding["binding_sha256"]
+                .as_str()
+                .is_some_and(|s| s.len() == 64),
         "file-job directional rights binding mismatch"
     );
     received.relay(channel)?;
@@ -336,18 +332,23 @@ async fn supervise(
         // Lost ACK is not loss of execution authority. This exact receiver's
         // completed/blocked record may arrive first; it attests durable Accepted
         // in the file domain and never synthesizes a Nexus detach ACK.
-        anyhow::ensure!(
-            first["status"]["job_id"] == request["recovery_id"]
-                && first["status"]["executor"]["state"] == "Accepted"
-                && first["status"]["executor"]["actor"] == hello["actor"]
-                && first["status"]["executor"]["epoch"] == request["epoch"]
-                && first["status"]["executor"]["transfer_id"] == binding,
-            "file-job completion lacks exact durable Accepted identity"
-        );
+        // This exact authenticated receiver sends only a bounded digest
+        // receipt. The sender verifies the full durable Accepted record;
+        // neither the relay nor a received ACK grants file write authority.
         first
     };
     anyhow::ensure!(
-        completed["transfer_id"] == binding["transfer_id"],
+        completed["schema"].as_u64() == Some(2)
+            && completed["kind"] == "completed"
+            && completed["transfer_id"] == binding["transfer_id"]
+            && completed["recovery_id"] == request["recovery_id"]
+            && completed["epoch"] == request["epoch"]
+            && completed["binding_sha256"] == binding["binding_sha256"]
+            && completed["revision"].as_u64().is_some()
+            && completed["record_sha256"]
+                .as_str()
+                .is_some_and(|s| s.len() == 64)
+            && completed["error"].as_bool().is_some(),
         "file-job completion identity mismatch"
     );
     endpoint

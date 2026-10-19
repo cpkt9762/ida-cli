@@ -49,6 +49,10 @@ impl Drop for Temporary {
 
 const SOURCES: &[(&str, &[u8])] = &[
     (
+        "volume_identity.py",
+        include_bytes!("../../../nexus_bridge/custody/volume_identity.py"),
+    ),
+    (
         "recovery_legacy.py",
         include_bytes!("../../../nexus_bridge/custody/recovery_legacy.py"),
     ),
@@ -249,12 +253,14 @@ fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 mod tests {
     #[test]
     fn installed_maintenance_modes_offline_preview_and_apply() {
+        use std::os::unix::process::ExitStatusExt;
         let root =
             std::path::PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root"));
         let installation = root.join("maintenance-installation");
         super::create(&installation).expect("current closed installation");
-        let output = std::process::Command::new("timeout")
-            .args(["30s"])
+        let mut command = std::process::Command::new("timeout");
+        command
+            .args(["120s"])
             .arg(std::env::var_os("R3A_PYTHON").expect("private prepared SDK Python"))
             .arg("-B")
             .arg(concat!(
@@ -262,8 +268,18 @@ mod tests {
                 "/tests/support/r4_maintenance.py"
             ))
             .arg(installation)
-            .output()
-            .expect("actual private operator driver");
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = super::super::test_spawn_std_child(&mut command)
+            .expect("recorded private operator driver birth");
+        let pid = child.id();
+        let output = child
+            .wait_with_output()
+            .expect("actual private operator driver terminal");
+        std::fs::write(root.join("maintenance-exit.json"),serde_json::to_vec_pretty(&serde_json::json!({
+            "pid":pid,"exit":output.status.code(),"signal":output.status.signal(),"success":output.status.success(),
+            "aggregate_timeout_seconds":120,"per_entry_timeout_seconds":15
+        })).expect("terminal JSON")).expect("driver terminal evidence");
         std::fs::write(root.join("maintenance.stdout"), &output.stdout).expect("stdout evidence");
         std::fs::write(root.join("maintenance.stderr"), &output.stderr).expect("stderr evidence");
         assert!(
