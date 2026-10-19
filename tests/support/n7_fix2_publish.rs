@@ -57,13 +57,15 @@ pub async fn released_waiter_retains_content_until_publication_syscall_returns()
     // SAFETY: exclusive disposable fixture path, never a user cache.
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
     let mut environment: BTreeMap<String, String> = std::env::vars().collect();
-    environment.insert("F1_SCENARIO".into(), "n7-open-drop".into());
+    environment.insert("R3A_SCENARIO".into(), "tools-barrier".into());
+    environment.insert("R3A_CASE_ROOT".into(), root.display().to_string());
+    environment.insert("R6_PUBLICATION".into(), "1".into());
     let router = RouterState::new().unwrap();
     let bridge = router
         .connect_nexus(BridgeConfig {
             python: PathBuf::from(std::env::var_os("IDA_NEXUS_PYTHON").unwrap()),
             script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/support/nexus_race_fixture.py"),
+                .join("tests/support/r3a_bridge_fixture.py"),
             directory: root.join("ipc"),
             environment,
         })
@@ -85,7 +87,7 @@ pub async fn released_waiter_retains_content_until_publication_syscall_returns()
             .await
     });
     tokio::select! {
-        _ = until(|| root.join("n7-open-proof.arrived").exists()) => {},
+        _ = until(|| root.join("analysis.arrived").exists()) => {},
         result = &mut task => panic!("open ended before publication barrier: {result:?}"),
     }
     let generation = std::fs::read_dir(cache.join("generations"))
@@ -94,9 +96,11 @@ pub async fn released_waiter_retains_content_until_publication_syscall_returns()
         .unwrap()
         .unwrap()
         .path();
-    // The transport fixture does not run IDA; model its packed output only.
-    std::fs::write(generation.join("input.i64"), b"packed fixture").unwrap();
-    std::fs::write(root.join("n7-open-proof.release"), b"").unwrap();
+    assert!(
+        generation.join("input.i64").is_file(),
+        "real public owner model must publish packed output"
+    );
+    std::fs::write(root.join("analysis.release"), b"").unwrap();
     let mut writer = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match std::fs::OpenOptions::new()
@@ -115,8 +119,15 @@ pub async fn released_waiter_retains_content_until_publication_syscall_returns()
     // At this point commit arbitration has succeeded and read(2) waits for EOF.
     task.abort();
     let cancelled = task.await.unwrap_err().is_cancelled();
-    until(|| root.join("n7-release-proof.arrived").exists()).await;
-    std::fs::write(root.join("n7-release-proof.release"), b"").unwrap();
+    // An acquired handle and last ACK still retain the actual owner guard.
+    until(|| root.join("release-requested").exists()).await;
+    assert_eq!(bridge.lifecycle_status()["resources"], 1);
+    std::fs::write(root.join("owner-release"), b"").unwrap();
+    until(|| {
+        bridge.lifecycle_status()["resources"] == 0
+            && bridge.lifecycle_status()["retirement_acks"] == 0
+    })
+    .await;
     until(|| {
         router
             .nexus_tools
@@ -126,8 +137,8 @@ pub async fn released_waiter_retains_content_until_publication_syscall_returns()
             .is_empty()
     })
     .await;
-    // Waiting for the observer to remove retained guards proves exact Released
-    // reached N1. The FIFO syscall is the sole remaining publication owner.
+    // Public lifetime settled real custody without another release. The FIFO
+    // syscall remains the publication owner after the caller future is gone.
     let prep = Preparation::new(Duration::from_secs(10));
     let lock = super::super::nexus_bridge::cache::prepare_n7_open(
         input.clone(),

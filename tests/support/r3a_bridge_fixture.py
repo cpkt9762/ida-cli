@@ -236,6 +236,24 @@ with Boundary(owner_root, ('lost-ack' if os.environ.get('R3A_SCENARIO') == 'rf4-
     sys.argv = [str(installation / 'bootstrap.py'), 'bridge', *sys.argv[1:]]
     try:
         runtime = vars(runpy.run_path(sys.argv[0], run_name='verified_fixture')['load_entry']())
+        if os.environ.get('R6_PUBLICATION')=='1':
+            from acquisition import Custodian
+            from r0_transport import install_ida_inputs
+            admit=Custodian.admit_target
+            def publication_input(self,*args,**kwargs):
+                result=admit(self,*args,**kwargs)
+                if not (root/'publication-native-input').exists():
+                    boundary.release_owner()
+                    boundary.path=Path(self.target_path)
+                    boundary.path.write_bytes(b'packed private publication model')
+                    boundary.registration=InstanceRegistration(REGISTRY_DIR,
+                        InstanceIdentity(str(boundary.path),str(boundary.path),'idalib',True),token=secrets.token_hex(24))
+                    boundary.instance=boundary.registration.publish(boundary.server.server_port)
+                    boundary.released=False
+                    install_ida_inputs(boundary.path)
+                    (root/'publication-native-input').touch()
+                return result
+            Custodian.admit_target=publication_input
         if scenario == 'observe-handoff-failed':
             from acquisition import Custodian
             original_transfer = Custodian.transact

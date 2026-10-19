@@ -346,19 +346,11 @@ def proof_verdict(self, operation_id):
         with self.lock:
             retained = operation_id in self.unknown
         outcome_event(unknown_retained=retained)
-if hasattr(bridge.Bridge, "publish_stop"):
-    original_publish_stop = bridge.Bridge.publish_stop
-    def publish_stop(self, operation_id, record, outcome):
-        original_publish_stop(self, operation_id, record, outcome)
-        proof_verdict(self, operation_id)
-    bridge.Bridge.publish_stop = publish_stop
-else:
-    # Keep the regression runnable on f56d116 without a missing hook failure.
-    original_confirm_stop = bridge.Bridge.confirm_stop
-    def confirm_stop(self, operation_id, record):
-        original_confirm_stop(self, operation_id, record)
-        proof_verdict(self, operation_id)
-    bridge.Bridge.confirm_stop = confirm_stop
+original_publish_stop = bridge.Bridge.publish_stop
+def publish_stop(self, operation_id, record, outcome):
+    original_publish_stop(self, operation_id, record, outcome)
+    proof_verdict(self, operation_id)
+bridge.Bridge.publish_stop = publish_stop
 cancelled_ids = []
 owner_started_at = time.time()
 handle_module.http.client.HTTPConnection = lambda *_a, **_k: Connection(control=True)
