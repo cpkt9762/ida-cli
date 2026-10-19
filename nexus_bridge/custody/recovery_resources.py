@@ -152,4 +152,3 @@ class ResourceCustody:
                 raise RuntimeError('RecoveryBlocked: retained no-acquisition evidence changed')
         else:
             raise RuntimeError('RecoveryBlocked: unsupported file-resource evidence scope')
-
