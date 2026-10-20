@@ -217,6 +217,13 @@ def smoke(product, path, name):
     return {'address': address, 'saved_read': actual, 'database': database, 'decompile': decompile}
 
 
+def daemon_birth(rows, pid):
+    row = next((row for row in rows if row["pid"] == pid), None)
+    if row is None:
+        raise RuntimeError("BLOCKED: E27 requires daemon creation records; build release with nexus-test-support")
+    return row
+
+
 def e27(env, binary, case, result):
     product = Product(env, binary, case / 'service')
     a = sample(env, case, 'A')
@@ -260,7 +267,7 @@ finally:handle.close(wait_for_database=True,timeout=15)
         wait_for(started.exists)
         rows = product.entries()
         daemon_pid=int((product.directory/'cli/server.pid').read_text())
-        daemon=next(row for row in rows if row['pid']==daemon_pid)
+        daemon=daemon_birth(rows, daemon_pid)
         shutdown = product.call('shutdown', ok=False)
         result['busy_shutdown_terminal'] = shutdown
         assert_busy_shutdown(shutdown, same_process(identity(daemon_pid),daemon['identity']), long.poll() is None)

@@ -14,6 +14,11 @@ SPEC.loader.exec_module(driver)
 
 
 class ReleaseAssertions(unittest.TestCase):
+    def test_e27_missing_daemon_birth_is_blocked(self):
+        for rows in ([], [{'pid': 456}]):
+            with self.subTest(rows=rows), self.assertRaisesRegex(RuntimeError, 'BLOCKED:.*nexus-test-support'):
+                driver.daemon_birth(rows, 123)
+
     def test_e27_detects_a_live_recorded_birth(self):
         with self.assertRaisesRegex(AssertionError, 'still live'):
             driver.assert_dead([{'pid': os.getpid(), 'identity': driver.identity(os.getpid())}])
