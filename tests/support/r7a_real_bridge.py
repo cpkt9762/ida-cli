@@ -67,4 +67,3 @@ def receive(self, channel, message):
 
 runtime.Bridge.receive = receive
 runtime.main()
-
