@@ -126,6 +126,12 @@ class Journal:
                     or item['origin_binding'].get('same_boot_eligibility') is not False):
                 raise RuntimeError('CoordinationBlocked: malformed active observation')
             watches.add(item['watch'])
+            successor=item.get('nonlast_successor')
+            if successor is not None:
+                anchor=v['entries'].get(str(successor))
+                if (type(successor) is not int or not 0 < successor < item['epoch']
+                        or anchor is None or anchor.get('owner') != item.get('owner')):
+                    raise RuntimeError('CoordinationBlocked: malformed nonlast observation successor')
             self.retirement(item)
             self.manual_closed(item)
             for reference in item['facts']:
@@ -574,8 +580,96 @@ class Journal:
         if item.get('detach_outcome') is not None and item['detach_outcome'] != outcome:
             raise RuntimeError('CoordinationBlocked: conflicting detach outcome')
         item['detach_outcome'] = outcome
+        result = {'epoch':item['epoch']}
+        # File recovery still requires its exact per-acquisition public proof.
+        from recovery_transaction import pinned_epochs
+        pinned = pinned_epochs(self.target)
+        if (outcome.get('lease_released') is True and outcome.get('ack_kind') == 'nonlast'
+                and pinned is not None and item['epoch'] not in pinned
+                and not self.value.get('file_intents')):
+            anchors = [i for i in self.value['entries'].values()
+                       if i['epoch'] < item['epoch'] and i['owner'] == item['owner']
+                       and i.get('lease') is not None
+                       and not i.get('nonlast_successor') and not i['producer_closed']
+                       and self.authorized_producers(i, ('Subscribed',)) == self.authorized_producers(item, ('Subscribed',))
+                       and self.authorized_producers(i, ('BridgeSubscribed',)) == self.authorized_producers(item, ('BridgeSubscribed',))]
+            if anchors:
+                anchor = min(anchors, key=lambda i:i['epoch'])
+                if self.authorized_producers(anchor, ('Subscribed',)):
+                    result['successor'] = anchor['watch']
+                    # Pin before any producer can close. Public-proof settlement
+                    # cannot compact this anchor during the handoff window.
+                    item['nonlast_successor'] = anchor['epoch']
         self.save()
-        return {'epoch':item['epoch'], 'revision':self.value['revision']}
+        result['revision'] = self.value['revision']
+        return result
+
+    def nonlast_transfer(self, value):
+        receipt = value['consumer']
+        record = receipt['record']
+        item = self.item(value['watch'], record['subscription_epoch'])
+        outcome = item.get('detach_outcome', {})
+        successor_record = record['successor_receipt']['record']
+        successor = self.item(record['successor'], successor_record['subscription_epoch'])
+        from recovery_transaction import pinned_epochs
+        pinned = pinned_epochs(self.target)
+        if (outcome.get('lease_released') is not True or outcome.get('ack_kind') != 'nonlast'
+                or record['owner'] != item['owner'] or record['acquisition'] != item['acquisition']
+                or record['helper'] not in self.authorized_producers(item, ('Subscribed',))
+                or successor['owner'] != item['owner'] or successor['epoch'] >= item['epoch']
+                or successor.get('nonlast_successor') or self.value.get('file_intents')
+                or pinned is None or item['epoch'] in pinned):
+            raise RuntimeError('CoordinationBlocked: nonlast transfer lacks exact ACK/owner/closure authority')
+        fact(record['successor_receipt'], self.target, kind='Subscribed')
+        if successor_record['acquisition'] != successor['acquisition']:
+            raise RuntimeError('CoordinationBlocked: nonlast successor acquisition mismatch')
+        reference = fact(receipt, self.target, kind='NonlastTransferred')
+        self.adopt_attempt_facts(item, record['previous_facts'])
+        if item.get('nonlast_successor', successor['epoch']) != successor['epoch']:
+            raise RuntimeError('CoordinationBlocked: nonlast successor changed')
+        item['nonlast_successor'] = successor['epoch']
+        if reference not in item['facts']:
+            item['facts'].append(reference)
+        self.save()
+        return {}
+
+    def nonlast_closed(self, value):
+        self.nonlast_transfer(value)
+        record = value['consumer']['record']
+        item = self.item(value['watch'], record['subscription_epoch'])
+        bridge = value['bridge_consumer']
+        closed = bridge['record']
+        if (closed['consumer'] != value['consumer'] or closed['watch'] != item['watch']
+                or closed['owner'] != item['owner'] or closed['acquisition'] != item['acquisition']
+                or closed['subscription_epoch'] != item['epoch']
+                or closed['helper'] not in self.authorized_producers(item, ('BridgeSubscribed',))):
+            raise RuntimeError('CoordinationBlocked: nonlast bridge producer closure mismatch')
+        reference = fact(bridge, self.target, kind='BridgeNonlastTransferred')
+        for previous in closed['previous_facts']:
+            prior = previous['record']
+            if (prior['watch'] != item['watch'] or prior['owner'] != item['owner']
+                    or prior['acquisition'] != item['acquisition'] or prior['subscription_epoch'] != item['epoch']):
+                raise RuntimeError('CoordinationBlocked: nonlast backup fact binding mismatch')
+            verified = fact(previous, self.target)
+            if verified['kind'] not in ('BridgeSubscribed', 'PublicOwnerLifetime'):
+                raise RuntimeError('CoordinationBlocked: unexpected nonlast backup fact')
+            if verified not in item['facts']:
+                item['facts'].append(verified)
+        if reference not in item['facts']:
+            item['facts'].append(reference)
+        item['producer_closed'] = item['consumer_closed'] = item['bridge_closed'] = item['detached'] = True
+        item['unacked_events'] = False
+        self.save()
+        return {}
+
+    def nonlast_exited(self, value):
+        self.nonlast_transfer(value)
+        self.bridge_process_closed(value)
+        item = self.item(value['watch'], value['consumer']['record']['subscription_epoch'])
+        item['producer_closed'] = item['consumer_closed'] = item['detached'] = True
+        item['unacked_events'] = False
+        self.save()
+        return {}
 
     def recovery_permission(self, value):
         """N1's exact original ACK joins public proof for this file obligation."""
@@ -757,7 +851,8 @@ class Journal:
     def bridge_process_closed(self, value):
         """Exact waitpid closes only this producer, never an IDA owner/lease."""
         item = next((i for i in self.value['entries'].values() if i['watch'] == value['watch']), None)
-        if item is None or not item.get('proof'):
+        if item is None or not (item.get('proof') or (item.get('nonlast_successor')
+                and any(f['kind'] == 'NonlastTransferred' for f in item['facts']))):
             raise RuntimeError('CoordinationBlocked: bridge exit without adopted public proof')
         for namespace, key in (('proofs', digest(item['owner'])),
                                ('observations', digest(item['watch'].encode()))):
@@ -867,6 +962,9 @@ class Journal:
                     and not item['unacked_events'] and not item.get('failure') and not item.get('launch')
                     and not item.get('manual_offline_recovery')
                     and item['epoch'] not in pinned]
+        eligible_epochs={i['epoch'] for i in eligible}
+        eligible=[item for item in eligible if not any(i.get('nonlast_successor') == item['epoch']
+                  and i['epoch'] not in eligible_epochs for i in self.value['entries'].values())]
         closed_epochs = {i['epoch'] for i in eligible}
         eligible += [i for i in self.value['entries'].values() if i.get('transferred_to') in closed_epochs
                      and i['producer_closed'] and i['consumer_closed'] and not i['unacked_events']
@@ -881,7 +979,8 @@ class Journal:
                                            'transferred_to':i.get('transferred_to'),
                                            'release_binding':digest({k:i[k] for k in ('lease','owner','watch','acquisition')})
                                                if i.get('lease') and i.get('proof') else None,
-                                           'release_observation':i.get('release_observation')} for i in eligible]
+                                           'release_observation':i.get('release_observation'),
+                                           'detach_outcome':i.get('detach_outcome')} for i in eligible]
         summary = summary[-SUMMARY_LIMIT:]
         while len(encoded(summary)) > SUMMARY_BYTES:
             summary.pop(0)
@@ -993,6 +1092,9 @@ class Journal:
         pinned = pinned_epochs(self.target)
         if self.value.get('file_intents') or pinned is None or set(intent['epochs']) & pinned:
             raise RuntimeError('RoutineCompactionFailed: file recovery acquired a new reference')
+        if any(i.get('nonlast_successor') in intent['epochs'] and i['epoch'] not in intent['epochs']
+               for i in self.value['entries'].values()):
+            raise RuntimeError('RoutineCompactionFailed: nonlast observation successor still referenced')
         for epoch in intent['epochs']:
             item = self.value['entries'].get(str(epoch))
             if not item or not (item['producer_closed'] and item['consumer_closed'] and item['detached']
@@ -1245,6 +1347,12 @@ def main():
                 result = journal.release_observation(value)
             elif action == 'detach_outcome':
                 result = journal.detach_outcome(value)
+            elif action == 'nonlast_transfer':
+                result = journal.nonlast_transfer(value)
+            elif action == 'nonlast_closed':
+                result = journal.nonlast_closed(value)
+            elif action == 'nonlast_exited':
+                result = journal.nonlast_exited(value)
             elif action == 'recovery_permission':
                 result = journal.recovery_permission(value)
             elif action == 'retire_old_boot':

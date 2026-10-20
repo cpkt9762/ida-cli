@@ -118,8 +118,7 @@ impl<C: Clock> NexusSessions<C> {
     /// Called after both durable consumer and producer closure. Internal RPC
     /// details no longer hold a live obligation; user results are left intact.
     pub fn settle_internal_custody(&mut self, lease: &SessionLease) -> Result<(), NexusError> {
-        let status = self.authorize(&lease.client_id, lease)?;
-        if status.phase != SessionPhase::Released || self.occupied(lease) {
+        if !self.custody_settle_ready(lease)? {
             return Err(NexusError::new(
                 NexusErrorCode::Busy,
                 "custody has live obligations",
@@ -151,6 +150,12 @@ impl<C: Clock> NexusSessions<C> {
         }
         self.custodies.remove(&lease.lease_id);
         Ok(())
+    }
+
+    /// Readiness never supplies stop proof or changes the original ACK/result.
+    pub fn custody_settle_ready(&self, lease: &SessionLease) -> Result<bool, NexusError> {
+        let status = self.authorize(&lease.client_id, lease)?;
+        Ok(status.phase == SessionPhase::Released && !self.occupied(lease))
     }
     /// Idempotent only for the exact reserved acquisition and physical lease.
     /// Callers must verify the helper's durable subscription before setting

@@ -421,14 +421,30 @@ impl NexusBridge {
             value["owner"] = resource.owner;
             value["watch"] = json!(resource.watch);
         }
-        let proof = self
+        let proofs = self
             .state
             .owner_proofs
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| e.into_inner());
+        let proof = proofs
             .get(&lease.lease_id)
             .filter(|(exact, _)| exact == lease)
-            .map(|(_, proof)| proof.clone());
+            .map(|(_, proof)| proof.clone())
+            .or_else(|| {
+                // Only confirmed nonlast leases share this diagnostic owner
+                // fact. Their original ACK/result and N1 history stay intact.
+                (value["outcome"]["lease_released"] == true
+                    && value["outcome"]["ack_kind"] == "nonlast"
+                    && value["owner"].is_object())
+                .then(|| {
+                    proofs
+                        .values()
+                        .find(|(_, proof)| proof["record"]["owner"] == value["owner"])
+                        .map(|(_, proof)| proof.clone())
+                })
+                .flatten()
+            });
+        drop(proofs);
         value["owner_released"] =
             json!(proof.is_some() || value["outcome"]["owner_released"] == true);
         value["owner_pending"] = json!(value["owner_released"] != true);
@@ -1159,6 +1175,10 @@ async fn event_received(
             item["backup_proof"] = proof.clone();
         }
         return Ok(());
+    }
+    if event["event"] == "nonlast_transfer_ack" {
+        anyhow::ensure!(control, "nonlast acknowledgement on wrong lane");
+        return custody_wire::nonlast_ack(&event, state).await;
     }
     if event["event"] == "owner_proof_ack" {
         anyhow::ensure!(control, "owner proof acknowledgement on wrong lane");

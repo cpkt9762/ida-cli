@@ -333,6 +333,11 @@ class Bridge(LifetimeListener):
         if 'owner_backup_query' in message:
             self.backup_sources.query(message['owner_backup_query'])
             return
+        if 'nonlast_transfer' in message:
+            consumer = message['nonlast_transfer']
+            closed = self.backup_sources.nonlast_transfer(consumer)
+            self.control.send({'event':'nonlast_transfer_ack', 'consumer':consumer, 'bridge_consumer':closed})
+            return
         if 'owner_proof_custody' in message:
             receipt = message['owner_proof_custody']
             owner = receipt['owner']

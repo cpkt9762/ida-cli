@@ -13,6 +13,7 @@ pub(super) struct Resource {
     pub coord_key: Value,
     pub proof: Option<Value>,
     pub consumer: Option<Value>,
+    pub nonlast_transfer: Option<Value>,
     pub bridge_proof_ack: bool,
     pub backup: Option<Value>,
     pub origin_binding: Value,
@@ -603,6 +604,7 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
                     coord_key: event["coord_key"].clone(),
                     proof: None,
                     consumer: None,
+                    nonlast_transfer: None,
                     bridge_proof_ack: false,
                     backup: None,
                     origin_binding: verified["origin_binding"].clone(),
@@ -965,10 +967,166 @@ pub(super) async fn detach_fact(event: &Value, state: &Arc<State>) -> anyhow::Re
         .helper
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("mandatory helper missing"))?;
-    helper.journal(json!({"action":"detach_outcome","target":resource.target,"coord_key":resource.coord_key,
+    let recorded = helper.journal(json!({"action":"detach_outcome","target":resource.target,"coord_key":resource.coord_key,
         "watch":resource.watch,"epoch":resource.receipt["record"]["subscription_epoch"],
         "lease":lease,"owner":resource.owner,"attempt":attempt,"outcome":event["outcome"]})).await?;
+    if recorded["successor"].is_string() {
+        if let Some(current) = state
+            .custody_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&lease.lease_id)
+        {
+            current.nonlast_transfer =
+                Some(json!({"successor":recorded["successor"],"consumer":null,"bridge":null}));
+        }
+    }
     Ok(())
+}
+
+pub(super) async fn nonlast_ack(event: &Value, state: &Arc<State>) -> anyhow::Result<()> {
+    let consumer = &event["consumer"];
+    let watch = consumer["record"]["watch"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("nonlast watch missing"))?;
+    let resource = state
+        .custody_resources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .find(|r| r.watch == watch)
+        .cloned();
+    let Some(resource) = resource else {
+        anyhow::ensure!(
+            state
+                .custody_retirements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(watch),
+            "nonlast ACK has no retained custody"
+        );
+        return Ok(());
+    };
+    let transfer = resource
+        .nonlast_transfer
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("unrequested nonlast closure"))?;
+    anyhow::ensure!(
+        transfer["consumer"] == *consumer
+            && state.bridge_observer.as_deref()
+                == event["bridge_consumer"]["record"]["helper"].as_str(),
+        "nonlast producer ACK identity mismatch"
+    );
+    let helper = state
+        .helper
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("mandatory helper missing"))?;
+    helper.journal(json!({"action":"nonlast_closed","target":resource.target,"coord_key":resource.coord_key,
+        "watch":watch,"consumer":consumer,"bridge_consumer":event["bridge_consumer"]})).await?;
+    if let Some(current) = state
+        .custody_resources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&resource.lease.lease_id)
+    {
+        if let Some(transfer) = current.nonlast_transfer.as_mut() {
+            transfer["bridge"] = event["bridge_consumer"].clone();
+        }
+    }
+    Ok(())
+}
+
+async fn consolidate_nonlast(state: &Arc<State>, writer: &Writer, helper: &helper::Helper) {
+    let resources: Vec<_> = state
+        .custody_resources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|r| r.nonlast_transfer.is_some())
+        .cloned()
+        .collect();
+    for resource in resources {
+        let watch = resource.watch.clone();
+        let result = consolidate_resource(state, writer, helper, resource).await;
+        observation_result(state, &watch, result);
+    }
+}
+
+async fn consolidate_resource(
+    state: &Arc<State>,
+    writer: &Writer,
+    helper: &helper::Helper,
+    resource: Resource,
+) -> anyhow::Result<()> {
+    let ready = state
+        .endpoint
+        .transition(|s, _| s.custody_settle_ready(&resource.lease))?;
+    if !ready {
+        return Ok(());
+    }
+    let mut transfer = resource
+        .nonlast_transfer
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("nonlast plan missing"))?;
+    if transfer["consumer"].is_null() {
+        let status = helper
+            .call(json!({"kind":"lookup","watch":resource.watch}))
+            .await?;
+        if status["item"]["proof"].is_object() && status["item"]["consumer"].is_null() {
+            if let Some(current) = state
+                .custody_resources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&resource.lease.lease_id)
+            {
+                current.nonlast_transfer = None;
+            }
+            return Ok(());
+        }
+        let closed = helper.call(json!({"kind":"nonlast_transfer","watch":resource.watch,"successor":transfer["successor"]})).await?;
+        helper.journal(json!({"action":"nonlast_transfer","target":resource.target,"coord_key":resource.coord_key,
+            "watch":resource.watch,"consumer":closed["consumer"]})).await?;
+        transfer["consumer"] = closed["consumer"].clone();
+        if let Some(current) = state
+            .custody_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&resource.lease.lease_id)
+        {
+            current.nonlast_transfer = Some(transfer.clone());
+        }
+    }
+    if transfer["bridge"].is_null() {
+        let exited = state
+            .bridge_exit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(exit) = exited {
+            helper.journal(json!({"action":"nonlast_exited","target":resource.target,"coord_key":resource.coord_key,
+                "watch":resource.watch,"consumer":transfer["consumer"],"exit":exit,"incarnation":state.bridge_observer})).await?;
+            transfer["bridge"] = json!({"exit":exit});
+            if let Some(current) = state
+                .custody_resources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&resource.lease.lease_id)
+            {
+                current.nonlast_transfer = Some(transfer.clone());
+            }
+        } else if !state.failed.load(std::sync::atomic::Ordering::Acquire) {
+            send(writer, &json!({"nonlast_transfer":transfer["consumer"]})).await?;
+            return Ok(());
+        } else {
+            return Ok(());
+        }
+    }
+    helper
+        .call(
+            json!({"kind":"retire","watch":resource.watch,"sha256":transfer["consumer"]["sha256"]}),
+        )
+        .await?;
+    finish_resource(state, helper, resource).await
 }
 
 /// Independent of command pending and bridge health. A public proof is first
@@ -980,6 +1138,7 @@ pub(super) async fn proofs(state: &Arc<State>, writer: &Writer) -> anyhow::Resul
     let heartbeat = helper
         .call(json!({"kind":"heartbeat", "summary_only":true}))
         .await?;
+    consolidate_nonlast(state, writer, helper).await;
     let resources: Vec<_> = state
         .custody_resources
         .lock()
@@ -1429,6 +1588,9 @@ async fn observe_resource(
     helper: &helper::Helper,
     mut resource: Resource,
 ) -> anyhow::Result<()> {
+    if resource.nonlast_transfer.is_some() {
+        return Ok(());
+    }
     let status = helper
         .call(json!({"kind":"lookup", "watch":resource.watch}))
         .await?;
@@ -1556,6 +1718,14 @@ async fn observe_resource(
     }
     helper.call(json!({"kind":"retire", "watch":resource.watch,
             "sha256":resource.consumer.as_ref().ok_or_else(|| anyhow::anyhow!("consumer receipt missing"))?["sha256"]})).await?;
+    finish_resource(state, helper, resource).await
+}
+
+async fn finish_resource(
+    state: &Arc<State>,
+    helper: &helper::Helper,
+    resource: Resource,
+) -> anyhow::Result<()> {
     helper
         .journal(
             json!({"action":"settle", "target":resource.target,"coord_key":resource.coord_key}),

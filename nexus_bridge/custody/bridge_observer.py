@@ -94,7 +94,7 @@ class BackupSources:
             if entry is None or not entry['released']:
                 return
             watch = value['watch']
-            if watch in entry['closed']:
+            if watch not in entry['watches'] or watch in entry['closed']:
                 return
             proof = entry['proofs'].get(watch)
             if proof is None:
@@ -160,6 +160,45 @@ class BackupSources:
                     for custodian in dict.fromkeys([*self.bridge.acquisitions.values(), *self.bridge.custodians.values()]):
                         custodian.originals.pop(digest(owner), None)
         return closed
+
+    def nonlast_transfer(self, consumer):
+        """Close this watch's producer while retaining the same original owner."""
+        from target_coordination import Target
+        from target_journal import fact
+        record = consumer['record']
+        with self.bridge.lock:
+            entry = self.items[digest(record['owner'])]
+            watch = record['watch']
+            closed = getattr(self, 'closed', {}).get(watch)
+            if closed is not None:
+                if closed['record'].get('consumer') != consumer:
+                    raise ValueError('ProtocolMismatch: conflicting nonlast bridge closure')
+                return closed
+            if watch not in entry['watches'] or record['successor'] not in entry['watches']:
+                raise ValueError('ProtocolMismatch: nonlast bridge successor absent')
+            binding = entry.get('bindings', {}).get(watch)
+            if binding is None:
+                raise ValueError('ProtocolMismatch: nonlast bridge source unbound')
+            with Target(record['owner']['canonical_idb_path']) as target:
+                fact(consumer, target, kind='NonlastTransferred')
+                journal, _, _ = target.directory.read('custody.json')
+                item = journal['entries'][str(record['subscription_epoch'])]
+                if (journal['coord_key'] != target.key or item['watch'] != watch
+                        or item.get('nonlast_successor') != record['successor_receipt']['record']['subscription_epoch']
+                        or not any(f['sha256'] == consumer['sha256'] and f['path'] == consumer['path'] for f in item['facts'])):
+                    raise ValueError('ProtocolMismatch: nonlast transfer not durably adopted')
+            value = {k:record[k] for k in ('watch','owner','coord_key','acquisition','subscription_epoch')}
+            value['target'] = record['owner']['canonical_idb_path']
+            previous = [binding, *([entry['proofs'][watch]] if watch in entry['proofs'] else [])]
+            closed = self.publisher.publish(value, 'BridgeNonlastTransferred', consumer=consumer, previous_facts=previous)
+            if not hasattr(self, 'closed'):
+                self.closed = {}
+            self.closed[watch] = closed
+            entry['closed'].add(watch)
+            for custody in dict.fromkeys([*self.bridge.acquisitions.values(), *self.bridge.custodians.values()]):
+                if custody.watch == watch:
+                    custody.originals.pop(digest(record['owner']), None)
+            return closed
 
     def no_attach(self, owner, watch, close_observation):
         with self.bridge.lock:

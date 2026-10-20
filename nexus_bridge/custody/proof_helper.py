@@ -26,6 +26,7 @@ REQUEST_FIELDS = {
     'lookup':('watch',), 'attach_attempt':('watch','attempt'), 'no_attach':('watch',),
     'adopt_public_proof':('watch','proof'), 'startup_transfer':('watch','successor'),
     'resource_retired':('watch','evidence'),
+    'nonlast_transfer':('watch','successor'),
     'retire':('watch','sha256'), 'proof_custody_ack':('watch','sha256','path'),
     'subscribe':('watch','target','coord_key','acquisition','owner','subscription_epoch'),
     'launch_intent':('watch','target','coord_key','acquisition','launch','subscription_epoch'),
@@ -155,7 +156,8 @@ class Observer:
                   'StartupOwnerSubscribed':'owner_receipt', 'PublicOwnerLifetime':'proof',
                   'ProducerClosed':'consumer', 'StartupTransferred':'consumer',
                   'ObservationFailed':'failed', 'ObservationAbandoned':'abandoned',
-                  'AttachAttempt':'attach_attempt', 'NoAttachClosed':'consumer'}
+                  'AttachAttempt':'attach_attempt', 'NoAttachClosed':'consumer',
+                  'NonlastTransferred':'consumer'}
         for watch, item in self.items.items():
             if item.get('watch') != watch:
                 raise RuntimeError('ObservationRecoveryBlocked: registry watch mismatch')
@@ -425,6 +427,40 @@ class Observer:
                 if not item.get('proof'):
                     item['proof'] = receipt
                 return {'proof':item.get('custody_proof', item['proof'])}
+            if kind == 'nonlast_transfer':
+                item = self.items[value['watch']]
+                if item.get('consumer'):
+                    record = item['consumer']['record']
+                    if record['kind'] != 'NonlastTransferred' or record['successor'] != value['successor']:
+                        raise ValueError('ProtocolMismatch: conflicting nonlast producer closure')
+                    return {'consumer':item['consumer']}
+                successor = self.items[value['successor']]
+                if (item.get('proof') or not item.get('owner') or item['owner'] != successor.get('owner')
+                        or item['coord_key'] != successor['coord_key'] or successor.get('consumer')
+                        or successor['subscription_epoch'] >= item['subscription_epoch']):
+                    raise ValueError('ProtocolMismatch: nonlast owner observation successor')
+                # Read the writer's durable plan without taking EX. An opener
+                # may hold EX while waiting for this helper's subscribe ACK.
+                with Target(item['target']) as target:
+                    journal, _, _ = target.directory.read('custody.json')
+                    bound = journal['entries'][str(item['subscription_epoch'])]
+                    anchor = journal['entries'][str(successor['subscription_epoch'])]
+                    outcome = bound.get('detach_outcome', {})
+                    if (journal['coord_key'] != target.key or bound['watch'] != item['watch']
+                            or anchor['watch'] != successor['watch']
+                            or bound.get('nonlast_successor') != successor['subscription_epoch']
+                            or bound['owner'] != item['owner'] or bound['acquisition'] != item['acquisition']
+                            or anchor['owner'] != item['owner'] or anchor.get('nonlast_successor')
+                            or outcome.get('lease_released') is not True or outcome.get('ack_kind') != 'nonlast'):
+                        raise ValueError('ProtocolMismatch: nonlast transfer without durable parsed ACK')
+                item['consumer'] = self.publish(item, 'NonlastTransferred',
+                    successor=successor['watch'], successor_receipt=successor['receipt'],
+                    previous_facts=[item['receipt'], *item.get('attach_facts', [])])
+                self.persist()
+                entry = self.owners.get(digest(item['owner']))
+                if entry is not None:
+                    entry['watches'].discard(item['watch'])
+                return {'consumer':item['consumer']}
             if kind == 'startup_transfer':
                 item = self.items[value['watch']]
                 successor = self.items[value['successor']]

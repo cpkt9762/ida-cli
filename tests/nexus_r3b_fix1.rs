@@ -308,6 +308,142 @@ mod cross {
         }
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nonlast_transfer_settles_real_n1_bridge_helper_and_preserves_ack() {
+        let root =
+            PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root")).join("nl");
+        std::fs::create_dir(&root).expect("private nonlast case");
+        let (_router, bridge) = bridge(&root, "nonlast-bounded").await;
+        let mut events = bridge.subscribe();
+        let client = ClientId::new("nonlast-client").expect("client");
+        let result: anyhow::Result<Value> = async {
+            let mut warm = None;
+            let mut closed = Vec::new();
+            let mut samples = Vec::new();
+            for n in 0..5 {
+                let id = format!("nonlast-{n}");
+                bridge.endpoint().transition(|s, t| {
+                    s.open(
+                        &client,
+                        AcceptedRequest::new(
+                            &SystemClock,
+                            RequestId::new(&id)?,
+                            None,
+                            "open",
+                            json!({"timeout_secs":20}),
+                        )?,
+                        OpenSpec {
+                            operation_id: OperationId::new(&id)?,
+                            path: root.join("a/tiny.i64").display().to_string(),
+                            options: json!({"spawn":false,"wait_analysis":false}),
+                        },
+                        t,
+                    )
+                })?;
+                let opened = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let event = events.recv().await?;
+                        anyhow::ensure!(
+                            event["event"] != "failed" && event["event"] != "uncertain",
+                            "{event}"
+                        );
+                        if event["event"] == "opened" {
+                            break Ok::<_, anyhow::Error>(event);
+                        }
+                    }
+                })
+                .await??;
+                let lease: SessionLease = serde_json::from_value(opened["lease"].clone())?;
+                if n == 0 {
+                    warm = Some(lease);
+                    continue;
+                }
+                bridge
+                    .endpoint()
+                    .transition(|s, t| s.release(&client, &lease, t))?;
+                let ack = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let event = events.recv().await?;
+                        if event["event"] == "released"
+                            && event["attempt"]["target"]["lease"] == json!(lease)
+                        {
+                            break Ok::<_, anyhow::Error>(event);
+                        }
+                    }
+                })
+                .await??;
+                anyhow::ensure!(
+                    ack["outcome"]["ack_kind"] == "nonlast"
+                        && ack["outcome"]["lease_released"] == true,
+                    "{ack}"
+                );
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while bridge.lifecycle_status()["resources"] != 1
+                        || bridge.lifecycle_status()["retirement_acks"] != 0
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await?;
+                let history = bridge
+                    .endpoint()
+                    .transition(|s, _| s.status(&client, &lease))?;
+                anyhow::ensure!(
+                    history.phase == SessionPhase::Released
+                        && history
+                            .control_delivery
+                            .as_ref()
+                            .is_some_and(|d| d.state == DeliveryState::Confirmed),
+                    "ACK history changed"
+                );
+                samples.push(bridge.lifecycle_status());
+                closed.push(lease);
+            }
+            bridge.status("bounded").await?;
+            let status = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let event = events.recv().await?;
+                    if event["event"] == "local_status" {
+                        break Ok::<_, anyhow::Error>(event);
+                    }
+                }
+            })
+            .await??;
+            anyhow::ensure!(
+                status["custodians"] == 1 && status["original_instances"] == 1,
+                "bridge custody/source accumulated: {status}"
+            );
+            let warm = warm.ok_or_else(|| anyhow::anyhow!("warm lease"))?;
+            bridge
+                .endpoint()
+                .transition(|s, t| s.release(&client, &warm, t))?;
+            let ack = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let e = events.recv().await?;
+                    if e["event"] == "released" && e["attempt"]["target"]["lease"] == json!(warm) {
+                        break Ok::<_, anyhow::Error>(e);
+                    }
+                }
+            })
+            .await??;
+            anyhow::ensure!(ack["outcome"]["ack_kind"] == "last", "{ack}");
+            std::fs::write(root.join("a/owner-release"), b"")?;
+            Ok(json!({"samples":samples,"last_ack":ack,"bridge":status,"closed_leases":closed}))
+        }
+        .await;
+        finish(&root, &bridge, &result, "nonlast-bounded").await;
+        result.expect("real production Rust/N1/bridge/helper nonlast handoff");
+        let status = bridge.lifecycle_status();
+        assert_eq!(status["resources"], 0);
+        let registry: Value = serde_json::from_slice(
+            &std::fs::read(root.join("i/helper-state.json")).expect("exact exited helper registry"),
+        )
+        .expect("registry JSON");
+        assert_eq!(registry["items"], json!({}));
+        assert_eq!(registry["parents"], json!({}));
+        assert_eq!(registry["finishing"], true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn f2_real_gate_failure_returns_final_slot() {
         f2_gate_case(false, "f2-gate").await;
     }

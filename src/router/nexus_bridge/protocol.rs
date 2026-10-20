@@ -67,6 +67,7 @@ impl Protocol {
                 "k2_acquisitions_v1",
                 "launch_observer_v1",
                 "lifetime_handshake_v1",
+                "nonlast_owner_transfer_v1",
                 "receiver_isolation_v1",
                 "release_observation_v1",
                 "retired_release_observation_v1",
