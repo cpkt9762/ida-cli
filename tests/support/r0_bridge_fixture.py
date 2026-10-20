@@ -20,7 +20,9 @@ def main():
     durable(ROOT / "process.json", {"pid":os.getpid(), "identity":identity(os.getpid())})
     with Boundary(ROOT, SCENARIO) as boundary:
         stopped = threading.Event()
+        reopened = False
         def inputs():
+            nonlocal reopened
             disconnected = False
             while not stopped.wait(.005):
                 if (ROOT / "owner-release").exists() and not (ROOT / "owner-released").exists():
@@ -28,6 +30,15 @@ def main():
                     durable(ROOT / "owner-proof.json", {"public_lifetime_released":
                         wait_database_released(boundary.instance, timeout=0)})
                     (ROOT / "owner-released").touch()
+                if (ROOT / "owner-reopen").exists() and not reopened:
+                    from ida_nexus._registry import InstanceIdentity, InstanceRegistration, REGISTRY_DIR
+                    import secrets
+                    boundary.registration = InstanceRegistration(REGISTRY_DIR,
+                        InstanceIdentity(str(boundary.path), str(boundary.path), "idalib", True), token=secrets.token_hex(24))
+                    boundary.instance = boundary.registration.publish(boundary.server.server_port)
+                    boundary.released = False
+                    reopened = True
+                    (ROOT / "owner-reopened").touch()
                 if not disconnected and (ROOT / "disconnect-primary").exists():
                     with boundary.lock:
                         stream = next(iter(boundary.streams.values()))

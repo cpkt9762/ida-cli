@@ -74,10 +74,8 @@ def main():
                 "--case",str(root / "real"),"--candidate",str(candidate)], 180)
             results["stages"]["real"] = str(root / "real")
         else:
-            if args.idasdk is None:
-                parser.error("--idasdk required for rust")
             extra = {"CARGO_HOME":str(args.cargo_home), "RUSTUP_HOME":str(args.rustup_home),
-                "CARGO_TARGET_DIR":str(args.target_dir or root / "target"), "IDASDK":str(args.idasdk), "IDADIR":manifest["ida_dir"],
+                "CARGO_TARGET_DIR":str(args.target_dir or root / "target"), "IDADIR":manifest["ida_dir"],
                  "IDA_CLI_HOME":str(root / "rust/cli"),
                 "R0_CASE_ROOT":str(root / "rust"), "R0_PYTHON":python,
                 "IDA_NEXUS_PYTHON":python, "IDA_NEXUS_IPC_ROOT":str(root / "rust/ipc")}
@@ -85,7 +83,7 @@ def main():
             run("rust-check", ["cargo","check",*target],180,extra)
             run("rust-clippy", ["cargo","clippy",*target,"--","-D","warnings"],180,extra)
             run("rust-build", ["cargo","test",*target,"--no-run"],180,extra)
-            run("rust-red", ["cargo","test",*target,"current_product_red_baselines","--","--exact","--nocapture","--test-threads=1"],120,extra)
+            run("rust-regressions", ["cargo","test",*target,"current_product_lifecycle_regressions","--","--exact","--nocapture","--test-threads=1"],120,extra)
             results["stages"]["rust"] = str(root / "rust")
         (root / "run.json").write_text(json.dumps(results, indent=2))
 

@@ -74,7 +74,7 @@ impl Rig {
             }
         })
         .await
-        .expect("expected production event");
+        .unwrap_or_else(|error| panic!("expected {name}: {error}; events={:?}", self.evidence));
         self.evidence.last().expect("event recorded").clone()
     }
     async fn n1_open(&mut self, client: &ClientId, operation: &str) -> SessionLease {
@@ -106,6 +106,7 @@ impl Rig {
             .expect("N1 real open");
     }
     async fn finish(self, fact: Value) {
+        let _ = std::fs::remove_file(self.root.join("owner-released"));
         self.signal("owner-release");
         self.marker("owner-released").await;
         let owner_proof: Value = serde_json::from_slice(
@@ -116,7 +117,7 @@ impl Rig {
         let shutdown = self.bridge.shutdown().await;
         // Preserve cleanup evidence for both historical red and R5 fixed scenarios.
         let path = self.root.join("rust-result.json");
-        let value = json!({"scope":if fact["id"] == "F2" {"R5-production-isolation"} else {"current-product-expected-red"}, "fact":fact,
+        let value = json!({"scope":if fact["id"] == "F2" {"R5-production-isolation"} else {"current-product-lifecycle-regression"}, "fact":fact,
             "events":self.evidence,"public_owner_proof":owner_proof,"shutdown":format!("{shutdown:?}")});
         std::fs::write(
             path,
@@ -164,7 +165,7 @@ impl Rig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn current_product_red_baselines() {
+async fn current_product_lifecycle_regressions() {
     let mut slow = Rig::new("slow-owner").await;
     let path = slow.root.join("tiny.i64");
     let (_, token) = slow
@@ -179,25 +180,29 @@ async fn current_product_red_baselines() {
         .expect("real Tools open");
     let close = slow.router.nexus_close_token(&token).await;
     assert!(
-        close.is_err(),
-        "F1: fixed product would close after owner proof"
+        close.is_ok(),
+        "F1: parsed detach ACK must close the client reference"
     );
-    slow.event("release_unconfirmed").await;
+    slow.event("released").await;
     slow.signal("owner-release");
     slow.marker("owner-released").await;
+    slow.signal("owner-reopen");
+    slow.marker("owner-reopened").await;
     let reopen = slow
         .router
         .ensure_worker_prepared(
             path.to_str().expect("UTF8 path"),
             None,
             None,
-            Preparation::new(Duration::from_secs(5)),
+            Preparation::new(Duration::from_secs(10)),
         )
         .await;
     assert!(
-        reopen.is_err(),
-        "F1 current Tools still blocks after actual public lifetime released"
+        reopen.is_ok(),
+        "F1: reopen succeeds after actual public lifetime released: {reopen:?}"
     );
+    let (_, reopened_token) = reopen.as_ref().expect("F1 reopened lease");
+    slow.router.nexus_close_token(reopened_token).await.expect("close reopened reference");
     slow.finish(json!({"id":"F1", "close":format!("{close:?}"),
         "reopen_after_public_lifetime":format!("{reopen:?}")}))
         .await;
@@ -208,27 +213,15 @@ async fn current_product_red_baselines() {
         "open-early",
         json!({"spawn":false,"wait_analysis":true}),
     );
-    let open = early.event("remote_error").await;
-    assert_eq!(
-        open["remote_code"], "execution_error",
-        "F4 cleanup fails before public acquisition delivery"
-    );
-    assert!(
-        open.get("lease").is_none(),
-        "no acquired lease delivered to N1"
-    );
-    let identity: OpenIdentity =
-        serde_json::from_value(open["attempt"]["target"]["identity"].clone())
-            .expect("actual N1 open identity");
-    let progress = early
-        .bridge
-        .endpoint()
-        .transition(|state, _| state.open_progress(&identity.client_id, &identity))
-        .expect("query actual N1 open outcome");
-    assert!(
-        progress.0.is_none() && progress.1.is_some(),
-        "N1 records failure without acquisition"
-    );
+    let open = early.event("failed").await;
+    assert_eq!(open["error"]["code"], "operation_failed");
+    assert!(open["error"]["message"].as_str().expect("analysis error").contains("wait_autoanalysis"));
+    let lease: SessionLease = serde_json::from_value(open["lease"].clone()).expect("F4 acquired lease is retained explicitly");
+    let identity: OpenIdentity = serde_json::from_value(open["attempt"]["target"]["identity"].clone()).expect("actual N1 open identity");
+    let progress = early.bridge.endpoint().transition(|state, _| state.open_progress(&identity.client_id, &identity)).expect("N1 open outcome");
+    assert!(progress.1.is_some(), "caller receives a definite analysis failure");
+    assert_eq!(early.bridge.lifecycle_status()["resources"], 1, "F4 acquired lease remains in explicit custody until public proof");
+    assert_eq!(early.bridge.endpoint().transition(|s,_|s.status(&lease.client_id,&lease)).expect("retained N1 lease").phase, SessionPhase::ReleaseRequired);
     early.signal("snapshot-request");
     early.marker("snapshot.json").await;
     let snapshot: Value = serde_json::from_slice(
@@ -237,11 +230,11 @@ async fn current_product_red_baselines() {
     .expect("snapshot JSON");
     assert_eq!(
         snapshot["physical_leases"], 1,
-        "F4 real acquired lease remains at server boundary"
+        "F4 unconfirmed native stop must retain the real acquired lease"
     );
     assert_eq!(
         snapshot["release_requests"], 0,
-        "failed cleanup cannot invent a release"
+        "no detach is invented while execution stop is unconfirmed"
     );
     early
         .finish(json!({"id":"F4", "caller":open,"n1_outcome":format!("{progress:?}"),"external_input":snapshot}))
@@ -259,7 +252,9 @@ async fn current_product_red_baselines() {
         .endpoint()
         .transition(|s, t| s.release(&a, &lease_a, t))
         .expect("real N1 release");
-    group.event("release_unconfirmed").await;
+    let release = group.event("uncertain").await;
+    assert_eq!(release["attempt"]["target"]["kind"], "release");
+    assert_eq!(release["error"]["code"], "unknown_outcome");
     let control = group.bridge.status("r5-b-control").await;
     if control.is_ok() {
         loop {
