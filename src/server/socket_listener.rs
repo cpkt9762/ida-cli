@@ -121,6 +121,7 @@ async fn handle_cli_connection(
         business_gate
     };
     let execution_permit = gate.try_acquire_owned();
+    let mut request_guard = None;
     let resp = match parsed {
         Ok(req) if execution_permit.is_err() => {
             RpcResponse::err(&req.id, -32000, "Busy: CLI lane capacity full")
@@ -146,7 +147,7 @@ async fn handle_cli_connection(
                         Some(super::response_cache::cache_or_inline(&req.method, result).await);
                 }
             }
-            let _ = ref_guard;
+            request_guard = ref_guard;
             response
         }
         Err(e) => RpcResponse::err("null", -32700, format!("Parse error: {e}")),
@@ -164,6 +165,7 @@ async fn handle_cli_connection(
         writer.flush().await
     })
     .await??;
+    drop(request_guard);
     if shutdown_accepted {
         shutdown.cancel();
     }
@@ -178,18 +180,7 @@ fn always_inline(method: &str) -> bool {
     primary_name_for(method) == "list_idbs"
 }
 
-struct CliRefGuard {
-    router: RouterState,
-    token: String,
-}
-
-impl Drop for CliRefGuard {
-    fn drop(&mut self) {
-        let router = self.router.clone();
-        let token = self.token.clone();
-        crate::router::nexus_tools::Tools::abandon(router, token);
-    }
-}
+type CliRefGuard = crate::router::CliLeaseGuard;
 
 async fn dispatch_cli_request(
     req: &RpcRequest,
@@ -502,7 +493,6 @@ async fn dispatch_cli_request(
                 router
                     .ensure_cli_worker_prepared(p, tenant_id.as_deref(), preparation.clone())
                     .await
-                    .map(|handle| (handle, None))
             } else {
                 return (
                     RpcResponse::err(
@@ -515,11 +505,8 @@ async fn dispatch_cli_request(
             };
 
             match resolve_result {
-                Ok((handle, ref_token)) => {
-                    let ref_guard = ref_token.map(|token| CliRefGuard {
-                        router: router.clone(),
-                        token,
-                    });
+                Ok((handle, request)) => {
+                    let ref_guard = Some(request);
                     match router
                         .route_request_prepared(Some(&handle), method, params, preparation)
                         .await

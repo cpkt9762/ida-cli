@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 pub type DbHandle = String;
 pub type ReqId = String;
-type CliPathGates = std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<Mutex<()>>>>;
+type CliPathGates = std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<CliPath>>>;
 #[cfg(test)]
 type CliOpenPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
@@ -135,6 +135,41 @@ impl RouterConfig {
     }
 }
 
+#[derive(Debug)]
+struct CliPath {
+    gate: Arc<Mutex<()>>,
+    requests: std::sync::atomic::AtomicUsize,
+}
+
+pub(crate) struct CliLeaseGuard {
+    activity: Arc<CliPath>,
+    _admission: tokio::sync::OwnedRwLockReadGuard<()>,
+    reference: Option<nexus_tools::ReferenceGuard>,
+}
+impl CliLeaseGuard {
+    fn new(activity: Arc<CliPath>, admission: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+        activity.requests.fetch_add(1, Ordering::AcqRel);
+        Self {
+            activity,
+            _admission: admission,
+            reference: None,
+        }
+    }
+}
+impl Drop for CliLeaseGuard {
+    fn drop(&mut self) {
+        self.activity.requests.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn cli_request_busy() -> crate::error::ToolError {
+    crate::nexus::NexusError::new(
+        crate::nexus::NexusErrorCode::CancelPending,
+        "CLI request is still in use; lease and warm tracking retained",
+    )
+    .into()
+}
+
 #[derive(Debug, Clone)]
 struct WarmLease {
     handle: DbHandle,
@@ -144,6 +179,8 @@ struct WarmLease {
     tenant_id: String,
     pinned_at: Instant,
     last_hit: Instant,
+    activity: Arc<CliPath>,
+    _slot: Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -318,6 +355,8 @@ pub struct RouterState {
     nexus_tools: Arc<nexus_tools::Tools>,
     warm_pool: Arc<Mutex<HashMap<PathBuf, WarmLease>>>,
     cli_open_gate: Arc<CliPathGates>,
+    warm_slots: Arc<tokio::sync::Semaphore>,
+    cli_admission: Arc<tokio::sync::RwLock<()>>,
     #[cfg(test)]
     cli_open_pause: Arc<Mutex<HashMap<PathBuf, CliOpenPause>>>,
     prewarm_queue: Arc<Mutex<PrewarmQueueState>>,
@@ -395,6 +434,8 @@ impl RouterState {
             nexus_tools: Arc::new(nexus_tools::Tools::new(config.max_pending_per_tenant)?),
             warm_pool: Arc::new(Mutex::new(HashMap::new())),
             cli_open_gate: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            warm_slots: Arc::new(tokio::sync::Semaphore::new(config.max_warm_workers)),
+            cli_admission: Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(test)]
             cli_open_pause: Arc::new(Mutex::new(HashMap::new())),
             prewarm_queue: Arc::new(Mutex::new(PrewarmQueueState::default())),
@@ -879,8 +920,7 @@ impl RouterState {
     }
 
     pub async fn shutdown_all(&self) {
-        self.warm_pool.lock().await.clear();
-        if let Err(error) = self.nexus_tools.shutdown(self).await {
+        if let Err(error) = self.shutdown_nexus().await {
             warn!(%error,"Nexus shutdown incomplete");
         }
     }
@@ -924,7 +964,12 @@ impl RouterState {
             ));
         }
         #[cfg(test)]
-        let pause = self.cli_open_pause.lock().await.get(std::path::Path::new(path)).cloned();
+        let pause = self
+            .cli_open_pause
+            .lock()
+            .await
+            .get(std::path::Path::new(path))
+            .cloned();
         #[cfg(test)]
         if let Some((entered, resume)) = pause {
             entered.notify_one();
@@ -933,14 +978,24 @@ impl RouterState {
         return self.nexus_tools.open(self, path, preparation).await;
     }
 
-    fn cli_path_gate(&self, path: &std::path::Path) -> Arc<Mutex<()>> {
-        let mut paths = self.cli_open_gate.lock().unwrap_or_else(|error| error.into_inner());
+    fn cli_path_gate(&self, path: &std::path::Path) -> Arc<CliPath> {
+        let mut paths = self
+            .cli_open_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         paths.retain(|_, gate| gate.strong_count() > 0);
-        paths.entry(path.to_path_buf()).or_default().upgrade().unwrap_or_else(|| {
-            let gate = Arc::new(Mutex::new(()));
-            paths.insert(path.to_path_buf(), Arc::downgrade(&gate));
-            gate
-        })
+        paths
+            .entry(path.to_path_buf())
+            .or_default()
+            .upgrade()
+            .unwrap_or_else(|| {
+                let gate = Arc::new(CliPath {
+                    gate: Arc::new(Mutex::new(())),
+                    requests: std::sync::atomic::AtomicUsize::new(0),
+                });
+                paths.insert(path.to_path_buf(), Arc::downgrade(&gate));
+                gate
+            })
     }
 
     /// CLI path requests share a bounded daemon-owned warm reference. MCP
@@ -950,7 +1005,7 @@ impl RouterState {
         path: &str,
         tenant_id: Option<&str>,
         preparation: crate::preprocess::Preparation,
-    ) -> Result<DbHandle, crate::error::ToolError> {
+    ) -> Result<(DbHandle, CliLeaseGuard), crate::error::ToolError> {
         use crate::error::ToolError;
         if tenant_id.is_some_and(|tenant| tenant != "default") {
             return Err(ToolError::NotSupported(
@@ -968,9 +1023,13 @@ impl RouterState {
                 },
             ))
             .await??;
-        let path_gate = self.cli_path_gate(&canonical);
+        let admission = preparation
+            .wait(async { Ok(self.cli_admission.clone().read_owned().await) })
+            .await?;
+        let activity = self.cli_path_gate(&canonical);
+        let mut request = CliLeaseGuard::new(activity.clone(), admission);
         let _opening = preparation
-            .wait(async { Ok(path_gate.lock().await) })
+            .wait(async { Ok(activity.gate.clone().lock_owned().await) })
             .await?;
         let existing = self.warm_pool.lock().await.get(&canonical).cloned();
         if let Some(existing) = existing {
@@ -978,48 +1037,102 @@ impl RouterState {
                 if let Some(warm) = self.warm_pool.lock().await.get_mut(&canonical) {
                     warm.last_hit = Instant::now();
                 }
-                return Ok(existing.handle);
+                return Ok((existing.handle, request));
             }
-            // Never replay a business request. Resolve the old reference's
-            // explicit cleanup before admitting a new owner on a later request.
-            self.release_warm_lease(&canonical).await?;
+            // This resolving request has not dispatched on the stale lease.
+            // Other admitted users still pin it and must not be interrupted.
+            self.release_warm_lease_locked(&canonical, 1).await?;
         }
-        if self.config.max_warm_workers == 0 {
-            return Err(ToolError::Busy);
-        }
-        loop {
-            let pool = self.warm_pool.lock().await;
-            if pool.len() < self.config.max_warm_workers {
-                break;
-            }
-            let oldest = pool
-                .values()
-                .min_by_key(|entry| entry.last_hit)
-                .map(|entry| entry.path.clone());
-            drop(pool);
-            if let Some(oldest) = oldest {
-                self.release_warm_lease(&oldest).await?;
-            }
-        }
+        let slot = self.warm_slot(&canonical).await?;
         let (handle, token) = self
-            .ensure_worker_prepared(path, None, tenant_id, preparation.clone())
+            .ensure_worker_prepared(
+                canonical
+                    .to_str()
+                    .ok_or_else(|| ToolError::InvalidPath("non-UTF8 CLI path".into()))?,
+                None,
+                tenant_id,
+                preparation.clone(),
+            )
             .await?;
         let mut reference = nexus_tools::ReferenceGuard::new(self.clone(), token.clone());
         preparation.check()?;
-        self.warm_pool.lock().await.insert(
-            canonical.clone(),
-            WarmLease {
-                handle: handle.clone(),
-                token,
-                path: canonical,
-                cache_path: None,
-                tenant_id: "default".into(),
-                pinned_at: Instant::now(),
-                last_hit: Instant::now(),
-            },
-        );
-        reference.transfer();
-        Ok(handle)
+        if let Some(slot) = slot {
+            self.warm_pool.lock().await.insert(
+                canonical.clone(),
+                WarmLease {
+                    handle: handle.clone(),
+                    token,
+                    path: canonical,
+                    cache_path: None,
+                    tenant_id: "default".into(),
+                    pinned_at: Instant::now(),
+                    last_hit: Instant::now(),
+                    activity,
+                    _slot: Arc::new(slot),
+                },
+            );
+            reference.transfer();
+        } else {
+            // Capacity pressure is an explicit request-level lifetime, not an
+            // alternate backend or a retry after a failed close/open.
+            request.reference = Some(reference);
+        }
+        Ok((handle, request))
+    }
+
+    async fn warm_slot(
+        &self,
+        current: &std::path::Path,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, crate::error::ToolError> {
+        if let Ok(slot) = self.warm_slots.clone().try_acquire_owned() {
+            return Ok(Some(slot));
+        }
+        let mut candidates: Vec<_> = self
+            .warm_pool
+            .lock()
+            .await
+            .values()
+            .filter(|entry| {
+                entry.path != current && entry.activity.requests.load(Ordering::Acquire) == 0
+            })
+            .map(|entry| (entry.last_hit, entry.path.clone(), entry.activity.clone()))
+            .collect();
+        candidates.sort_by_key(|(last, _, _)| *last);
+        for (_, path, activity) in candidates {
+            // Never await a second path's admission lock: that could block
+            // unrelated opens, or invert two concurrent eviction lock orders.
+            let Ok(_idle) = activity.gate.clone().try_lock_owned() else {
+                continue;
+            };
+            if activity.requests.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            self.release_warm_lease_locked(&path, 0).await?;
+            return Ok(self.warm_slots.clone().try_acquire_owned().ok());
+        }
+        Ok(None)
+    }
+
+    async fn release_warm_lease_locked(
+        &self,
+        path: &std::path::Path,
+        resolving: usize,
+    ) -> Result<(), crate::error::ToolError> {
+        let lease = self.warm_pool.lock().await.get(path).cloned();
+        if let Some(lease) = lease {
+            if lease.activity.requests.load(Ordering::Acquire) > resolving {
+                return Err(cli_request_busy());
+            }
+            self.nexus_close_token(&lease.token).await?;
+            let mut pool = self.warm_pool.lock().await;
+            if pool
+                .get(path)
+                .is_some_and(|entry| entry.token == lease.token)
+            {
+                pool.remove(path);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn nexus_close_path_detailed(
@@ -1029,6 +1142,14 @@ impl RouterState {
         Result<(), crate::error::ToolError>,
         Option<serde_json::Value>,
     ) {
+        let activity = self.cli_path_gate(path);
+        if activity.requests.load(Ordering::Acquire) != 0 {
+            return (Err(cli_request_busy()), None);
+        }
+        let _path = activity.gate.lock().await;
+        if activity.requests.load(Ordering::Acquire) != 0 {
+            return (Err(cli_request_busy()), None);
+        }
         self.nexus_tools.close_path_detailed(self, path).await
     }
 
@@ -1037,7 +1158,7 @@ impl RouterState {
         path: &std::path::Path,
         _tenant_id: Option<&str>,
     ) -> Result<(), crate::error::ToolError> {
-        return self.nexus_tools.close_path(self, path).await;
+        self.nexus_close_path_detailed(path).await.0
     }
 
     pub async fn prewarm_path(
@@ -1069,9 +1190,6 @@ impl RouterState {
         preparation: crate::preprocess::Preparation,
     ) -> Result<serde_json::Value, crate::error::ToolError> {
         use crate::error::ToolError;
-        if keep_warm && self.config.max_warm_workers == 0 {
-            return Err(ToolError::Busy);
-        }
         let expanded = crate::expand_path(path);
         let canonical = preparation
             .wait(crate::blocking::run(
@@ -1083,6 +1201,20 @@ impl RouterState {
                 },
             ))
             .await??;
+        let admission = preparation
+            .wait(async { Ok(self.cli_admission.clone().read_owned().await) })
+            .await?;
+        let activity = self.cli_path_gate(&canonical);
+        let _request = CliLeaseGuard::new(activity.clone(), admission);
+        let _path = if keep_warm {
+            Some(
+                preparation
+                    .wait(async { Ok(activity.gate.clone().lock_owned().await) })
+                    .await?,
+            )
+        } else {
+            None
+        };
         let already_open = self
             .nexus_tools
             .workers(self)
@@ -1108,12 +1240,26 @@ impl RouterState {
             .as_str()
             .ok_or_else(|| ToolError::IdaError("Nexus open missing cache path".into()))?
             .to_string();
+        let mut kept_warm = false;
         if keep_warm {
-            loop {
-                preparation.check()?;
-                let mut pool = self.warm_pool.lock().await;
-                if pool.contains_key(&canonical) || pool.len() < self.config.max_warm_workers {
-                    let previous = pool.insert(
+            let previous = self.warm_pool.lock().await.get(&canonical).cloned();
+            if let Some(previous) = previous {
+                if self.nexus_tools.active_reference(self, &previous.handle) {
+                    // Keep the existing authority, including its admitted users.
+                    self.nexus_close_token(&token).await?;
+                    reference.transfer();
+                    if let Some(warm) = self.warm_pool.lock().await.get_mut(&canonical) {
+                        warm.cache_path = Some(PathBuf::from(&idb));
+                        warm.last_hit = Instant::now();
+                    }
+                    kept_warm = true;
+                } else {
+                    self.release_warm_lease_locked(&canonical, 1).await?;
+                }
+            }
+            if !kept_warm {
+                if let Some(slot) = self.warm_slot(&canonical).await? {
+                    self.warm_pool.lock().await.insert(
                         canonical.clone(),
                         WarmLease {
                             handle,
@@ -1123,39 +1269,23 @@ impl RouterState {
                             tenant_id: "default".into(),
                             pinned_at: Instant::now(),
                             last_hit: Instant::now(),
+                            activity,
+                            _slot: Arc::new(slot),
                         },
                     );
                     reference.transfer();
-                    drop(pool);
-                    if let Some(previous) = previous {
-                        self.nexus_close_token(&previous.token).await?;
-                    }
-                    break;
-                }
-                let oldest = pool
-                    .values()
-                    .min_by_key(|lease| lease.last_hit)
-                    .map(|lease| lease.path.clone());
-                drop(pool);
-                if let Some(oldest) = oldest {
-                    self.release_warm_lease(&oldest).await?;
+                    kept_warm = true;
                 }
             }
-        } else {
+        }
+        if !kept_warm {
             self.nexus_close_token(&token).await?;
             reference.transfer();
         }
-        Ok(
-            serde_json::json!({"path":canonical.display().to_string(),"backend":"nexus","cached_before":cached_before,"cached_after":true,"cache_path":idb,"database_info":info,"already_open":already_open,"kept_warm":keep_warm,"worker_closed_after_prewarm":!keep_warm && !already_open}),
-        )
-    }
 
-    async fn release_warm_lease(&self, path: &PathBuf) -> Result<(), crate::error::ToolError> {
-        let lease = self.warm_pool.lock().await.remove(path);
-        if let Some(lease) = lease {
-            self.nexus_close_token(&lease.token).await?;
-        }
-        Ok(())
+        Ok(
+            serde_json::json!({"path":canonical.display().to_string(),"backend":"nexus","cached_before":cached_before,"cached_after":true,"cache_path":idb,"database_info":info,"already_open":already_open,"kept_warm":kept_warm,"worker_closed_after_prewarm":!kept_warm && !already_open}),
+        )
     }
 
     pub async fn enqueue_prewarm(
@@ -1721,7 +1851,14 @@ impl RouterState {
     }
 
     pub async fn shutdown_nexus(&self) -> Result<(), crate::error::ToolError> {
-        self.nexus_tools.shutdown(self).await
+        let _exclusive = self
+            .cli_admission
+            .clone()
+            .try_write_owned()
+            .map_err(|_| cli_request_busy())?;
+        self.nexus_tools.shutdown(self).await?;
+        self.warm_pool.lock().await.clear();
+        Ok(())
     }
     pub async fn cleanup_probe(&self) -> anyhow::Result<()> {
         if let Some(bridge) = self.nexus_bridge.get() {
