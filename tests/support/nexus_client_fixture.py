@@ -89,6 +89,19 @@ else:
             return handle
 
         DatabaseHandle.open = classmethod(lose_root_on_open)
+    # E07 deliberately composes crash restore with one accepted R9 retry.
+    # The marker is armed only after the old owner's definite exit/proof.
+    from ida_nexus import DatabaseHandle
+    e07_open = DatabaseHandle.open
+    def e07_reopen(_class, *args, **kwargs):
+        handle = e07_open(*args, **kwargs)
+        arm = env.root / 'e07-reopen-root-loss.arm'
+        if arm.exists():
+            arm.unlink()
+            handle.execute_python("import ida_netnode\nida_netnode.netnode('Root Node', 0, False).kill()", timeout=5)
+            (env.root / 'e07-reopen-root-loss.observed').write_text(str(handle.instance.pid))
+        return handle
+    DatabaseHandle.open = classmethod(e07_reopen)
     if os.environ.get("N3_LEASE_FAULT"):
         from ida_nexus import DatabaseHandle
         original_open_lease = DatabaseHandle._open_lease

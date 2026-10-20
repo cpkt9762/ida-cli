@@ -371,8 +371,15 @@ async fn crash_recovery(packed: bool) {
     })
     .await
     .expect("disconnect and public proof barriers");
-    assert_eq!(a.bridge.endpoint().transition(|s,_|s.status(&a.client,&old)).unwrap().phase,
-        SessionPhase::Released, "public owner proof advances the disconnected lease to Released");
+    assert_eq!(
+        a.bridge
+            .endpoint()
+            .transition(|s, _| s.status(&a.client, &old))
+            .unwrap()
+            .phase,
+        SessionPhase::Released,
+        "public owner proof advances the disconnected lease to Released"
+    );
     assert!(
         a.bridge
             .endpoint()
@@ -392,7 +399,23 @@ async fn crash_recovery(packed: bool) {
             .is_err(),
         "old disconnected handle rejects new operations"
     );
+    if packed {
+        std::fs::write(root().join("e07-reopen-root-loss.arm"), b"one R9 retry")
+            .expect("arm exact post-crash acquisition");
+    }
     let (replacement, reopened) = a.open(&source, json!({"auto_analysis":false})).await;
+    if packed {
+        assert!(root().join("e07-reopen-root-loss.observed").is_file());
+        assert!(!root().join("e07-reopen-root-loss.arm").exists());
+        let ordinal = reopened["acquisition"]["ordinal"]
+            .as_u64()
+            .expect("actual acquisition ordinal");
+        assert!(
+            (2..=3).contains(&ordinal),
+            "one injected failure within the accepted three-attempt R9 budget"
+        );
+        assert_eq!(reopened["acquisition"]["purpose"], "initial_root_retry");
+    }
     assert_ne!(old.instance_id, replacement.instance_id);
     assert_eq!(
         reopened["recovery"],
@@ -421,7 +444,20 @@ async fn crash_recovery(packed: bool) {
                 ))
         })
         .collect();
-    assert_eq!(backups.len(), usize::from(packed));
+    assert_eq!(
+        backups.len(),
+        if packed {
+            usize::try_from(
+                reopened["acquisition"]["ordinal"]
+                    .as_u64()
+                    .expect("actual recovery acquisition"),
+            )
+            .expect("bounded ordinal")
+        } else {
+            0
+        },
+        "exactly one backup per actual accepted restore acquisition; no extra or missing backup"
+    );
     a.release(&replacement).await;
     a.shutdown().await.unwrap();
     record(
