@@ -236,7 +236,8 @@ class Candidate:
             with stream.makefile('rb') as source:
                 reply = json.loads(source.readline())
         assert reply.get('id') == 'fixture-control' and 'result' in reply, reply
-        return reply['result']
+        value, _ = unwrap_cache(reply['result'], self.home)
+        return value
 
     def wait_closed_owner(self):
         lifecycle = self.last_close_lifecycle

@@ -104,6 +104,9 @@ def main():
             variables["N4_BASELINE"] = str(args.baseline.resolve(strict=True))
         Path(variables["N3_IPC_ROOT"]).mkdir(mode=0o700, exist_ok=True)
         (env.root / "ipc-root.json").write_text(json.dumps(str(ipc_root)))
+        native_ledger = env.root / 'native-processes.jsonl'
+        native_ledger.touch(mode=0o600, exist_ok=True)
+        variables['R2_LEDGER'] = str(native_ledger)
         (env.root / "rust-env.json").write_text(json.dumps(variables, indent=2) + "\n")
         suite_timeout = "300s" if args.suite == "special_inputs" else "180s"
         command = ["timeout", suite_timeout, str(cargo), "test", "--locked", "--features", "nexus-test-support", "--test", f"nexus_{args.suite}_e2e", "--", "--test-threads=1"]
@@ -202,27 +205,41 @@ def main():
                 expected = ["E08", "E09", "E10", "E11", "E12", "E13", "E14", "E15", "E18", "E26", "N5-hooks", "N5-lifecycle", "N5-reconnect", "N5-compare"]
                 cases = [event["case"] for event in events if event.get("status") == "PASS"]
             assert sorted(cases) == sorted(expected), f"wrong scenario evidence: {cases}"
+            from verify_nexus_gui import capture_ready
+            capture_ready(env)
             env.assert_clean()
             assert not list((env.root / "state/instances").glob("*.json")), "Nexus registrations remain"
             result.update({"status":"PASS", "actual_tests":count, "cases":cases})
         finally:
-            if args.suite == 'release':
-                from verify_nexus_gui import capture_native_processes
-                for case in ('E27','E28','E29'):
-                    directory=env.root/case
-                    if not directory.exists():continue
-                    owned=Environment(env.root)
-                    owned.ledger=directory/'processes.jsonl'
-                    owned.intents=directory/'process-intents'
-                    capture_native_processes(owned,directory/'native-processes.jsonl')
-                    owned.cleanup()
-                    owned.assert_clean()
-            result["cleanup_signalled_pids"] = env.cleanup()
-            env.assert_clean()
+            from verify_nexus_gui import capture_native_processes, capture_ready
+            cleanup_error = None
+            try:
+                if args.suite == 'release':
+                    for case in ('E27','E28','E29'):
+                        directory=env.root/case
+                        if not directory.exists():continue
+                        owned=Environment(env.root)
+                        owned.ledger=directory/'processes.jsonl'
+                        owned.intents=directory/'process-intents'
+                        capture_native_processes(owned,directory/'native-processes.jsonl')
+                        owned.cleanup()
+                        owned.assert_clean()
+                capture_ready(env)
+            except Exception as error:
+                cleanup_error = error
+                result.update(status='FAIL', native_capture_error=str(error))
+            try:
+                result["cleanup_signalled_pids"] = env.cleanup()
+                env.assert_clean()
+            except Exception as error:
+                cleanup_error = error
+                result.update(status='FAIL', cleanup_error=str(error))
             result["owned_processes"] = len(env.entries())
             sockets = [str(path) for path in ipc_root.rglob("*") if stat.S_ISSOCK(path.lstat().st_mode)]
             result["residual_sockets"] = sockets
             (env.root / f"{args.suite}-result.json").write_text(json.dumps(result, indent=2) + "\n")
+            if cleanup_error is not None:
+                raise cleanup_error
             assert not sockets, f"owned IPC socket files remain: {sockets}"
         print(json.dumps(result))
         return 0
