@@ -1,0 +1,374 @@
+//! Offline special-input builders; the returned open still uses ordinary N1 custody.
+use super::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DscInput {
+    pub arch: String,
+    pub module: String,
+    pub frameworks: Vec<String>,
+    pub ida_version: u8,
+    #[serde(skip)]
+    pub log_path: Option<PathBuf>,
+}
+impl DscInput {
+    pub fn validate(&self) -> Result<(), ToolError> {
+        if !matches!(self.ida_version, 8 | 9) || self.arch.is_empty() {
+            return Err(ToolError::InvalidParams(
+                "invalid DSC architecture or IDA version".into(),
+            ));
+        }
+        for module in std::iter::once(&self.module).chain(&self.frameworks) {
+            if !module.starts_with('/')
+                || module.contains('\0')
+                || module.split('/').any(|s| s == "..")
+            {
+                return Err(ToolError::InvalidParams(
+                    "DSC modules must be absolute paths without traversal or NUL".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) async fn sbpf(
+    mut prepared: PreparedOpen,
+    preparation: &Preparation,
+) -> Result<PreparedOpen, ToolError> {
+    if prepared.path.extension().is_some_and(|e| e == "i64") {
+        return Ok(prepared);
+    }
+    let output = prepared.path.with_extension("i64");
+    crate::sbpf::run_sbx_aot_i64(&prepared.path, &output, preparation.clone()).await?;
+    prepared.path = output;
+    prepared.options = serde_json::json!({"auto_analysis":false});
+    Ok(prepared)
+}
+
+// Hash every companion, including .symbols when present. Names are part of the
+// identity; a different module/framework/loader selection is a different cache key.
+fn members(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("DSC parent missing"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("DSC name missing"))?
+        .to_string_lossy();
+    let prefix = format!("{name}.");
+    let mut files = vec![path.to_path_buf()];
+    for item in std::fs::read_dir(parent)? {
+        let item = item?;
+        let suffix = item.file_name();
+        let suffix = suffix.to_string_lossy();
+        if suffix.starts_with(&prefix)
+            && !suffix.ends_with(".i64")
+            && !suffix.ends_with(".idb")
+            && !suffix.ends_with(".map")
+            && !suffix.ends_with(".atlas")
+        {
+            files.push(item.path());
+        }
+    }
+    anyhow::ensure!(files.len() <= 1024, "DSC companion count exceeds 1024");
+    files.sort();
+    for file in &files {
+        anyhow::ensure!(
+            file.symlink_metadata()?.file_type().is_file(),
+            "DSC member is not a regular file: {}",
+            file.display()
+        );
+    }
+    Ok(files)
+}
+fn content_hash(path: &std::path::Path, preparation: &Preparation) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut input = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    anyhow::ensure!(
+        input.metadata()?.is_file(),
+        "DSC member is not a regular file"
+    );
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 65536];
+    loop {
+        preparation.check()?;
+        let size = input.read(&mut buffer)?;
+        if size == 0 {
+            break;
+        }
+        hasher.update(&buffer[..size]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+fn identity(
+    files: &[PathBuf],
+    config: &DscInput,
+    preparation: &Preparation,
+) -> anyhow::Result<Vec<u8>> {
+    let mut hashes = std::collections::BTreeMap::new();
+    for file in files {
+        let name = file
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("DSC member name missing"))?;
+        hashes.insert(
+            name.to_string_lossy().into_owned(),
+            content_hash(file, preparation)?,
+        );
+    }
+    Ok(serde_json::to_vec(
+        &serde_json::json!({"kind":"dsc-sha256-v1","files":hashes,"loader":config}),
+    )?)
+}
+
+pub async fn prepare(
+    path: PathBuf,
+    cache: PathBuf,
+    config: DscInput,
+    preparation: &Preparation,
+) -> Result<PreparedOpen, ToolError> {
+    config.validate()?;
+    let guard = super::super::cache_lock::acquire(&cache, preparation).await?;
+    let original = path.clone();
+    let parameters = config.clone();
+    let preparing = preparation.clone();
+    let hashing_guard = guard.clone();
+    let (files, bytes) = preparation
+        .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+            let _guard = hashing_guard;
+            let files = members(&original)?;
+            let bytes = identity(&files, &parameters, &preparing)?;
+            Ok::<_, anyhow::Error>((files, bytes))
+        }))
+        .await?
+        .map_err(|e| ToolError::IdaError(format!("DSC content identity: {e:#}")))?;
+    let key = blake3::hash(&bytes).to_hex()[..12].to_string();
+    let content_guard =
+        super::super::cache_lock::acquire_content(&cache, &key, preparation).await?;
+    let root = cache.clone();
+    let lookup = key.clone();
+    let lookup_guard = guard.clone();
+    let lookup_content_guard = content_guard.clone();
+    let previous = preparation
+        .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+            let _guards = (lookup_guard, lookup_content_guard);
+            super::super::generations::current(&root, &lookup)
+        }))
+        .await?
+        .map_err(|e| ToolError::IdaError(format!("DSC cache lookup: {e:#}")))?;
+    if let Some(idb) = previous {
+        let input = idb.with_extension("");
+        let bundle = idb
+            .parent()
+            .ok_or_else(|| ToolError::InvalidPath("DSC generation parent missing".into()))?
+            .join("dsc-inputs");
+        let expected = bytes.clone();
+        let cached_config = config.clone();
+        let preparing = preparation.clone();
+        let validation_guard = guard.clone();
+        let validation_content_guard = content_guard.clone();
+        let valid = preparation
+            .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+                let _guards = (validation_guard, validation_content_guard);
+                let cached_members = members(
+                    &bundle.join(
+                        path.file_name()
+                            .ok_or_else(|| anyhow::anyhow!("DSC name missing"))?,
+                    ),
+                )?;
+                Ok::<_, anyhow::Error>(
+                    std::fs::read(input)? == expected
+                        && identity(&cached_members, &cached_config, &preparing)? == expected,
+                )
+            }))
+            .await?
+            .map_err(|e| ToolError::IdaError(format!("DSC cached identity: {e}")))?;
+        if !valid || !idb.is_file() {
+            return Err(ToolError::IdaError(
+                "DSC cached generation is incomplete or has a different identity".into(),
+            ));
+        }
+        let mut prepared = PreparedOpen::plain(idb);
+        prepared.options = serde_json::json!({"auto_analysis":false});
+        prepared.cache_hit = true;
+        prepared.cache_guard = Some(guard);
+        prepared.content_guard = Some(content_guard);
+        return Ok(prepared);
+    }
+    let preparing = preparation.clone();
+    let root = cache.clone();
+    let selection = config.clone();
+    let cache_key = key.clone();
+    // The blocking job itself owns both guards until copying really stops.
+    let retained_guard = guard.clone();
+    let retained_content = content_guard.clone();
+    let (snapshot, input) = preparation
+        .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+            let _guards = (retained_guard, retained_content);
+            let snapshot = StagedArtifact::create(&root.join(".dsc-snapshot"))?;
+            std::fs::create_dir(&snapshot.output)?;
+            let mut copied = Vec::new();
+            for file in files {
+                preparing.check()?;
+                let destination = snapshot.output.join(
+                    file.file_name()
+                        .ok_or_else(|| anyhow::anyhow!("DSC name missing"))?,
+                );
+                let mut source = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(file)?;
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination)?;
+                let mut buffer = [0; 65536];
+                loop {
+                    preparing.check()?;
+                    let size = source.read(&mut buffer)?;
+                    if size == 0 {
+                        break;
+                    }
+                    output.write_all(&buffer[..size])?;
+                }
+                output.sync_all()?;
+                copied.push(destination);
+            }
+            anyhow::ensure!(
+                identity(&copied, &selection, &preparing)? == bytes,
+                "DSC changed during snapshot copy"
+            );
+            let manifest = snapshot.directory.join("identity.json");
+            std::fs::write(&manifest, &bytes)?;
+            let input =
+                super::super::generations::create(&root, &cache_key, &manifest, &preparing)?;
+            let directory = input.parent().ok_or_else(|| anyhow::anyhow!("DSC generation parent missing"))?;
+            let bundle = StagedArtifact::create(&directory.join("dsc-inputs"))?;
+            std::fs::rename(&snapshot.output, &bundle.output)?;
+            bundle.publish_directory(&preparing)?;
+            let identity: serde_json::Value = serde_json::from_slice(&bytes)?;
+            std::fs::write(directory.join("generation.json"), serde_json::to_vec(&serde_json::json!({"version":1,"key":cache_key,"dsc_inputs":identity["files"]}))?)?;
+            std::fs::File::open(directory.join("generation.json"))?.sync_all()?;
+            std::fs::File::open(directory)?.sync_all()?;
+            Ok::<_, anyhow::Error>((snapshot, input))
+        }))
+        .await?
+        .map_err(|e| ToolError::IdaError(format!("DSC snapshot: {e:#}")))?;
+    let receipt = snapshot.cleanup_receipt();
+    let result = build(&path, &input, &config, preparation).await;
+    drop(snapshot);
+    receipt.wait().await?;
+    result?;
+    let idb = input.with_extension("i64");
+    let mut prepared = PreparedOpen::plain(idb.clone());
+    prepared.options = serde_json::json!({"auto_analysis":false});
+    prepared.generation = Some((cache, key, idb));
+    prepared.cache_guard = Some(guard);
+    prepared.content_guard = Some(content_guard);
+    Ok(prepared)
+}
+
+async fn build(
+    path: &std::path::Path,
+    input: &std::path::Path,
+    config: &DscInput,
+    preparation: &Preparation,
+) -> Result<(), ToolError> {
+    let stage = StagedArtifact::create(&input.with_extension("i64"))
+        .map_err(|e| ToolError::IdaError(format!("DSC output staging: {e}")))?;
+    let receipt = stage.cleanup_receipt();
+    let result = async {
+        let script = stage.directory.join("load.py");
+        let code = crate::dsc::dsc_load_script(&config.module, &config.frameworks);
+        let destination = script.clone();
+        preparation
+            .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+                std::fs::write(destination, code)
+            }))
+            .await?
+            .map_err(|e| ToolError::IdaError(format!("DSC script: {e}")))?;
+        let copied = input
+            .parent()
+            .ok_or_else(|| ToolError::InvalidPath("DSC generation parent missing".into()))?
+            .join("dsc-inputs")
+            .join(
+                path.file_name()
+                    .ok_or_else(|| ToolError::InvalidPath("DSC name missing".into()))?,
+            );
+        let args = crate::dsc::idat_dsc_args(
+            &copied,
+            &stage.output,
+            &script,
+            &crate::dsc::dsc_file_type(&config.arch, config.ida_version),
+            config.log_path.as_deref(),
+        );
+        let output = crate::dsc::run_idat_offline(
+            &crate::dsc::find_idat()?,
+            &args,
+            &config.module,
+            preparation.clone(),
+        )
+        .await?;
+        if !output.status.success() {
+            return Err(ToolError::IdaError(format!(
+                "DSC idat failed ({}): {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            )));
+        }
+        let preparing = preparation.clone();
+        blocking::run(blocking::WorkClass::Prepare, move || {
+            stage.publish(&preparing)
+        })
+        .await??;
+        Ok(())
+    }
+    .await;
+    receipt.wait().await?;
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dsc_identity_binds_companions_and_loader_but_not_log_destination() {
+        let root = std::env::temp_dir().join(format!("n7b-identity-{}", std::process::id()));
+        std::fs::create_dir(&root).expect("private DSC identity root");
+        let main = root.join("dyld_shared_cache_arm64e");
+        let companion = root.join("dyld_shared_cache_arm64e.01");
+        std::fs::write(&main, b"primary").expect("primary fixture");
+        std::fs::write(&companion, b"companion").expect("companion fixture");
+        let config = DscInput {
+            arch: "arm64e".into(),
+            module: "/usr/lib/a.dylib".into(),
+            frameworks: vec![],
+            ida_version: 9,
+            log_path: None,
+        };
+        let prep = Preparation::new(std::time::Duration::from_secs(5));
+        let first =
+            identity(&members(&main).expect("DSC files"), &config, &prep).expect("identity");
+        let mut changed = config.clone();
+        changed.log_path = Some(root.join("log"));
+        assert_eq!(
+            first,
+            identity(&members(&main).expect("files"), &changed, &prep)
+                .expect("log-independent identity")
+        );
+        changed.module = "/usr/lib/b.dylib".into();
+        assert_ne!(
+            first,
+            identity(&members(&main).expect("files"), &changed, &prep).expect("module identity")
+        );
+        std::fs::write(companion, b"different").expect("changed companion");
+        assert_ne!(
+            first,
+            identity(&members(&main).expect("files"), &config, &prep).expect("companion identity")
+        );
+        changed.module = "/usr/lib/../invalid".into();
+        assert!(changed.validate().is_err());
+        std::fs::remove_dir_all(root).expect("remove private identity fixtures");
+    }
+}

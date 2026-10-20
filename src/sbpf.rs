@@ -66,12 +66,16 @@ pub async fn run_sbx_aot_i64(
         .wait(crate::blocking::run(
             crate::blocking::WorkClass::Prepare,
             move || {
-                let bin = find_sbx()?;
+                let bin = find_sbx()?
+                    .canonicalize()
+                    .map_err(|e| ToolError::InvalidParams(format!("sbx executable: {e}")))?;
                 let abs_input = std::fs::canonicalize(&input).map_err(|e| {
                     ToolError::InvalidParams(format!("sbx input {}: {e}", input.display()))
                 })?;
                 let stage = crate::preprocess::StagedArtifact::create(&destination)
                     .map_err(|e| ToolError::IdaError(format!("sbx staging: {e}")))?;
+                std::fs::create_dir(stage.directory.join("tmp"))
+                    .map_err(|e| ToolError::IdaError(format!("sbx temporary directory: {e}")))?;
                 Ok::<_, ToolError>((bin, abs_input, stage))
             },
         ))
@@ -81,6 +85,10 @@ pub async fn run_sbx_aot_i64(
         preparation.check()?;
         let mut command = Command::new(&bin);
         command
+            .current_dir(&stage.directory)
+            .env("TMPDIR", stage.directory.join("tmp"))
+            .env_remove("DYLD_LIBRARY_PATH")
+            .env("LITESVM_DEX_DIR", stage.directory.join("sbx-cache"))
             .arg("aot")
             .arg("i64")
             .arg("--program")

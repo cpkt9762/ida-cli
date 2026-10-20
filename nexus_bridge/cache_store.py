@@ -150,7 +150,30 @@ class Store:
         if group.is_symlink() or not group.is_dir():
             return 'generation is not a regular directory'
         allowed = {'input', 'input.i64', 'generation.json', 'quarantine.json'}
+        try:
+            manifest = self.manifest(group)
+        except (OSError, ValueError, TypeError) as error:
+            return f'invalid generation manifest: {error}'
+        bundle = manifest.get('dsc_inputs')
+        if bundle is not None:
+            if (not isinstance(bundle, dict) or not bundle or len(bundle) > 1024
+                    or any(not isinstance(name, str) or name in ('', '.', '..')
+                           or '/' in name or '\\' in name or '\x00' in name
+                           or not isinstance(digest, str) or len(digest) != 64
+                           or any(c not in '0123456789abcdef' for c in digest)
+                           for name, digest in bundle.items())):
+                return 'invalid retained DSC bundle manifest'
+            directory = group/'dsc-inputs'
+            if directory.is_symlink() or not directory.is_dir():
+                return 'retained DSC bundle is missing or replaced'
+            entries = list(directory.iterdir())
+            if ({p.name for p in entries} != set(bundle)
+                    or any(p.is_symlink() or not p.is_file() for p in entries)):
+                return 'unexpected retained DSC bundle member'
+            allowed.add('dsc-inputs')
         for item in group.iterdir():
+            if item.name == 'dsc-inputs' and bundle is not None:
+                continue
             if item.is_symlink() or not item.is_file() or item.name not in allowed:
                 return 'unexpected or unpacked generation component: ' + item.name
         if not missing and not (group/'input.i64').is_file():
