@@ -83,6 +83,20 @@ impl StagedArtifact {
             rename_group(&self.output, &self.destination)
         })
     }
+    /// Publish a complete task-owned subdirectory without replacing any destination.
+    pub(crate) fn publish_owned_directory(
+        &self,
+        source: &Path,
+        destination: &Path,
+        preparation: &Preparation,
+    ) -> Result<(), ToolError> {
+        if source.parent() != Some(self.directory.as_path()) {
+            return Err(ToolError::InvalidPath(
+                "directory is not owned by this preparation stage".into(),
+            ));
+        }
+        self.commit(preparation, || rename_group(source, destination))
+    }
     pub(crate) fn commit(
         &self,
         preparation: &Preparation,

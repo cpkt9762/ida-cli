@@ -1,6 +1,7 @@
 //! Offline special-input builders; the returned open still uses ordinary N1 custody.
 use super::*;
 use serde::{Deserialize, Serialize};
+mod storage;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DscInput {
@@ -148,6 +149,12 @@ pub async fn prepare(
     let key = blake3::hash(&bytes).to_hex()[..12].to_string();
     let content_guard =
         super::super::cache_lock::acquire_content(&cache, &key, preparation).await?;
+    let member_guard = super::super::cache_lock::acquire_content(
+        &cache,
+        "dsc-shared-member-store-v1",
+        preparation,
+    )
+    .await?;
     let root = cache.clone();
     let lookup = key.clone();
     let lookup_guard = guard.clone();
@@ -170,19 +177,47 @@ pub async fn prepare(
         let preparing = preparation.clone();
         let validation_guard = guard.clone();
         let validation_content_guard = content_guard.clone();
+        let validation_member_guard = member_guard.clone();
+        let member_root = cache.clone();
         let valid = preparation
             .wait(blocking::run(blocking::WorkClass::Prepare, move || {
-                let _guards = (validation_guard, validation_content_guard);
-                let cached_members = members(
-                    &bundle.join(
-                        path.file_name()
-                            .ok_or_else(|| anyhow::anyhow!("DSC name missing"))?,
-                    ),
-                )?;
-                Ok::<_, anyhow::Error>(
-                    std::fs::read(input)? == expected
-                        && identity(&cached_members, &cached_config, &preparing)? == expected,
-                )
+                let _guards = (
+                    validation_guard,
+                    validation_content_guard,
+                    validation_member_guard,
+                );
+                anyhow::ensure!(
+                    std::fs::read(&input)? == expected,
+                    "DSC cached input identity changed"
+                );
+                let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                    input
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("generation parent missing"))?
+                        .join("generation.json"),
+                )?)?;
+                if let Some(version) = manifest.get("dsc_store") {
+                    anyhow::ensure!(
+                        version.as_u64() == Some(1),
+                        "unknown DSC shared-store version"
+                    );
+                    let hashes = serde_json::from_value(manifest["dsc_inputs"].clone())?;
+                    let requested: serde_json::Value = serde_json::from_slice(&expected)?;
+                    anyhow::ensure!(
+                        manifest["dsc_inputs"] == requested["files"],
+                        "DSC shared inventory changed"
+                    );
+                    storage::validate_links(&member_root, &bundle, &hashes, &preparing)?;
+                    Ok::<_, anyhow::Error>(true)
+                } else {
+                    let cached_members = members(
+                        &bundle.join(
+                            path.file_name()
+                                .ok_or_else(|| anyhow::anyhow!("DSC name missing"))?,
+                        ),
+                    )?;
+                    Ok(identity(&cached_members, &cached_config, &preparing)? == expected)
+                }
             }))
             .await?
             .map_err(|e| ToolError::IdaError(format!("DSC cached identity: {e}")))?;
@@ -200,44 +235,18 @@ pub async fn prepare(
     }
     let preparing = preparation.clone();
     let root = cache.clone();
-    let selection = config.clone();
     let cache_key = key.clone();
     // The blocking job itself owns both guards until copying really stops.
     let retained_guard = guard.clone();
     let retained_content = content_guard.clone();
     let (snapshot, input) = preparation
         .wait(blocking::run(blocking::WorkClass::Prepare, move || {
-            let _guards = (retained_guard, retained_content);
+            let _guards = (retained_guard, retained_content, member_guard);
             let snapshot = StagedArtifact::create(&root.join(".dsc-snapshot"))?;
             std::fs::create_dir(&snapshot.output)?;
-            let mut copied = Vec::new();
-            for file in files {
-                preparing.check()?;
-                let destination = snapshot.output.join(
-                    file.file_name()
-                        .ok_or_else(|| anyhow::anyhow!("DSC name missing"))?,
-                );
-                let mut source = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(file)?;
-                let mut output = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&destination)?;
-                let mut buffer = [0; 65536];
-                loop {
-                    preparing.check()?;
-                    let size = source.read(&mut buffer)?;
-                    if size == 0 {
-                        break;
-                    }
-                    output.write_all(&buffer[..size])?;
-                }
-                output.sync_all()?;
-                copied.push(destination);
-            }
-            anyhow::ensure!(
-                identity(&copied, &selection, &preparing)? == bytes,
-                "DSC changed during snapshot copy"
-            );
+            let identity: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let hashes = serde_json::from_value(identity["files"].clone())?;
+            storage::link_inputs(&files, &hashes, &root, &snapshot, &preparing)?;
             let manifest = snapshot.directory.join("identity.json");
             std::fs::write(&manifest, &bytes)?;
             let input =
@@ -247,7 +256,7 @@ pub async fn prepare(
             std::fs::rename(&snapshot.output, &bundle.output)?;
             bundle.publish_directory(&preparing)?;
             let identity: serde_json::Value = serde_json::from_slice(&bytes)?;
-            std::fs::write(directory.join("generation.json"), serde_json::to_vec(&serde_json::json!({"version":1,"key":cache_key,"dsc_inputs":identity["files"]}))?)?;
+            std::fs::write(directory.join("generation.json"), serde_json::to_vec(&serde_json::json!({"version":1,"key":cache_key,"dsc_inputs":identity["files"],"dsc_store":1}))?)?;
             std::fs::File::open(directory.join("generation.json"))?.sync_all()?;
             std::fs::File::open(directory)?.sync_all()?;
             Ok::<_, anyhow::Error>((snapshot, input))
