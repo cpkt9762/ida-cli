@@ -48,8 +48,13 @@ def next_retry(self):
 
 
 Custodian.next_retry = next_retry
+startup_script_used = [False]
+
 def obtain(self, Handle, Options, path, options, context):
-    if os.environ.get('R7A_STARTUP_SCRIPT'):
+    inject = os.environ.get('R7A_STARTUP_SCRIPT') and (
+        os.environ.get('R7A_STARTUP_SCRIPT_ONCE') != '1' or not startup_script_used[0])
+    if inject:
+        startup_script_used[0] = True
         options = dict(options, script_file=os.environ['R7A_STARTUP_SCRIPT'], startup_timeout=2)
     return original_obtain(self, Handle, Options, path, options, context)
 

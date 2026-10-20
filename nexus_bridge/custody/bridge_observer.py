@@ -17,7 +17,7 @@ class BackupSources:
 
     def reject_closed(self, owner, watch):
         if watch in self.absent:
-            if self.absent[watch]['owner'] != owner:
+            if self.absent[watch]['owner'] != digest(owner):
                 raise ValueError('ProtocolMismatch: closed watch owner mismatch')
             raise ValueError('ObservationClosed: cannot revive an unregistered watch')
 
@@ -85,6 +85,11 @@ class BackupSources:
 
     def query(self, value):
         with self.bridge.lock:
+            tombstone = self.absent.get(value['watch'])
+            if tombstone is not None:
+                if tombstone['owner'] != digest(value['owner']):
+                    raise ValueError('ProtocolMismatch: closed query owner mismatch')
+                return None
             entry = self.items.get(digest(value['owner']))
             if entry is None or not entry['released']:
                 return
@@ -123,16 +128,17 @@ class BackupSources:
                     or record.get('evidence_type') != 'public_owner_lifetime'):
                 raise ValueError('ProtocolMismatch: owner proof custody identity/type')
             if entry is None or watch not in entry['watches']:
-                # There was no producer to close. Pin the complete receipt so a
+                # There was no producer to close. Pin its exact digest so a
                 # late subscribe cannot turn absence into a revived observation.
                 from target_coordination import Target
                 from target_journal import fact
                 with Target(value['target']) as target:
                     fact(value['proof'], target, kind='PublicOwnerLifetime')
+                tombstone = {'owner':digest(owner), 'receipt':digest(value)}
                 previous = self.absent.get(watch)
-                if previous is not None and previous != value:
+                if previous is not None and previous != tombstone:
                     raise ValueError('ProtocolMismatch: conflicting absent producer receipt')
-                self.absent[watch] = dict(value)
+                self.absent[watch] = tombstone
                 return None
             previous = [proof for key,proof in entry['proofs'].items() if key == watch] if entry is not None else []
             record = value['proof']['record']

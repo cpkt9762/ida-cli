@@ -278,6 +278,28 @@ class CustodyFix1(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'ProtocolMismatch'):
                 backup.close(wrong)
 
+    def test_absent_watch_query_cannot_publish_after_sibling_registration(self):
+        from target_coordination import digest
+        with Boundary(self.root/'absent-query', stub_ida=False) as boundary:
+            observer = self.observer('absent-query-helper')
+            old = self.subscribe(observer, boundary)
+            other = self.subscribe(observer, boundary, 'other')
+            bridge = SimpleNamespace(lock=threading.RLock(), acquisitions={}, custodians={},
+                                     control=SimpleNamespace(send=lambda _:None))
+            backup = BackupSources(bridge, 8)
+            backup.subscribe(boundary.instance, other['owner'], other['watch'])
+            with Target(boundary.path) as target, target.locked():
+                Journal(target).bridge_signed(backup.bind(other))
+            boundary.release_owner()
+            proof = until(lambda: observer.items['watch'].get('proof'))
+            self.assertIsNone(backup.close(dict(owner=old['owner'], watch=old['watch'],
+                target=old['target'], proof=proof)))
+            until(lambda: backup.items[digest(old['owner'])]['released'])
+            self.assertIsNone(backup.query(old), 'late query must not recreate an absent producer')
+            self.assertEqual(backup.query(other)['record']['watch'], 'other')
+            self.assertEqual(set(backup.items[digest(old['owner'])]['proofs']), {'other'})
+            backup.retire('other')
+
     def test_two_authorized_public_sources_keep_first_durable_proof_and_both_facts(self):
         with Boundary(self.root/'two-public-sources', stub_ida=False) as boundary:
             observer = self.observer('two-source-helper')
