@@ -61,6 +61,7 @@ async fn e02_readiness_dependencies_versions_and_runtime() {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
     missing.python = shell;
+    let mut rejected_directories = vec![missing.directory.clone()];
     let router = ida_mcp::router::RouterState::new().unwrap();
     let error = router
         .connect_nexus(missing)
@@ -74,6 +75,7 @@ async fn e02_readiness_dependencies_versions_and_runtime() {
     wrong
         .environment
         .insert("N3_WRONG_VERSION".into(), "1".into());
+    rejected_directories.push(wrong.directory.clone());
     let router = ida_mcp::router::RouterState::new().unwrap();
     let error = router
         .connect_nexus(wrong)
@@ -93,6 +95,7 @@ async fn e02_readiness_dependencies_versions_and_runtime() {
     unsupported
         .environment
         .insert("IDADIR".into(), fake.to_string_lossy().into_owned());
+    rejected_directories.push(unsupported.directory.clone());
     let router = ida_mcp::router::RouterState::new().unwrap();
     let error = router
         .connect_nexus(unsupported)
@@ -101,6 +104,19 @@ async fn e02_readiness_dependencies_versions_and_runtime() {
         .expect("unsupported runtime rejected")
         .to_string();
     assert!(error.contains("runtime_unavailable"), "{error}");
+    // StartupGuard reaps on a native thread. Keep this test runtime alive until
+    // its precise rejected launches have finished their own socket cleanup.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rejected_directories.iter().any(|directory| {
+            ["b", "c", "l"]
+                .iter()
+                .any(|name| directory.join(name).exists())
+        }) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("rejected startup reapers finish exact socket cleanup");
     record(json!({"case":"E02", "status":"PASS", "assertions":4}));
 }
 #[tokio::test]
