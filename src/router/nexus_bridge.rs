@@ -1093,7 +1093,7 @@ impl NexusBridge {
                 if !helper.is_finished() {
                     tokio::time::timeout_at(
                         preparation.deadline.into(),
-                        helper.call(json!({"kind":"heartbeat", "summary_only":true})),
+                        helper.observe_for_shutdown(),
                     )
                     .await
                     .map_err(|_| {

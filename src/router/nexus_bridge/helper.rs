@@ -10,6 +10,8 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+#[cfg(test)]
+type HeartbeatPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 pub(super) struct Helper {
     pub endpoint: PathBuf,
     pub incarnation: String,
@@ -24,6 +26,8 @@ pub(super) struct Helper {
     finished: std::sync::atomic::AtomicBool,
     file_job_slots: Arc<tokio::sync::Semaphore>,
     registry_limit: u64,
+    #[cfg(test)]
+    heartbeat_pause: std::sync::Mutex<Option<HeartbeatPause>>,
 }
 impl Helper {
     pub async fn start(
@@ -155,6 +159,8 @@ impl Helper {
             finished: std::sync::atomic::AtomicBool::new(false),
             file_job_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             registry_limit,
+            #[cfg(test)]
+            heartbeat_pause: std::sync::Mutex::new(None),
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -284,6 +290,29 @@ impl Helper {
             };
         }
         result
+    }
+
+    pub(super) async fn observe_for_shutdown(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        {
+            let pause = self
+                .heartbeat_pause
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some((entered, resume)) = pause {
+                entered.notify_one();
+                resume.notified().await;
+            }
+        }
+        // The finished check and exchange share finish's serialization gate.
+        // Accepted retirement may win while this observation is queued.
+        let _call = tokio::time::timeout(Duration::from_secs(2), self.calls.lock()).await?;
+        if !self.is_finished() {
+            self.exchange(json!({"kind":"heartbeat", "summary_only":true}))
+                .await?;
+        }
+        Ok(())
     }
 
     pub(super) fn is_finished(&self) -> bool {
@@ -494,19 +523,18 @@ impl Helper {
 
     pub async fn finish(&self) -> anyhow::Result<()> {
         let _call = tokio::time::timeout(Duration::from_secs(2), self.calls.lock()).await?;
-        if self.finished.load(std::sync::atomic::Ordering::Acquire) {
-            return Ok(());
-        }
-        if let Err(error) = self.exchange(json!({"kind":"finish"})).await {
-            if !self.finish_accepted()? {
-                return Err(error);
+        if !self.finished.load(std::sync::atomic::Ordering::Acquire) {
+            if let Err(error) = self.exchange(json!({"kind":"finish"})).await {
+                if !self.finish_accepted()? {
+                    return Err(error);
+                }
+                tracing::warn!(%error, "helper finish reply lost; exact durable acceptance recovered");
             }
-            tracing::warn!(%error, "helper finish reply lost; exact durable acceptance recovered");
+            self.finished
+                .store(true, std::sync::atomic::Ordering::Release);
         }
-        // Serialize against every heartbeat/custody request. Once finish was
-        // accepted, a late caller must not turn the clean exit into recovery.
-        self.finished
-            .store(true, std::sync::atomic::Ordering::Release);
+        // A repeated finish still confirms actual child exit; durable
+        // acceptance alone cannot turn a failed/unfinished reap into success.
         let status = tokio::time::timeout(
             Duration::from_secs(2),
             super::wait_child(&mut *self.child.lock().await),
@@ -564,6 +592,63 @@ impl Helper {
 
 #[cfg(all(test, feature = "nexus-test-support"))]
 mod tests {
+    #[tokio::test]
+    async fn shutdown_observer_queued_before_accepted_finish_does_not_reopen_helper() {
+        use super::*;
+        let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private helper root"))
+            .join(format!(
+                "e-finish-{}",
+                crate::router::nexus_transport::monotonic_ns().unwrap()
+            ));
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let installation = root.join("installation");
+        crate::router::nexus_bridge::installation::create(&installation).unwrap();
+        let mut config = BridgeConfig {
+            python: PathBuf::from(std::env::var_os("F1_PYTHON").expect("prepared interpreter")),
+            script: installation.join("bridge.py"),
+            directory: root.clone(),
+            environment: std::env::vars().collect(),
+        };
+        config.environment.insert(
+            "IDA_NEXUS_STATE_DIR".into(),
+            root.join("state").display().to_string(),
+        );
+        let helper = Helper::start(&mut config, &installation)
+            .await
+            .expect("actual helper");
+        helper.call(json!({"kind":"heartbeat"})).await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *helper.heartbeat_pause.lock().unwrap() = Some((entered.clone(), resume.clone()));
+        let queued = helper.clone();
+        let heartbeat = tokio::spawn(async move { queued.observe_for_shutdown().await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("observer reached its serialization boundary");
+        helper
+            .finish()
+            .await
+            .expect("exact empty helper accepts finish and exits");
+        resume.notify_one();
+        let result = heartbeat.await.unwrap();
+        helper
+            .finish()
+            .await
+            .expect("repeat finish still confirms the actual child exit");
+        assert_eq!(
+            helper.restarts.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(
+            !helper.endpoint.exists(),
+            "own socket removed by normal finish"
+        );
+        result.expect("an accepted concurrent finish satisfies shutdown observation");
+    }
     use super::*;
     use tokio::io::AsyncBufReadExt;
 
