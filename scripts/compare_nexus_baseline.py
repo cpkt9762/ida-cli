@@ -547,6 +547,15 @@ def streams(env,binary):
                 assert 'result' in response, response
                 result=response['result']
                 assert result["stdout"]==tag+"\n" and result["stderr"]==tag+" err\n",result
+        # The earlier CLI comparisons own a separate warm lease. Establish
+        # exactly one public MCP lease for the cancellation leak assertion.
+        closed = client.mcp('close_idb', {'close_token':client.opened['close_token']})
+        assert 'result' in closed, closed
+        client.opened = None
+        assert client.control('close', {'path':str(sample)})['ok'] is True
+        reopened = client.mcp('open_idb', {'path':str(sample)})
+        assert 'result' in reopened, reopened
+        client.opened = reopened['result']
         marker=env.root/"e17-native-started"
         # Running cancellation uses the already acquired public MCP lease.
         # A fresh CLI acquisition shares its one-second deadline with setup
