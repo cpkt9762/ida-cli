@@ -64,6 +64,16 @@ class ReleaseAssertions(unittest.TestCase):
                 with patch.object(driver.time,'sleep',side_effect=publish) as observed:
                     self.assertEqual(driver.capture(env),[started])
                     self.assertEqual(observed.call_count,1)
+                # A follow-up snapshot may already prove completion; do not
+                # misclassify that positive evidence as an unfinished intent.
+                original=driver.capture_native_processes
+                attempts=[0]
+                def initially_pending(*args):
+                    attempts[0]+=1
+                    if attempts[0]==1:raise AssertionError('unfinished or duplicate native creation intent')
+                    return original(*args)
+                with patch.object(driver,'capture_native_processes',side_effect=initially_pending):
+                    self.assertEqual(driver.capture(env),[started])
                 ledger.write_text(json.dumps(intent)+'\n')
                 with patch.object(driver.time,'monotonic',side_effect=[0,4]),self.assertRaises(AssertionError):
                     driver.capture(env)

@@ -33,8 +33,8 @@ def capture(env):
             records=[json.loads(line) for line in env.native_ledger.read_text().splitlines()]
             intents={row['intent'] for row in records if row['kind']=='intent'}
             terminals=[row['intent'] for row in records if row['kind'] in ('started','spawn_failed')]
-            if len(set(terminals))!=len(terminals) or not (intents-set(terminals)) or time.monotonic()>=deadline:raise
-            time.sleep(.01)  # Wait only for recorded creation intents, never guess successful cleanup.
+            if len(set(terminals))!=len(terminals) or set(terminals)-intents or time.monotonic()>=deadline:raise
+            if intents-set(terminals):time.sleep(.01)  # Wait only for recorded creation intents, never guess successful cleanup.
     sockets=env.root/'sockets.jsonl'
     known={line for line in sockets.read_text().splitlines()} if sockets.exists() else set()
     with sockets.open('a') as output:
@@ -226,7 +226,8 @@ def e27(env, binary, case, result):
     external_code = """import os,sys,json
 from ida_nexus import DatabaseHandle,DatabaseOpenOptions
 handle=DatabaseHandle.open(sys.argv[1],options=DatabaseOpenOptions(startup_timeout=15,worker_env=dict(os.environ)))
-print(json.dumps({'event':'external_opened','pid':handle.instance.pid,'instance_id':handle.instance.record_id}),flush=True)
+assert handle.wait_autoanalysis(timeout=15)['complete']
+print(json.dumps({'event':'external_opened','pid':handle.instance.pid,'instance_id':handle.instance.record_id,'idb_path':handle.instance.idb_path}),flush=True)
 try:
  for line in sys.stdin:
   request=json.loads(line)
@@ -248,6 +249,9 @@ finally:handle.close(wait_for_database=True,timeout=15)
         assert first['metadata']['ida_version'] == env.manifest['installed_ida_version']
         functions = product.raw(a, 'list_functions')['functions']
         target = functions[0]['address']
+        owner_a_pid=int(product.script(a,"import os; print(os.getpid())").strip())
+        assert owner_a_pid != ready['pid'], 'A and B must be independent database owners'
+        result['independent_owner_pids']={'A':owner_a_pid,'B':ready['pid']}
         product.script(a, f"import ida_name,ida_bytes,ida_loader; assert ida_name.set_name({int(target,16)},'E27_SAVED',ida_name.SN_CHECK); assert ida_bytes.set_cmt({int(target,16)},'E27_SAVED',False); assert ida_loader.save_database(ida_loader.get_path(ida_loader.PATH_TYPE_IDB),0)")
         code = ("from pathlib import Path\nimport time\n" + f"with Path({str(started)!r}).open('a') as f: f.write('start\\n')\n"
                 + f"while not Path({str(release)!r}).exists(): time.sleep(.01)\n"
@@ -263,8 +267,10 @@ finally:handle.close(wait_for_database=True,timeout=15)
         assert not release.exists() and not continued.exists(), 'busy shutdown stopped/released the cooperative barrier'
         assert product.call('status')['worker_count'] == 1, 'service remains responsive and owns A'
         def external_query():
-            external.child.stdin.write((json.dumps({'command':'query','code':'1+1'})+'\n').encode());external.child.stdin.flush()
-            assert external.lines.json()['result'] == 2
+            code="import ida_funcs,ida_loader\n{'functions':ida_funcs.get_func_qty(),'path':ida_loader.get_path(ida_loader.PATH_TYPE_IDB)}"
+            external.child.stdin.write((json.dumps({'command':'query','code':code})+'\n').encode());external.child.stdin.flush()
+            value=external.lines.json()['result']
+            assert value['functions'] >= 2 and Path(value['path']).resolve()==Path(ready['idb_path']).resolve(),value
             assert same_process(identity(ready['pid']), external_birth)
         external_query()
         result['busy_refusal_preserved_service_and_operation']=True
