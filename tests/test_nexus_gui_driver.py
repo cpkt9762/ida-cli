@@ -30,6 +30,22 @@ class GuiDriverTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             gui_driver.gui_home(self.root)
 
+    def test_live_capture_waits_only_for_recorded_pending_births(self):
+        from types import SimpleNamespace
+        ledger = self.root/'native-processes.jsonl'
+        intent = {'kind':'intent','intent':'one'}
+        started = {'kind':'started','intent':'one'}
+        ledger.write_text(json.dumps(intent)+'\n')
+        env = SimpleNamespace(root=self.root)
+        with patch.object(gui_driver,'capture_native_processes',side_effect=[AssertionError('unfinished or duplicate native creation intent'), ['captured']]), \
+                patch.object(gui_driver.time,'sleep') as pause:
+            self.assertEqual(gui_driver.capture_ready(env),['captured'])
+            pause.assert_called_once_with(.01)
+        ledger.write_text(''.join(json.dumps(row)+'\n' for row in (intent,started,started)))
+        with patch.object(gui_driver,'capture_native_processes',side_effect=AssertionError('unfinished or duplicate native creation intent')), \
+                self.assertRaisesRegex(AssertionError,'duplicate'):
+            gui_driver.capture_ready(env)
+
     def test_exact_gui_owner_required(self):
         self.assertEqual(gui_driver.check_owner([self.owner], self.owner, 123, self.database), self.owner)
         for records in ([], [self.owner, self.owner]):

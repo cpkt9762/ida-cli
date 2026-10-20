@@ -128,6 +128,25 @@ def capture_native_processes(env, ledger=None):
     return started
 
 
+def capture_ready(env):
+    """Wait for recorded creation handoffs; duplicate/malformed records fail."""
+    deadline = time.monotonic() + 3
+    ledger = env.root / 'native-processes.jsonl'
+    while True:
+        try:
+            return capture_native_processes(env, ledger)
+        except AssertionError as error:
+            if str(error) != 'unfinished or duplicate native creation intent':
+                raise
+            rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+            intents = {row['intent'] for row in rows if row['kind'] == 'intent'}
+            terminals = [row['intent'] for row in rows if row['kind'] in ('started', 'spawn_failed')]
+            if len(set(terminals)) != len(terminals) or set(terminals) - intents or time.monotonic() >= deadline:
+                raise
+            if intents - set(terminals):
+                time.sleep(.01)
+
+
 def run_seed(env, variables, sample):
     code = ("import idapro,ida_auto,ida_loader; "
             f"assert idapro.open_database({str(sample)!r},True)==0; "
@@ -219,7 +238,7 @@ def exercise(env, binary, result):
             release=released, lifecycle=lifecycle, after_release=after_release,
             scene_before_release=before, scene_after_release=scene(gui_root),
             surviving_owner=check_owner([owner_record(x.instance) for x in discover_databases()], expected, gui.pid, database))
-        result['native_before_cleanup'] = capture_native_processes(env)
+        result['native_before_cleanup'] = capture_ready(env)
         assert result['native_before_cleanup'], 'build with --features nexus-test-support for native accounting'
         assert not any('worker' in x['command'] or 'idalib_worker' in ' '.join(x['command'])
             for x in env.entries()), 'second owner was spawned'
@@ -288,7 +307,7 @@ def main():
         finally:
             try:
                 if admitted:
-                    result['native_processes'] = capture_native_processes(env)
+                    result['native_processes'] = capture_ready(env)
                     result['cleanup_signalled'] = env.cleanup()
                     env.assert_clean()
                     result['cleanup'] = 'PASS'
