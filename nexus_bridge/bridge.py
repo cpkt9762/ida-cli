@@ -87,7 +87,7 @@ TOOL_SOURCE += ("\n_tools_metadata = {}\n"
                 + "install_tools(_tools_metadata)\n")
 RELEASE_SOURCE = module_source('lifecycle.py')
 SLICE_GATE_SOURCES = {name: module_source(name + '.py', custody=True) for name in (
-    'target_coordination', 'custody_process_identity', 'origin', 'owner_identity', 'target_journal',
+    'target_coordination', 'custody_process_identity', 'origin', 'process_timeout', 'owner_identity', 'target_journal',
     'durable_records', 'recovery_files', 'recovery_resources', 'recovery_transaction','recovery_legacy','volume_identity')}
 SLICE_SOURCE = ("import sys, types\n"
     + f"_target_gate_sources = {SLICE_GATE_SOURCES!r}\n"

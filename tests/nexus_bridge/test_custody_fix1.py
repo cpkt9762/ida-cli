@@ -77,6 +77,24 @@ class CustodyFix1(unittest.TestCase):
                     slices.attach_cleanup(boundary.instance)
                 self.assertEqual(calls, [boundary.instance])
 
+    def test_owner_slice_gate_has_a_closed_import_chain_without_repo_sys_path(self):
+        import builtins
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('isolated_slices', REPO/'nexus_bridge/slices.py')
+        slices = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(slices)
+        slices._target_gate_sources = SLICE_GATE_SOURCES
+        original = builtins.__import__
+        def external_import(name, *args, **kwargs):
+            if name == 'process_timeout':
+                raise ModuleNotFoundError('process_timeout is unavailable outside the closed owner source bundle')
+            return original(name, *args, **kwargs)
+        with Boundary(self.root/'closed-slice', stub_ida=False) as boundary, \
+                patch('builtins.__import__', side_effect=external_import), \
+                patch('ida_nexus.DatabaseHandle.attach', return_value='attached') as attached:
+            self.assertEqual(slices.attach_cleanup(boundary.instance),'attached')
+            attached.assert_called_once_with(boundary.instance)
+
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix='fix-', dir=os.environ['R3A_CASE_ROOT']))
         self.observers = []
