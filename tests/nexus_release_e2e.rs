@@ -231,3 +231,7 @@ fn e27_shutdown_and_same_product_restart() {
 fn e28_version_rollback_from_private_backup() {
     release_case("E28");
 }
+#[test]
+fn e29_unique_backend_installed_release() {
+    release_case("E29");
+}

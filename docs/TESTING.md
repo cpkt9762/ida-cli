@@ -449,7 +449,7 @@ implemented; other planned `nexus_*_e2e` targets remain future work and cannot b
 counted as executed tests.
 
 Use a new worktree and an external, nonexistent environment directory. Install
-GNU `timeout` first. Select an IDA 9.4+ installation with its existing legal
+GNU `timeout` first. Select an IDA 9.4 or 9.5 installation with its existing legal
 license available, Python 3.11+, and an already accepted `ida.reg`. Preparation
 never accepts terms or copies `.hexlic` files. An external 0600 bootstrap copy
 of the selected registry is reduced by IDA's public registry API to existing
@@ -471,7 +471,7 @@ timeout 30s "$N0_ROOT/venv/bin/python" tests/test_nexus_n0_support.py -v
 
 The preparation pins Nexus `0.13.4` at
 `d60ff582fde90c59726336c0dbdf3e8286e9df7a`, Domain `0.5.1`, and the IDA-supplied
-`idapro 0.0.10`. `scripts/nexus/requirements.lock` fixes the build/test dependency
+`idapro 0.0.9` (9.4) or `0.0.10` (9.5). `scripts/nexus/requirements.lock` fixes the build/test dependency
 closure. Wheel and sample SHA-256 values, `pip check`, the full package freeze,
 all preparation commands/exit codes and logs are recorded in the external root.
 The root contains independent `venv`, `profile`, `state`, `cli-home`, `fixtures`,
@@ -1888,3 +1888,49 @@ policy only; this delivery's real E25 evidence remains macOS/APFS.
 安装器按应用名称数字版本逐段比较、尾零等价、同版本按规范路径升序选择最新项，打印其他候选；最新不兼容时报错并提示用 `IDADIR` 指定其他候选，不自动退选。启动器保存安装时路径，显式 `IDADIR` 可覆盖到另一受支持版本；probe-runtime/status 分别报告实际 `ida_version` 和 `installed_ida_version`，建议按目标版本重新安装。实际版本由无数据库的有界子进程加载内核核实，并在每次 open 后核对 owner。
 
 N0 固定二进制链接 IDA 9.5，输出对照仅在 9.5 成立。9.4 下需要 N0 的 suite 明确 BLOCKED；contract 可用 `--case E16`、`E17`、`E22` 单独运行。E22 在 9.4 现场生成带标注的旧平铺布局库，核对缓存与预热契约，不宣称 N0 跨版本对照。
+
+## N9-E2E release directed suite
+
+`verify_nexus_e2e.py --suite release --baseline <fixed-N0-binary>` runs exactly
+E27/E28/E29 as three separate Rust `--exact` entries; R7a's large seed case stays
+separate. Prebuild `target/release/ida-cli` with `nexus-test-support` for exact
+native creation evidence. Build without IDASDKDIR/IDALIB_SDK; use a new physical
+/private/tmp prepared environment, private HOME/IDA_CLI_HOME, profile/state/IPC.
+The verifier copies and hashes the N0 binary before use. IDA/license/N0 absence
+is BLOCKED. At 9.4 the entire suite/E28 is BLOCKED because N0 links 9.5; E27 or
+E29 can be selected with `--case` and the same fixed `--baseline` prerequisite.
+
+Each real case has a shell `timeout 180s`; the three-case outer bound is **570s**
+(3 * 180s plus 30s for aggregation and exact cleanup). A single case uses an
+outer 210s. Compile/link beforehand. Each case writes its own result JSON,
+PID/native birth ledger, negative assertion witness and socket evidence; the
+summary requires exactly three actual test terminals and three PASS cases.
+Partial PASS counts, 124, unknown inner terminals and zero tests never pass.
+After interruption run the verifier's `--cleanup` on that exact environment.
+No cleanup scans process names. A failed case retains diagnostics and is not
+converted to PASS by cleanup.
+
+E27 asserts successful whole-service shutdown after an active script's barrier,
+external public client's B survival, natural service-owned process/socket/lease
+cleanup and saved A edits after restarting the same artifact. **Implementation
+is currently blocked by the accepted busy-shutdown contract**: N1 release
+returns CancelPending while work is active, and the existing
+`n4_fix_busy_shutdown_does_not_exit` regression requires refusal without exit.
+The strict E27 regression reports FAIL at that boundary; changing this semantic
+requires orchestrator authorization. It is not skipped or counted as passed.
+
+E28 creates its pre-migration backup during the case, checks N0 annotations,
+migrates a separate copy, retains that scene and restores only the backup in
+another directory using N0/9.5. It checks hashes, names/comments/decompilation
+and absence of post-backup edits. A damaged disposable copy demonstrates the
+backup equality assertion failing. N0 is never given the migrated copy.
+
+E29 packages and installs the release under its own prefix, checks otool
+libraries/load commands and cargo tree, rejected commands/variables (also with
+an existing daemon), and failures after renaming only the private venv. Exact
+creation ledgers prohibit legacy/native/idat query workers. A real disposable
+extra child named idat demonstrates detection, then its held Popen is reaped.
+After restoring the venv, list/decompile/write/save/close/reopen/readback and
+shutdown must succeed naturally. CLI automatic startup now reports an exited
+Nexus daemon immediately using the held Child; no alternate backend is tried.
+Existing N9 patch-tamper regression remains the patch hash negative control.

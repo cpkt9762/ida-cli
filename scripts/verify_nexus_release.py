@@ -19,6 +19,7 @@ from nexus_env import Environment
 from process_identity import identity, same_process
 from compare_nexus_baseline import BASELINE_SHA, digest, Process, unwrap_cache
 from verify_nexus_gui import capture_native_processes
+from test_nexus_removed_config import REMOVED
 
 
 def capture(env):
@@ -344,6 +345,82 @@ def assert_annotations(actual, expected):
     assert actual == expected, (actual, expected)
 
 
+def e29(env, binary, case, result):
+    assert binary.parent.name == 'release', 'E29 requires the release build'
+    archive = case/'bundle.tar.gz'
+    command(env, [sys.executable, str(REPO/'scripts/package_release.py'), '--binary', str(binary), '--output',str(archive)])
+    bundle = case/'bundle';bundle.mkdir()
+    command(env, ['tar','-xzf',str(archive),'-C',str(bundle)])
+    prefix = case/'prefix'
+    variables = env.variables()
+    # Unset IDADIR at 9.5 proves automatic newest selection on this host. Other
+    # platforms may supply private injected roots through their prepared env.
+    if env.manifest['installed_ida_version'] == '9.5':
+        variables.pop('IDADIR',None)
+    install = command(env, ['bash',str(bundle/'scripts/install.sh'),'--bundle',str(bundle),
+        '--bin-dir',str(prefix/'bin'),'--install-root',str(prefix/'lib'),
+        '--nexus-source',str(env.root/'nexus-source'),'--wheels',str(env.root/'wheels')], variables, limit=180)
+    result['install_output'] = install
+    launcher = prefix/'bin/ida-cli'
+    roots = list((prefix/'lib').glob('version.*'));assert len(roots)==1
+    root = roots[0]
+    instrument(root/'nexus/venv/bin/python')
+    links = command(env,['otool','-L',str(root/'ida-cli.real')])
+    rpaths = command(env,['otool','-l',str(root/'ida-cli.real')])
+    assert not any(word in links+rpaths for word in ('libida','libidalib','IDASDK','idasdk','/Applications/IDA')), links
+    assert CARGO is not None, 'BLOCKED: cargo missing'
+    tree = command(env,[CARGO,'tree','--locked'], os.environ.copy())
+    assert not any(word in tree for word in ('idalib v','idalib-build')), tree
+    result['linkage'] = {'libraries':links,'rpath_load_commands':rpaths,'cargo_tree':tree}
+    product = Product(env,launcher,case/'installed',python=root/'nexus/venv/bin/python')
+    # The launcher supplies the frozen default when IDADIR is absent.
+    product.variables.pop('IDADIR',None)
+    probe = command(env,[str(launcher),'probe-runtime'],product.variables)
+    assert json.loads(probe)['metadata']['ida_version'] == env.manifest['installed_ida_version']
+    assert json.loads(probe)['metadata']['installed_ida_version'] == env.manifest['installed_ida_version']
+    assert product.call('serve-worker',ok=False)['exit'] != 0
+    for name in REMOVED:
+        rejected = product.call('status',ok=False,variables=product.variables|{name:''})
+        assert rejected['exit'] != 0 and name in rejected['stderr'],rejected
+    # Only this private installation is renamed. The launcher continues to name
+    # the missing venv; neither product nor test may select another interpreter.
+    before = len(env.entries())
+    runtime = root/'nexus/venv';missing = root/'nexus/venv.missing';runtime.rename(missing)
+    a = sample(env,case,'tools')
+    try:
+        failures=[]
+        for args in (['--path',str(a),'list-functions'],['serve'],['probe-runtime']):
+            failure=product.call(*args,ok=False)
+            assert failure['exit'] not in (0,124),failure
+            assert any(word in failure['stderr'].lower() for word in ('nexus','python','no such file')),failure
+            failures.append(failure)
+        capture(env)
+        rows=env.entries()[before:]
+        no_query_workers(rows)
+        result['missing_runtime']={'failures':failures,'processes':rows,'no_query_worker':True}
+        injected_path = case/'idat'
+        injected_path.symlink_to('/bin/sleep')
+        injected_argv = [str(injected_path), '30']
+        injected = env.spawn(lambda: subprocess.Popen(injected_argv,env=product.variables),injected_argv)
+        try:
+            injected_entry = next(row for row in env.entries() if row['pid']==injected.pid)
+            result['negative_witness']=negative_witness('missing dependency starts no query worker',
+                lambda:no_query_workers(rows+[injected_entry]))
+            result['negative_witness']['injected_process'] = injected_entry
+        finally:
+            injected.terminate()
+            injected.wait(timeout=3)
+    finally:
+        missing.rename(runtime)
+    result['smoke']=smoke(product,a,'E29_PERSISTED')
+    result['daemon_status']=product.call('status')
+    for name in REMOVED:
+        rejected=product.call('status',ok=False,variables=product.variables|{name:''})
+        assert rejected['exit']!=0 and name in rejected['stderr'],rejected
+    result['removed_config_with_existing_daemon']=list(REMOVED)
+    product.stop();product.clean(product.entries())
+
+
 def command(env, argv, variables=None, *, limit=30):
     args=['timeout',str(limit)+'s',*argv]
     child=env.spawn(lambda:subprocess.Popen(args,cwd=REPO,env=variables or env.variables(),
@@ -358,7 +435,7 @@ def main():
     parser.add_argument('--root',type=Path,required=True)
     parser.add_argument('--binary',type=Path,required=True)
     parser.add_argument('--baseline',type=Path)
-    parser.add_argument('--case',choices=('E27','E28'),required=True)
+    parser.add_argument('--case',choices=('E27','E28','E29'),required=True)
     args=parser.parse_args()
     env=Environment(args.root)
     case=env.root/args.case;case.mkdir(mode=0o700)
@@ -378,6 +455,7 @@ def main():
         assert os.environ.get('IDA_TEST')=='1','BLOCKED: explicit IDA_TEST=1 required'
         if args.case=='E27':e27(env,args.binary,case,result)
         elif args.case=='E28':e28(env,args.binary,args.baseline,case,result)
+        else:e29(env,args.binary,case,result)
         capture(env)
         env.assert_clean()
         result['status']='PASS'

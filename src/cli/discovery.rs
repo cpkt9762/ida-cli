@@ -78,7 +78,7 @@ fn auto_start_server() -> Result<(), String> {
     eprintln!("No running server found, starting one...");
     let exe = std::env::current_exe().map_err(|e| format!("Cannot find own binary: {e}"))?;
 
-    let child = std::process::Command::new(&exe)
+    let mut child = std::process::Command::new(&exe)
         .args(["serve-http", "--bind", "127.0.0.1:0"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -90,6 +90,15 @@ fn auto_start_server() -> Result<(), String> {
 
     for i in 0..40 {
         std::thread::sleep(std::time::Duration::from_millis(250));
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("Cannot observe Nexus daemon startup: {error}"))?
+        {
+            return Err(format!(
+                "Nexus daemon exited during startup ({status}); check IDA_NEXUS_PYTHON and its runtime dependencies; see {}",
+                crate::idb_store::log_path().display()
+            ));
+        }
         if read_discovery_file().is_some() {
             eprintln!("Server ready ({:.1}s)", (i + 1) as f64 * 0.25);
             return Ok(());

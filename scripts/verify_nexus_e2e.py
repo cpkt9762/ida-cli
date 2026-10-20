@@ -25,12 +25,12 @@ def main():
     parser.add_argument("--ipc-root", type=Path, help="short private directory for per-router Unix sockets")
     parser.add_argument("--tmp-root", type=Path, help="short alias of the prepared environment's tmp directory")
     parser.add_argument("--cleanup", action="store_true")
-    parser.add_argument("--suite", choices=("lifecycle", "contract", "concurrency", "n6", "special_inputs"), default="lifecycle")
+    parser.add_argument("--suite", choices=("lifecycle", "contract", "concurrency", "n6", "special_inputs", "release"), default="lifecycle")
     parser.add_argument("--baseline", type=Path, help="fixed independently hashed N0 binary for N4")
-    parser.add_argument("--case", choices=("E16", "E17", "E22"), help="run one case in a fresh contract environment")
+    parser.add_argument("--case", choices=("E16", "E17", "E22", "E27", "E28", "E29"), help="run one case in a fresh contract environment")
     args = parser.parse_args()
-    if args.case and args.suite != "contract":
-        parser.error("--case requires --suite contract")
+    if args.case and ((args.suite == "contract" and args.case not in {"E16","E17","E22"}) or (args.suite == "release" and args.case not in {"E27","E28","E29"}) or args.suite not in {"contract","release"}):
+        parser.error("--case must belong to the selected contract/release suite")
     try:
         env = Environment(args.root)
     except (OSError, ValueError) as error:
@@ -49,11 +49,26 @@ def main():
             parser.error("client cancellation and close proof patches required; BLOCKED")
         variables = env.variables()
         ida_version = env.manifest.get("installed_ida_version", "9.5")
-        needs_baseline = args.suite in {"concurrency", "n6"} or (args.suite == "contract" and not args.case)
+        needs_baseline = args.suite in {"concurrency", "n6"} or (args.suite == "contract" and (not args.case or (args.case == "E22" and ida_version == "9.5"))) or (args.suite == "release" and args.case not in {"E27","E29"})
         if needs_baseline and ida_version != "9.5":
             blocked = {"status": "BLOCKED", "reason": "N0 baseline links IDA 9.5; cross-version output comparison is invalid", "actual_tests": 0}
             (env.root / f"{args.suite}-result.json").write_text(json.dumps(blocked, indent=2)+"\n")
             parser.exit(1, "BLOCKED: " + blocked["reason"] + "\n")
+        if args.suite == 'release':
+            from compare_nexus_baseline import BASELINE_SHA, digest
+            if args.baseline is None or not args.baseline.is_file() or digest(args.baseline) != BASELINE_SHA:
+                blocked = {'status':'BLOCKED','actual_tests':0,'reason':'release requires the fixed N0 --baseline and its SHA256'}
+                (env.root/'release-result.json').write_text(json.dumps(blocked,indent=2)+'\n')
+                parser.exit(1, 'BLOCKED: '+blocked['reason']+'\n')
+            copied = env.root/'n0-baseline'
+            shutil.copyfile(args.baseline, copied)
+            copied.chmod(0o700)
+            assert digest(copied) == BASELINE_SHA
+            args.baseline = copied
+            release_binary = args.target.resolve(strict=True)/'release/ida-cli'
+            if not release_binary.is_file():
+                parser.exit(1, 'BLOCKED: build target/release/ida-cli first\n')
+            variables['N9_RELEASE_BINARY'] = str(release_binary)
         for name in ("CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"):
             if os.environ.get(name):
                 variables[name] = os.environ[name]
@@ -81,7 +96,9 @@ def main():
             variables["IDA_NEXUS_GC_GRACE_MS"] = "0"
         if needs_baseline:
             if args.baseline is None or not args.baseline.is_file():
-                parser.error("contract suite requires --baseline")
+                blocked = {'status':'BLOCKED','actual_tests':0,'reason':'selected suite/case requires fixed N0 --baseline (IDA 9.5)'}
+                (env.root/f'{args.suite}-result.json').write_text(json.dumps(blocked,indent=2)+'\n')
+                parser.exit(1, 'BLOCKED: '+blocked['reason']+'\n')
             variables["N4_BASELINE"] = str(args.baseline.resolve(strict=True))
         if args.baseline is not None:
             variables["N4_BASELINE"] = str(args.baseline.resolve(strict=True))
@@ -90,10 +107,17 @@ def main():
         (env.root / "rust-env.json").write_text(json.dumps(variables, indent=2) + "\n")
         suite_timeout = "300s" if args.suite == "special_inputs" else "180s"
         command = ["timeout", suite_timeout, str(cargo), "test", "--locked", "--features", "nexus-test-support", "--test", f"nexus_{args.suite}_e2e", "--", "--test-threads=1"]
-        if args.case:
+        if args.case and args.suite == "contract":
             command.insert(command.index("--"), {"E16":"e16_cli_stdio_http_and_independent_close_token", "E17":"e17_unicode_streams_errors_and_response_cache", "E22":"e22_old_cache_proof_preserves_edits_and_warm_lease"}[args.case])
             command.append("--exact")
         commands = [command]
+        if args.suite == 'release':
+            names = {'E27':'e27_shutdown_and_same_product_restart', 'E28':'e28_version_rollback_from_private_backup', 'E29':'e29_unique_backend_installed_release'}
+            commands=[]
+            for case in ([args.case] if args.case else names):
+                exact=command.copy()
+                exact.insert(exact.index('--'),names[case]);exact.append('--exact')
+                commands.append(exact)
         if args.suite == "n6":
             # Each real case keeps its own 180s shell bound. Four complete
             # exact terminals replace a single aggregate timeout around them.
@@ -143,11 +167,19 @@ def main():
             summary = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", text)
             if result["exit"] and re.search(r"license.*(?:invalid|failed|not found|unavailable|expired)|no valid license", text, re.IGNORECASE):
                 result["status"] = "BLOCKED"
+            if args.suite == 'release':
+                expected = [args.case] if args.case else ['E27','E28','E29']
+                events = [json.loads((env.root/f'{case}-result.json').read_text()) for case in expected if (env.root/f'{case}-result.json').is_file()]
+                result.update(actual_tests=len(terminals), case_results=events,
+                    cases=[row['case'] for row in events if row['status']=='PASS'])
+                if any(row['status']=='BLOCKED' for row in events):result['status']='BLOCKED'
             assert result["exit"] == 0, f"{result['status']}: suite command failed: {result['exit']}"
-            count = 1 if args.case else {"lifecycle": 9, "contract": 4, "concurrency": 14, "n6": 4, "special_inputs": 8}[args.suite]
-            expected_summary = [("1", "0", "0")]*4 if args.suite == "n6" else [(str(count), "0", "0")]
+            count = 1 if args.case else {"lifecycle": 9, "contract": 4, "concurrency": 14, "n6": 4, "special_inputs": 8, "release":3}[args.suite]
+            expected_summary = [("1", "0", "0")]*4 if args.suite == "n6" else ([("1","0","0")]*count if args.suite == "release" else [(str(count), "0", "0")])
             assert summary == expected_summary, f"wrong actual test count: {summary}"
-            if args.suite == "lifecycle":
+            if args.suite == "release":
+                cases = result["cases"]
+            elif args.suite == "lifecycle":
                 events = [json.loads(line) for line in (env.root / "rust-evidence.jsonl").read_text().splitlines()]
                 cases = [event["case"] for event in events if event.get("status") == "PASS"]
                 expected = ["E02", "E03", "E05", "E06-client", "E06-bridge", "E07-packed", "E07-unpacked", "E05-concurrent-open", "E06-lease-fault"]
@@ -174,6 +206,17 @@ def main():
             assert not list((env.root / "state/instances").glob("*.json")), "Nexus registrations remain"
             result.update({"status":"PASS", "actual_tests":count, "cases":cases})
         finally:
+            if args.suite == 'release':
+                from verify_nexus_gui import capture_native_processes
+                for case in ('E27','E28','E29'):
+                    directory=env.root/case
+                    if not directory.exists():continue
+                    owned=Environment(env.root)
+                    owned.ledger=directory/'processes.jsonl'
+                    owned.intents=directory/'process-intents'
+                    capture_native_processes(owned,directory/'native-processes.jsonl')
+                    owned.cleanup()
+                    owned.assert_clean()
             result["cleanup_signalled_pids"] = env.cleanup()
             env.assert_clean()
             result["owned_processes"] = len(env.entries())
