@@ -86,10 +86,10 @@ pub struct NexusRuntime {
 
 impl NexusRuntime {
     pub fn validate(&self) -> Result<(), NexusError> {
-        if self.ida < Version(9, 4, 0) || self.python < Version(3, 11, 0) {
+        if !matches!(self.ida, Version(9, 4 | 5, _)) || self.python < Version(3, 11, 0) {
             return Err(NexusError::new(
                 NexusErrorCode::RuntimeUnavailable,
-                "Nexus requires IDA >=9.4 and Python >=3.11",
+                "Nexus supports IDA 9.4/9.5 and requires Python >=3.11",
             ));
         }
         let (Some(nexus), Some(domain)) = (self.nexus, self.domain) else {

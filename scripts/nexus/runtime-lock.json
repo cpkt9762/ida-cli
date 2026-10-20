@@ -1,10 +1,8 @@
 {
-  "schema": 1,
+  "schema": 2,
   "nexus_sha": "d60ff582fde90c59726336c0dbdf3e8286e9df7a",
   "nexus_version": "0.13.4",
   "domain_version": "0.5.1",
-  "idapro_version": "0.0.10",
-  "idapro_wheel_sha256": "43f227953a0e348ced21c050d277b7ce34103e2ce05fc739b7d8c186ef0e1542",
   "patches": [
     "loopback-bind.patch",
     "client-cancel-unknown.patch",
@@ -24,5 +22,31 @@
     "_resolver.py": "d06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8",
     "options.py": "1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe",
     "_http.py": "30f6b0271ce1a0c622cc6854740a55377cea3c832237f03f12229ad6e3cbf339"
+  },
+  "runtimes": {
+    "9.4": {
+      "ida_version": "9.4",
+      "idapro_version": "0.0.9",
+      "idapro_wheel": "idapro-0.0.9-py3-none-any.whl",
+      "idapro_wheel_sha256": "9518ead4d84833a92e6085e9c8204e87ab4b3ae1800267d6c3dc579822311405",
+      "code_sha256": {
+        "__init__.py": "3d18a1a49ccc5c67e28c2d3fbe9b9e404cac33955665d49d8593ebc717a25555",
+        "config.py": "63288585e894c815815784ed8be96f028603790aca16d8e75e715b7870b3c800"
+      },
+      "compatibility": {
+        "pip_check_exception": "ida-domain 0.5.1 has requirement idapro>=0.0.10, but you have idapro 0.0.9.",
+        "reason": "IDA 9.4 ships 0.0.9. Its __init__.py and config.py are byte-identical to the locked 0.0.10 runtime code. Domain supports IDA >=9.1 and gates newer APIs. Permit only this exact metadata conflict after installed code hashes match; all other conflicts fail."
+      }
+    },
+    "9.5": {
+      "ida_version": "9.5",
+      "idapro_version": "0.0.10",
+      "idapro_wheel": "idapro-0.0.10-py3-none-any.whl",
+      "idapro_wheel_sha256": "43f227953a0e348ced21c050d277b7ce34103e2ce05fc739b7d8c186ef0e1542",
+      "code_sha256": {
+        "__init__.py": "3d18a1a49ccc5c67e28c2d3fbe9b9e404cac33955665d49d8593ebc717a25555",
+        "config.py": "63288585e894c815815784ed8be96f028603790aca16d8e75e715b7870b3c800"
+      }
+    }
   }
 }

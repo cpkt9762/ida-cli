@@ -1,12 +1,12 @@
 """Persistent Nexus public client. Separate physical business/control streams."""
 import concurrent.futures
 import hashlib
+import functools
 import importlib.metadata
 import json
 import logging
 import os
 from pathlib import Path
-import plistlib
 import queue
 import socket
 import sys
@@ -106,6 +106,24 @@ def error(code, message):
     return {"code": code, "message": str(message)}
 
 
+@functools.lru_cache(maxsize=1)
+def runtime_versions():
+    """Load the selected native kernel in a bounded, database-free child."""
+    from process_timeout import run
+    code = "import idapro,ida_kernwin,json; print(json.dumps({'ida':ida_kernwin.get_kernel_version()}))"
+    child = run([sys.executable, '-I', '-B', '-c', code], timeout=10, text=True)
+    if child.returncode:
+        raise ValueError('actual IDA kernel probe failed: ' + child.stderr[-2000:])
+    version = json.loads(child.stdout)['ida']
+    parts = [int(part) for part in version.split('.')[:3]]
+    parts += [0] * (3-len(parts))
+    if tuple(parts[:2]) not in ((9, 4), (9, 5)) or sys.version_info < (3, 11):
+        raise ValueError('unsupported actual IDA ' + version + '; supported IDA versions: 9.4, 9.5; Python >=3.11 required')
+    manifest = Path(sys.prefix).parent / 'environment.json'
+    installed = json.loads(manifest.read_text()).get('installed_ida_version') if manifest.is_file() else None
+    return parts, installed
+
+
 def readiness():
     try:
         paths = startup_paths()
@@ -114,18 +132,13 @@ def readiness():
     except (ImportError, importlib.metadata.PackageNotFoundError, ValueError, OSError) as exc:
         return {"ready": False, "error": error("dependency_unavailable", exc)}
     try:
-        ida_dir = Path(os.environ["IDADIR"]).resolve(strict=True)
-        with (ida_dir.parent / "Info.plist").open("rb") as stream:
-            version = plistlib.load(stream)["CFBundleShortVersionString"]
-        ida = [int(part) for part in version.split(".")[:3]]
-        ida += [0] * (3 - len(ida))
-        if tuple(ida) < (9, 4, 0) or sys.version_info < (3, 11):
-            raise ValueError("Nexus requires IDA >=9.4 and Python >=3.11")
-    except (KeyError, ValueError, OSError) as exc:
+        ida, installed = runtime_versions()
+    except Exception as exc:
         return {"ready": False, "error": error("runtime_unavailable", exc)}
     return {"ready": True, "capabilities": {"runtime": {
         "ida": ida, "python": list(sys.version_info[:3]), "nexus": [0, 13, 4], "domain": [0, 5, 1]},
-        "methods": METHODS}, "client_cancel_patch": True, "client_sdk_modules": sdk_modules, "protocol": protocol, "paths": paths, "custody_protocol": 1,
+        "methods": METHODS}, "installed_ida_version": installed,
+        "client_cancel_patch": True, "client_sdk_modules": sdk_modules, "protocol": protocol, "paths": paths, "custody_protocol": 1,
         "observer_incarnation":OBSERVER_INCARNATION}
 
 
@@ -815,6 +828,8 @@ class Bridge(LifetimeListener):
                     operation_id=command['identity'].get('operation_id'), record_id=instance.record_id)))
             caps = readiness()["capabilities"]
             ida = [int(x) for x in actual["result"].split(".")[:3]]
+            if tuple(ida[:2]) not in ((9, 4), (9, 5)):
+                raise ValueError("unsupported actual owner IDA version: " + actual["result"])
             caps["runtime"]["ida"] = ida + [0] * (3 - len(ida))
             custodian.ready(caps, wait_analysis, handle.recovery)
             return

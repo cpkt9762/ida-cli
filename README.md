@@ -220,3 +220,11 @@ Release binaries have no IDA linkage. The installer creates and directly locates
 MIT
 
 Removed configuration is an error (even an empty value), before CLI daemon discovery or server startup: `IDA_CLI_NEXUS_DEV`, `IDA_CLI_WORKER_BACKEND`, `IDA_CLI_SDK_VERSION`, `IDA_CLI_MAX_WORKERS`, `IDA_CLI_MAX_WORKERS_PER_TENANT`, `IDA_CLI_MAX_PENDING_PER_WORKER`, `IDA_CLI_MAX_CONCURRENT_SPAWNS`. Remove these variables. For Nexus limits use the applicable `IDA_CLI_MAX_PENDING_PER_TENANT`, `IDA_CLI_NEXUS_RETENTION_CAPACITY`, or `IDA_CLI_HELPER_CAPACITY`; these are independent limits, not direct replacements for worker counts.
+
+支持的 IDA 运行时集合为 **9.4、9.5**，不接纳低版本或未知新版本。runtime-lock 为每版锁定自带 idapro wheel（9.4: 0.0.9；9.5: 0.0.10）及 SHA256，不跨版本借用。9.4 条目仅在安装后 `__init__.py`、`config.py` 与登记哈希一致时，允许 Domain 0.5.1 要求 idapro>=0.0.10 的这一条元数据冲突；两版运行代码字节相同，Domain 代码支持 IDA >=9.1 且检测新 API。闭包全哈希锁定并以 `--no-deps` 安装，其他 pip check 冲突仍失败。
+
+安装器按应用名称数字版本逐段比较、尾零等价、同版本按规范路径升序选择最新项，打印其他候选；最新不兼容时报错并提示用 `IDADIR` 指定其他候选，不自动退选。启动器保存安装时路径，显式 `IDADIR` 可覆盖到另一受支持版本；probe-runtime/status 分别报告实际 `ida_version` 和 `installed_ida_version`，建议按目标版本重新安装。实际版本由无数据库的有界子进程加载内核核实，并在每次 open 后核对 owner。
+
+N0 固定二进制链接 IDA 9.5，输出对照仅在 9.5 成立。9.4 下需要 N0 的 suite 明确 BLOCKED；contract 可用 `--case E16`、`E17`、`E22` 单独运行。E22 在 9.4 现场生成带标注的旧平铺布局库，核对缓存与预热契约，不宣称 N0 跨版本对照。
+
+Supported IDA runtimes: **9.4 and 9.5** only. Each uses its own locked wheel. For 9.4 only, the Domain metadata exception is conditional on exact installed runtime code hashes; every other dependency conflict fails. An explicit IDADIR override may switch between supported versions; reinstall for the target version is recommended. probe-runtime/status distinguish actual and installation versions. N0 comparisons require 9.5.

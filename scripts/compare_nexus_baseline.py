@@ -584,10 +584,18 @@ def legacy_cache(env,baseline,binary):
         home=env.root/f"legacy-{kind}-{os.getpid()}"
         home.mkdir()
         variables=env.variables() | {"IDA_CLI_HOME":str(home),"TMPDIR":os.environ["TMPDIR"]}
-        old=Process(env,[str(baseline),"serve-worker"],variables,f"e22-old-{kind}")
-        opened=old.rpc("open",{"path":str(sample)})
-        assert "result" in opened,opened
-        idb=Path(opened["result"]["path"])
+        use_n0 = env.manifest.get('installed_ida_version', '9.5') == '9.5'
+        if use_n0:
+            old=Process(env,[str(baseline),"serve-worker"],variables,f"e22-old-{kind}")
+            opened=old.rpc("open",{"path":str(sample)})
+            assert "result" in opened,opened
+            idb=Path(opened["result"]["path"])
+        else:
+            # IDA 9.4 seed generation, not an N0 comparison. Produce a closed
+            # IDB directly, then place it in the historical flat-cache layout.
+            private = env.root / f'e22-seed-{kind}'
+            shutil.copyfile(sample, private)
+            idb = Path(str(private)+'.i64')
         code="import ida_name, ida_funcs, ida_bytes\nea=ida_funcs.getn_func(0).start_ea\nassert ida_name.set_name(ea,'N4_USER_EDIT',ida_name.SN_CHECK)\nassert ida_bytes.set_cmt(ea,'N4 preserved comment',False)\nprint('USER_EDIT_SAVED')"
         if kind!="match":
             code+="\nimport ctypes, ida_ida, ida_nalt\nf=ctypes.CDLL(None).setinf_buf\nf.argtypes=[ctypes.c_int,ctypes.c_void_p,ctypes.c_size_t]\nf.restype=ctypes.c_bool\n"
@@ -595,10 +603,17 @@ def legacy_cache(env,baseline,binary):
                 code+="b=ctypes.create_string_buffer(b'X')\nassert f(ida_ida.INF_SHA256,b,1)\nassert ida_nalt.retrieve_input_file_sha256() is None\n"
             else:
                 code+="b=ctypes.create_string_buffer(b'X'*32)\nassert f(ida_ida.INF_SHA256,b,32)\nassert ida_nalt.retrieve_input_file_sha256()==b'X'*32\n"
-        script=old.rpc("run_script",{"code":code})
-        assert script["result"]["success"] is True and script["result"]["stdout"]=="USER_EDIT_SAVED\n",script
-        assert "result" in old.rpc("close")
-        old.rpc("shutdown"); old.wait()
+        if use_n0:
+            script=old.rpc("run_script",{"code":code})
+            assert script["result"]["success"] is True and script["result"]["stdout"]=="USER_EDIT_SAVED\n",script
+            assert "result" in old.rpc("close")
+            old.rpc("shutdown"); old.wait()
+        else:
+            script = "import idapro; assert idapro.open_database("+repr(str(private))+",True)==0\n"+code+"\nidapro.close_database(True)"
+            child = env.spawn(lambda: subprocess.Popen([str(env.root/'venv/bin/python'), '-I', '-B', '-c', script], env=variables,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE), ['ida94-seed', str(private)])
+            stdout, stderr = child.communicate(timeout=20)
+            assert child.returncode == 0 and stdout == b'USER_EDIT_SAVED\n', (stdout, stderr)
         original_hash=digest(idb)
         client=Candidate(env,binary,sample,f"e22-{kind}",seed=idb,allow_open_error=True)
         try:
@@ -667,12 +682,13 @@ def legacy_cache(env,baseline,binary):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root",type=Path,required=True)
-    parser.add_argument("--baseline",type=Path,required=True)
+    parser.add_argument("--baseline",type=Path)
     parser.add_argument("--binary",type=Path,required=True)
     parser.add_argument("--case",choices=("E04","E16","E17","E22"),required=True)
     args=parser.parse_args()
     assert os.environ.get("IDA_TEST")=="1","BLOCKED: IDA_TEST=1 required"
-    assert digest(args.baseline)==BASELINE_SHA,"BLOCKED: N0 baseline checksum mismatch"
+    if args.case == "E04" or (args.case == "E22" and Environment(args.root).manifest.get("installed_ida_version", "9.5") == "9.5"):
+        assert args.baseline is not None and args.baseline.is_file() and digest(args.baseline)==BASELINE_SHA,"BLOCKED: N0 baseline checksum mismatch"
     env=Environment(args.root)
     result={"case":args.case,"status":"FAIL"}
     # The outer verifier holds the environment lock for the whole Rust suite.

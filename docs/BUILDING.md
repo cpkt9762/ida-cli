@@ -25,3 +25,9 @@ App versions are the ASCII dotted integer components immediately after `IDA Prof
 Before creating a new installation prefix, the selected runtime must pass the existing Python >=3.11, IDA bundle version >=9.4 and exact IDA-provided idapro wheel version/SHA256 checks. Preparation then validates the pinned Nexus/Domain dependency environment and patched modules. A failed selected runtime stops installation; it never silently selects an older candidate. Failed preparation leaves the previous launcher active.
 
 唯一 Nexus 后端在 CLI 发现 daemon 或服务启动前拒绝已删除配置（包括空值）：`IDA_CLI_NEXUS_DEV`、`IDA_CLI_WORKER_BACKEND`、`IDA_CLI_SDK_VERSION`、`IDA_CLI_MAX_WORKERS`、`IDA_CLI_MAX_WORKERS_PER_TENANT`、`IDA_CLI_MAX_PENDING_PER_WORKER`、`IDA_CLI_MAX_CONCURRENT_SPAWNS`。请删除这些变量；按实际需求配置 `IDA_CLI_MAX_PENDING_PER_TENANT`、`IDA_CLI_NEXUS_RETENTION_CAPACITY` 或 `IDA_CLI_HELPER_CAPACITY`。它们是独立限制，不与旧 worker 数量一一对应。
+
+支持的 IDA 运行时集合为 **9.4、9.5**，不接纳低版本或未知新版本。runtime-lock 为每版锁定自带 idapro wheel（9.4: 0.0.9；9.5: 0.0.10）及 SHA256，不跨版本借用。9.4 条目仅在安装后 `__init__.py`、`config.py` 与登记哈希一致时，允许 Domain 0.5.1 要求 idapro>=0.0.10 的这一条元数据冲突；两版运行代码字节相同，Domain 代码支持 IDA >=9.1 且检测新 API。闭包全哈希锁定并以 `--no-deps` 安装，其他 pip check 冲突仍失败。
+
+安装器按应用名称数字版本逐段比较、尾零等价、同版本按规范路径升序选择最新项，打印其他候选；最新不兼容时报错并提示用 `IDADIR` 指定其他候选，不自动退选。启动器保存安装时路径，显式 `IDADIR` 可覆盖到另一受支持版本；probe-runtime/status 分别报告实际 `ida_version` 和 `installed_ida_version`，建议按目标版本重新安装。实际版本由无数据库的有界子进程加载内核核实，并在每次 open 后核对 owner。
+
+N0 固定二进制链接 IDA 9.5，输出对照仅在 9.5 成立。9.4 下需要 N0 的 suite 明确 BLOCKED；contract 可用 `--case E16`、`E17`、`E22` 单独运行。E22 在 9.4 现场生成带标注的旧平铺布局库，核对缓存与预热契约，不宣称 N0 跨版本对照。

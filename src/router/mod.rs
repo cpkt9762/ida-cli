@@ -296,6 +296,7 @@ pub struct DaemonMetadata {
     pub http_address: Option<String>,
     pub backend: Option<String>,
     pub ida_version: Option<String>,
+    pub installed_ida_version: Option<String>,
     pub supported_methods: Vec<String>,
     pub supported_tools: Vec<String>,
 }
@@ -642,7 +643,14 @@ impl RouterState {
             mcp_socket_path: crate::idb_store::mcp_socket_path().display().to_string(),
             http_address: self.http_address.lock().await.clone(),
             backend: Some("nexus".into()),
-            ida_version: Some("9.5".into()),
+            ida_version: self
+                .nexus_bridge
+                .get()
+                .map(|bridge| bridge.ida_version.clone()),
+            installed_ida_version: self
+                .nexus_bridge
+                .get()
+                .and_then(|bridge| bridge.installed_ida_version.clone()),
             supported_tools: supported_methods.clone(),
             supported_methods,
         };

@@ -97,6 +97,8 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn('selected idapro wheel hash mismatch', result.stderr)
         self.assertIn(str(wheel), result.stderr)
         self.assertEqual(result.stdout, '')
+        self.assertIn('set IDADIR', result.stderr)
+        self.assertIn('9.4.app', result.stderr)
 
     def test_no_candidate_fails_with_search_roots_and_guidance(self):
         result = self.detect()
@@ -121,6 +123,41 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn(str(missing), result.stderr)
         self.assertIn('set IDADIR', result.stderr)
         self.assertEqual(result.stdout, '')
+
+
+class RuntimeLockTests(unittest.TestCase):
+    setUp = DiscoveryTests.setUp
+    app = DiscoveryTests.app
+    def runtime(self, version='9.4'):
+        import hashlib
+        import plistlib
+        spec = importlib.util.spec_from_file_location('runtime_preparer', REPO / 'scripts/prepare_nexus_env.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        runtime = self.app('IDA Professional '+version+'.app') / 'Contents/MacOS'
+        (runtime.parent / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': version}))
+        wheel = runtime / 'idalib/python/idapro-test.whl'
+        wheel.parent.mkdir(parents=True)
+        wheel.write_bytes(b'private test wheel')
+        lock = {'assets': {}, 'runtimes': {'9.4': {'idapro_wheel': wheel.name,
+            'idapro_wheel_sha256': hashlib.sha256(wheel.read_bytes()).hexdigest()}}}
+        return module, runtime, wheel, lock
+
+    def test_94_selects_only_its_locked_wheel(self):
+        module, runtime, wheel, lock = self.runtime()
+        self.assertEqual(module.validate_runtime(runtime, lock), wheel)
+
+    def test_hash_mismatch_is_not_accepted(self):
+        module, runtime, wheel, lock = self.runtime()
+        wheel.write_bytes(b'changed')
+        with self.assertRaisesRegex(RuntimeError, 'wheel hash mismatch'):
+            module.validate_runtime(runtime, lock)
+
+    def test_unsupported_old_and_unknown_new_versions(self):
+        for version in ('9.3', '9.6', '10.0'):
+            module, runtime, _, lock = self.runtime(version)
+            with self.assertRaisesRegex(RuntimeError, 'unsupported IDA'):
+                module.validate_runtime(runtime, lock)
 
 
 class LauncherTests(unittest.TestCase):

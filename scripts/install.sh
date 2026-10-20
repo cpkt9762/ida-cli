@@ -7,7 +7,7 @@ INSTALL_ROOT="${IDA_CLI_INSTALL_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/ida-c
 TAG="" REF="" BUNDLE="" SOURCE="" WHEELS="" BUILD=0 KEEP=0 ADD_PATH=0
 usage() {
   cat <<'EOF'
-Install the Nexus-only ida-cli release (IDA >=9.4, Python >=3.11).
+Install the Nexus-only ida-cli release (IDA 9.4/9.5, Python >=3.11).
   --tag TAG | --ref REF | --build-from-source
   --bin-dir DIR --install-root DIR --add-path --keep-temp
   --bundle DIR          Install an already extracted release bundle

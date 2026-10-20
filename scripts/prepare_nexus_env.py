@@ -134,25 +134,47 @@ def run(root: Path, label: str, args: list[str], *, cwd: Path = REPO, env=None) 
     return stdout.strip()
 
 
-def validate_runtime(ida):
-    """Refuse an incompatible selected runtime instead of selecting an older one."""
+def runtime_entry(ida, lock=None):
+    lock = RUNTIME_LOCK if lock is None else lock
+    with (ida.parent / 'Info.plist').open('rb') as stream:
+        version = str(plistlib.load(stream)['CFBundleShortVersionString'])
+    parts = version.split('.')
+    version = '.'.join(parts[:2])
+    if version not in lock['runtimes']:
+        raise RuntimeError('unsupported IDA ' + version + '; supported IDA versions: 9.4, 9.5; set IDADIR to a supported candidate')
+    return lock['runtimes'][version]
+
+
+def validate_runtime(ida, lock=None):
+    """Select exactly this runtime's locked wheel; never borrow another version."""
+    lock = RUNTIME_LOCK if lock is None else lock
     if sys.version_info < (3, 11):
         raise RuntimeError('Nexus requires Python >=3.11')
-    info = ida.parent / 'Info.plist'
-    if info.is_file():
-        with info.open('rb') as stream:
-            version = plistlib.load(stream)['CFBundleShortVersionString']
-        if tuple(int(part) for part in version.split('.')[:2]) < (9, 4):
-            raise RuntimeError('Nexus requires IDA >=9.4')
-    wheel = ida / "idalib/python/idapro-0.0.10-py3-none-any.whl"
+    entry = runtime_entry(ida, lock)
+    wheel = ida / 'idalib/python' / entry['idapro_wheel']
     if not wheel.is_file():
-        raise FileNotFoundError("selected IDA does not provide idapro 0.0.10; BLOCKED")
-    for name, expected in RUNTIME_LOCK['assets'].items():
+        raise FileNotFoundError('selected IDA does not provide ' + entry['idapro_wheel'])
+    for name, expected in lock['assets'].items():
         if digest(REPO / 'scripts/nexus' / name) != expected:
             raise RuntimeError('runtime asset hash mismatch: ' + name)
-    if digest(wheel) != RUNTIME_LOCK['idapro_wheel_sha256']:
+    if digest(wheel) != entry['idapro_wheel_sha256']:
         raise RuntimeError('selected idapro wheel hash mismatch: ' + str(wheel))
     return wheel
+
+
+def check_dependencies(root, python, pip, entry):
+    # Only the registered 9.4 metadata conflict is accepted, after checking the
+    # installed runtime code without importing/initializing native IDA.
+    code = "import importlib.util,json,hashlib; from pathlib import Path; p=Path(importlib.util.find_spec('idapro').origin).parent; print(json.dumps({n:hashlib.sha256((p/n).read_bytes()).hexdigest() for n in ('__init__.py','config.py')}))"
+    actual = json.loads(run(root, 'idapro-code', [str(python), '-I', '-B', '-c', code]))
+    if actual != entry['code_sha256']:
+        raise RuntimeError('installed idapro runtime code hash mismatch')
+    exception = entry.get('compatibility', {}).get('pip_check_exception')
+    script = ("import subprocess,sys; p=subprocess.run(sys.argv[2:],capture_output=True,text=True); "
+              "print(p.stdout,end=''); print(p.stderr,end='',file=sys.stderr); "
+              "lines=p.stdout.strip().splitlines(); "
+              "sys.exit(0 if (p.returncode==0 or (p.returncode==1 and lines==[sys.argv[1]] and not p.stderr)) else p.returncode)")
+    run(root, 'pip-check', [str(python), '-I', '-B', '-c', script, exception or '', *pip, 'check'])
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -160,8 +182,9 @@ def prepare(args: argparse.Namespace) -> None:
     installed_runtime = args.runtime_only and root == REPO / 'nexus'
     if not installed_runtime and (root.is_relative_to(REPO) or REPO.is_relative_to(root)):
         raise ValueError("environment root must be outside the repository")
-    ida = args.ida_dir.expanduser().resolve(strict=True)
+    ida = discover_ida({"IDADIR": str(args.ida_dir)})
     wheel = validate_runtime(ida)
+    entry = runtime_entry(ida)
     registry = None
     eula = []
     if not args.runtime_only:
@@ -170,7 +193,7 @@ def prepare(args: argparse.Namespace) -> None:
         registry = args.eula_registry.expanduser().resolve(strict=True).read_bytes()
         eula = accepted_eula_entries(registry)
     root.mkdir(mode=0o700)
-    for name in ("logs", "wheels", "profile", "state", "cli-home", "fixtures", "tmp", "backups"):
+    for name in ("home", "logs", "wheels", "profile", "state", "cli-home", "fixtures", "tmp", "backups"):
         (root / name).mkdir(mode=0o700)
     if registry is not None:
         (root / "profile/ida.reg").write_bytes(registry)
@@ -226,7 +249,7 @@ def prepare(args: argparse.Namespace) -> None:
                               "--no-cache-dir", "-w", str(root / "wheels"), str(source)])
     run(root, "nexus-install", [*pip, "install", "--no-deps", "--no-index", "--find-links", str(root / "wheels"),
                                 "ida-nexus==0.13.4"])
-    run(root, "pip-check", [*pip, "check"])
+    check_dependencies(root, python, pip, entry)
     installed = json.loads(run(root, "installed-sdk", [str(python), "-I", "-B", "-c",
         "import hashlib,importlib,json,sys; from pathlib import Path; "
         "names=('handle','_resolver','options'); "
@@ -239,7 +262,7 @@ def prepare(args: argparse.Namespace) -> None:
             raise RuntimeError(f"installed SDK differs from prepared source: {name}; BLOCKED")
     if not args.runtime_only:
         profile_env = {name: os.environ[name] for name in ("HOME", "USER", "LOGNAME", "PATH") if name in os.environ}
-        profile_env.update({"IDADIR": str(ida), "IDAUSR": str(root / "profile"),
+        profile_env.update({"HOME": str(root / "home"), "IDADIR": str(ida), "IDAUSR": str(root / "profile"),
                             "IDA_CLI_HOME": str(root / "cli-home"), "IDA_NEXUS_STATE_DIR": str(root / "state"),
                             "TMPDIR": str(root / "tmp"), "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1"})
         sanitized = run(root, "profile-sanitize", [str(python), str(REPO / "scripts/nexus/sanitize_profile.py"), *eula],
@@ -264,7 +287,7 @@ def prepare(args: argparse.Namespace) -> None:
         if digest(installed_http) != RUNTIME_LOCK['installed_files']['_http.py']:
             raise RuntimeError('installed loopback patch hash mismatch')
     manifest = {"root": str(root), "ida_dir": str(ida), "nexus_sha": sha,
-                "runtime_lock": RUNTIME_LOCK, "runtime_only": args.runtime_only,
+                "runtime_lock": RUNTIME_LOCK, "installed_ida_version": entry["ida_version"], "runtime_only": args.runtime_only,
                 "patch_sha256": digest(patch), "python": sys.version,
                 "client_cancel_patch_applied": cancel_applied,
                 "client_cancel_patch_sha256": digest(cancel_patch) if cancel_applied else None,
@@ -304,7 +327,10 @@ def main() -> None:
         if args.detect_ida:
             selected = discover_ida(report=sys.stderr)
             if args.check_runtime:
-                validate_runtime(selected)
+                try:
+                    validate_runtime(selected)
+                except (OSError, ValueError, RuntimeError) as error:
+                    raise RuntimeError(str(error) + '; selection was not changed; see Other IDA candidates above and set IDADIR to one of them') from error
             print(selected)
             return
         if args.check_runtime:

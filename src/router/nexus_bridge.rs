@@ -304,6 +304,8 @@ pub struct NexusBridge {
     installation: PathBuf,
     owned_files: Mutex<Option<owned_files::OwnedFiles>>,
     probe_cleanup_ready: std::sync::atomic::AtomicBool,
+    pub ida_version: String,
+    pub installed_ida_version: Option<String>,
     pub pid: u32,
 }
 // F2/P2-b: acquired before bind/spawn, retained across every startup await.
@@ -645,10 +647,11 @@ impl NexusBridge {
                 b,
                 c,
                 ready["observer_incarnation"].as_str().map(str::to_owned),
+                ready["installed_ida_version"].as_str().map(str::to_owned),
             ))
         };
         let connected = tokio::time::timeout(Duration::from_secs(15), startup).await;
-        let (caps, b, c, bridge_observer) = match connected {
+        let (caps, b, c, bridge_observer, installed_ida_version) = match connected {
             Ok(Ok(value)) => value,
             other => {
                 return Err(match other {
@@ -657,6 +660,7 @@ impl NexusBridge {
                 });
             }
         };
+        let ida_version = format!("{}.{}", caps.runtime.ida.0, caps.runtime.ida.1);
         router.install_nexus_capabilities(caps)?;
         let endpoint = router.nexus_endpoint();
         let lanes = endpoint
@@ -800,6 +804,8 @@ impl NexusBridge {
             installation: installation_path.canonicalize()?,
             owned_files: Mutex::new(Some(owned_files)),
             probe_cleanup_ready: std::sync::atomic::AtomicBool::new(false),
+            ida_version,
+            installed_ida_version,
             pid,
         })
     }

@@ -2,6 +2,9 @@
 import json
 import os
 
+IDAPRO_CODE = {'__init__.py': '3d18a1a49ccc5c67e28c2d3fbe9b9e404cac33955665d49d8593ebc717a25555',
+               'config.py': '63288585e894c815815784ed8be96f028603790aca16d8e75e715b7870b3c800'}
+
 SDK_FILES = {'handle.py': 'dd9daf669b6dc55f657dd11b60f9869dcca70cf278cc65bc1d91b4e02b199acd', '_resolver.py': 'd06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8', 'options.py': '1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe'}
 HANDLE_SHA = SDK_FILES['handle.py']
 
@@ -11,14 +14,19 @@ def verify_client():
     import hashlib
     import importlib
     import importlib.metadata
+    import importlib.util
     from pathlib import Path
     import ida_nexus
     versions=[importlib.metadata.version(name) for name in ('ida-nexus','ida-domain')]
     if versions != ['0.13.4','0.5.1']:
         raise ValueError('ProtocolMismatch: fixed Nexus 0.13.4/Domain 0.5.1 required; '
                          + f'actual Nexus {versions[0]}/Domain {versions[1]}')
-    if importlib.metadata.version('idapro') != '0.0.10':
-        raise ValueError('ProtocolMismatch: fixed idapro 0.0.10 required')
+    if importlib.metadata.version('idapro') not in ('0.0.9', '0.0.10'):
+        raise ValueError('ProtocolMismatch: locked idapro 0.0.9/0.0.10 required')
+    runtime = Path(importlib.util.find_spec('idapro').origin).parent
+    if any(hashlib.sha256((runtime/name).read_bytes()).hexdigest() != expected
+           for name, expected in IDAPRO_CODE.items()):
+        raise ValueError('ProtocolMismatch: incompatible idapro runtime code')
     package=Path(ida_nexus.__file__).resolve().parent
     modules={}
     for name,expected in SDK_FILES.items():

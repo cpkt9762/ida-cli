@@ -11,7 +11,7 @@ fn contract(case: &str) {
         &std::fs::read_to_string(root.join("rust-env.json")).expect("isolated runtime variables"),
     )
     .expect("valid environment JSON");
-    let baseline = std::env::var_os("N4_BASELINE").expect("independent N0 baseline binary");
+    let baseline = std::env::var_os("N4_BASELINE").unwrap_or_default();
     let status = std::process::Command::new("timeout")
         // E04/E16 aggregate dozens of real CLI children and custody cleanup.
         // E22 has three native baseline starts; the whole suite remains 180s.

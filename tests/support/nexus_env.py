@@ -123,10 +123,10 @@ class Environment:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     def variables(self) -> dict[str, str]:
-        # Preserve the actual home for IDA's existing legal license lookup.
+        # Every test client uses its own home; no user daemon or cache discovery.
         # No profile, credentials, PYTHONPATH or daemon settings are inherited.
         env = {name: os.environ[name] for name in ("HOME", "USER", "LOGNAME") if name in os.environ}
-        env.update({"PATH": os.pathsep.join((str(self.root / "venv/bin"), str(Path(TIMEOUT).parent), os.defpath)),
+        env.update({"HOME": str(self.root / "home"), "PATH": os.pathsep.join((str(self.root / "venv/bin"), str(Path(TIMEOUT).parent), os.defpath)),
                     "IDADIR": self.manifest["ida_dir"], "IDAUSR": str(self.root / "profile"),
                     "IDA_CLI_HOME": str(self.root / "cli-home"),
                     "IDAPYTHON_VENV_EXECUTABLE": str(self.root / "venv/bin/python"),

@@ -27,7 +27,7 @@ def main():
     parser.add_argument("--cleanup", action="store_true")
     parser.add_argument("--suite", choices=("lifecycle", "contract", "concurrency", "n6", "special_inputs"), default="lifecycle")
     parser.add_argument("--baseline", type=Path, help="fixed independently hashed N0 binary for N4")
-    parser.add_argument("--case", choices=("E22",), help="run only E22 in a fresh contract environment")
+    parser.add_argument("--case", choices=("E16", "E17", "E22"), help="run one case in a fresh contract environment")
     args = parser.parse_args()
     if args.case and args.suite != "contract":
         parser.error("--case requires --suite contract")
@@ -48,6 +48,12 @@ def main():
         if not patch_status["applied"] or not patch_status["close_applied"]:
             parser.error("client cancellation and close proof patches required; BLOCKED")
         variables = env.variables()
+        ida_version = env.manifest.get("installed_ida_version", "9.5")
+        needs_baseline = args.suite in {"concurrency", "n6"} or (args.suite == "contract" and not args.case)
+        if needs_baseline and ida_version != "9.5":
+            blocked = {"status": "BLOCKED", "reason": "N0 baseline links IDA 9.5; cross-version output comparison is invalid", "actual_tests": 0}
+            (env.root / f"{args.suite}-result.json").write_text(json.dumps(blocked, indent=2)+"\n")
+            parser.exit(1, "BLOCKED: " + blocked["reason"] + "\n")
         for name in ("CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"):
             if os.environ.get(name):
                 variables[name] = os.environ[name]
@@ -73,9 +79,11 @@ def main():
                 "IDA_NEXUS_BRIDGE_SCRIPT": str(REPO / "tests/support/nexus_client_fixture.py")})
         if args.suite == "special_inputs":
             variables["IDA_NEXUS_GC_GRACE_MS"] = "0"
-        if args.suite in {"contract", "concurrency", "n6"}:
+        if needs_baseline:
             if args.baseline is None or not args.baseline.is_file():
                 parser.error("contract suite requires --baseline")
+            variables["N4_BASELINE"] = str(args.baseline.resolve(strict=True))
+        if args.baseline is not None:
             variables["N4_BASELINE"] = str(args.baseline.resolve(strict=True))
         Path(variables["N3_IPC_ROOT"]).mkdir(mode=0o700, exist_ok=True)
         (env.root / "ipc-root.json").write_text(json.dumps(str(ipc_root)))
@@ -83,7 +91,8 @@ def main():
         suite_timeout = "300s" if args.suite == "special_inputs" else "180s"
         command = ["timeout", suite_timeout, str(cargo), "test", "--locked", "--features", "nexus-test-support", "--test", f"nexus_{args.suite}_e2e", "--", "--test-threads=1"]
         if args.case:
-            command.insert(command.index("--"), "e22_old_cache_proof_preserves_edits_and_warm_lease")
+            command.insert(command.index("--"), {"E16":"e16_cli_stdio_http_and_independent_close_token", "E17":"e17_unicode_streams_errors_and_response_cache", "E22":"e22_old_cache_proof_preserves_edits_and_warm_lease"}[args.case])
+            command.append("--exact")
         commands = [command]
         if args.suite == "n6":
             # Each real case keeps its own 180s shell bound. Four complete
