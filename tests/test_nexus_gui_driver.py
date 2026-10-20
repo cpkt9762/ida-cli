@@ -23,6 +23,13 @@ class GuiDriverTests(unittest.TestCase):
         self.owner = {'record_id': 'gui-one', 'pid': 123, 'started_at': 1.0,
             'idb_path': str(self.database), 'backend': 'gui', 'managed': False}
 
+    def test_prepared_home_is_accepted_but_gui_home_cannot_be_reused(self):
+        (self.root / 'home').mkdir()
+        self.assertEqual(gui_driver.gui_home(self.root), self.root / 'gui-home')
+        self.assertTrue((self.root / 'home').is_dir())
+        with self.assertRaises(FileExistsError):
+            gui_driver.gui_home(self.root)
+
     def test_exact_gui_owner_required(self):
         self.assertEqual(gui_driver.check_owner([self.owner], self.owner, 123, self.database), self.owner)
         for records in ([], [self.owner, self.owner]):

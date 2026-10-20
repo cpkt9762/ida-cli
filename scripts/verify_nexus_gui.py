@@ -142,10 +142,15 @@ def run_seed(env, variables, sample):
     assert 'E23_SEED_READY' in (env.root / 'gui-seed.log').read_text()
 
 
+def gui_home(root):
+    home = root / "gui-home"
+    home.mkdir(mode=0o700)
+    return home
+
+
 def exercise(env, binary, result):
     from ida_nexus import discover_databases
-    variables = env.variables() | {'HOME': str(env.root / 'home')}
-    Path(variables['HOME']).mkdir(mode=0o700)
+    variables = env.variables() | {'HOME': str(gui_home(env.root))}
     gui_root = env.root / 'gui'
     gui_root.mkdir(mode=0o700)
     sample = gui_root / 'mini'
