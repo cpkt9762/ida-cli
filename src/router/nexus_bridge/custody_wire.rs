@@ -1015,15 +1015,33 @@ pub(super) async fn proofs(state: &Arc<State>, writer: &Writer) -> anyhow::Resul
         };
         observation_result(state, &watch, result);
     }
+    // Independent watches retain separate facts and target EX serialization.
+    // Bound in-flight writers so a full owner does not delay every retirement
+    // behind all earlier subprocess startup and IPC waits.
+    let mut observations = tokio::task::JoinSet::new();
     for resource in resources {
-        let watch = resource.watch.clone();
-        let old_boot = &resource.origin_binding["creator"]["boot_id"];
-        let result = if !old_boot.is_null() && *old_boot != heartbeat["identity"]["boot_id"] {
-            retire_resource(state, writer, helper, resource).await
-        } else {
-            observe_resource(state, writer, helper, resource).await
-        };
-        observation_result(state, &watch, result);
+        if observations.len() == 4 {
+            if let Some(result) = observations.join_next().await {
+                result?;
+            }
+        }
+        let state = Arc::clone(state);
+        let writer = Arc::clone(writer);
+        let helper = Arc::clone(helper);
+        let current_boot = heartbeat["identity"]["boot_id"].clone();
+        observations.spawn(async move {
+            let watch = resource.watch.clone();
+            let old_boot = &resource.origin_binding["creator"]["boot_id"];
+            let result = if !old_boot.is_null() && *old_boot != current_boot {
+                retire_resource(&state, &writer, &helper, resource).await
+            } else {
+                observe_resource(&state, &writer, &helper, resource).await
+            };
+            observation_result(&state, &watch, result);
+        });
+    }
+    while let Some(result) = observations.join_next().await {
+        result?;
     }
     let retirements: Vec<_> = state
         .custody_retirements

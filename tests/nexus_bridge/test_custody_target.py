@@ -18,6 +18,32 @@ from acquisition import Custodian
 
 
 class TargetCustody(unittest.TestCase):
+    def test_large_helper_registry_keeps_target_fact_budget_and_exact_reread(self):
+        from target_coordination import Directory, MAX_RECORD
+        path = self.root/'private-helper-registry'
+        path.mkdir(mode=0o700)
+        value = {'private_registry_fixture':'x'*(MAX_RECORD+4096)}
+        directory = Directory(path)
+        try:
+            directory.max_record = MAX_RECORD*2
+            directory.retry_immutable('helper-state.json', value, immutable=False)
+            self.assertEqual(directory.read('helper-state.json')[0], value)
+            facts = directory.child('proof-budget-control')
+            try:
+                with self.assertRaisesRegex(ValueError, 'invalid immutable fact slot'):
+                    facts.retry_immutable('proof.json', value)
+                self.assertEqual(list(facts.path.iterdir()), [])
+            finally:
+                facts.close()
+        finally:
+            directory.close()
+        ordinary = Directory(path)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'oversized record'):
+                ordinary.read('helper-state.json')
+        finally:
+            ordinary.close()
+
     def test_unwritable_actual_parent_refuses_before_public_probe_and_leaves_no_coordination(self):
         from open_recovery import open_checked
         with patch('ida_nexus.probe_database_state',side_effect=AssertionError('probe before writable gate')) as probe:

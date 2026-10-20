@@ -76,6 +76,9 @@ class Observer:
     def __init__(self, incarnation, capacity, *, clock=time.monotonic, storage=None):
         self.incarnation, self.capacity, self.clock = incarnation, capacity, clock
         self.state = state_identity()
+        # Scale the live budget by 32KiB per configured watch, with independent
+        # cleanup headroom. A fixed 512KiB pool underfunded these reservations.
+        self.live_ref_limit_bytes = max(512*1024, capacity*32768)
         self.lock = threading.RLock()
         self.items = {}
         self.parents = {}
@@ -89,6 +92,9 @@ class Observer:
         self.pending_registry = None
         self.recovered = False
         if storage is not None:
+            # This mutable registry contains every watch and its cleanup facts.
+            # Individual proofs and IPC frames keep their original fixed bound.
+            storage.max_record = max(1024*1024, self.live_ref_limit_bytes*4)
             try:
                 saved, _, _ = storage.read('helper-state.json')
             except FileNotFoundError:
@@ -307,6 +313,8 @@ class Observer:
                 result = {'state_root':self.state, 'identity':self.identity,
                           'watches':list(self.items), 'owner_count':len(self.owners),
                           'used':len(self.items), 'limit':self.capacity,
+                          'live_ref_bytes':sum(len(encoded(self.public_item(i))) + 8192 for i in self.items.values()),
+                          'live_ref_limit_bytes':self.live_ref_limit_bytes,
                           'reserved':sum(p['budget'] for p in self.parents.values()), 'parent_count':len(self.parents),
                           'exit_blocked':self.exit_blocked, 'recovered':self.recovered,
                           'orphan_after_seconds':300, 'orphan_action':'durable_abandoned_only',
@@ -484,7 +492,8 @@ class Observer:
                     raise RuntimeError('Busy: helper observation capacity')
                 if len(encoded(value)) > 8192:
                     raise RuntimeError('Busy: helper subscription byte capacity')
-                if sum(len(encoded(self.public_item(i))) + 8192 for i in self.items.values()) > 512*1024:
+                if (sum(len(encoded(self.public_item(i))) + 8192 for i in self.items.values())
+                        + len(encoded(value)) + 8192 > self.live_ref_limit_bytes):
                     raise RuntimeError('Busy: helper live_refs byte capacity; cleanup reserve retained')
                 item = {k:value[k] for k in fields}
                 item['subscription_epoch'] = value.get('subscription_epoch')

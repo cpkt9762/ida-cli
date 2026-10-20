@@ -23,6 +23,7 @@ pub(super) struct Helper {
     calls: Mutex<()>,
     finished: std::sync::atomic::AtomicBool,
     file_job_slots: Arc<tokio::sync::Semaphore>,
+    registry_limit: u64,
 }
 impl Helper {
     pub async fn start(
@@ -75,6 +76,17 @@ impl Helper {
             "IDA_NEXUS_STATE_DIR".into(),
             state.to_string_lossy().into_owned(),
         );
+        let registry_limit = config
+            .environment
+            .get("IDA_CLI_HELPER_CAPACITY")
+            .map(String::as_str)
+            .unwrap_or("512")
+            .parse::<u64>()?
+            .checked_mul(32768)
+            .ok_or_else(|| anyhow::anyhow!("helper registry capacity overflow"))?
+            .max(512 * 1024)
+            .checked_mul(4)
+            .ok_or_else(|| anyhow::anyhow!("helper registry cleanup capacity overflow"))?;
         let incarnation = format!(
             "{}-{}",
             std::process::id(),
@@ -111,7 +123,7 @@ impl Helper {
                     .environment
                     .get("IDA_CLI_HELPER_CAPACITY")
                     .map(String::as_str)
-                    .unwrap_or("256"),
+                    .unwrap_or("512"),
             )
             .env_clear()
             .envs(&config.environment)
@@ -142,6 +154,7 @@ impl Helper {
             calls: Mutex::new(()),
             finished: std::sync::atomic::AtomicBool::new(false),
             file_job_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            registry_limit,
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -307,11 +320,13 @@ impl Helper {
                 && before.uid() == uid
                 && before.nlink() == 1
                 && before.permissions().mode() & 0o777 == 0o600
-                && before.len() <= 1024 * 1024,
+                && before.len() <= self.registry_limit,
             "ObservationRecoveryBlocked: untrusted helper registry"
         );
         let mut data = Vec::new();
-        (&mut file).take(1024 * 1024 + 1).read_to_end(&mut data)?;
+        (&mut file)
+            .take(self.registry_limit.saturating_add(1))
+            .read_to_end(&mut data)?;
         let after = file.metadata()?;
         let current = std::fs::symlink_metadata(path)?;
         anyhow::ensure!(
@@ -384,7 +399,7 @@ impl Helper {
                 self.environment
                     .get("IDA_CLI_HELPER_CAPACITY")
                     .map(String::as_str)
-                    .unwrap_or("256"),
+                    .unwrap_or("512"),
             )
             .env_clear()
             .envs(&self.environment)
@@ -795,7 +810,13 @@ mod tests {
             .arg("proof_helper")
             .arg(root.as_path().join("h"))
             .arg(&helper.incarnation)
-            .arg("256")
+            .arg(
+                config
+                    .environment
+                    .get("IDA_CLI_HELPER_CAPACITY")
+                    .map(String::as_str)
+                    .unwrap_or("512"),
+            )
             .env_clear()
             .envs(&config.environment)
             .stdin(Stdio::null())

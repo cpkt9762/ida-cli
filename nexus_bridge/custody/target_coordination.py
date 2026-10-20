@@ -173,6 +173,7 @@ class Directory:
     def __init__(self, path, *, private=True, _fd=None):
         self.path = Path(path)
         self.private = private
+        self.max_record = MAX_RECORD
         self.fd = _fd if _fd is not None else self.open_path(self.path)
         value = os.fstat(self.fd)
         try:
@@ -249,9 +250,9 @@ class Directory:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
         try:
             before = checked(fd)
-            if before.st_size > MAX_RECORD:
+            if before.st_size > self.max_record:
                 raise RuntimeError('CoordinationBlocked: oversized record')
-            data = os.read(fd, MAX_RECORD + 1)
+            data = os.read(fd, self.max_record + 1)
             after = os.fstat(fd)
             at_path = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
             if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
@@ -303,7 +304,7 @@ class Directory:
     def retry_immutable(self, name, value, *, immutable=True):
         """Resume only this producer's durably reserved exact immutable slot."""
         data = encoded(value)
-        if len(data) > MAX_RECORD or Path(name).name != name:
+        if len(data) > self.max_record or Path(name).name != name:
             raise ValueError('invalid immutable fact slot')
         temporary = name + '.new'
         # Publication can fail between link and unlink. Only the two exact
@@ -320,7 +321,7 @@ class Directory:
                         and stat.S_IMODE(final.st_mode) == 0o600):
                     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
                     try:
-                        if identity(os.fstat(fd)) != identity(final) or os.read(fd, MAX_RECORD+1) != data:
+                        if identity(os.fstat(fd)) != identity(final) or os.read(fd, self.max_record+1) != data:
                             raise RuntimeError('ObservationRecoveryBlocked: linked fact conflict')
                         self.verify()
                         if identity(os.stat(temporary, dir_fd=self.fd, follow_symlinks=False)) != identity(final):
@@ -346,7 +347,7 @@ class Directory:
             fd = os.open(temporary, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
         try:
             before = checked(fd)
-            prefix = os.read(fd, MAX_RECORD + 1)
+            prefix = os.read(fd, self.max_record + 1)
             if not data.startswith(prefix) or len(prefix) != before.st_size:
                 raise RuntimeError('ObservationRecoveryBlocked: reserved fact partial content conflict')
             self.verify()
