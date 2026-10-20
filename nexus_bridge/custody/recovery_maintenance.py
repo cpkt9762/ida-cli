@@ -10,6 +10,7 @@ import subprocess
 from types import SimpleNamespace
 
 from origin import creation_scope
+from process_timeout import run
 from recovery_files import file_info, inventory, visible_names
 from recovery_transaction import Transaction, recovery_name
 from target_coordination import Directory, Target, MAX_RECORD, digest, encoded
@@ -316,8 +317,12 @@ def accepted_preview(target,transaction,evidence):
 def occupancy(roots, path):
     installation=Path(__file__).parent
     for state in roots:
-        result=subprocess.run(['timeout','3s',sys.executable,'-I','-B',str(installation/'bootstrap.py'),
-            'recovery_probe',json.dumps(state),str(path)],capture_output=True,text=True,check=False)
+        try:
+            result=run([sys.executable,'-I','-B',str(installation/'bootstrap.py'),
+                'recovery_probe',json.dumps(state),str(path)],text=True,check=False,
+                timeout=3)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError('MaintenanceBlocked: independent exact-state occupancy timed out') from error
         if result.returncode != 0:
             raise RuntimeError('MaintenanceBlocked: independent exact-state occupancy failed: '+result.stderr)
         reason=json.loads(result.stdout)['reason']

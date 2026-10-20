@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import uuid
 
@@ -117,7 +118,11 @@ def content_key(path):
     executable = os.environ.get('IDA_CLI_LEGACY_TOOL')
     if not executable:
         raise RuntimeError('content-key verification requires the ida-cli cache-legacy entrypoint')
-    result = offline.run_child(['timeout', '--foreground', str(files.remaining_seconds())+'s', executable, 'cache-legacy', '--content-key', str(path)])
+    try:
+        result = offline.run_child([executable, 'cache-legacy', '--content-key', str(path)],
+                                   timeout=files.remaining_seconds())
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError('content-key verification failed: budget expired') from error
     if result.returncode or not re.fullmatch(r'[0-9a-f]{12}\n?', result.stdout):
         raise RuntimeError('content-key verification failed')
     return result.stdout.strip()
@@ -129,8 +134,11 @@ def inspect_copy(backup, idb_name):
     probe.mkdir(mode=0o700)
     source = backup/'files'/idb_name
     files.copy_verified(source, probe/'probe.i64', files.fingerprint(source))
-    result = offline.run_child(['timeout', '--foreground', str(files.remaining_seconds())+'s', *offline.child_argv('--inspect-copy', str(probe/'probe.i64'),
-                               '--result', str(probe/'result.json'))])
+    try:
+        result = offline.run_child(offline.child_argv('--inspect-copy', str(probe/'probe.i64'),
+                                   '--result', str(probe/'result.json')), timeout=files.remaining_seconds())
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError('private packed IDB inspection timed out; copy retained at ' + str(probe)) from error
     if result.returncode:
         raise RuntimeError('private packed IDB inspection failed; copy retained at ' + str(probe))
     value = json.loads(files.read(probe/'result.json'))

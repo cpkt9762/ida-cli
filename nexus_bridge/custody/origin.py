@@ -10,6 +10,7 @@ import threading
 import uuid
 
 from custody_process_identity import capture
+from process_timeout import run
 
 _scopes = {}
 _lock = threading.Lock()
@@ -22,7 +23,7 @@ def native_scope(directory, device):
         'boot_retirement_capability': 'UnsupportedBootScope'}
     def query(label, argv, decode=lambda data: data):
         try:
-            return decode(subprocess.check_output(['timeout', '2s', *argv], stderr=subprocess.PIPE))
+            return decode(run(argv, timeout=2, check=True).stdout)
         except (OSError, subprocess.SubprocessError, ValueError, TypeError, IndexError) as error:
             reasons.append(label + ' unavailable: ' + type(error).__name__)
             return None

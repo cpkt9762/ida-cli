@@ -134,14 +134,17 @@ def child_argv(*arguments):
     return [sys.executable, '-B', str(Path(__file__).with_name('legacy_cache.py')), *arguments]
 
 
-def run_child(argv, *, env=None):
+def run_child(argv, *, env=None, timeout=None):
     """Own the helper group and observe its terminal before rolling back."""
     checkpoint()
+    deadline = None if timeout is None else time.monotonic() + timeout
     with subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, start_new_session=True) as child:
         try:
             while True:
                 checkpoint()
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(argv, timeout)
                 try:
                     stdout, stderr = child.communicate(timeout=0.1)
                     checkpoint()
@@ -169,8 +172,11 @@ def observe(path, states, *, read_only=True):
     if not states:
         return {'packed': None, 'openers': 'unknown: no Nexus state-root inventory'}
     for state in states:
-        result = run_child(['timeout', '--foreground', '5s', *child_argv('--observe-readonly' if read_only else '--observe', str(path))],
-                           env=os.environ | {'IDA_NEXUS_STATE_DIR': str(state)})
+        try:
+            result = run_child(child_argv('--observe-readonly' if read_only else '--observe', str(path)),
+                               env=os.environ | {'IDA_NEXUS_STATE_DIR': str(state)}, timeout=5)
+        except subprocess.TimeoutExpired:
+            return {'packed': None, 'openers': 'unknown: public observation failed', 'exit': 124}
         if result.returncode:
             return {'packed': None, 'openers': 'unknown: public observation failed', 'exit': result.returncode}
         value = json.loads(result.stdout)

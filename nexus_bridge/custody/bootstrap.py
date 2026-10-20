@@ -13,6 +13,7 @@ REQUIRED = frozenset(('acquisition.py', 'analysis_tools.py', 'bootstrap.py', 'br
 
 REQUIRED |= frozenset(('legacy_cache.py','legacy_cache_files.py','legacy_cache_offline.py','recovery_job.py','recovery_transfer.py','recovery_maintenance.py','recovery_probe.py','recovery_resources.py','recovery_legacy.py'))
 REQUIRED |= frozenset(('volume_identity.py',))
+REQUIRED |= frozenset(('process_timeout.py',))
 ASSETS = frozenset(('maintenance-launch',))
 
 

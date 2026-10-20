@@ -49,6 +49,10 @@ impl Drop for Temporary {
 
 const SOURCES: &[(&str, &[u8])] = &[
     (
+        "process_timeout.py",
+        include_bytes!("../../../nexus_bridge/custody/process_timeout.py"),
+    ),
+    (
         "legacy_cache.py",
         include_bytes!("../../../nexus_bridge/legacy_cache.py"),
     ),

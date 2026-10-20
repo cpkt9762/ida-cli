@@ -3,6 +3,7 @@
 //! Manages the `~/.ida/` directory hierarchy and an `index.json` that tracks
 //! metadata about every analysed binary.
 
+#[cfg(test)]
 use crate::process_spawn::StdOutputFenced;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
@@ -136,10 +137,8 @@ impl IdbStore {
                 EPOCH.get_or_init(|| format!("{}-{:?}", std::process::id(), SystemTime::now()));
             let python = crate::router::nexus_tools::runtime_python()?;
             let installation = crate::router::nexus_bridge::installation::Temporary::create()?;
-            let mut command = std::process::Command::new("timeout");
+            let mut command = std::process::Command::new(python);
             command
-                .arg("10s")
-                .arg(python)
                 .args(["-I", "-B"])
                 .arg(installation.path.join("installation/bootstrap.py"))
                 .arg("cache_store")
@@ -152,7 +151,11 @@ impl IdbStore {
             if let Some(key) = key {
                 command.arg("--key").arg(key);
             }
-            let output = command.output_fenced()?;
+            let output = crate::process_spawn::output_bounded(
+                &mut command,
+                std::time::Duration::from_secs(10),
+                &installation.path,
+            )?;
             anyhow::ensure!(
                 output.status.success(),
                 "cache maintenance failed: {}; {}",
