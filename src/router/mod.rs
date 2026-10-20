@@ -573,10 +573,33 @@ impl RouterState {
         params: serde_json::Value,
         preparation: crate::preprocess::Preparation,
     ) -> Result<serde_json::Value, crate::error::ToolError> {
+        let params = Self::prepare_request_params(method, params, &preparation).await?;
         return self
             .nexus_tools
             .execute(self, handle, method, params, preparation)
             .await;
+    }
+
+    /// Shared admission for CLI, queued jobs and MCP, before acquiring an IDB.
+    pub async fn prepare_request_params(
+        method: &str,
+        params: serde_json::Value,
+        preparation: &crate::preprocess::Preparation,
+    ) -> Result<serde_json::Value, crate::error::ToolError> {
+        if crate::tool_registry::primary_name_for(method) != "run_script" {
+            return Ok(params);
+        }
+        preparation.check()?;
+        let mut request: crate::server::RunScriptRequest =
+            serde_json::from_value(params).map_err(|error| {
+                crate::error::ToolError::InvalidParams(format!("invalid params: {error}"))
+            })?;
+        request.code = Some(
+            crate::server::resolve_script_code(request.code, request.file.take(), preparation)
+                .await?,
+        );
+        serde_json::to_value(request)
+            .map_err(|error| crate::error::ToolError::InvalidParams(error.to_string()))
     }
 
     pub(crate) fn scoped_ref(&self, token: String) -> ScopedRefToken {
@@ -1082,6 +1105,23 @@ impl RouterState {
         use crate::error::ToolError;
         nexus_tools::Tools::require(crate::tool_registry::primary_name_for(method))?;
 
+        let script_preparation = if crate::tool_registry::primary_name_for(method) == "run_script" {
+            let seconds = params
+                .get("timeout_secs")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(120)
+                .min(600);
+            Some(crate::preprocess::Preparation::new(Duration::from_secs(
+                seconds,
+            )))
+        } else {
+            None
+        };
+        let params = if let Some(preparation) = &script_preparation {
+            Self::prepare_request_params(method, params, preparation).await?
+        } else {
+            params
+        };
         let tenant_id = Self::normalize_tenant(tenant_id.as_deref());
         let mut queue = self.route_queue.lock().await;
         if queue.queued.len() >= self.config.max_queued_tasks {
@@ -1127,14 +1167,15 @@ impl RouterState {
                 path: path.to_string(),
                 method: method.to_string(),
                 preparation: {
-                    let maximum = if method == "open" { 3600 } else { 600 };
-                    let seconds = params
-                        .get("timeout_secs")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(120)
-                        .min(maximum);
-                    let preparation =
-                        crate::preprocess::Preparation::new(Duration::from_secs(seconds));
+                    let preparation = script_preparation.unwrap_or_else(|| {
+                        let maximum = if method == "open" { 3600 } else { 600 };
+                        let seconds = params
+                            .get("timeout_secs")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(120)
+                            .min(maximum);
+                        crate::preprocess::Preparation::new(Duration::from_secs(seconds))
+                    });
                     self.task_registry
                         .set_cancellation(&task_id, preparation.cancel.clone());
                     preparation
@@ -1176,6 +1217,13 @@ impl RouterState {
         use crate::error::ToolError;
         nexus_tools::Tools::require(crate::tool_registry::primary_name_for(method))?;
 
+        let seconds = params
+            .get("timeout_secs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(120)
+            .min(600);
+        let preparation = crate::preprocess::Preparation::new(Duration::from_secs(seconds));
+        let params = Self::prepare_request_params(method, params, &preparation).await?;
         let tenant_id = Self::normalize_tenant(tenant_id.as_deref());
         let nodes = self.federation_nodes_snapshot().await;
         let candidates =

@@ -2253,48 +2253,9 @@ impl IdaMcpServer {
             ))
         });
         let _cancellation_guard = preparation.cancel_on_drop();
-        let code = match (req.code, req.file) {
-            (Some(code), None) => code,
-            (None, Some(path)) => {
-                let source = path.clone();
-                match preparation
-                    .wait(crate::blocking::run(
-                        crate::blocking::WorkClass::Prepare,
-                        move || {
-                            if !Self::validate_path(&source) {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    "invalid script path",
-                                ));
-                            }
-                            read_script_file(source)
-                        },
-                    ))
-                    .await
-                {
-                    Ok(Ok(contents)) => contents,
-                    Ok(Err(e)) => {
-                        return Ok(ToolError::InvalidPath(format!(
-                            "Failed to read script file '{}': {}",
-                            path, e
-                        ))
-                        .to_tool_result());
-                    }
-                    Err(error) => return Ok(error.to_tool_result()),
-                }
-            }
-            (Some(_), Some(_)) => {
-                return Ok(ToolError::InvalidParams(
-                    "Provide either 'code' or 'file', not both".into(),
-                )
-                .to_tool_result());
-            }
-            (None, None) => {
-                return Ok(ToolError::InvalidParams(
-                    "Provide either 'code' (inline Python) or 'file' (path to .py)".into(),
-                )
-                .to_tool_result());
-            }
+        let code = match resolve_script_code(req.code, req.file, &preparation).await {
+            Ok(code) => code,
+            Err(error) => return Ok(error.to_tool_result()),
         };
         let timeout = req.timeout_secs.map(|t| t.min(600));
         let router = &self.router;
@@ -3362,6 +3323,46 @@ mod tests {
 #[path = "../../tests/support/r2_server.rs"]
 mod r2_lifecycle;
 
+/// Resolve the shared scripting input before any database acquisition/dispatch.
+pub(crate) async fn resolve_script_code(
+    code: Option<String>,
+    file: Option<String>,
+    preparation: &crate::preprocess::Preparation,
+) -> Result<String, ToolError> {
+    match (code, file) {
+        (Some(code), None) => Ok(code),
+        (None, Some(path)) => {
+            let source = path.clone();
+            preparation
+                .wait(crate::blocking::run(
+                    crate::blocking::WorkClass::Prepare,
+                    move || {
+                        if !IdaMcpServer::validate_path(&source) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "invalid script path",
+                            ));
+                        }
+                        read_script_file(source)
+                    },
+                ))
+                .await?
+                .map_err(|error| {
+                    ToolError::InvalidPath(format!(
+                        "Failed to read script file '{}': {}",
+                        path, error
+                    ))
+                })
+        }
+        (Some(_), Some(_)) => Err(ToolError::InvalidParams(
+            "Provide either 'code' or 'file', not both".into(),
+        )),
+        (None, None) => Err(ToolError::InvalidParams(
+            "Provide either 'code' (inline Python) or 'file' (path to .py)".into(),
+        )),
+    }
+}
+
 fn read_script_file(source: String) -> std::io::Result<String> {
     #[cfg(test)]
     {
@@ -3460,6 +3461,61 @@ mod list_idbs_tests {
             "expired read reserves no Nexus operation"
         );
         std::fs::remove_dir_all(base).expect("remove owned script");
+    }
+
+    #[tokio::test]
+    async fn router_script_read_uses_admission_deadline_without_bridge_or_operations() {
+        use super::SCRIPT_READ_BARRIERS;
+        use std::time::Duration;
+        let path =
+            std::env::temp_dir().join(format!("router-script-blocked-{}.py", std::process::id()));
+        std::fs::write(&path, "print('never dispatched')").expect("owned script");
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        SCRIPT_READ_BARRIERS
+            .lock()
+            .expect("barriers")
+            .insert(path.display().to_string(), (started, released));
+        let router = RouterState::new().expect("router");
+        let copy = router.clone();
+        let preparation = crate::preprocess::Preparation::new(Duration::from_millis(150));
+        let observed = preparation.clone();
+        let params = json!({"file":path});
+        let task = tokio::spawn(async move {
+            copy.route_request_prepared(None, "run_script", params, preparation)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .expect("read admission")
+            .expect("started");
+        let result = tokio::time::timeout(Duration::from_millis(400), task).await;
+        let tracked = observed.active_input_jobs();
+        release.send(()).expect("release owned read");
+        assert!(result
+            .expect("bounded original deadline")
+            .expect("task")
+            .is_err());
+        assert_eq!(
+            tracked, 1,
+            "abandoned job retains tracking until its closure completes"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed.active_input_jobs() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("read closure ended");
+        assert!(router.status_snapshot().await.nexus_lifecycle.is_none());
+        assert_eq!(
+            router
+                .nexus_endpoint()
+                .transition(|s, _| s.retention_status())
+                .total_used,
+            0
+        );
+        std::fs::remove_file(path).expect("remove private script");
     }
 
     async fn call_list_idbs(server: &IdaMcpServer) -> (Value, String) {

@@ -187,8 +187,6 @@ def invoke(method, params):
     import ida_funcs
     import ida_ida
     import ida_idaapi
-    import ida_idp
-    import ida_loader
     import ida_nalt
     import idautils
     import idc
@@ -254,25 +252,26 @@ def invoke(method, params):
                 raise ValueError(f"Function not found: {name}")
         return min(2**64 - 1, ea + offset)
 
-    if any(method in globals().get(group, ()) for group in ("TYPE_METHODS", "EDIT_METHODS", "ANALYSIS_METHODS", "STRUCT_METHODS", "QUERY_METHODS", "SEARCH_METHODS")):
+    providers = globals()
+    if any(method in providers.get(group, ()) for group in ("TYPE_METHODS", "EDIT_METHODS", "ANALYSIS_METHODS", "STRUCT_METHODS", "QUERY_METHODS", "SEARCH_METHODS")):
         try:
-            if method in TYPE_METHODS:
-                value = invoke_type(method, params, resolve)
-            elif method in EDIT_METHODS:
-                value = invoke_edit(method, params, resolve, parse_address)
-            elif method in ANALYSIS_METHODS:
-                value = invoke_analysis(method, params, parse_address)
-            elif method in STRUCT_METHODS:
+            if method in providers["TYPE_METHODS"]:
+                value = providers["invoke_type"](method, params, resolve)
+            elif method in providers["EDIT_METHODS"]:
+                value = providers["invoke_edit"](method, params, resolve, parse_address)
+            elif method in providers["ANALYSIS_METHODS"]:
+                value = providers["invoke_analysis"](method, params, parse_address)
+            elif method in providers["STRUCT_METHODS"]:
                 def ref_info(ref):
                     code_types = {0: "Unknown", 16: "FarCall", 17: "NearCall", 18: "FarJump", 19: "NearJump", 20: "Obsolete", 21: "Flow"}
                     data_types = {0: "Unknown", 1: "Offset", 2: "Write", 3: "Read", 4: "Text", 5: "Informational", 6: "EnumMember"}
                     return {"from": hex(ref.frm), "to": hex(ref.to), "is_code": bool(ref.iscode),
                             "type": ("Code(" + code_types[ref.type & 31] + ")") if ref.iscode else ("Data(" + data_types[ref.type & 31] + ")")}
-                value = invoke_struct(method, params, parse_address, ref_info)
-            elif method in QUERY_METHODS:
-                value = invoke_query(method, params, resolve, parse_address, invoke)
+                value = providers["invoke_struct"](method, params, parse_address, ref_info)
+            elif method in providers["QUERY_METHODS"]:
+                value = providers["invoke_query"](method, params, resolve, parse_address, invoke)
             else:
-                value = invoke_search(method, params)
+                value = providers["invoke_search"](method, params)
             return {"ok": True, "value": value}
         except ValueError as exc:
             return failure(str(exc))
@@ -424,6 +423,8 @@ def invoke(method, params):
                         "immediately call rename_symbol to rename it before proceeding.\n\n" + code)
             value = {"code": code}
     elif method == "run_script":
+        if not isinstance(params.get("code"), str):
+            return failure("Invalid params: run_script requires resolved 'code'")
         import __main__
         import contextlib
         import io
@@ -435,7 +436,7 @@ def invoke(method, params):
                 # Native N0's extlang wrapper executes user code on line 11.
                 # Keep that frame for uncaught SystemExit/KeyboardInterrupt;
                 # Nexus's internal cancellation BaseException must propagate.
-                __main__.__dict__["_mcp_code_input"] = params.get("code") or ""
+                __main__.__dict__["_mcp_code_input"] = params["code"]
                 exec("\n" * 10 + "exec(_mcp_code_input)", __main__.__dict__)
             except Exception as exc:
                 message = str(exc)

@@ -913,7 +913,12 @@ pub async fn dispatch_rpc<W: WorkerDispatch>(
         // ── IDAPython script ─────────────────────────────────────────────
         "run_script" => {
             let req: RunScriptRequest = parse_params(p)?;
-            let code = req.code.unwrap_or_default();
+            let preparation = crate::preprocess::current().unwrap_or_else(|| {
+                crate::preprocess::Preparation::new(std::time::Duration::from_secs(
+                    req.timeout_secs.unwrap_or(120).min(600),
+                ))
+            });
+            let code = crate::server::resolve_script_code(req.code, req.file, &preparation).await?;
             let timeout = req.timeout_secs;
             worker.run_script(&code, timeout).await
         }
@@ -3433,6 +3438,26 @@ mod tests {
         "code",
         json!("print('ok')")
     );
+
+    #[tokio::test]
+    async fn script_file_and_input_errors_match_mcp_without_worker_calls() {
+        let path = std::env::temp_dir().join(format!("rpc-script-{}.py", std::process::id()));
+        std::fs::write(&path, "print('rpc file')").expect("private script");
+        let calls = run_dispatch("run_script", json!({"file":path})).await;
+        assert_eq!(calls[0].1["code"], "print('rpc file')");
+        for params in [
+            json!({}),
+            json!({"code":"x","file":path}),
+            json!({"file":"missing-script.py"}),
+        ] {
+            let worker = MockWorker::new();
+            dispatch_rpc(&RpcRequest::new("1", "run_script", params), &worker)
+                .await
+                .expect_err("local input rejection");
+            assert!(worker.calls.lock().expect("mock calls").is_empty());
+        }
+        std::fs::remove_file(path).expect("remove owned file");
+    }
 
     // -- Compound tools --
     #[tokio::test]

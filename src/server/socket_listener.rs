@@ -489,6 +489,15 @@ async fn dispatch_cli_request(
                 .min(maximum);
             let preparation =
                 crate::preprocess::Preparation::new(std::time::Duration::from_secs(seconds));
+            let params =
+                match RouterState::prepare_request_params(method, req.params.clone(), &preparation)
+                    .await
+                {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return (RpcResponse::err(&req.id, -32000, error.to_string()), None)
+                    }
+                };
             let resolve_result = if let Some(ref p) = path {
                 router
                     .ensure_worker_prepared(p, None, tenant_id.as_deref(), preparation.clone())
@@ -512,12 +521,7 @@ async fn dispatch_cli_request(
                         token,
                     });
                     match router
-                        .route_request_prepared(
-                            Some(&handle),
-                            method,
-                            req.params.clone(),
-                            preparation,
-                        )
+                        .route_request_prepared(Some(&handle), method, params, preparation)
                         .await
                     {
                         Ok(v) => (RpcResponse::ok(&req.id, v), ref_guard),
