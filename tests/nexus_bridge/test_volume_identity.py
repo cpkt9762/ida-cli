@@ -202,9 +202,15 @@ class VolumeEpoch(unittest.TestCase):
                             **({} if variant=='volume' else {'VolumeUUID':'private-native-volume'}),Internal=True))
                     if '/usr/sbin/sysctl' in argv:return b'0\n'
                     raise AssertionError(argv)
-                with patch.object(origin.subprocess,'check_output',side_effect=output), \
+                with patch.object(origin,'run',side_effect=lambda argv, **options: subprocess.CompletedProcess(
+                        argv, 0, output(argv, **options))) as query, \
+                        patch.object(origin.subprocess, 'Popen', side_effect=AssertionError('unexpected native query')), \
                         self.assertLogs('origin',level='WARNING') as diagnostics:
                     scope=origin.native_scope(Path(os.environ['R3A_CASE_ROOT']),123)
+                self.assertEqual([call.args[0][0] for call in query.call_args_list],
+                    ['/usr/sbin/ioreg', '/bin/df', *([] if variant=='mount' else ['/usr/sbin/diskutil']), '/usr/sbin/sysctl'])
+                for call in query.call_args_list:
+                    self.assertEqual(call.kwargs, dict(timeout=2, check=True))
                 self.assertEqual(scope['boot_retirement_capability'],'UnsupportedBootScope')
                 self.assertTrue(scope['unsupported_reason'])
                 self.assertIn(scope['unsupported_reason'],diagnostics.output[0])
