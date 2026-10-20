@@ -129,9 +129,12 @@ class Http:
 
 
 class Candidate:
-    def __init__(self, env, binary, sample, label, transport="http", inline="512", seed=None, allow_open_error=False, extra=None, cache=None, defer_open=False):
+    def __init__(self, env, binary, sample, label, transport="http", inline="512", seed=None, allow_open_error=False, extra=None, cache=None, defer_open=False, legacy=False):
         label = f"{label}-{os.getpid()}"
         self.env, self.binary, self.sample, self.transport = env, binary, sample, transport
+        self.legacy = legacy
+        if legacy:
+            assert digest(binary) == BASELINE_SHA, 'legacy fixture requires the frozen N0 binary'
         self.home = env.root / f"home-{label}"
         self.home.mkdir(mode=0o700)
         if cache is not None:
@@ -171,7 +174,13 @@ class Candidate:
                     data=control.makefile("rb").readline()
                 metadata=json.loads(data)["result"]["metadata"]
                 port=int(metadata["http_address"].rsplit(":",1)[1])
+            # These are this exact test child's published control endpoints.
+            for name in ('server.sock', 'mcp.sock'):
+                env.record_socket(self.home/name, self.process.child.pid)
             self.client = Http(port)
+        if transport == 'stdio':
+            for name in ('server.sock',):
+                env.record_socket(self.home/name, self.process.child.pid)
         self.open_result = {} if defer_open else self.mcp("open_idb", {"path":str(sample)})
         if defer_open:
             self.opened = None
@@ -187,6 +196,8 @@ class Candidate:
         assert "result" in response, response
         result = response["result"]
         assert result.get("content") and len(result["content"]) == 1, result
+        if method == 'close_idb' and not self.legacy:
+            self.last_close_lifecycle = result.get('_meta', {}).get('nexus', {}).get('lifecycle')
         text = result["content"][0]["text"]
         if result.get("isError"):
             return {"error":text}
@@ -216,10 +227,54 @@ class Candidate:
     def call(self, method, params):
         return self.mcp(method, params)
 
+    def control(self, method, params=None):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+            stream.settimeout(20 if method == "wait_owner_exit" else 3)
+            stream.connect(str(self.home/'server.sock'))
+            stream.sendall((json.dumps({'jsonrpc':'2.0','id':'fixture-control',
+                'method':method,'params':params or {}})+'\n').encode())
+            with stream.makefile('rb') as source:
+                reply = json.loads(source.readline())
+        assert reply.get('id') == 'fixture-control' and 'result' in reply, reply
+        return reply['result']
+
+    def wait_closed_owner(self):
+        lifecycle = self.last_close_lifecycle
+        if lifecycle['outcome']['ack_kind'] == 'last':
+            closed = self.control('wait_owner_exit', {'owner_observation_ref':
+                lifecycle['owner_observation_ref'], 'timeout_secs':15})
+            assert closed['owner_released'] is True, closed
+            deadline = time.monotonic()+15
+            while True:
+                status = self.control('status')['nexus_lifecycle']
+                if all(status[k] == 0 for k in ('resources','startup_and_pre_attach','retirement_acks')):
+                    break
+                assert time.monotonic() < deadline, status
+                time.sleep(.02)
+        else:
+            assert lifecycle['outcome']['ack_kind'] == 'nonlast', lifecycle
+
     def stop(self):
         if self.opened:
             result = self.mcp("close_idb", {"close_token":self.opened["close_token"]})
             assert "result" in result, result
+            self.opened = None
+        if not self.legacy:
+            deadline = time.monotonic()+20
+            observations = []
+            while True:
+                status = self.control('status')['nexus_lifecycle']
+                assert isinstance(status, dict), status
+                observations.append(status)
+                snapshot = status['helper'].get('snapshot')
+                if (all(status[key] == 0 for key in ('resources','startup_and_pre_attach','retirement_acks'))
+                        and isinstance(snapshot, dict) and snapshot['used'] == snapshot['parent_count'] == snapshot['live_ref_bytes'] == 0):
+                    break
+                assert time.monotonic() < deadline, status
+                time.sleep(.02)
+            with (self.env.root/'close-accounting.jsonl').open('a') as output:
+                output.write(json.dumps({'home':str(self.home),'first':observations[0],
+                    'settled':observations[-1]})+'\n')
         if self.transport == "stdio":
             self.process.child.stdin.close()
         else:
@@ -480,11 +535,16 @@ def streams(env,binary):
         with ThreadPoolExecutor(max_workers=2) as pool:
             jobs=[pool.submit(client.call,"run_script",{"code":f"import sys,time; print('{tag}'); time.sleep(.05); print('{tag} err',file=sys.stderr)"}) for tag in ("甲","乙")]
             for tag,job in zip(("甲","乙"),jobs):
-                result=job.result(timeout=10)["result"]
+                response=job.result(timeout=10)
+                assert 'result' in response, response
+                result=response['result']
                 assert result["stdout"]==tag+"\n" and result["stderr"]==tag+" err\n",result
         marker=env.root/"e17-native-started"
-        cancelled=client.direct("run_script",{"code":f"from pathlib import Path; Path({str(marker)!r}).touch()\nwhile True:\n    pass", "timeout_secs":1})
-        assert marker.is_file() and cancelled.get("exit")==1,cancelled
+        # Running cancellation uses the already acquired public MCP lease.
+        # A fresh CLI acquisition shares its one-second deadline with setup
+        # and is correctly NotSent under protocol section 4.2.
+        cancelled=client.call("run_script",{"code":f"from pathlib import Path; Path({str(marker)!r}).touch()\nwhile True:\n    pass", "timeout_secs":1})
+        assert marker.is_file() and 'error' in cancelled, cancelled
         assert "deadline" in cancelled["error"].lower(),cancelled
         deadline=time.monotonic()+10
         while True:
@@ -494,6 +554,14 @@ def streams(env,binary):
             assert time.monotonic()<deadline,status
             time.sleep(.02)
         assert client.call("list_functions",{})["result"]["total"]==2
+        not_sent_marker = env.root/'e17-cli-not-sent'
+        not_sent = client.direct('run_script', {'code':f"from pathlib import Path; Path({str(not_sent_marker)!r}).touch()", 'timeout_secs':1})
+        assert not_sent.get('exit') == 1 and not not_sent_marker.exists(), not_sent
+        assert 'internal RPC not sent: insufficient HTTP allowance' in not_sent['error'], not_sent
+        assert client.call('list_functions',{})['result']['total'] == 2
+        (env.root/'E17-deadline.json').write_text(json.dumps({
+            'running_mcp':cancelled, 'running_marker':marker.is_file(),
+            'cli_not_sent':not_sent, 'cli_marker':not_sent_marker.exists()},indent=2)+'\n')
         std_sample=env.root/"fixtures/e17-stdio"
         shutil.copyfile(sample,std_sample)
         stdio=Candidate(env,binary,std_sample,"e17-stdio","stdio")
@@ -556,7 +624,10 @@ def legacy_cache(env,baseline,binary):
                 closed=client.mcp("close_idb",{"close_token":client.opened["close_token"]})
                 assert "still active" in closed["result"],closed
                 client.opened=None
-                assert client.direct("close",{})["result"]=={"ok":True}
+                closed = client.direct("close",{})["result"]
+                assert set(closed) == {'ok','lifecycle'} and closed['ok'] is True, closed
+                assert closed['lifecycle']['lease_detached'] is True, closed
+                assert closed['lifecycle']['owner_observation_ref'], closed
                 # Last warm reference has saved/unlocked this exact old cache.
                 assert client.direct("get_function_by_name",{"name":"N4_USER_EDIT"})["result"]["name"]=="N4_USER_EDIT"
             else:
@@ -579,7 +650,17 @@ def legacy_cache(env,baseline,binary):
             raise
         finally:
             client.stop()
-        assert not list((client.home/"idb").glob(".nexus-*")),"staging/verification residue"
+        for directory in (client.home/'idb').glob('.nexus-*'):
+            assert directory.name.startswith('.nexus-verify-') and not directory.is_symlink(), directory
+            children = list(directory.iterdir())
+            assert len(children) == 1 and children[0].name.startswith('.ida-cli-txn-'), children
+            coordination = children[0]
+            assert not coordination.is_symlink() and coordination.is_dir(), coordination
+            assert {p.name for p in coordination.iterdir()} <= {
+                'root.lock','lock','target.json','volume.json','custody.json','proofs','observations'}, coordination
+            journal = json.loads((coordination/'custody.json').read_text())
+            assert journal['entries'] == {} and journal.get('compaction') is None, journal
+            assert not journal.get('file_intents') and journal['closed_through'] > 0, journal
     return {"legacy_cases":results,"warm_lease_released":True,"verified_snapshot_retained":True}
 
 

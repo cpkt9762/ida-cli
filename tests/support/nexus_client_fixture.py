@@ -148,9 +148,12 @@ else:
     send = runtime["Channel"].send
     def boundary_send(self, message):
         publish = os.environ.get('N7_PUBLISH_BARRIER')
-        if publish and message.get('event') == 'opened':
+        if (publish and message.get('event') == 'custody_request'
+                and message.get('action') == 'acquired'
+                and message['acquisition']['purpose'] == 'final'):
             barrier = Path(publish)
-            barrier.with_suffix('.arrived').write_text(json.dumps({'idb_path':message['idb_path']}))
+            barrier.with_suffix('.arrived').write_text(json.dumps(
+                {'idb_path':message['owner']['canonical_idb_path']}))
             import time
             deadline = time.monotonic() + 15
             while not barrier.with_suffix('.release').exists():

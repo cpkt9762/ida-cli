@@ -109,8 +109,11 @@ async fn n5_hooks_external_modifications_and_fail_closed_state_loss() {
             .len(),
         4
     );
-    close(&mut a, &la).await;
+    a.release(&la).await;
     close(&mut b, &lb).await;
+    a.shutdown()
+        .await
+        .expect("nonlast hook observer settles after B's last release");
     passed("N5-hooks", json!({"aborts":checks,"self_decompile":4}));
 }
 
@@ -150,7 +153,7 @@ async fn n5_hooks_shared_references_install_failure_and_lease_release() {
     b.event(|v| v["event"] == "yielded").await;
     assert_eq!(inspector.value(&li,"execute_python",json!({"code":"import sys\nm=sys.modules['_ida_cli_nexus_slices_v1']\nresult=[len(m.jobs),m.counter is not None]"})).await,json!([2,true]));
     assert_eq!(cancel(&a.bridge, &oa).status, OperationStatus::Cancelled);
-    close(&mut a, &la).await;
+    a.release(&la).await;
     assert_eq!(
         inspector.value(
             &li,
@@ -191,8 +194,14 @@ async fn n5_hooks_shared_references_install_failure_and_lease_release() {
         json!({"code":"import ida_idp\nida_idp.IDB_Hooks.hook=ida_idp._n5_hook_original\nresult=True"}),
     )
     .await;
-    close(&mut b, &lb).await;
+    b.release(&lb).await;
     close(&mut inspector, &li).await;
+    a.shutdown()
+        .await
+        .expect("A helper settled after inspector released");
+    b.shutdown()
+        .await
+        .expect("B helper settled after inspector released");
     passed("N5-lifecycle",json!("two leases share counter; releasing cancelled A retains B; last job unhooks; failed installation closes"));
 }
 
@@ -247,6 +256,15 @@ async fn n5_hooks_bridge_loss_and_reconnection_reject_old_checkpoint() {
         tokio::task::yield_now().await;
     }
     close(&mut b, &lb).await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while a.bridge.lifecycle_status()["resources"] != 0
+            || a.bridge.lifecycle_status()["startup_and_pre_attach"] != 0
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("dead bridge producer and helper settle after B releases");
     a.bridge.shutdown().await.unwrap();
     let pid = opened["pid"].as_u64().unwrap() as i32;
     tokio::time::timeout(Duration::from_secs(15), async {

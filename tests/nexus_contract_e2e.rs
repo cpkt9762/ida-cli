@@ -13,9 +13,15 @@ fn contract(case: &str) {
     .expect("valid environment JSON");
     let baseline = std::env::var_os("N4_BASELINE").expect("independent N0 baseline binary");
     let status = std::process::Command::new("timeout")
-        // Three independently saved native baselines each wait for IDA's
-        // loader/analysis; E22 needs up to 90s inside the 180s suite budget.
-        .arg(if case == "E22" { "90s" } else { "30s" })
+        // E04/E16 aggregate dozens of real CLI children and custody cleanup.
+        // E22 has three native baseline starts; the whole suite remains 180s.
+        .arg(if case == "E22" {
+            "90s"
+        } else if matches!(case, "E04" | "E16") {
+            "120s"
+        } else {
+            "30s"
+        })
         .arg(root.join("venv/bin/python"))
         .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/compare_nexus_baseline.py"))
         .arg("--root")

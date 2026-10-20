@@ -81,7 +81,7 @@ fn record_child_exit(pid: Option<u32>, status: &std::process::ExitStatus, method
 }
 
 #[cfg(feature = "nexus-test-support")]
-pub(crate) fn test_record_child_exit(pid: u32, status: &std::process::ExitStatus, method: &str) {
+pub fn test_record_child_exit(pid: u32, status: &std::process::ExitStatus, method: &str) {
     record_child_exit(Some(pid), status, method);
 }
 

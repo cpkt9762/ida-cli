@@ -83,6 +83,28 @@ def install():
                 self._r2_polled = True
 
     subprocess.Popen = Recorded
+    # Test-only bind journal. Even os._exit fault cases leave the creator's
+    # native identity and actual inode; a parent may clean only after wait.
+    import socket
+    import stat
+    original_bind = socket.socket.bind
+    def bind(endpoint, address):
+        result = original_bind(endpoint, address)
+        if endpoint.family == socket.AF_UNIX and isinstance(address, str) and address.startswith('/'):
+            path = Path(address)
+            info = path.lstat()
+            captured = identity(os.getpid())
+            if not stat.S_ISSOCK(info.st_mode) or captured is None:
+                raise RuntimeError('test socket bind identity unavailable')
+            row = {'kind':'socket_bound','path':address,'dev':info.st_dev,'ino':info.st_ino,
+                   'pid':os.getpid(),'identity':captured}
+            record(row)
+            root = os.environ.get('N3_ENV_ROOT')
+            if root:
+                with (Path(root)/'sockets.jsonl').open('a') as output:
+                    output.write(json.dumps(row)+'\n');output.flush();os.fsync(output.fileno())
+        return result
+    socket.socket.bind = bind
     def finish_observers():
         deadline=time.monotonic()+1
         for waiter in waiters:

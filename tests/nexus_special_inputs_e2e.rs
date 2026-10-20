@@ -97,6 +97,24 @@ async fn e21_router_lease_excludes_actual_store_gc() {
         .nexus_close_token(&token)
         .await
         .expect("release actual owner");
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let status = router
+                .status_snapshot()
+                .await
+                .nexus_lifecycle
+                .expect("opened bridge status");
+            if status["resources"] == 0
+                && status["startup_and_pre_attach"] == 0
+                && status["retirement_acks"] == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("last ACK followed by public proof and custody settlement");
     router
         .shutdown_nexus()
         .await

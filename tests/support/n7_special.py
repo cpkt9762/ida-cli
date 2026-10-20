@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -59,6 +58,7 @@ def close(client):
     result = client.mcp('close_idb', {'close_token':client.opened['close_token']})
     assert 'result' in result, result
     client.opened = None
+    client.wait_closed_owner()
 
 
 def cache_case(env, binary, case):

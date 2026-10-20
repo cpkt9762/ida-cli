@@ -39,6 +39,15 @@ class HelperCustody(unittest.TestCase):
                 rows.append({'pid':child.pid, 'forced':True, 'exit':code})
             else:
                 rows.append({'pid':child.pid, 'forced':False, 'exit':code})
+            bound = getattr(child, '_fixture_endpoint', None)
+            if bound is not None:
+                endpoint, inode = bound
+                try:
+                    current = endpoint.lstat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISSOCK(current.st_mode) and (current.st_dev, current.st_ino) == inode:
+                    endpoint.unlink()  # Actual wait above ended this exact creator.
         (self.root / 'audit.json').write_text(json.dumps(rows))
         self.assertFalse(any(row['forced'] for row in rows), 'helper must naturally finish after custody')
 

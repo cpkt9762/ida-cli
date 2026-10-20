@@ -83,7 +83,7 @@ class Environment:
         self.ledger = self.root / "processes.jsonl"
         self.intents = self.root / "process-intents"
         self.children = []
-        self.test_telemetry = {name: os.environ[name] for name in ('R2_LEDGER', 'R2_TELEMETRY_SOURCE')
+        self.test_telemetry = {name: os.environ[name] for name in ('R2_LEDGER', 'R2_TELEMETRY_SOURCE', 'R2_CASE_ROOT', 'R2_RUN_ROOT')
                                if name in os.environ}
 
     def client_patch_status(self):

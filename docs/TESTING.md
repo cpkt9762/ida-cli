@@ -32,6 +32,11 @@ N6 的完整工具与能力覆盖见 [能力对照表](plan/nexus-n6-capabilitie
 不能代替改动后的验证。正式结果、每条命令的 exit/uptime、失败历史与审计保存在外部
 `/tmp/ida-nexus-run-20261015.98rmfb/n6/report.md`。
 
+N6 验证器串行执行四个 `--exact` 子入口，每个仍用 `timeout 180s`，并逐条记录
+argv、uptime 和退出码；要求四条 `1 passed / 0 failed / 0 ignored` 以及原四个 PASS
+场景全部齐全。外层可用 `timeout 740s` 仅聚合这四个有界终态，不能把内层 124 计为通过。
+冷构建须事先完成；其他四套 E2E 的单套件上限不变。
+
 `--suite n6` 必须指定固定 N0 `--baseline`，检查 E04-N6、E20、N6-tools、E20-cancel
 四个实际 PASS 场景。E04-N6 包含 73 项方法/写后读回对照（57 个方法）、x86 汇编成功/读回两项，
 另有 N6-F1 的 18 项缺失元数据/地址边界/无栈帧严格对照；
@@ -1599,3 +1604,10 @@ replacement. Actual wait, emergency waitpid and cached status after Tokio kill
 are collected separately from public database lifetime. Evidence and remaining
 physical boot/remount and independent-review gates are in `r4-fix2/`; these tests
 do not accept R4 or start R6.
+
+R7a-fix1 的 close 文本保持单个 legacy `content` 项。MCP stdio/HTTP 的生命周期字段为
+`_meta.nexus.lifecycle`；CLI 成功为 `result.lifecycle`，错误为 `error.data.lifecycle`。
+`close` ACK 与 owner 保存/退出仍分开；文件读取和 GC 夹具显式等待公开 owner proof、
+producer/consumer 及 retirement ACK 结清。固定 N0 输出归一化和相等规则不变。
+helper 默认预留 512 个 watch（每 parent 四个），live bytes 按每 slot 32KiB 有界计费，
+mutable registry 另留四倍收尾空间；单份 immutable proof 与 IPC frame 保留原上限。

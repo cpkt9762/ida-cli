@@ -234,7 +234,7 @@ def baseline_prebuilt_open(env, baseline, sample, label, *, native=False):
                 assert 'result' in row['open_response'], row
                 response = client.rpc('get_database_info')
             else:
-                client = Candidate(env, baseline, sample, f'{label}-{attempt}', transport='stdio', inline='8000000')
+                client = Candidate(env, baseline, sample, f'{label}-{attempt}', transport='stdio', inline='8000000', legacy=True)
                 row['open_response'] = client.open_result
                 response = client.call('get_database_info', {})
             row['metadata_response'] = response

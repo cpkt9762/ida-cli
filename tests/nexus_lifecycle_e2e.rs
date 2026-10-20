@@ -81,7 +81,10 @@ async fn e02_readiness_dependencies_versions_and_runtime() {
         .err()
         .expect("wrong version rejected")
         .to_string();
-    assert!(error.contains("0.13.3"), "{error}");
+    assert!(
+        error.contains("0.13.3") && error.contains("0.13.4") && error.contains("0.5.1"),
+        "{error}"
+    );
     let fake = root().join("unsupported/Contents/MacOS");
     std::fs::create_dir_all(&fake).unwrap();
     std::fs::write(fake.parent().unwrap().join("Info.plist"), b"<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>CFBundleShortVersionString</key><string>9.3</string></dict></plist>").unwrap();
@@ -223,8 +226,24 @@ async fn e06_client_killed_shared_owner_survives_and_last_release_saves() {
     )
     .await;
     assert_eq!(external.opened["instance_id"], lease.instance_id.as_str());
+    #[cfg(feature = "nexus-test-support")]
+    let pid = external.child.id().expect("owned external client PID");
     external.child.kill().await.unwrap();
-    external.child.wait().await.unwrap();
+    let status = external
+        .child
+        .wait()
+        .await
+        .expect("actual killed external status");
+    #[cfg(feature = "nexus-test-support")]
+    ida_mcp::router::nexus_bridge::test_record_child_exit(
+        pid,
+        &status,
+        "E06.Child.wait.cached_after_kill",
+    );
+    assert!(
+        !status.success(),
+        "controlled client kill must have a native terminal"
+    );
     let address = rename(&mut a, &lease, "N3_SURVIVES_CLIENT_KILL").await;
     assert_eq!(
         name(&mut a, &lease, address).await,
@@ -264,8 +283,37 @@ async fn e06_bridge_killed_external_lease_survives() {
         external.call(json!({"command":"close"})).await["event"],
         "external_closed"
     );
-    external.child.wait().await.unwrap();
+    #[cfg(feature = "nexus-test-support")]
+    let pid = external
+        .child
+        .id()
+        .expect("owned closing external client PID");
+    let status = external
+        .child
+        .wait()
+        .await
+        .expect("actual external close status");
+    #[cfg(feature = "nexus-test-support")]
+    ida_mcp::router::nexus_bridge::test_record_child_exit(
+        pid,
+        &status,
+        "E06.Child.wait.external_close",
+    );
+    assert!(status.success(), "external close must exit successfully");
     owner_exited(opened["pid"].as_u64().unwrap() as u32).await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while a.bridge.lifecycle_status()["resources"] != 0
+            || a.bridge.lifecycle_status()["startup_and_pre_attach"] != 0
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("dead bridge's public proof and producer closures");
+    a.bridge
+        .shutdown()
+        .await
+        .expect("finish exact dead bridge helper after public proof");
     let mut b = Client::new().await;
     let (lease, _) = b.open(&source, json!({})).await;
     let info = b.value(&lease, "database_info", json!({})).await;

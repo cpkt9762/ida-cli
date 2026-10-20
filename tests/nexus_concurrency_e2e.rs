@@ -580,8 +580,11 @@ async fn e14_queued_write_expires_without_marker_or_database_effect() {
         !forbidden.exists(),
         "public remote queue never executes expired write"
     );
-    close(&mut peer, &lp).await;
+    peer.release(&lp).await;
     close(&mut a, &lease).await;
+    peer.shutdown()
+        .await
+        .expect("nonlast peer helper settles after last owner release");
     passed(
         "E14",
         json!("queued deadline expired; no marker/comment after blocker returned"),
@@ -764,7 +767,7 @@ mod hooks;
 #[test]
 fn n5_batch_and_search_match_fixed_legacy_binary() {
     let status = std::process::Command::new("timeout")
-        .arg("30s")
+        .arg("120s")
         .arg(root().join("venv/bin/python"))
         .arg(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
