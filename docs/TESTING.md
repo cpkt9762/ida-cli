@@ -1611,3 +1611,42 @@ R7a-fix1 的 close 文本保持单个 legacy `content` 项。MCP stdio/HTTP 的�
 producer/consumer 及 retirement ACK 结清。固定 N0 输出归一化和相等规则不变。
 helper 默认预留 512 个 watch（每 parent 四个），live bytes 按每 slot 32KiB 有界计费，
 mutable registry 另留四倍收尾空间；单份 immutable proof 与 IPC frame 保留原上限。
+
+## Nexus E23 dedicated GUI
+
+`scripts/verify_nexus_gui.py` runs one macOS Qt GUI on a newly prepared private
+sample/IDB, HOME, IDAUSR and Nexus state. Build the explicit candidate with
+`nexus-test-support` for existing native spawn/socket telemetry. It loads the
+prepared upstream `ida_nexus_plugin.py`, uses GUI timer events independently of
+Nexus, and exercises MCP open/close plus real flat CLI read/write calls. Require
+one unchanged GUI record/PID/birth, both comment directions, nonlast detach ACK,
+GUI responsiveness afterwards and identical IDB component hashes/inodes/mtime.
+Only after these assertions does cleanup TERM/KILL the exact dedicated GUI
+PID/birth, then wait for public owner proof and helper retirement. This does not
+claim that GUI menu exit or upstream `qexit` is qualified.
+
+```sh
+uptime
+timeout 180s env IDA_TEST=1 "$E23_ROOT/venv/bin/python" -B scripts/verify_nexus_gui.py \
+  --root "$E23_ROOT" --binary "$CARGO_TARGET_DIR/debug/ida-cli"
+timeout 30s python3 -B scripts/verify_nexus_gui.py --root "$E23_ROOT" --cleanup
+uptime
+```
+
+Use a fresh physical `/private/tmp` prepared root for each run; do not reuse a
+venv or process ledger. The result is exactly one `E23` PASS/FAIL/BLOCKED in
+`e23-result.json`, with before/after uptime, binary/source identities, public
+owner records, visibility/release witnesses and cleanup; control-capable close
+tokens and Nexus authentication fields are never serialized. `native-processes.jsonl`
+and `processes.jsonl` retain precise births; Python bind telemetry journals exact
+socket inodes before interruption cleanup. A refused reused environment never
+signals its existing processes. Run `test_nexus_gui_driver.py` for owner ambiguity,
+scene replacement, incomplete creation evidence and reused-root refusal.
+
+Missing GUI/authorization readiness is BLOCKED, never a skip. Inspect only this
+instance's `gui/gui.log` and `gui/ida.log`; if IDA requests new terms or licensing,
+stop and have the user prepare that private profile legally, then use a fresh
+prepared root. The driver does not accept terms, copy licenses, patch installed
+IDA, use the user's daemon, or close other GUI instances. Always run the cleanup
+command after an interrupted outer timeout; unresolved creation identities remain
+a failure requiring inspection, never guessed process-name cleanup.
