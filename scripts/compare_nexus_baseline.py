@@ -571,10 +571,6 @@ def streams(env,binary):
             assert time.monotonic()<deadline,status
             time.sleep(.02)
         assert client.call("list_functions",{})["result"]["total"]==2
-        # Isolate the RPC allowance boundary from variable cold-open setup.
-        # The exact one-second request must reach an already admitted lease.
-        retained = client.direct('prewarm', {'keep_warm':True})
-        assert retained['result']['kept_warm'] is True, retained
         not_sent_marker = env.root/'e17-cli-not-sent'
         not_sent = client.direct('run_script', {'code':f"from pathlib import Path; Path({str(not_sent_marker)!r}).touch()", 'timeout_secs':1})
         assert not_sent.get('exit') == 1 and not not_sent_marker.exists(), not_sent

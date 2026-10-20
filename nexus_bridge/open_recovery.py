@@ -507,7 +507,7 @@ def open_checked(Handle, Options, path, options, deadline, guarded_source, conte
                     proof = {'initial': False, 'evidence_error': type(diagnostic).__name__}
                 if proof.get('close_safe') is not True:
                     raise RuntimeError('save protection unavailable; owner and exact lease retained; '
-                                       'no default close') from exc
+                                       'no default close; original failure: '+type(exc).__name__+': '+str(exc)) from exc
                 retryable = proof['initial'] and handle.instance.backend == 'idalib'
                 if retryable:
                     logging.getLogger('ida_cli.open').warning('Root Node initial-open failure: %s',

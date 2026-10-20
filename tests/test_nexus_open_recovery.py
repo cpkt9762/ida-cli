@@ -134,6 +134,23 @@ class OpenTests(unittest.TestCase):
         self.assertEqual(self.calls, ['open', 'guard'])
         self.assertEqual(self.wait_calls, 0)
 
+    def test_failed_protection_query_keeps_original_notsent_cause_and_lease(self):
+        def open_without_guard(*args, **kwargs):
+            handle = self.open(*args, **kwargs)
+            def execute(*_args, **_kwargs):
+                raise TimeoutError('internal RPC not sent: insufficient HTTP allowance')
+            handle.execute_python = execute
+            return handle
+        self.Handle.open = open_without_guard
+        with patch.object(recovery, 'failure_state', side_effect=TimeoutError('protection query has no allowance')):
+            with self.assertRaisesRegex(RuntimeError, 'internal RPC not sent: insufficient HTTP allowance') as caught:
+                self.run_open()
+        self.assertIsInstance(caught.exception.__cause__, TimeoutError)
+        self.assertIn('exact lease retained; no default close', str(caught.exception))
+        self.assertEqual(self.calls, ['open'], 'no retry or default close without fresh protection')
+        self.assertEqual(self.released, [])
+        self.assertEqual(self.target.read_bytes(), b'original packed')
+
     def test_normal_does_not_snapshot_or_reopen(self):
         with patch.object(recovery, 'Snapshot', side_effect=AssertionError('unexpected snapshot')):
             self.assertEqual(self.run_open()[2], 1)
