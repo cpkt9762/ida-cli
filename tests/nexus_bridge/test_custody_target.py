@@ -260,3 +260,31 @@ except BlockingIOError:
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class VerificationSnapshot(unittest.TestCase):
+    def test_atomic_replacement_is_retried_but_mutating_a_record_never_passes(self):
+        from unittest.mock import patch
+        import tempfile
+        import target_journal
+        from target_coordination import Directory
+        root = Path(tempfile.mkdtemp(dir=os.environ['R3A_CASE_ROOT'], prefix='verify-snapshot-'))
+        from contextlib import closing
+        with closing(Directory(root)) as directory:
+            directory.durable('custody.json', {'revision':1})
+            original = os.stat
+            replaced = []
+            def stat(name, *args, **kwargs):
+                if name == 'custody.json' and kwargs.get('dir_fd') == directory.fd and not replaced:
+                    replaced.append(True)
+                    temporary = root/'next'
+                    temporary.write_text('{"revision":2}')
+                    temporary.chmod(0o600)
+                    temporary.replace(root/'custody.json')
+                return original(name,*args,**kwargs)
+            with patch('target_coordination.os.stat', side_effect=stat):
+                self.assertEqual(target_journal.verification_snapshot(directory)[0], {'revision':2})
+            with patch.object(directory,'read',side_effect=RuntimeError('CoordinationBlocked: record changed during read')) as read:
+                with self.assertRaisesRegex(RuntimeError,'record changed during read'):
+                    target_journal.verification_snapshot(directory)
+                self.assertEqual(read.call_count,8,'verification has a fixed retry bound')

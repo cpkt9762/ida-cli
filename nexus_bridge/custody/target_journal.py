@@ -1339,13 +1339,25 @@ def verification_probe_cleanup(target, state_root, parent):
     return receipt
 
 
+def verification_snapshot(directory):
+    # The SDK callback still owns target EX; this verifier must remain read-only.
+    # Atomic publisher replacement is retried with all FD/path checks intact.
+    for attempt in range(8):
+        try:
+            return directory.read('custody.json')
+        except RuntimeError as error:
+            if str(error) != 'CoordinationBlocked: record changed during read' or attempt == 7:
+                raise
+
+
+
 def main():
     value = json.loads(sys.stdin.buffer.readline(1024*1024+1))
     with Target(value['target']) as target:
         if target.key != value['coord_key']:
             raise RuntimeError('CoordinationBlocked: target writer identity mismatch')
         if value['action'] in ('verify_adopt', 'verify_launch', 'verify_observe'):
-            journal, _, _ = target.directory.read('custody.json')
+            journal, _, _ = verification_snapshot(target.directory)
             record = value['receipt']['record']
             item = journal['entries'].get(str(record['subscription_epoch']))
             if (journal.get('schema') != 1 or journal['coord_key'] != target.key or not item
