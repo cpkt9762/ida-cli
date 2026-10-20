@@ -21,6 +21,9 @@ use tracing::{info, warn};
 
 pub type DbHandle = String;
 pub type ReqId = String;
+type CliPathGates = std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<Mutex<()>>>>;
+#[cfg(test)]
+type CliOpenPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
@@ -314,7 +317,9 @@ pub struct RouterState {
     nexus_bridge: Arc<tokio::sync::OnceCell<Arc<nexus_bridge::NexusBridge>>>,
     nexus_tools: Arc<nexus_tools::Tools>,
     warm_pool: Arc<Mutex<HashMap<PathBuf, WarmLease>>>,
-    cli_open_gate: Arc<Mutex<()>>,
+    cli_open_gate: Arc<CliPathGates>,
+    #[cfg(test)]
+    cli_open_pause: Arc<Mutex<HashMap<PathBuf, CliOpenPause>>>,
     prewarm_queue: Arc<Mutex<PrewarmQueueState>>,
     route_queue: Arc<Mutex<RouteQueueState>>,
     task_registry: TaskRegistry,
@@ -389,7 +394,9 @@ impl RouterState {
             nexus_bridge: Arc::new(tokio::sync::OnceCell::new()),
             nexus_tools: Arc::new(nexus_tools::Tools::new(config.max_pending_per_tenant)?),
             warm_pool: Arc::new(Mutex::new(HashMap::new())),
-            cli_open_gate: Arc::new(Mutex::new(())),
+            cli_open_gate: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            cli_open_pause: Arc::new(Mutex::new(HashMap::new())),
             prewarm_queue: Arc::new(Mutex::new(PrewarmQueueState::default())),
             route_queue: Arc::new(Mutex::new(RouteQueueState::default())),
             task_registry: TaskRegistry::new(),
@@ -916,7 +923,24 @@ impl RouterState {
                 "Nexus N4 custom outputs and tenant overrides are not implemented".into(),
             ));
         }
+        #[cfg(test)]
+        let pause = self.cli_open_pause.lock().await.get(std::path::Path::new(path)).cloned();
+        #[cfg(test)]
+        if let Some((entered, resume)) = pause {
+            entered.notify_one();
+            resume.notified().await;
+        }
         return self.nexus_tools.open(self, path, preparation).await;
+    }
+
+    fn cli_path_gate(&self, path: &std::path::Path) -> Arc<Mutex<()>> {
+        let mut paths = self.cli_open_gate.lock().unwrap_or_else(|error| error.into_inner());
+        paths.retain(|_, gate| gate.strong_count() > 0);
+        paths.entry(path.to_path_buf()).or_default().upgrade().unwrap_or_else(|| {
+            let gate = Arc::new(Mutex::new(()));
+            paths.insert(path.to_path_buf(), Arc::downgrade(&gate));
+            gate
+        })
     }
 
     /// CLI path requests share a bounded daemon-owned warm reference. MCP
@@ -944,8 +968,9 @@ impl RouterState {
                 },
             ))
             .await??;
+        let path_gate = self.cli_path_gate(&canonical);
         let _opening = preparation
-            .wait(async { Ok(self.cli_open_gate.lock().await) })
+            .wait(async { Ok(path_gate.lock().await) })
             .await?;
         let existing = self.warm_pool.lock().await.get(&canonical).cloned();
         if let Some(existing) = existing {
@@ -2155,3 +2180,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../../tests/support/n4_router.rs"]
 pub(crate) mod n4_fix_regressions;
+
+#[cfg(all(test, feature = "nexus-test-support"))]
+#[path = "../../tests/support/cli_warm.rs"]
+mod cli_warm_regressions;
