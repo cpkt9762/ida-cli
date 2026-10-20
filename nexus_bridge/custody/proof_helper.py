@@ -87,6 +87,7 @@ class Observer:
         self.seq = 0
         self.last_router = clock()
         self.exit_blocked = None
+        self.orphan_exit = None
         self.finishing = False
         self.identity = capture(os.getpid())
         self.storage = storage
@@ -107,6 +108,8 @@ class Observer:
                         or not isinstance(saved.get('items'), dict) or len(saved['items']) > capacity):
                     raise RuntimeError('ObservationRecoveryBlocked: helper registry identity/schema')
                 self.seq, self.items = saved['seq'], saved['items']
+                self.exit_blocked = saved.get("exit_blocked")
+                self.orphan_exit = saved.get("orphan_exit")
                 self.finishing = saved.get('finishing', False)
                 if type(self.finishing) is not bool or (self.finishing and (self.items or saved.get('parents'))):
                     raise RuntimeError('ObservationRecoveryBlocked: invalid finish tombstone')
@@ -140,6 +143,7 @@ class Observer:
             value = {'schema':1, 'helper':self.incarnation,
                      'state_root':self.state, 'capacity':self.capacity, 'seq':self.seq,
                      'parents':self.parents, 'finishing':self.finishing,
+                     'exit_blocked':self.exit_blocked, 'orphan_exit':self.orphan_exit,
                      'items':{k:self.public_item(v) for k,v in self.items.items()}}
             # A failed write can only resume the exact snapshot that reserved it.
             # Finish that slot before writing a newer view; never discard .new.
@@ -319,7 +323,8 @@ class Observer:
                           'live_ref_limit_bytes':self.live_ref_limit_bytes,
                           'reserved':sum(p['budget'] for p in self.parents.values()), 'parent_count':len(self.parents),
                           'exit_blocked':self.exit_blocked, 'recovered':self.recovered,
-                          'orphan_after_seconds':300, 'orphan_action':'durable_abandoned_only',
+                          'orphan_after_seconds':300, 'orphan_action':'retain_obligations_and_exit',
+                          'orphan_exit':self.orphan_exit,
                           'same_boot_eligibility':False}
                 if not value.get('summary_only'):
                     result['items'] = [self.public_item(item) for item in self.items.values()]
@@ -643,16 +648,32 @@ class Observer:
         with self.lock:
             if self.clock() - self.last_router < 300:
                 return False
+            status = 'published'
             try:
                 for item in self.items.values():
                     if not item.get('proof') and not item.get('abandoned'):
                         item['abandoned'] = self.publish(item, 'ObservationAbandoned',
                             cause='router disconnected', last_observation=item.get('observation_error'))
+            except Exception as exc:
+                status = 'publication_failed'
+                self.exit_blocked = type(exc).__name__ + ': ' + str(exc)
+            # Abandonment is diagnostic, never proof or permission to drop a
+            # watch. Keep every item/reservation/pending fact for exact recovery.
+            self.orphan_exit = {'status': status, 'retained_watches': list(self.items),
+                'recovery': 'restore target storage and reconnect the exact helper incarnation',
+                'released': False}
+            try:
                 self.persist()
-                return True
             except Exception as exc:
                 self.exit_blocked = type(exc).__name__ + ': ' + str(exc)
-                return False
+                # Even unavailable registry storage cannot hold a process and
+                # listening socket forever. Earlier committed custody is kept.
+                import logging
+                logging.getLogger(__name__).exception('ObservationRecoveryBlocked: orphan exit registry unavailable; committed obligations retained')
+            if self.exit_blocked:
+                import logging
+                logging.getLogger(__name__).error('ObservationRecoveryBlocked: orphan exiting with retained obligations: %s', self.exit_blocked)
+            return True
 
     def discover_startups(self):
         """Public discovery is additive; absence never retires a launch."""

@@ -571,7 +571,7 @@ with Target(sys.argv[1]) as target:
             request(endpoint, self.identity, {'kind':'finish'})
 
 
-    def test_orphan_write_failure_retains_responsibility_and_prevents_exit(self):
+    def test_orphan_write_failure_retains_responsibility_and_exits_with_recovery_diagnostic(self):
         from unittest.mock import patch
         target_path = self.root/'orphan.i64'
         target_path.write_bytes(b'private input')
@@ -579,7 +579,10 @@ with Target(sys.argv[1]) as target:
             with target.locked():
                 coord = target.key
         clock = [0.0]
-        observer = Observer(self.identity, 8, clock=lambda:clock[0])
+        from target_coordination import Directory
+        storage = Directory(self.root)
+        self.addCleanup(storage.close)
+        observer = Observer(self.identity, 8, clock=lambda:clock[0], storage=storage)
         def call(kind, **fields):
             return observer.receive(dict(kind=kind, protocol=2, helper=self.identity, **fields))
         call('reserve_parent', parent='orphan')
@@ -588,13 +591,56 @@ with Target(sys.argv[1]) as target:
              launch={'suffix':'no-public-owner','target':str(target_path),'backend':'idalib'})
         clock[0] = 300
         with patch.object(observer, 'publish', side_effect=OSError('injected durable storage failure')):
-            self.assertFalse(observer.orphan_done())
+            self.assertTrue(observer.orphan_done(), 'failed target publication cannot keep an orphan process forever')
+        saved = storage.read('helper-state.json')[0]
+        self.assertEqual(saved['orphan_exit']['status'], 'publication_failed')
+        self.assertIn('durable storage failure', saved['exit_blocked'])
+        self.assertIn('startup', saved['items'])
+        self.assertFalse(saved['finishing'], 'orphan exit is not a release/finish tombstone')
         self.assertIn('startup', observer.items)
         self.assertNotIn('proof', observer.items['startup'])
         self.assertNotIn('abandoned', observer.items['startup'])
         self.assertIn('durable storage failure', observer.exit_blocked)
         self.assertTrue(observer.orphan_done())
         self.assertEqual(observer.items['startup']['abandoned']['record']['kind'], 'ObservationAbandoned')
+
+    def test_orphan_parent_exit_removes_exact_socket_on_publish_success_and_failure(self):
+        import shutil
+        from process_identity import identity, same_process
+        for failure in (False, True):
+            with self.subTest(publication_failure=failure):
+                case = self.root / str(failure)
+                case.mkdir(mode=0o700)
+                parent = subprocess.Popen([sys.executable, '-B', str(REPO / 'tests/support/helper_orphan_parent.py'), str(case)])
+                self.children.append(parent)
+                deadline = time.monotonic()+5
+                while not (case/'ready.json').exists():
+                    self.assertIsNone(parent.poll())
+                    self.assertLess(time.monotonic(),deadline)
+                    time.sleep(.002)
+                born = json.loads((case/'ready.json').read_text())
+                try:
+                    (case/'parent-exit').touch()
+                    self.assertEqual(parent.wait(timeout=3),0)
+                    if failure:
+                        shutil.rmtree(case/'target')
+                    (case/'clock').write_bytes((301).to_bytes(8,'big'))
+                    while same_process(identity(born['pid']),born['identity']):
+                        self.assertLess(time.monotonic(),deadline,'orphan must exit despite failed publication')
+                        time.sleep(.002)
+                    self.assertFalse((case/'helper/h').exists())
+                    saved = json.loads((case/'helper/helper-state.json').read_text())
+                    self.assertFalse(saved['finishing'])
+                    self.assertIn('pending',saved['items'])
+                    self.assertNotIn('proof',saved['items']['pending'])
+                    self.assertEqual(saved['orphan_exit']['status'],'publication_failed' if failure else 'published')
+                    self.assertEqual('abandoned' in saved['items']['pending'],not failure)
+                    if failure:
+                        self.assertIn('ObservationRecoveryBlocked', (case/'helper.log').read_text())
+                finally:
+                    if same_process(identity(born['pid']),born['identity']):
+                        import signal
+                        os.kill(born['pid'],signal.SIGTERM)  # Exact recorded test birth only; assertion remains failed.
 
     def test_missing_original_source_after_restart_is_blocked_without_fake_proof(self):
         with Boundary(self.root/'owner') as boundary:
