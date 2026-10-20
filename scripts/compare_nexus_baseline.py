@@ -260,6 +260,12 @@ class Candidate:
             assert "result" in result, result
             self.opened = None
         if not self.legacy:
+            # CLI queries keep their own daemon warm lease. Release that exact
+            # path explicitly before asserting all local custody is settled.
+            status = self.control('status')
+            for warm in status['warm_pool']:
+                if Path(warm['path']).resolve() == self.sample.resolve():
+                    assert self.control('close', {'path':warm['path']})['ok'] is True
             deadline = time.monotonic()+20
             observations = []
             while True:

@@ -167,6 +167,8 @@ class Product:
         return wait_for(settled)
 
     def stop(self):
+        for warm in self.call('status')['warm_pool']:
+            assert self.call('--path', warm['path'], 'close')['ok'] is True
         self.settle()
         result = self.call('shutdown')
         assert result['ok'] is True, result
