@@ -408,7 +408,7 @@ fn prepare_impl_inner(
             // Nexus inspects a packed copy with autoanalysis disabled first.
             let directory = cache.join(format!(
                 ".nexus-verify-{}",
-                blake3::hash(idb.as_os_str().as_encoded_bytes()).to_hex()
+                blake3::hash(idb.canonicalize()?.as_os_str().as_encoded_bytes()).to_hex()
             ));
             match std::fs::create_dir(&directory) {
                 Ok(()) => {
@@ -588,11 +588,17 @@ mod f1_regressions {
         let short = blake3::hash(b"test input").to_hex()[..12].to_string();
         let idb = cache.join(format!("raw.{short}.dylib.i64"));
         std::fs::write(&idb, b"synthetic packed IDB").expect("private packed boundary");
+        let alias = root.join("cache-alias");
+        std::os::unix::fs::symlink(&cache, &alias).expect("private cache alias");
         let mut identities = std::collections::BTreeSet::new();
-        for _ in 0..16 {
+        for n in 0..16 {
             let mut prepared = prepare_impl(
                 input.clone(),
-                cache.clone(),
+                if n % 2 == 0 {
+                    cache.clone()
+                } else {
+                    alias.clone()
+                },
                 &Preparation::new(Duration::from_secs(10)),
                 true,
             )
