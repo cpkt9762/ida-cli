@@ -1558,6 +1558,12 @@ impl RouterState {
     pub async fn shutdown_nexus(&self) -> Result<(), crate::error::ToolError> {
         self.nexus_tools.shutdown(self).await
     }
+    pub async fn cleanup_probe(&self) -> anyhow::Result<()> {
+        if let Some(bridge) = self.nexus_bridge.get() {
+            bridge.cleanup_probe().await?;
+        }
+        Ok(())
+    }
     pub async fn refresh_nexus_cache(
         &self,
         path: &str,

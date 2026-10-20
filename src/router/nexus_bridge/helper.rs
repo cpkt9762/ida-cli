@@ -298,6 +298,10 @@ impl Helper {
     }
 
     fn finish_accepted(&self) -> anyhow::Result<bool> {
+        Ok(self.finish_record()?.is_some())
+    }
+
+    pub(super) fn finish_record(&self) -> anyhow::Result<Option<std::fs::Metadata>> {
         use std::io::Read;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
         let path = self.endpoint.with_file_name("helper-state.json");
@@ -307,7 +311,7 @@ impl Helper {
             .open(&path)
         {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         #[cfg(all(test, feature = "nexus-test-support"))]
@@ -350,14 +354,14 @@ impl Helper {
             "ObservationRecoveryBlocked: helper finish identity mismatch"
         );
         if saved["finishing"] != true {
-            return Ok(false);
+            return Ok(None);
         }
         anyhow::ensure!(
             saved["items"].as_object().is_some_and(|m| m.is_empty())
                 && saved["parents"].as_object().is_some_and(|m| m.is_empty()),
             "ObservationRecoveryBlocked: finish still has responsibility"
         );
-        Ok(true)
+        Ok(Some(current))
     }
 
     async fn reconnect(&self) -> anyhow::Result<()> {

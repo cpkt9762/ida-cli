@@ -219,6 +219,13 @@ const SOURCES: &[(&str, &[u8])] = &[
     ),
 ];
 
+pub(super) fn members() -> impl Iterator<Item = &'static str> {
+    SOURCES
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(std::iter::once("manifest.json"))
+}
+
 pub(super) fn create(directory: &Path) -> anyhow::Result<()> {
     std::fs::create_dir(directory)?;
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;

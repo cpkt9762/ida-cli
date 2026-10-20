@@ -640,6 +640,7 @@ fn run_probe_runtime() -> anyhow::Result<()> {
             &serde_json::json!({"backend":"nexus","supported":true,"metadata":status.metadata}),
         )?;
         router.shutdown_nexus().await?;
+        router.cleanup_probe().await?;
         println!("{result}");
         Ok(())
     })

@@ -6,6 +6,7 @@ mod file_jobs;
 pub mod generations;
 mod helper;
 pub(crate) mod installation;
+mod owned_files;
 pub mod protocol;
 mod receiver;
 pub mod recovery_guard;
@@ -301,6 +302,8 @@ pub struct NexusBridge {
     directory: PathBuf,
     prepared_python: PathBuf,
     installation: PathBuf,
+    owned_files: Mutex<Option<owned_files::OwnedFiles>>,
+    probe_cleanup_ready: std::sync::atomic::AtomicBool,
     pub pid: u32,
 }
 // F2/P2-b: acquired before bind/spawn, retained across every startup await.
@@ -528,8 +531,10 @@ impl NexusBridge {
         );
         std::fs::create_dir(&config.directory)?;
         std::fs::set_permissions(&config.directory, std::fs::Permissions::from_mode(0o700))?;
+        let mut owned_files = owned_files::OwnedFiles::created(&config.directory)?;
         let installation_path = config.directory.join("installation");
         installation::create(&installation_path)?;
+        owned_files.record_installation()?;
         config.environment.insert(
             "IDA_CLI_BRIDGE_INSTALLATION".into(),
             installation_path.to_string_lossy().into_owned(),
@@ -550,9 +555,12 @@ impl NexusBridge {
         let business_path = config.directory.join("b");
         let control_path = config.directory.join("c");
         let business = UnixListener::bind(&business_path)?;
+        owned_files.record_socket("b")?;
         let control = UnixListener::bind(&control_path)?;
+        owned_files.record_socket("c")?;
         let capacity = router.config.max_pending_per_tenant;
         let log = std::fs::File::create(config.directory.join("stderr.log"))?;
+        owned_files.record(std::path::Path::new("stderr.log"), false)?;
         let production = config
             .script
             .file_name()
@@ -776,6 +784,11 @@ impl NexusBridge {
                 });
             }
         });
+        owned_files.record_socket("l")?;
+        if state.helper.is_some() {
+            owned_files.record(std::path::Path::new("helper.log"), false)?;
+            owned_files.record_socket("h")?;
+        }
         owner.directory = None; // ownership transfers to the live bridge only now.
         Ok(Self {
             state,
@@ -785,6 +798,8 @@ impl NexusBridge {
             directory: config.directory,
             prepared_python: config.python,
             installation: installation_path.canonicalize()?,
+            owned_files: Mutex::new(Some(owned_files)),
+            probe_cleanup_ready: std::sync::atomic::AtomicBool::new(false),
             pid,
         })
     }
@@ -900,7 +915,7 @@ impl NexusBridge {
                 );
             }
         }
-        remove_lifetime_socket(&self.directory)?;
+        let socket_cleanup = self.remove_recorded_socket("l");
         self.state.fail("bridge stopped");
         if let Some(helper) = &self.state.helper {
             // Never force-stop an observer with outstanding responsibility.
@@ -910,7 +925,55 @@ impl NexusBridge {
         // responsibility. Stop the local poller only after that acceptance;
         // a refused finish must keep recovery/observation running.
         self.state.observer_stop.cancel();
+        self.probe_cleanup_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        socket_cleanup?;
         Ok(())
+    }
+
+    fn remove_recorded_socket(&self, name: &str) -> anyhow::Result<()> {
+        let owned = self
+            .owned_files
+            .lock()
+            .map_err(|_| anyhow::anyhow!("bridge creation records poisoned"))?;
+        if let Some(owned) = &*owned {
+            owned.remove_socket(name)?;
+        }
+        Ok(())
+    }
+
+    /// Only a readiness probe with no acquisition history may discard its
+    /// temporary installation. Ordinary sessions retain all durable evidence.
+    pub(crate) async fn cleanup_probe(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.probe_cleanup_ready
+                .load(std::sync::atomic::Ordering::Acquire),
+            "probe cleanup requires confirmed bridge/helper shutdown"
+        );
+        anyhow::ensure!(
+            self.state
+                .endpoint
+                .transition(|s, _| s.retention_status())
+                .total_used
+                == 0,
+            "probe cleanup refused: acquisition history retained"
+        );
+        let mut owned = self
+            .owned_files
+            .lock()
+            .map_err(|_| anyhow::anyhow!("bridge creation records poisoned"))?
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("probe creation records already consumed"))?;
+        if let Some(helper) = &self.state.helper {
+            // Finish atomically creates the final registry inode. Its durable
+            // creator/incarnation and empty obligations must be verified before
+            // that last creation is registered for disposable probe cleanup.
+            let created = helper
+                .finish_record()?
+                .ok_or_else(|| anyhow::anyhow!("probe helper finish not durably confirmed"))?;
+            owned.record_validated(std::path::Path::new("helper-state.json"), &created)?;
+        }
+        owned.cleanup()
     }
     /// Test supervisor may terminate this exact child; no process-name scans.
     pub async fn terminate(&self) -> anyhow::Result<()> {
@@ -925,14 +988,9 @@ impl NexusBridge {
 impl Drop for NexusBridge {
     fn drop(&mut self) {
         self.state.fail("bridge owner dropped");
-        if let Err(error) = remove_lifetime_socket(&self.directory) {
-            tracing::warn!(%error, "bridge lifetime socket cleanup");
-        }
-        for name in ["b", "c"] {
-            if let Err(error) = std::fs::remove_file(self.directory.join(name)) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(%error, "bridge socket cleanup");
-                }
+        for name in ["b", "c", "l"] {
+            if let Err(error) = self.remove_recorded_socket(name) {
+                tracing::warn!(%error, "bridge socket cleanup retained replacement");
             }
         }
     }
