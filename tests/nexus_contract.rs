@@ -1465,3 +1465,90 @@ fn r3a_custody_does_not_complete_open_and_ready_requires_exact_rpc_facts() {
         "Active uses session lifecycle"
     );
 }
+
+#[test]
+fn rv81_completed_business_operations_outlive_the_pending_default() {
+    let config = ida_mcp::router::RouterConfig::from_env();
+    assert_eq!(config.max_pending_per_tenant, 512);
+    assert_eq!(config.nexus_retention_capacity, 65536);
+    let mut rig = Rig::new();
+    rig.sessions = NexusSessions::with_limits(
+        rig.clock.clone(),
+        Ok(capabilities()),
+        config.max_pending_per_tenant,
+        config.nexus_retention_capacity,
+    );
+    let lease = rig.connect("rv81", "rv81-owner", 1);
+    let mut first = None;
+    for index in 0..513 {
+        let operation = rig.queue(&lease, &format!("rv81-{index}"), "list_functions", 120);
+        rig.dispatch(&operation);
+        rig.sessions
+            .complete(&operation, Completion::Success(json!({"index":index})))
+            .expect("complete actual business operation");
+        rig.sessions
+            .take_operation_result(&lease.client_id, &operation)
+            .expect("consume result without forgetting terminal identity");
+        first.get_or_insert(operation);
+        let usage = rig.sessions.retention_status();
+        assert_eq!(
+            usage.business_used,
+            index + 2,
+            "open plus completed operations"
+        );
+        assert_eq!(usage.total_used, index + 2);
+        assert_eq!(usage.business_capacity, 65536);
+    }
+    let first = first.expect("first completed operation");
+    assert_eq!(rig.snapshot(&first).status, OperationStatus::Succeeded);
+    let duplicate = rig
+        .sessions
+        .queue(
+            &lease.client_id,
+            &lease,
+            accepted(&rig.clock, "rv81-0", "list_functions", json!({})),
+            first.operation_id,
+        )
+        .expect_err("terminal ID must remain reserved for this coordinator lifetime");
+    assert_eq!(duplicate.code, NexusErrorCode::DuplicateIdentity);
+    assert_eq!(rig.backend.executed.len(), 513);
+}
+
+#[test]
+fn rv81_small_retention_is_independent_of_physical_admission() {
+    let mut rig = Rig::new();
+    rig.sessions = NexusSessions::with_limits(rig.clock.clone(), Ok(capabilities()), 1, 3);
+    let lease = rig.connect("rv81-small", "rv81-small-owner", 1);
+    for index in 0..2 {
+        let operation = rig.queue(&lease, &format!("small-{index}"), "list_functions", 120);
+        rig.dispatch(&operation);
+        rig.sessions
+            .complete(&operation, Completion::Success(json!(index)))
+            .expect("complete before testing cumulative retention");
+    }
+    let error = rig
+        .sessions
+        .queue(
+            &lease.client_id,
+            &lease,
+            accepted(&rig.clock, "overflow", "list_functions", json!({})),
+            OperationId::new("overflow").unwrap(),
+        )
+        .expect_err("retention full at 3, no pending work");
+    assert_eq!(error.code, NexusErrorCode::Busy);
+    for text in [
+        "business contract",
+        "3/3",
+        "coordinator lifetime",
+        "restart the daemon/bridge",
+        "IDA_CLI_NEXUS_RETENTION_CAPACITY",
+        "do not replay",
+    ] {
+        assert!(error.message.contains(text), "missing {text}: {error}");
+    }
+    assert_eq!(
+        rig.sessions.retention_status().total_used,
+        3,
+        "refusal retains every ID"
+    );
+}

@@ -21,4 +21,4 @@ pub use custody::{
 pub use deadline::{AcceptedRequest, Clock, Deadline, RemainingBudget, SystemClock};
 pub use error::{NexusError, NexusErrorCode, RetryAdvice};
 pub use model::*;
-pub use session::NexusSessions;
+pub use session::{NexusRetentionStatus, NexusSessions};

@@ -23,6 +23,17 @@ pub(super) struct Opening {
     pub(super) wait_analysis: bool,
 }
 
+/// Lifetime identity retention usage, distinct from pending/physical admission.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NexusRetentionStatus {
+    pub business_used: usize,
+    pub business_capacity: usize,
+    pub internal_used: usize,
+    pub internal_capacity: usize,
+    pub total_used: usize,
+    pub total_capacity: usize,
+}
+
 /// Pure local coordinator. All mutations are serialized by `&mut self`.
 /// Responses must carry the complete identity; a request id alone is inadequate.
 /// Terminal IDs are retained for this coordinator's lifetime; reaching capacity
@@ -32,7 +43,10 @@ pub struct NexusSessions<C> {
     pub(super) internal_operations: HashMap<OperationId, (AcquisitionId, InternalPurpose, u64)>,
     pub(super) clock: C,
     capabilities: Result<NexusCapabilities, NexusError>,
+    // Physical lease/acquisition limit; independent of retained request IDs.
     pub(super) capacity: usize,
+    // Business tombstones; internal and absolute budgets retain the 48/64 ratios.
+    retention_capacity: usize,
     pub(super) sessions: HashMap<LeaseId, SessionSnapshot>,
     pub(super) resource_origins: HashMap<LeaseId, serde_json::Value>,
     pub(super) resource_retirements: HashMap<LeaseId, serde_json::Value>,
@@ -57,12 +71,23 @@ impl<C: Clock> NexusSessions<C> {
         capabilities: Result<NexusCapabilities, NexusError>,
         capacity: usize,
     ) -> Self {
+        Self::with_limits(clock, capabilities, capacity, capacity)
+    }
+
+    /// Physical admission and lifetime identity retention have separate limits.
+    pub fn with_limits(
+        clock: C,
+        capabilities: Result<NexusCapabilities, NexusError>,
+        physical_capacity: usize,
+        retention_capacity: usize,
+    ) -> Self {
         Self {
             custodies: HashMap::new(),
             internal_operations: HashMap::new(),
             clock,
             capabilities,
-            capacity,
+            capacity: physical_capacity,
+            retention_capacity,
             sessions: HashMap::new(),
             resource_origins: HashMap::new(),
             resource_retirements: HashMap::new(),
@@ -86,17 +111,9 @@ impl<C: Clock> NexusSessions<C> {
         Ok(caps)
     }
 
-    pub(super) fn reserve(
-        &mut self,
-        request: &RequestId,
-        operation: &OperationId,
-    ) -> Result<(), NexusError> {
-        if self.requests.contains(request) || self.used_operations.contains(operation) {
-            return Err(NexusError::new(
-                NexusErrorCode::DuplicateIdentity,
-                "request/operation identity cannot be reused",
-            ));
-        }
+    /// Includes terminal IDs; U6 retirement only stops charging the business
+    /// quota. Retired and internal IDs still count toward the absolute limit.
+    pub fn retention_status(&self) -> NexusRetentionStatus {
         let retired_ids = self
             .operations
             .iter()
@@ -118,17 +135,51 @@ impl<C: Clock> NexusSessions<C> {
             )
             .filter(|id| !self.internal_ids.contains(*id))
             .count();
-        if self.used_operations.len() >= self.capacity.saturating_mul(64)
-            || self
+        NexusRetentionStatus {
+            business_used: self
                 .used_operations
                 .len()
                 .saturating_sub(self.internal_ids.len())
-                .saturating_sub(retired_ids)
-                >= self.capacity
-        {
+                .saturating_sub(retired_ids),
+            business_capacity: self.retention_capacity,
+            internal_used: self.internal_ids.len(),
+            internal_capacity: self.retention_capacity.saturating_mul(48),
+            total_used: self.used_operations.len(),
+            total_capacity: self.retention_capacity.saturating_mul(64),
+        }
+    }
+
+    fn retention_full(reason: &str, used: usize, limit: usize) -> NexusError {
+        NexusError::new(
+            NexusErrorCode::Busy,
+            format!("Nexus {reason} retention capacity reached ({used}/{limit}); terminal request/operation IDs are retained for the coordinator lifetime; restart the daemon/bridge to start a new coordinator, or increase IDA_CLI_NEXUS_RETENTION_CAPACITY before restarting; do not replay requests with unknown outcomes"),
+        )
+    }
+
+    pub(super) fn reserve(
+        &mut self,
+        request: &RequestId,
+        operation: &OperationId,
+    ) -> Result<(), NexusError> {
+        if self.requests.contains(request) || self.used_operations.contains(operation) {
             return Err(NexusError::new(
-                NexusErrorCode::Busy,
-                "Nexus contract retention capacity reached",
+                NexusErrorCode::DuplicateIdentity,
+                "request/operation identity cannot be reused",
+            ));
+        }
+        let retention = self.retention_status();
+        if retention.total_used >= retention.total_capacity {
+            return Err(Self::retention_full(
+                "absolute contract",
+                retention.total_used,
+                retention.total_capacity,
+            ));
+        }
+        if retention.business_used >= retention.business_capacity {
+            return Err(Self::retention_full(
+                "business contract",
+                retention.business_used,
+                retention.business_capacity,
             ));
         }
         self.requests.insert(request.clone());
@@ -150,10 +201,20 @@ impl<C: Clock> NexusSessions<C> {
         // Each admitted parent can retain at most three serial acquisitions,
         // each with sixteen exact RPC IDs. This is diagnostic retention, not
         // another public admission slot and not preallocated physical leases.
-        if self.internal_ids.len() >= self.capacity.saturating_mul(48) {
-            return Err(NexusError::new(
-                NexusErrorCode::Busy,
-                "internal diagnostic retention capacity reached",
+        let total_limit = self.retention_capacity.saturating_mul(64);
+        if self.used_operations.len() >= total_limit {
+            return Err(Self::retention_full(
+                "absolute contract",
+                self.used_operations.len(),
+                total_limit,
+            ));
+        }
+        let internal_limit = self.retention_capacity.saturating_mul(48);
+        if self.internal_ids.len() >= internal_limit {
+            return Err(Self::retention_full(
+                "internal diagnostic",
+                self.internal_ids.len(),
+                internal_limit,
             ));
         }
         self.requests.insert(request.clone());
@@ -893,5 +954,111 @@ impl<C: Clock> NexusSessions<C> {
         session.pending_shutdown = None;
         self.confirm_delivery(attempt.target.clone());
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn rv81_default_retention_accepts_operation_513() {
+        let router = crate::router::RouterState::new().expect("default router");
+        assert_eq!(
+            crate::router::RouterConfig::from_env().max_pending_per_tenant,
+            512
+        );
+        let endpoint = router.nexus_endpoint();
+        for index in 1..=513 {
+            endpoint
+                .transition(|sessions, _| {
+                    sessions.reserve(
+                        &RequestId::new(format!("rv81-r-{index}")).unwrap(),
+                        &OperationId::new(format!("rv81-o-{index}")).unwrap(),
+                    )
+                })
+                .unwrap_or_else(|error| {
+                    panic!("business reservation {index} must succeed: {error}")
+                });
+        }
+    }
+
+    #[test]
+    fn rv81_internal_and_absolute_retention_are_bounded() {
+        let mut sessions = NexusSessions::with_limits(
+            SystemClock,
+            Err(NexusError::new(
+                NexusErrorCode::BridgeUnavailable,
+                "no bridge in reservation test",
+            )),
+            1,
+            1,
+        );
+        for index in 0..48 {
+            sessions
+                .reserve_internal(
+                    &RequestId::new(format!("ir-{index}")).unwrap(),
+                    &OperationId::new(format!("io-{index}")).unwrap(),
+                )
+                .unwrap();
+        }
+        let error = sessions
+            .reserve_internal(
+                &RequestId::new("extra-r").unwrap(),
+                &OperationId::new("extra-o").unwrap(),
+            )
+            .expect_err("bounded internal diagnostics");
+        assert_eq!(error.code, NexusErrorCode::Busy);
+        assert!(error.message.contains("internal diagnostic"));
+        assert!(error.message.contains("48/48"));
+        assert!(error.message.contains("restart the daemon/bridge"));
+        sessions
+            .reserve(
+                &RequestId::new("business-r").unwrap(),
+                &OperationId::new("business-o").unwrap(),
+            )
+            .expect("internal IDs do not charge business quota");
+        assert_eq!(sessions.retention_status().business_used, 1);
+        // Model retained U6 history at the absolute boundary; IDs are never GC'd.
+        for index in 49..64 {
+            sessions
+                .used_operations
+                .insert(OperationId::new(format!("retired-{index}")).unwrap());
+        }
+        for internal in [false, true] {
+            let request = RequestId::new("absolute-r").unwrap();
+            let operation = OperationId::new("absolute-o").unwrap();
+            let result = if internal {
+                sessions.reserve_internal(&request, &operation)
+            } else {
+                sessions.reserve(&request, &operation)
+            };
+            let error = result.expect_err("both admission paths honor the absolute cap");
+            assert_eq!(error.code, NexusErrorCode::Busy);
+            assert!(error.message.contains("absolute contract"));
+            assert!(error.message.contains("64/64"));
+            assert!(error.message.contains("restart the daemon/bridge"));
+            assert_eq!(sessions.retention_status().total_used, 64);
+        }
+    }
+
+    #[test]
+    fn rv81_retained_id_layout() {
+        assert_eq!(
+            std::mem::size_of::<RequestId>(),
+            std::mem::size_of::<String>()
+        );
+        assert_eq!(
+            std::mem::size_of::<OperationId>(),
+            std::mem::size_of::<String>()
+        );
+        println!(
+            "RequestId={} OperationId={} Operation={} Opening={} DeliveryRecord={}",
+            std::mem::size_of::<RequestId>(),
+            std::mem::size_of::<OperationId>(),
+            std::mem::size_of::<Operation>(),
+            std::mem::size_of::<Opening>(),
+            std::mem::size_of::<super::super::delivery::DeliveryRecord>()
+        );
     }
 }

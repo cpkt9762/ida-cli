@@ -135,6 +135,7 @@ pub struct Tools {
     close_observers: Mutex<HashSet<SessionLease>>,
 }
 impl Tools {
+    /// Bounds concurrent open supervisors, not lifetime N1 identity retention.
     pub fn new(capacity: usize) -> anyhow::Result<Self> {
         // N9 MUST DELETE: migration validation only; default keeps the old path.
         let selected = match std::env::var("IDA_CLI_NEXUS_DEV") {

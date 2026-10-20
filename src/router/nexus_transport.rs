@@ -489,12 +489,20 @@ impl NexusEndpoint {
         capacity: usize,
         capabilities: Result<NexusCapabilities, NexusError>,
     ) -> Self {
-        let sessions = Arc::new(Mutex::new(NexusSessions::new(
+        Self::with_limits(capacity, capacity, capabilities)
+    }
+    pub fn with_limits(
+        business_capacity: usize,
+        retention_capacity: usize,
+        capabilities: Result<NexusCapabilities, NexusError>,
+    ) -> Self {
+        let sessions = Arc::new(Mutex::new(NexusSessions::with_limits(
             SystemClock,
             capabilities,
-            capacity,
+            business_capacity,
+            retention_capacity,
         )));
-        let (transport, lanes) = NexusTransport::new(sessions.clone(), capacity, 8);
+        let (transport, lanes) = NexusTransport::new(sessions.clone(), business_capacity, 8);
         Self {
             sessions,
             transport,

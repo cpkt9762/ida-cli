@@ -138,6 +138,20 @@ fn format_status(v: &Value) -> String {
     if let Some(max_pending_per_tenant) = max_pending_per_tenant {
         lines.push(format!("max_pending_per_tenant: {max_pending_per_tenant}"));
     }
+    if let Some(retention) = v.get("nexus_retention") {
+        for kind in ["business", "internal", "total"] {
+            if let (Some(used), Some(capacity)) = (
+                retention
+                    .get(format!("{kind}_used"))
+                    .and_then(Value::as_u64),
+                retention
+                    .get(format!("{kind}_capacity"))
+                    .and_then(Value::as_u64),
+            ) {
+                lines.push(format!("nexus_retention_{kind}: {used}/{capacity}"));
+            }
+        }
+    }
     if let Some(max_spawns) = max_spawns {
         lines.push(format!("max_concurrent_spawns: {max_spawns}"));
     }
@@ -273,6 +287,18 @@ fn truncate_output(s: &str) -> String {
 mod tests {
     use super::{format_response, OutputMode};
     use serde_json::json;
+
+    #[test]
+    fn rv81_human_status_shows_retention_usage_and_limits() {
+        let response = json!({"nexus_retention":{
+            "business_used":513,"business_capacity":65536,
+            "internal_used":4,"internal_capacity":3145728,
+            "total_used":517,"total_capacity":4194304}});
+        let text = format_response(&OutputMode::Human, "status", &response);
+        assert!(text.contains("nexus_retention_business: 513/65536"));
+        assert!(text.contains("nexus_retention_internal: 4/3145728"));
+        assert!(text.contains("nexus_retention_total: 517/4194304"));
+    }
 
     #[test]
     fn human_strings_show_backend_content() {

@@ -87,6 +87,57 @@ result=$?; uptime; test "$result" -eq 0
 12项标准门禁、第13项（F1_PYTHON）、lib连续三轮、N0 support、bridge pytest、fix系列
 与两个probe红绿对照继续保留；不能用N6新套件代替回归套件。
 
+## N1 retention and pending limits (RV8-1)
+
+`IDA_CLI_NEXUS_RETENTION_CAPACITY` independently sets the coordinator's lifetime
+business identity retention limit (positive integer, default **65536**). Unset,
+invalid or zero values use the default, matching existing router configuration.
+`IDA_CLI_MAX_PENDING_PER_TENANT` remains **512** by default: it still bounds the
+legacy tenant's pending requests, Nexus business lane, physical acquisition/lease
+slots, bridge live slots, concurrent open supervisors and uncertain-open guards.
+Changing retention does not enlarge those pending/physical limits.
+
+Completed and failed request/operation IDs remain reserved for the coordinator's
+entire lifetime. U6 retirement stops charging the business quota but retains the
+IDs against reuse. Internal diagnostic IDs have a separate `retention * 48`
+budget; all IDs, including retired and internal IDs, share the absolute
+`retention * 64` ceiling (saturating arithmetic). At defaults these limits are
+65536 business, 3145728 internal and 4194304 total. Both public and internal
+reservation paths enforce the absolute ceiling; no tombstones are evicted.
+
+Router JSON `status`, the MCP HTTP daemon's `/statusz`, and human CLI `status`
+show `nexus_retention`: `business_used/capacity`, `internal_used/capacity` and
+`total_used/capacity`. The human form prints three `nexus_retention_<kind>` lines.
+Business usage includes terminal operations and excludes U6-retired resources;
+total usage still includes those IDs. This adds no MCP tool or remote status
+query. When full, Busy identifies the exhausted budget and usage/limit, explains
+lifetime retention, and directs an explicit daemon/bridge restart (optionally
+with a larger retention configuration). Unknown-outcome work must not be replayed.
+
+On the current 64-bit target, RequestId/OperationId each contain a 24-byte String,
+with up to 128 ASCII payload bytes. A business identity pair therefore holds
+304 bytes before hash-table slack/control bytes; an internal triple holds
+456 bytes. For the default total/internal ceilings, ID sets alone are about
+1.86 GiB at worst-length IDs including current hash-table bucket slack (excluding
+allocator bookkeeping). Allocations grow on demand, not at coordinator creation.
+These are identity-count bounds, not an RSS budget: retained Operation (600 bytes),
+Opening (384 bytes), delivery records (232 bytes), their keys, cloned identities,
+request JSON and other lifecycle metadata add workload-dependent memory. Choose
+retention against available memory; RV8-1 preserves terminal data and introduces
+no compaction or payload eviction.
+
+Deterministic regressions cover the default 513th reservation, 513 completed
+business operations plus their open, small retention Busy, lifetime duplicate
+rejection, configuration independence, unchanged lane/physical limits, status
+growth and both absolute-admission paths. Run only the affected targets here;
+final E2E acceptance is a separate orchestrator step.
+
+```bash
+timeout 120s cargo test --locked --lib rv81_ -- --test-threads=1
+timeout 120s cargo test --locked --test nexus_contract -- --test-threads=1
+timeout 120s cargo test --locked --lib nexus_business_capacity_ -- --test-threads=1
+```
+
 ## Run tests
 
 ```bash
