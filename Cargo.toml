@@ -30,7 +30,6 @@ path = "tests/nexus_r0_prototypes.rs"
 required-features = ["nexus-test-support"]
 
 [dependencies]
-idalib = { path = "3rd-github/idalib/idalib" }
 rmcp = { path = "3rd-github/rust-sdk/crates/rmcp", features = ["server", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal", "process", "io-util", "time"] }
 tokio-util = "0.7"
@@ -51,9 +50,6 @@ http-body = "1"
 http-body-util = "0.1"
 tower-service = "0.3"
 sha2 = "=0.10.9"
-
-[build-dependencies]
-idalib-build = { path = "3rd-github/idalib/idalib-build" }
 
 [dev-dependencies]
 rstest = "0.25"
