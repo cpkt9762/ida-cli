@@ -125,18 +125,6 @@ impl RpcConnection {
             capacity,
         }
     }
-    #[cfg(test)]
-    pub(super) fn has_written_bytes(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pending
-            .values()
-            .any(|p| {
-                let n = p.bytes.load(Ordering::SeqCst);
-                n > 0 && n != usize::MAX
-            })
-    }
     pub async fn closed(&self) {
         self.stop.cancelled().await;
     }

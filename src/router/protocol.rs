@@ -84,6 +84,7 @@ impl RpcResponse {
 // Reserved internal metadata is attached by the local router, consumed and
 // removed before the legacy dispatcher. External timeout_secs remains seconds.
 const DEADLINE_KEY: &str = "_ida_cli_deadline_monotonic_ns";
+#[cfg(test)]
 pub(crate) fn attach_deadline(
     params: &mut Value,
     deadline: std::time::Instant,

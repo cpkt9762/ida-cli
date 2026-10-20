@@ -148,7 +148,7 @@ class Candidate:
         ipc.mkdir(mode=0o700, parents=True)
         temporary = Path(os.environ["TMPDIR"])
         self.variables = env.variables() | {"IDA_CLI_HOME":str(self.home), "TMPDIR":str(temporary),
-            "N3_ENV_ROOT":str(env.root), "IDA_CLI_NEXUS_DEV":"1", "IDA_NEXUS_PYTHON":str(env.root/"venv/bin/python"),
+            "N3_ENV_ROOT":str(env.root),  "IDA_NEXUS_PYTHON":str(env.root/"venv/bin/python"),
             "IDA_NEXUS_IPC_ROOT":str(ipc), "IDA_NEXUS_BRIDGE_SCRIPT":str(REPO/"tests/support/nexus_client_fixture.py"),
             "IDA_MCP_MAX_INLINE_BYTES":inline}
         self.variables.update(extra or {})

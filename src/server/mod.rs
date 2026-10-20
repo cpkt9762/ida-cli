@@ -10,7 +10,6 @@ pub mod task;
 pub use requests::*;
 
 use crate::error::ToolError;
-use crate::ida::IdaWorker;
 use crate::tool_registry::{self, ToolCategory};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
@@ -19,26 +18,17 @@ use rmcp::{
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
 use serde_json::{json, Value};
-use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
 /// MCP server for IDA Pro analysis
 #[derive(Clone)]
 pub struct IdaMcpServer {
-    worker: Arc<IdaWorker>,
     tool_mux: ToolMux<IdaMcpServer>,
-    mode: ServerMode,
+    router: crate::router::RouterState,
     task_registry: task::TaskRegistry,
     /// Identity of the MCP session this server instance serves. The daemon
     /// builds one instance per session (per request in stateless HTTP mode).
     client: crate::router::listing::ClientIdentity,
-}
-
-#[derive(Clone, Debug)]
-pub enum ServerMode {
-    Stdio,
-    Http,
-    Router(crate::router::RouterState),
 }
 
 #[derive(Clone)]
@@ -74,19 +64,17 @@ impl ToolMux<IdaMcpServer> {
         &self,
         context: ToolCallContext<'_, IdaMcpServer>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(router) = &context.service.mode {
-            if router.uses_nexus()
-                && !matches!(
-                    context.name.as_ref(),
-                    "open_idb"
-                        | "list_idbs"
-                        | "close_idb"
-                        | "tool_catalog"
-                        | "tool_help"
-                        | "get_task_status"
-                        | "convert_number"
-                )
-            {
+        {
+            if !matches!(
+                context.name.as_ref(),
+                "open_idb"
+                    | "list_idbs"
+                    | "close_idb"
+                    | "tool_catalog"
+                    | "tool_help"
+                    | "get_task_status"
+                    | "convert_number"
+            ) {
                 if let Err(error) = crate::router::nexus_tools::Tools::require_tool(
                     tool_registry::primary_name_for(&context.name),
                 ) {
@@ -98,41 +86,20 @@ impl ToolMux<IdaMcpServer> {
     }
 }
 
-/// Parameters for the background DSC loading task.
-struct DscBackgroundCtx {
-    idat: std::path::PathBuf,
-    idat_args: Vec<String>,
-    preparation: crate::preprocess::Preparation,
-    stage: crate::preprocess::StagedArtifact,
-    script_path: std::path::PathBuf,
-    log_path: Option<std::path::PathBuf>,
-    out_i64: std::path::PathBuf,
-    module: String,
-    frameworks: Vec<String>,
-}
-
 impl IdaMcpServer {
-    pub fn new(worker: Arc<IdaWorker>, mode: ServerMode) -> Self {
+    pub fn new(router: crate::router::RouterState) -> Self {
         info!("Creating IDA MCP server");
         let call_router = Self::tool_router();
         Self {
-            worker,
             tool_mux: ToolMux::new(call_router),
-            mode,
+            router,
             task_registry: task::TaskRegistry::new(),
             client: crate::router::listing::ClientIdentity::mcp_session(),
         }
     }
 
     fn close_hint(&self) -> &'static str {
-        match self.mode {
-            ServerMode::Stdio => {
-                "Call close_idb when done to release locks for other sessions."
-            }
-            ServerMode::Http | ServerMode::Router(_) => {
-                "In multi-client (HTTP/SSE) mode, close_idb requires the close_token returned by open_idb; each opener holds one reference, database closes when all references are released."
-            }
-        }
+        "close_idb requires the close_token returned by open_idb; each opener holds one reference, database closes when all references are released."
     }
 
     fn instructions(&self) -> String {
@@ -272,292 +239,6 @@ impl IdaMcpServer {
             .ok_or_else(|| ToolError::InvalidAddress("empty address list".to_string()))
     }
 
-    fn value_to_bytes(value: &Value) -> Result<Vec<u8>, ToolError> {
-        match value {
-            Value::String(s) => {
-                let s = s.trim();
-                if s.is_empty() {
-                    return Err(ToolError::InvalidParams("no bytes provided".to_string()));
-                }
-
-                // Split by common separators (whitespace, comma, colon, dash, underscore)
-                let tokens: Vec<&str> = s
-                    .split(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | ':' | '-' | '_'))
-                    .filter(|t| !t.is_empty())
-                    .collect();
-
-                let mut hex_str = String::with_capacity(s.len());
-                for token in &tokens {
-                    // Strip 0x/0X prefix from each token
-                    let cleaned = token
-                        .strip_prefix("0x")
-                        .or_else(|| token.strip_prefix("0X"))
-                        .unwrap_or(token);
-                    // Validate all remaining chars are hex digits
-                    for c in cleaned.chars() {
-                        if !c.is_ascii_hexdigit() {
-                            return Err(ToolError::InvalidParams(format!(
-                                "invalid hex character: {c}"
-                            )));
-                        }
-                    }
-                    hex_str.push_str(cleaned);
-                }
-
-                if hex_str.is_empty() {
-                    return Err(ToolError::InvalidParams("no bytes provided".to_string()));
-                }
-                if !hex_str.len().is_multiple_of(2) {
-                    return Err(ToolError::InvalidParams(
-                        "hex string has odd length".to_string(),
-                    ));
-                }
-                let mut out = Vec::with_capacity(hex_str.len() / 2);
-                for i in (0..hex_str.len()).step_by(2) {
-                    let byte = u8::from_str_radix(&hex_str[i..i + 2], 16)
-                        .map_err(|_| ToolError::InvalidParams("invalid hex byte".to_string()))?;
-                    out.push(byte);
-                }
-                Ok(out)
-            }
-            Value::Array(arr) => {
-                let mut out = Vec::with_capacity(arr.len());
-                for v in arr {
-                    match v {
-                        Value::Number(n) => {
-                            let byte = n.as_u64().ok_or_else(|| {
-                                ToolError::InvalidParams("invalid byte".to_string())
-                            })?;
-                            if byte > u8::MAX as u64 {
-                                return Err(ToolError::InvalidParams(
-                                    "byte value out of range".to_string(),
-                                ));
-                            }
-                            out.push(byte as u8);
-                        }
-                        Value::String(s) => {
-                            let val = Self::parse_address(s)?;
-                            if val > u8::MAX as u64 {
-                                return Err(ToolError::InvalidParams(
-                                    "byte value out of range".to_string(),
-                                ));
-                            }
-                            out.push(val as u8);
-                        }
-                        _ => {
-                            return Err(ToolError::InvalidParams(
-                                "bytes must be numbers or strings".to_string(),
-                            ))
-                        }
-                    }
-                }
-                if out.is_empty() {
-                    Err(ToolError::InvalidParams("no bytes provided".to_string()))
-                } else {
-                    Ok(out)
-                }
-            }
-            Value::Number(n) => {
-                let byte = n
-                    .as_u64()
-                    .ok_or_else(|| ToolError::InvalidParams("invalid byte".to_string()))?;
-                if byte > u8::MAX as u64 {
-                    return Err(ToolError::InvalidParams(
-                        "byte value out of range".to_string(),
-                    ));
-                }
-                Ok(vec![byte as u8])
-            }
-            _ => Err(ToolError::InvalidParams(
-                "expected hex string or array of bytes".to_string(),
-            )),
-        }
-    }
-
-    /// Open an existing DSC .i64 synchronously and return db_info.
-    async fn open_dsc_i64(
-        &self,
-        out_i64: &std::path::Path,
-        module: &str,
-        frameworks: &[String],
-        preparation: crate::preprocess::Preparation,
-    ) -> Result<CallToolResult, McpError> {
-        let _guard = preparation.cancel_on_drop();
-        info!(out_i64 = %out_i64.display(), "Opening existing DSC .i64");
-
-        let i64_str = out_i64.display().to_string();
-        let open_result = preparation
-            .native(
-                self.worker
-                    .open(&i64_str, false, None, false, false, None, true, Vec::new()),
-            )
-            .await;
-
-        let db_info = match open_result {
-            Ok(info) => info,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-
-        let close_token = if matches!(self.mode, ServerMode::Http | ServerMode::Router(_)) {
-            Some(self.worker.issue_db_ref())
-        } else {
-            None
-        };
-
-        let mut value = match serde_json::to_value(&db_info) {
-            Ok(v) => v,
-            Err(_) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "{db_info:?}"
-                ))]))
-            }
-        };
-        if let Value::Object(map) = &mut value {
-            map.insert("module".to_string(), json!(module));
-            if !frameworks.is_empty() {
-                map.insert("frameworks_loaded".to_string(), json!(frameworks));
-            }
-            map.insert("close_hint".to_string(), json!(self.close_hint()));
-            if let Some(token) = close_token {
-                map.insert("close_token".to_string(), json!(token));
-            }
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{value:?}")),
-        )]))
-    }
-
-    /// Background task: run idat, then open the resulting .i64 with idalib.
-    async fn run_dsc_background(
-        task_id: String,
-        registry: task::TaskRegistry,
-        worker: Arc<IdaWorker>,
-        mode: ServerMode,
-        ctx: DscBackgroundCtx,
-    ) {
-        let DscBackgroundCtx {
-            idat,
-            idat_args,
-            preparation,
-            stage,
-            script_path,
-            log_path,
-            out_i64,
-            module,
-            frameworks,
-        } = ctx;
-        let _cancellation_guard = preparation.cancel_on_drop();
-
-        // Phase 1: run idat subprocess
-        info!(task_id = %task_id, "Background: running idat");
-        registry.update_message(&task_id, "Running idat to create .i64...");
-
-        let result =
-            crate::dsc::run_idat_offline(&idat, &idat_args, &module, preparation.clone()).await;
-        let output = match result {
-            Ok(output) => output,
-            Err(error) => {
-                if preparation.cancel.is_cancelled()
-                    && matches!(
-                        error,
-                        ToolError::Preparation {
-                            execution_stopped: true,
-                            ..
-                        }
-                    )
-                {
-                    registry.cancellation_confirmed(&task_id);
-                } else {
-                    registry.fail(&task_id, &error.to_string());
-                }
-                return;
-            }
-        };
-        if !output.status.success() {
-            registry.fail(
-                &task_id,
-                &format!(
-                    "idat exited with {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            );
-            return;
-        }
-        let cleanup = stage.cleanup_receipt();
-        let publish = preparation.clone();
-        let result = crate::blocking::run(crate::blocking::WorkClass::Prepare, move || {
-            stage.publish(&publish)
-        })
-        .await;
-        if let Err(error) = cleanup.wait().await {
-            registry.fail(&task_id, &error.to_string());
-            return;
-        }
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) | Err(error) => {
-                if preparation.cancel.is_cancelled() {
-                    registry.cancellation_confirmed(&task_id);
-                } else {
-                    registry.fail(&task_id, &error.to_string());
-                }
-                return;
-            }
-        }
-        let _ = (script_path, log_path);
-        info!(task_id = %task_id, "idat completed, opening .i64");
-        registry.update_message(&task_id, "Opening database with idalib...");
-
-        // Phase 2: open the .i64 with idalib
-        let i64_str = out_i64.display().to_string();
-        let open_result = preparation
-            .native(worker.open(&i64_str, false, None, false, false, None, true, Vec::new()))
-            .await;
-
-        let db_info = match open_result {
-            Ok(info) => info,
-            Err(e) => {
-                if preparation.cancel.is_cancelled()
-                    && matches!(
-                        e,
-                        ToolError::Preparation {
-                            execution_stopped: true,
-                            ..
-                        }
-                    )
-                {
-                    registry.cancellation_confirmed(&task_id);
-                } else {
-                    registry.fail(&task_id, &e.to_string());
-                }
-                return;
-            }
-        };
-
-        let close_token = if matches!(mode, ServerMode::Http | ServerMode::Router(_)) {
-            Some(worker.issue_db_ref())
-        } else {
-            None
-        };
-
-        let mut value = serde_json::to_value(&db_info)
-            .unwrap_or_else(|_| json!({"info": format!("{db_info:?}")}));
-        if let Value::Object(map) = &mut value {
-            map.insert("module".to_string(), json!(module));
-            if !frameworks.is_empty() {
-                map.insert("frameworks_loaded".to_string(), json!(frameworks));
-            }
-            if let Some(token) = close_token {
-                map.insert("close_token".to_string(), json!(token));
-            }
-        }
-
-        info!(task_id = %task_id, "DSC background task completed");
-        registry.complete(&task_id, value);
-    }
-
     async fn route_or_err(
         &self,
         router: &crate::router::RouterState,
@@ -585,15 +266,14 @@ impl IdaMcpServer {
                 }
             }
             Err(e)
-                if router.uses_nexus()
-                    && (method == "load_debug_info"
-                        || matches!(
-                            method,
-                            "patch_assembly"
-                                | "rename_local_variable"
-                                | "set_local_variable_type"
-                                | "set_decompiler_comment"
-                        ) && matches!(&e, ToolError::IdaError(_))) =>
+                if (method == "load_debug_info"
+                    || matches!(
+                        method,
+                        "patch_assembly"
+                            | "rename_local_variable"
+                            | "set_local_variable_type"
+                            | "set_decompiler_comment"
+                    ) && matches!(&e, ToolError::IdaError(_))) =>
             {
                 // The legacy MCP adapter wraps the worker's business error.
                 // Raw RPC keeps its original error text in nexus_tools.
@@ -612,41 +292,21 @@ impl IdaMcpServer {
         _route_args: Value,
     ) -> Result<CallToolResult, McpError> {
         let outer_timeout = timeout_secs + 5;
-        if let ServerMode::Router(ref router) = self.mode {
-            let params = json!({"code": script, "timeout_secs": outer_timeout});
-            return match router.route_request(db_handle, "run_script", params).await {
-                Ok(result) => match crate::ida::handlers::debug::parse_debug_output(&result) {
-                    Ok(data) => Ok(CallToolResult::success(vec![Content::text(
-                        serde_json::to_string_pretty(&data).unwrap_or_default(),
-                    )])),
-                    Err(e) => {
-                        warn!(tool = tool_name, error = %e, "debug script parse failed (routed)");
-                        Ok(e.to_tool_result())
-                    }
-                },
-                Err(e) => Ok(e.to_tool_result()),
-            };
-        }
+        let router = &self.router;
 
-        match self.worker.run_script(script, Some(outer_timeout)).await {
+        let params = json!({"code": script, "timeout_secs": outer_timeout});
+        return match router.route_request(db_handle, "run_script", params).await {
             Ok(result) => match crate::ida::handlers::debug::parse_debug_output(&result) {
                 Ok(data) => Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&data).unwrap_or_default(),
                 )])),
                 Err(e) => {
-                    warn!(tool = tool_name, error = %e, "debug script parse failed");
+                    warn!(tool = tool_name, error = %e, "debug script parse failed (routed)");
                     Ok(e.to_tool_result())
                 }
             },
-            Err(ToolError::Timeout(t)) => {
-                warn!(tool = tool_name, timeout_secs = t, "debug script timed out");
-                Ok(
-                    ToolError::IdaError(format!("{tool_name} timed out after {t}s"))
-                        .to_tool_result(),
-                )
-            }
             Err(e) => Ok(e.to_tool_result()),
-        }
+        };
     }
 
     async fn open_idb_routed(
@@ -654,119 +314,7 @@ impl IdaMcpServer {
         router: &crate::router::RouterState,
         req: &OpenIdbRequest,
     ) -> Result<CallToolResult, McpError> {
-        if router.uses_nexus() {
-            return self.open_idb_nexus(router, req).await;
-        }
-        let limit = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        let mut preparation = crate::preprocess::current().unwrap_or_else(|| {
-            crate::preprocess::Preparation::new(std::time::Duration::from_secs(120))
-        });
-        preparation.deadline = preparation.deadline.min(limit);
-        let expanded = crate::expand_path(&req.path);
-        let sbpf_input = expanded.clone();
-        let is_sbpf = match preparation
-            .wait(crate::blocking::run(
-                crate::blocking::WorkClass::Prepare,
-                move || crate::router::is_sbpf_elf(&sbpf_input),
-            ))
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => return Ok(error.to_tool_result()),
-        };
-        let resolved = match crate::router::resolve_open_path(&req.path, preparation.clone()).await
-        {
-            Ok(value) => value,
-            Err(error) => return Ok(error.to_tool_result()),
-        };
-
-        let spawn = tokio::select! {biased;
-            _=preparation.cancel.cancelled()=>return Ok(ToolError::Preparation {message:"open cancelled during startup".into(),execution_stopped:false}.to_tool_result()),
-            _=tokio::time::sleep_until(preparation.deadline.into())=>return Ok(ToolError::Preparation {message:"open total deadline expired during startup".into(),execution_stopped:false}.to_tool_result()),
-            result=router.spawn_worker_for_client(&req.path,None,&self.client)=>result,
-        };
-        let (db_handle, close_token) = match spawn {
-            Ok(r) => r,
-            Err(e) => return Ok(ToolError::OpenFailed(e.to_string()).to_tool_result()),
-        };
-        let mut reference = close_token.map(|token| router.scoped_ref(token));
-
-        let params = json!({
-            "path": resolved.open_path.as_deref().unwrap_or(&req.path),
-            "idb_output_path": resolved.idb_output_path,
-            "auto_analyse": true,
-            "load_debug_info": req.load_debug_info.unwrap_or(false),
-            "debug_info_path": req.debug_info_path,
-            "debug_info_verbose": req.debug_info_verbose.unwrap_or(false),
-            "force": req.force.unwrap_or(false),
-            "file_type": req.file_type,
-        });
-
-        let result = match router
-            .route_request_prepared(Some(&db_handle), "open", params, preparation.clone())
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                if let Some(reference) = reference.as_mut() {
-                    if let Err(cleanup) = preparation
-                        .scope(router.release_failed_open(&db_handle, reference))
-                        .await
-                    {
-                        warn!(handle = %db_handle, %cleanup, "failed MCP open cleanup failed");
-                    }
-                }
-                return Ok(e.to_tool_result());
-            }
-        };
-
-        let mut value = result;
-        if let Value::Object(map) = &mut value {
-            map.insert("db_handle".to_string(), json!(db_handle));
-            if let Some(token) = reference.as_ref().and_then(|reference| reference.token()) {
-                map.insert("close_token".to_string(), json!(token));
-            }
-            map.insert("close_hint".to_string(), json!(self.close_hint()));
-            map.insert(
-                "quick_tools".to_string(),
-                json!([
-                    "list_functions",
-                    "get_function_by_name",
-                    "disassemble_function",
-                    "decompile_function",
-                    "get_xrefs_to",
-                    "list_strings",
-                    "close_idb"
-                ]),
-            );
-
-            if is_sbpf {
-                let sbpf_info = self.detect_sbpf_entry(router, &db_handle).await;
-                if let Value::Object(sbpf_map) = sbpf_info {
-                    for (k, v) in sbpf_map {
-                        map.insert(k, v);
-                    }
-                }
-            }
-        }
-
-        let encoded = serde_json::to_string_pretty(&value);
-        let transfers_token = encoded.is_ok()
-            && reference
-                .as_ref()
-                .and_then(|reference| reference.token())
-                .is_some_and(|token| {
-                    value.get("close_token").and_then(Value::as_str) == Some(token)
-                });
-        let response = CallToolResult::success(vec![Content::text(
-            encoded.unwrap_or_else(|_| format!("{value:?}")),
-        )]);
-        if transfers_token {
-            if let Some(reference) = reference.as_mut() {
-                reference.transfer();
-            }
-        }
-        Ok(response)
+        return self.open_idb_nexus(router, req).await;
     }
 
     async fn open_idb_nexus(
@@ -826,196 +374,32 @@ impl IdaMcpServer {
         Ok(CallToolResult::success(vec![Content::text(encoded)]))
     }
 
-    async fn detect_sbpf_entry(
-        &self,
-        router: &crate::router::RouterState,
-        db_handle: &str,
-    ) -> Value {
-        let ep_info: Option<Value> = router
-            .route_request(
-                Some(db_handle),
-                "get_function_by_name",
-                json!({"name": "entrypoint"}),
-            )
-            .await
-            .ok();
-
-        let ep_addr = ep_info
-            .as_ref()
-            .and_then(|v| v.get("address"))
-            .and_then(|v| v.as_str())
-            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-
-        let Some(ep_addr) = ep_addr else {
-            return json!({ "entrypoint": ep_info });
-        };
-
-        let cg: Option<Value> = router
-            .route_request(
-                Some(db_handle),
-                "build_callgraph",
-                json!({
-                    "roots": format!("0x{:x}", ep_addr),
-                    "max_depth": 2,
-                    "max_nodes": 256,
-                }),
-            )
-            .await
-            .ok();
-
-        let ep_hex = format!("0x{:x}", ep_addr);
-
-        let pi_info: Option<Value> = 'pi: {
-            let edges = match cg
-                .as_ref()
-                .and_then(|v| v.get("edges"))
-                .and_then(|v| v.as_array())
-            {
-                Some(e) => e.clone(),
-                None => break 'pi None,
-            };
-
-            let direct: Vec<&str> = edges
-                .iter()
-                .filter_map(|e| {
-                    if e.get("from")?.as_str()? == ep_hex {
-                        e.get("to")?.as_str()
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if direct.len() != 2 {
-                break 'pi None;
-            }
-
-            let c0 = edges
-                .iter()
-                .filter(|e| e.get("from").and_then(|v| v.as_str()) == Some(direct[0]))
-                .count();
-            let c1 = edges
-                .iter()
-                .filter(|e| e.get("from").and_then(|v| v.as_str()) == Some(direct[1]))
-                .count();
-            if c0 == c1 {
-                break 'pi None;
-            }
-            let pi_hex = if c0 > c1 { direct[0] } else { direct[1] };
-            let pi_addr = match u64::from_str_radix(pi_hex.trim_start_matches("0x"), 16) {
-                Ok(a) => a,
-                Err(_) => break 'pi None,
-            };
-
-            let current_name = router
-                .route_request(
-                    Some(db_handle),
-                    "get_function_at_address",
-                    json!({"address": pi_hex}),
-                )
-                .await
-                .ok()
-                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from));
-
-            let _ = router
-                .route_request(
-                    Some(db_handle),
-                    "rename_symbol",
-                    json!({
-                        "address": pi_hex,
-                        "new_name": "process_instruction",
-                    }),
-                )
-                .await;
-
-            Some(json!({
-                "address": format!("0x{:x}", pi_addr),
-                "name": "process_instruction",
-                "previous_name": current_name,
-            }))
-        };
-
-        json!({
-            "entrypoint": ep_info,
-            "process_instruction": pi_info,
-        })
-    }
-
     async fn close_idb_routed(
         &self,
         router: &crate::router::RouterState,
         req: &CloseIdbRequest,
     ) -> Result<CallToolResult, McpError> {
-        if router.uses_nexus() {
-            let Some(token) = req.token.as_deref() else {
-                return Ok(ToolError::InvalidParams(
-                    "close_idb requires close_token in Nexus mode".into(),
-                )
-                .to_tool_result());
-            };
-            let (result, lifecycle) = router.nexus_close_token_detailed(token).await;
-            let mut result = match result {
+        let Some(token) = req.token.as_deref() else {
+            return Ok(ToolError::InvalidParams(
+                "close_idb requires close_token in Nexus mode".into(),
+            )
+            .to_tool_result());
+        };
+        let (result, lifecycle) = router.nexus_close_token_detailed(token).await;
+        let mut result = match result {
                 Ok(None) => CallToolResult::success(vec![Content::text("close_idb ignored: invalid close_token")]),
                 Ok(Some((_,remaining))) if remaining > 0 => CallToolResult::success(vec![Content::text(format!("Reference released ({remaining} client(s) still active, database remains open)"))]),
                 Ok(Some(_)) => CallToolResult::success(vec![Content::text("Database closed")]),
                 Err(error) => error.to_tool_result(),
             };
-            if let Some(lifecycle) = lifecycle {
-                result
-                    .meta
-                    .get_or_insert_with(Default::default)
-                    .0
-                    .insert("nexus".into(), json!({"lifecycle":lifecycle}));
-            }
-            return Ok(result);
+        if let Some(lifecycle) = lifecycle {
+            result
+                .meta
+                .get_or_insert_with(Default::default)
+                .0
+                .insert("nexus".into(), json!({"lifecycle":lifecycle}));
         }
-        let token = match req.token.as_deref() {
-            Some(t) => t,
-            None => {
-                let handle = match router.active_handle().await {
-                    Some(h) => h,
-                    None => return Ok(ToolError::NoDatabaseOpen.to_tool_result()),
-                };
-                let _ = router
-                    .route_request(Some(&handle), "close", json!({}))
-                    .await;
-                let _ = router
-                    .route_request(Some(&handle), "shutdown", json!({}))
-                    .await;
-                let _ = router.close_worker(&handle).await;
-                info!("Router: closed active worker {}", handle);
-                return Ok(CallToolResult::success(vec![Content::text(
-                    "Database closed",
-                )]));
-            }
-        };
-
-        match router.release_ref_token(token).await {
-            None => Ok(CallToolResult::success(vec![Content::text(
-                "close_idb ignored: invalid close_token",
-            )])),
-            Some((handle, remaining)) if remaining > 0 => {
-                info!(
-                    remaining,
-                    "Router: reference released for {}, {} remaining", handle, remaining
-                );
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Reference released ({remaining} client(s) still active, database remains open)"
-                ))]))
-            }
-            Some((handle, _)) => {
-                let _ = router
-                    .route_request(Some(&handle), "close", json!({}))
-                    .await;
-                let _ = router
-                    .route_request(Some(&handle), "shutdown", json!({}))
-                    .await;
-                let _ = router.close_worker(&handle).await;
-                info!("Router: closed worker {} (last reference released)", handle);
-                Ok(CallToolResult::success(vec![Content::text(
-                    "Database closed",
-                )]))
-            }
-        }
+        Ok(result)
     }
 }
 
@@ -1046,62 +430,9 @@ impl IdaMcpServer {
             return Ok(ToolError::InvalidPath(req.path).to_tool_result());
         }
 
-        if let ServerMode::Router(ref router) = self.mode {
-            return self.open_idb_routed(router, &req).await;
-        }
+        let router = &self.router;
 
-        match self
-            .worker
-            .open(
-                &req.path,
-                req.load_debug_info.unwrap_or(false),
-                req.debug_info_path.clone(),
-                req.debug_info_verbose.unwrap_or(false),
-                req.force.unwrap_or(false),
-                req.file_type.clone(),
-                true,
-                Vec::new(),
-            )
-            .await
-        {
-            Ok(info) => {
-                let close_token = if matches!(self.mode, ServerMode::Http | ServerMode::Router(_)) {
-                    Some(self.worker.issue_db_ref())
-                } else {
-                    None
-                };
-                let mut value = match serde_json::to_value(&info) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return Ok(CallToolResult::success(vec![Content::text(format!(
-                            "{info:?}"
-                        ))]))
-                    }
-                };
-                if let Value::Object(map) = &mut value {
-                    map.insert(
-                        "quick_tools".to_string(),
-                        json!([
-                            "list_functions",
-                            "get_function_by_name",
-                            "disassemble_function",
-                            "decompile_function",
-                            "get_xrefs_to",
-                            "list_strings",
-                            "close_idb"
-                        ]),
-                    );
-                    map.insert("close_hint".to_string(), json!(self.close_hint()));
-                    if let Some(token) = close_token {
-                        map.insert("close_token".to_string(), json!(token));
-                    }
-                }
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{value:?}")),
-                )]))
-            }
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self.open_idb_routed(router, &req).await;
     }
 
     #[tool(
@@ -1114,26 +445,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<LoadDebugInfoRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: load_debug_info");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "load_debug_info",
-                    json!({"path": req.path, "verbose": req.verbose.unwrap_or(false)}),
-                )
-                .await;
-        }
-        match self
-            .worker
-            .load_debug_info(req.path, req.verbose.unwrap_or(false))
-            .await
-        {
-            Ok(info) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap_or_else(|_| format!("{info:?}")),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "load_debug_info",
+                json!({"path": req.path, "verbose": req.verbose.unwrap_or(false)}),
+            )
+            .await;
     }
 
     #[tool(description = "Report auto-analysis status (auto_is_ok, auto_state). \
@@ -1141,17 +462,11 @@ impl IdaMcpServer {
     #[instrument(skip(self))]
     async fn get_analysis_status(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: get_analysis_status");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(router, None, "get_analysis_status", json!({}))
-                .await;
-        }
-        match self.worker.analysis_status().await {
-            Ok(status) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&status).unwrap_or_else(|_| format!("{status:?}")),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(router, None, "get_analysis_status", json!({}))
+            .await;
     }
 
     #[tool(description = "Close the currently open IDA database. \
@@ -1165,51 +480,9 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         info!("Tool call: close_idb received");
 
-        if let ServerMode::Router(ref router) = self.mode {
-            return self.close_idb_routed(router, &req).await;
-        }
+        let router = &self.router;
 
-        if matches!(self.mode, ServerMode::Http) {
-            let token = match req.token.as_deref() {
-                Some(t) => t,
-                None => {
-                    info!("close_idb ignored: close_token required in HTTP mode");
-                    return Ok(CallToolResult::success(vec![Content::text(
-                        "close_idb ignored: close_token required in HTTP mode",
-                    )]));
-                }
-            };
-            match self.worker.release_db_ref(token) {
-                None => {
-                    info!("close_idb: invalid or already-released token");
-                    return Ok(CallToolResult::success(vec![Content::text(
-                        "close_idb: invalid or expired token",
-                    )]));
-                }
-                Some(remaining) if remaining > 0 => {
-                    info!(
-                        remaining,
-                        "close_idb: reference released, database still open"
-                    );
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Reference released ({remaining} client(s) still active, database remains open)"
-                    ))]));
-                }
-                Some(0) => {}
-                _ => unreachable!(),
-            }
-        }
-
-        match self.worker.close().await {
-            Ok(()) => {
-                self.worker.clear_db_refs();
-                info!("Tool call: close_idb completed successfully");
-                Ok(CallToolResult::success(vec![Content::text(
-                    "Database closed",
-                )]))
-            }
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self.close_idb_routed(router, &req).await;
     }
 
     #[tool(description = "List the databases the daemon currently holds open. \
@@ -1222,12 +495,7 @@ impl IdaMcpServer {
     #[instrument(skip(self))]
     async fn list_idbs(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_idbs");
-        let ServerMode::Router(ref router) = self.mode else {
-            return Ok(ToolError::NotSupported(
-                "list_idbs needs the multi-database daemon (serve-http or serve)".to_string(),
-            )
-            .to_tool_result());
-        };
+        let router = &self.router;
         let listing = router.list_idbs(Some(&self.client)).await;
         let text = match listing
             .to_json()
@@ -1374,31 +642,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<ListFunctionsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_functions");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "list_functions",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        // Clamp limit to prevent excessive responses
-        let limit = req.limit.unwrap_or(100).min(10000);
-        let offset = req.offset.unwrap_or(0);
-        let filter = req.filter.clone();
+        let router = &self.router;
 
-        match self
-            .worker
-            .list_functions(offset, limit, filter, req.timeout_secs)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "list_functions",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "List functions (ida-pro-mcp compatible alias). \
@@ -1409,30 +662,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<ListFunctionsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_funcs");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "list_functions",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let limit = req.limit.unwrap_or(100).min(10000);
-        let offset = req.offset.unwrap_or(0);
-        let filter = req.filter.clone();
+        let router = &self.router;
 
-        match self
-            .worker
-            .list_functions(offset, limit, filter, req.timeout_secs)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "list_functions",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Resolve a function name to its address")]
@@ -1442,22 +681,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<ResolveFunctionRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: get_function_by_name");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_function_by_name",
-                    json!({"name": req.name}),
-                )
-                .await;
-        }
-        match self.worker.resolve_function(&req.name).await {
-            Ok(info) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap_or_else(|_| format!("{:?}", info)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_function_by_name",
+                json!({"name": req.name}),
+            )
+            .await;
     }
 
     #[tool(
@@ -1467,26 +700,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<GetFunctionPrototypeRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_function_prototype",
-                    json!({"address": req.address, "name": req.name}),
-                )
-                .await;
-        }
-        let addr = req
-            .address
-            .as_ref()
-            .and_then(crate::rpc_dispatch::parse_address_value);
-        match self.worker.get_function_prototype(addr, req.name).await {
-            Ok(v) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&v).unwrap_or_else(|_| format!("{v:?}")),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_function_prototype",
+                json!({"address": req.address, "name": req.name}),
+            )
+            .await;
     }
 
     #[tool(description = "Get address context (segment, function, nearest symbol)")]
@@ -1494,34 +717,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<AddrInfoRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_address_info",
-                    json!({"addr": req.address, "name": req.target_name, "offset": req.offset}),
-                )
-                .await;
-        }
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
-        };
-        let offset = req.offset.unwrap_or(0);
-        match self
-            .worker
-            .addr_info(addr, req.target_name.clone(), offset)
-            .await
-        {
-            Ok(info) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap_or_else(|_| format!("{:?}", info)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_address_info",
+                json!({"addr": req.address, "name": req.target_name, "offset": req.offset}),
+            )
+            .await;
     }
 
     #[tool(description = "Get the function that contains an address")]
@@ -1529,34 +734,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<FunctionAtRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_function_at_address",
-                    json!({"addr": req.address, "name": req.target_name, "offset": req.offset}),
-                )
-                .await;
-        }
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
-        };
-        let offset = req.offset.unwrap_or(0);
-        match self
-            .worker
-            .function_at(addr, req.target_name.clone(), offset)
-            .await
-        {
-            Ok(info) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap_or_else(|_| format!("{:?}", info)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_function_at_address",
+                json!({"addr": req.address, "name": req.target_name, "offset": req.offset}),
+            )
+            .await;
     }
 
     #[tool(description = "Get disassembly at an address")]
@@ -1566,47 +753,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<DisasmRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: disassemble");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "disassemble",
-                    json!({"address": req.address, "count": req.count}),
-                )
-                .await;
-        }
-        // Clamp instruction count
-        let count = req.count.unwrap_or(10).min(1000);
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(a) => a,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
+        let router = &self.router;
 
-        if addrs.len() == 1 {
-            match self.worker.disasm(addrs[0], count).await {
-                Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self.worker.disasm(addr, count).await {
-                    Ok(text) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "disasm": text
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "disassemble",
+                json!({"address": req.address, "count": req.count}),
+            )
+            .await;
     }
 
     #[tool(description = "Get disassembly for a function by name")]
@@ -1616,22 +772,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<DisasmByNameRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: disassemble_function");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "disassemble_function",
-                    json!({"name": req.name, "count": req.count}),
-                )
-                .await;
-        }
-        let count = req.count.unwrap_or(10).min(1000);
+        let router = &self.router;
 
-        match self.worker.disasm_by_name(&req.name, count).await {
-            Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "disassemble_function",
+                json!({"name": req.name, "count": req.count}),
+            )
+            .await;
     }
 
     #[tool(description = "Disassemble the function containing an address")]
@@ -1639,33 +789,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<DisasmFunctionAtRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "disassemble_function_at",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
-        };
-        let offset = req.offset.unwrap_or(0);
-        let count = req.count.unwrap_or(200).min(5000);
-        match self
-            .worker
-            .disasm_function_at(addr, req.target_name.clone(), offset, count)
-            .await
-        {
-            Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "disassemble_function_at",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(
@@ -1680,84 +813,20 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: decompile_function");
         let line_addresses = req.line_addresses == Some(true);
-        if let ServerMode::Router(ref router) = self.mode {
-            let mut params = json!({"address": req.address});
-            if line_addresses {
-                params["line_addresses"] = json!(true);
-            }
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "decompile_function",
-                    params,
-                )
-                .await;
-        }
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(a) => a,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
+        let router = &self.router;
 
+        let mut params = json!({"address": req.address});
         if line_addresses {
-            return match crate::rpc_dispatch::decompile_with_line_addresses(&*self.worker, &addrs)
-                .await
-            {
-                Ok(value) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{value:?}")),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            };
+            params["line_addresses"] = json!(true);
         }
-
-        if addrs.len() == 1 {
-            match self.worker.decompile(addrs[0]).await {
-                Ok(code) => {
-                    // Detect IDA auto-generated unknown function names (sub_XXXX, nullsub_X, j_sub_XXXX).
-                    // Only check the first line (the function signature) to avoid false positives
-                    // from callee references inside the function body.
-                    let has_unknown_name = code
-                        .lines()
-                        .next()
-                        .map(|sig| {
-                            sig.contains("sub_")
-                                || sig.contains("nullsub_")
-                                || sig.contains("j_sub_")
-                        })
-                        .unwrap_or(false);
-                    let output = if has_unknown_name {
-                        format!(
-                            "💡 If you understand this function's purpose, \
-                             immediately call rename_symbol to rename it before proceeding.\n\n\
-                             {}",
-                            code
-                        )
-                    } else {
-                        code
-                    };
-                    Ok(CallToolResult::success(vec![Content::text(output)]))
-                }
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self.worker.decompile(addr).await {
-                    Ok(code) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "decompile": code
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "decompile_function",
+                params,
+            )
+            .await;
     }
 
     #[tool(
@@ -1772,57 +841,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<PseudocodeAtRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: get_pseudocode_at");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_pseudocode_at",
-                    json!({"address": req.address, "end_addr": req.end_address}),
-                )
-                .await;
-        }
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(a) => a,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
+        let router = &self.router;
 
-        let end_addr = if let Some(ref end_str) = req.end_address {
-            match Self::parse_address(end_str) {
-                Ok(a) => Some(a),
-                Err(e) => return Ok(e.to_tool_result()),
-            }
-        } else {
-            None
-        };
-
-        if addrs.len() == 1 {
-            match self.worker.pseudocode_at(addrs[0], end_addr).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self.worker.pseudocode_at(addr, end_addr).await {
-                    Ok(result) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "pseudocode": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_pseudocode_at",
+                json!({"address": req.address, "end_addr": req.end_address}),
+            )
+            .await;
     }
 
     #[tool(
@@ -1853,46 +881,16 @@ impl IdaMcpServer {
             include_addresses,
         );
 
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "run_script",
-                    json!({"code": script, "timeout_secs": 120}),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        match self.worker.run_script(&script, Some(120)).await {
-            Ok(result) => {
-                if !run_script_succeeded(&result) {
-                    let message = run_script_failure_message(&result);
-                    return Ok(ToolError::IdaError(message).to_tool_result());
-                }
-                let stdout = run_script_field(&result, "stdout").unwrap_or("{}");
-                match serde_json::from_str::<Value>(stdout) {
-                    Ok(parsed) => {
-                        if parsed.get("error").is_some() {
-                            return Ok(ToolError::IdaError(
-                                parsed["error"].as_str().unwrap_or("unknown").to_string(),
-                            )
-                            .to_tool_result());
-                        }
-                        Ok(CallToolResult::success(vec![Content::text(
-                            serde_json::to_string_pretty(&parsed).unwrap_or_default(),
-                        )]))
-                    }
-                    Err(_) => Ok(CallToolResult::success(vec![Content::text(stdout)])),
-                }
-            }
-            Err(ToolError::Timeout(secs)) => Ok(ToolError::IdaError(format!(
-                "decompile_structured timed out after {}s",
-                secs
-            ))
-            .to_tool_result()),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "run_script",
+                json!({"code": script, "timeout_secs": 120}),
+            )
+            .await;
     }
 
     #[tool(
@@ -1912,48 +910,16 @@ impl IdaMcpServer {
             vec![req.addresses.clone()]
         };
 
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "batch_decompile",
-                    json!({ "addresses": addrs }),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        let mut results = Vec::new();
-        for addr_val in &addrs {
-            let addr = match Self::value_to_single_address(addr_val) {
-                Ok(a) => a,
-                Err(e) => {
-                    results.push(json!({
-                        "address": addr_val,
-                        "error": e.to_string(),
-                        "success": false,
-                    }));
-                    continue;
-                }
-            };
-
-            match self.worker.decompile(addr).await {
-                Ok(code) => results.push(json!({
-                    "address": addr_val,
-                    "pseudocode": code,
-                    "success": true,
-                })),
-                Err(e) => results.push(json!({
-                    "address": addr_val,
-                    "error": e.to_string(),
-                    "success": false,
-                })),
-            }
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&results).unwrap_or_default(),
-        )]))
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "batch_decompile",
+                json!({ "addresses": addrs }),
+            )
+            .await;
     }
 
     #[tool(description = "Search all functions' decompiled pseudocode for a text pattern")]
@@ -1965,30 +931,20 @@ impl IdaMcpServer {
 
         let limit = req.limit.unwrap_or(20).min(100);
 
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "search_pseudocode",
-                    json!({
-                        "pattern": req.pattern,
-                        "limit": limit,
-                        "timeout_secs": req.timeout_secs,
-                    }),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        let result = self
-            .worker
-            .search_pseudocode(&req.pattern, limit, req.timeout_secs)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap_or_default(),
-        )]))
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "search_pseudocode",
+                json!({
+                    "pattern": req.pattern,
+                    "limit": limit,
+                    "timeout_secs": req.timeout_secs,
+                }),
+            )
+            .await;
     }
 
     #[tool(description = "Scan a table in memory by reading entries at stride intervals")]
@@ -2001,61 +957,20 @@ impl IdaMcpServer {
         let stride = req.stride.unwrap_or(8).max(1);
         let count = req.count.unwrap_or(16).min(256);
 
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "scan_memory_table",
-                    json!({
-                        "base_address": req.base_address,
-                        "stride": stride,
-                        "count": count,
-                    }),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        let base_addr = Self::value_to_single_address(&req.base_address).map_err(|_| {
-            McpError::invalid_params("base_address is required and must be a valid address", None)
-        })?;
-
-        let mut entries = Vec::new();
-        for i in 0..count {
-            let offset = (i as u64) * stride;
-            let addr = base_addr + offset;
-            match self
-                .worker
-                .get_bytes(Some(addr), None, 0, stride as usize)
-                .await
-            {
-                Ok(r) => {
-                    entries.push(json!({
-                        "index": i,
-                        "address": format!("0x{:x}", addr),
-                        "bytes": r.bytes,
-                    }));
-                }
-                Err(e) => {
-                    entries.push(json!({
-                        "index": i,
-                        "address": format!("0x{:x}", addr),
-                        "error": e.to_string(),
-                    }));
-                    break;
-                }
-            }
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({
-                "base_address": format!("0x{:x}", base_addr),
-                "stride": stride,
-                "count": entries.len(),
-                "entries": entries,
-            }))
-            .unwrap_or_default(),
-        )]))
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "scan_memory_table",
+                json!({
+                    "base_address": req.base_address,
+                    "stride": stride,
+                    "count": count,
+                }),
+            )
+            .await;
     }
 
     #[tool(
@@ -2067,99 +982,30 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: diff_pseudocode");
 
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "diff_pseudocode",
-                    json!({
-                        "addr1": req.addr1,
-                        "addr2": req.addr2,
-                    }),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        let addr1 = Self::value_to_single_address(&req.addr1).map_err(|_| {
-            McpError::invalid_params("addr1 is required and must be a valid address", None)
-        })?;
-        let addr2 = Self::value_to_single_address(&req.addr2).map_err(|_| {
-            McpError::invalid_params("addr2 is required and must be a valid address", None)
-        })?;
-
-        let result1 = self.worker.decompile(addr1).await.map_err(|e| {
-            McpError::internal_error(format!("Failed to decompile addr1: {}", e), None)
-        })?;
-        let result2 = self.worker.decompile(addr2).await.map_err(|e| {
-            McpError::internal_error(format!("Failed to decompile addr2: {}", e), None)
-        })?;
-
-        let lines1: Vec<&str> = result1.lines().collect();
-        let lines2: Vec<&str> = result2.lines().collect();
-
-        let mut diff_lines = Vec::new();
-        let max_len = lines1.len().max(lines2.len());
-        let mut same = 0usize;
-        let mut different = 0usize;
-
-        for i in 0..max_len {
-            match (lines1.get(i), lines2.get(i)) {
-                (Some(l1), Some(l2)) => {
-                    if l1 == l2 {
-                        diff_lines.push(format!("  {}", l1));
-                        same += 1;
-                    } else {
-                        diff_lines.push(format!("- {}", l1));
-                        diff_lines.push(format!("+ {}", l2));
-                        different += 1;
-                    }
-                }
-                (Some(l1), None) => {
-                    diff_lines.push(format!("- {}", l1));
-                    different += 1;
-                }
-                (None, Some(l2)) => {
-                    diff_lines.push(format!("+ {}", l2));
-                    different += 1;
-                }
-                (None, None) => {}
-            }
-        }
-
-        let total = same + different;
-        let similarity = if total == 0 {
-            1.0f64
-        } else {
-            same as f64 / total as f64
-        };
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({
-                "function1": result1,
-                "function2": result2,
-                "similarity_ratio": (similarity * 100.0).round() / 100.0,
-                "diff_lines": diff_lines,
-            }))
-            .unwrap_or_default(),
-        )]))
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "diff_pseudocode",
+                json!({
+                    "addr1": req.addr1,
+                    "addr2": req.addr2,
+                }),
+            )
+            .await;
     }
 
     #[tool(description = "List all segments in the database with their permissions and types")]
     #[instrument(skip(self))]
     async fn list_segments(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_segments");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(router, None, "list_segments", json!({}))
-                .await;
-        }
-        match self.worker.segments().await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(router, None, "list_segments", json!({}))
+            .await;
     }
 
     #[tool(
@@ -2174,53 +1020,23 @@ impl IdaMcpServer {
         debug!("Tool call: list_strings");
         let query = req.query.or(req.filter);
 
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "list_strings",
-                    json!({
-                        "query": query,
-                        "exact": req.exact,
-                        "case_insensitive": req.case_insensitive,
-                        "offset": req.offset,
-                        "limit": req.limit,
-                        "timeout_secs": req.timeout_secs,
-                    }),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        let limit = req.limit.unwrap_or(100).min(10000);
-        let offset = req.offset.unwrap_or(0);
-        if let Some(q) = query {
-            let exact = req.exact.unwrap_or(false);
-            let case_insensitive = req.case_insensitive.unwrap_or(true);
-            match self
-                .worker
-                .find_string(q, exact, case_insensitive, offset, limit, req.timeout_secs)
-                .await
-            {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            match self
-                .worker
-                .strings(offset, limit, None, req.timeout_secs)
-                .await
-            {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "list_strings",
+                json!({
+                    "query": query,
+                    "exact": req.exact,
+                    "case_insensitive": req.case_insensitive,
+                    "offset": req.offset,
+                    "limit": req.limit,
+                    "timeout_secs": req.timeout_secs,
+                }),
+            )
+            .await;
     }
 
     #[tool(description = "Find strings and return xrefs to each match. \
@@ -2229,39 +1045,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<XrefsToStringRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_xrefs_to_string",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let limit = req.limit.unwrap_or(100).min(10000);
-        let offset = req.offset.unwrap_or(0);
-        let exact = req.exact.unwrap_or(false);
-        let case_insensitive = req.case_insensitive.unwrap_or(true);
-        let max_xrefs = req.max_xrefs.unwrap_or(64);
-        match self
-            .worker
-            .xrefs_to_string(
-                req.query.clone(),
-                exact,
-                case_insensitive,
-                offset,
-                limit,
-                max_xrefs,
-                req.timeout_secs,
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_xrefs_to_string",
+                serde_json::to_value(&req).unwrap_or_default(),
             )
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+            .await;
     }
 
     #[tool(description = "Get cross-references TO an address (who references this address)")]
@@ -2271,48 +1064,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<AddressRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: get_xrefs_to");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_xrefs_to",
-                    json!({"address": req.address}),
-                )
-                .await;
-        }
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(a) => a,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
+        let router = &self.router;
 
-        if addrs.len() == 1 {
-            match self.worker.xrefs_to(addrs[0]).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self.worker.xrefs_to(addr).await {
-                    Ok(result) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "xrefs": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_xrefs_to",
+                json!({"address": req.address}),
+            )
+            .await;
     }
 
     #[tool(description = "Get cross-references FROM an address (what this address references)")]
@@ -2322,48 +1083,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<AddressRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: get_xrefs_from");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_xrefs_from",
-                    json!({"address": req.address}),
-                )
-                .await;
-        }
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(a) => a,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
+        let router = &self.router;
 
-        if addrs.len() == 1 {
-            match self.worker.xrefs_from(addrs[0]).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self.worker.xrefs_from(addr).await {
-                    Ok(result) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "xrefs": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_xrefs_from",
+                json!({"address": req.address}),
+            )
+            .await;
     }
 
     #[tool(description = "List imports (external symbols) with pagination")]
@@ -2373,25 +1102,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<PaginatedRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_imports");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "list_imports",
-                    json!({"offset": req.offset, "limit": req.limit}),
-                )
-                .await;
-        }
-        let limit = req.limit.unwrap_or(100).min(10000);
-        let offset = req.offset.unwrap_or(0);
+        let router = &self.router;
 
-        match self.worker.imports(offset, limit).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "list_imports",
+                json!({"offset": req.offset, "limit": req.limit}),
+            )
+            .await;
     }
 
     #[tool(description = "List exports/names (public symbols) with pagination")]
@@ -2401,42 +1121,27 @@ impl IdaMcpServer {
         Parameters(req): Parameters<PaginatedRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_exports");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "list_exports",
-                    json!({"offset": req.offset, "limit": req.limit}),
-                )
-                .await;
-        }
-        let limit = req.limit.unwrap_or(100).min(10000);
-        let offset = req.offset.unwrap_or(0);
+        let router = &self.router;
 
-        match self.worker.exports(offset, limit).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "list_exports",
+                json!({"offset": req.offset, "limit": req.limit}),
+            )
+            .await;
     }
 
     #[tool(description = "Get entry point addresses of the binary")]
     #[instrument(skip(self))]
     async fn list_entry_points(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_entry_points");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(router, None, "list_entry_points", json!({}))
-                .await;
-        }
-        match self.worker.entrypoints().await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(router, None, "list_entry_points", json!({}))
+            .await;
     }
 
     #[tool(description = "Read raw bytes from an address as hex string")]
@@ -2446,66 +1151,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<GetBytesRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: read_bytes");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "read_bytes",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let size = req.size.unwrap_or(256).min(0x10000);
-        if let Some(addr_value) = req.address.as_ref() {
-            let addrs = match Self::value_to_addresses(addr_value) {
-                Ok(a) => a,
-                Err(e) => return Ok(e.to_tool_result()),
-            };
+        let router = &self.router;
 
-            if addrs.len() == 1 {
-                match self.worker.get_bytes(Some(addrs[0]), None, 0, size).await {
-                    Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                        serde_json::to_string_pretty(&result)
-                            .unwrap_or_else(|_| format!("{:?}", result)),
-                    )])),
-                    Err(e) => Ok(e.to_tool_result()),
-                }
-            } else {
-                let mut results = Vec::new();
-                for addr in addrs {
-                    match self.worker.get_bytes(Some(addr), None, 0, size).await {
-                        Ok(result) => results.push(json!({
-                            "address": format!("{:#x}", addr),
-                            "bytes": result
-                        })),
-                        Err(e) => results.push(json!({
-                            "address": format!("{:#x}", addr),
-                            "error": e.to_string()
-                        })),
-                    }
-                }
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&json!({ "results": results }))
-                        .unwrap_or_else(|_| format!("{:?}", results)),
-                )]))
-            }
-        } else if let Some(name) = req.target_name.as_ref() {
-            let offset = req.offset.unwrap_or(0);
-            match self
-                .worker
-                .get_bytes(None, Some(name.clone()), offset, size)
-                .await
-            {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            Ok(ToolError::InvalidParams("address or name required".to_string()).to_tool_result())
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "read_bytes",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Get basic blocks of a function (control flow graph nodes)")]
@@ -2515,48 +1170,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<AddressRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: get_basic_blocks");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_basic_blocks",
-                    json!({"address": req.address}),
-                )
-                .await;
-        }
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(a) => a,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
+        let router = &self.router;
 
-        if addrs.len() == 1 {
-            match self.worker.basic_blocks(addrs[0]).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self.worker.basic_blocks(addr).await {
-                    Ok(result) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "basic_blocks": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_basic_blocks",
+                json!({"address": req.address}),
+            )
+            .await;
     }
 
     #[tool(description = "Get functions called BY a function (callees/children in call graph)")]
@@ -2566,48 +1189,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<AddressRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: get_callees");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_callees",
-                    json!({"address": req.address}),
-                )
-                .await;
-        }
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(a) => a,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
+        let router = &self.router;
 
-        if addrs.len() == 1 {
-            match self.worker.callees(addrs[0]).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self.worker.callees(addr).await {
-                    Ok(result) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "callees": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_callees",
+                json!({"address": req.address}),
+            )
+            .await;
     }
 
     #[tool(description = "Get functions that CALL a function (callers/parents in call graph)")]
@@ -2617,65 +1208,27 @@ impl IdaMcpServer {
         Parameters(req): Parameters<AddressRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: get_callers");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_callers",
-                    json!({"address": req.address}),
-                )
-                .await;
-        }
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(a) => a,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
+        let router = &self.router;
 
-        if addrs.len() == 1 {
-            match self.worker.callers(addrs[0]).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self.worker.callers(addr).await {
-                    Ok(result) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "callers": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_callers",
+                json!({"address": req.address}),
+            )
+            .await;
     }
 
     #[tool(description = "Get IDB metadata (ida-pro-mcp compatibility)")]
     #[instrument(skip(self))]
     async fn get_database_info(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: get_database_info");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(router, None, "get_database_info", json!({}))
-                .await;
-        }
-        match self.worker.idb_meta().await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(router, None, "get_database_info", json!({}))
+            .await;
     }
 
     #[tool(description = "Lookup functions by name or address (batch)")]
@@ -2685,26 +1238,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<LookupFuncsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: batch_lookup_functions");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "batch_lookup_functions",
-                    json!({"queries": req.queries}),
-                )
-                .await;
-        }
-        let queries = match Self::value_to_strings(&req.queries) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        match self.worker.lookup_funcs(queries).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "batch_lookup_functions",
+                json!({"queries": req.queries}),
+            )
+            .await;
     }
 
     #[tool(description = "List global names (non-function symbols). \
@@ -2715,28 +1258,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<ListGlobalsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_globals");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "list_globals",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let limit = req.limit.unwrap_or(100).min(10000);
-        let offset = req.offset.unwrap_or(0);
-        match self
-            .worker
-            .list_globals(req.query.clone(), offset, limit, req.timeout_secs)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "list_globals",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Find byte patterns (ida-pro-mcp compatibility). \
@@ -2747,67 +1278,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<FindBytesRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: search_bytes");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "search_bytes",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let patterns = match Self::value_to_strings(&req.patterns) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        let limit = req.limit.unwrap_or(100).min(10000);
-        let offset = req.offset.unwrap_or(0);
-        let timeout_secs = req.timeout_secs;
-        let mut results = Vec::new();
+        let router = &self.router;
 
-        for pattern in patterns {
-            let max_results = (offset + limit).min(20000);
-            match self
-                .worker
-                .find_bytes(pattern.clone(), max_results, timeout_secs)
-                .await
-            {
-                Ok(value) => {
-                    let matches = value
-                        .get("matches")
-                        .and_then(|m| m.as_array())
-                        .cloned()
-                        .unwrap_or_default();
-                    let total = matches.len();
-                    let sliced = matches
-                        .into_iter()
-                        .skip(offset)
-                        .take(limit)
-                        .collect::<Vec<_>>();
-                    let next_offset = if offset + limit < total {
-                        Some(offset + limit)
-                    } else {
-                        None
-                    };
-                    results.push(json!({
-                        "pattern": pattern,
-                        "matches": sliced,
-                        "total": total,
-                        "next_offset": next_offset
-                    }));
-                }
-                Err(e) => results.push(json!({
-                    "pattern": pattern,
-                    "error": e.to_string()
-                })),
-            }
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({ "results": results }))
-                .unwrap_or_else(|_| format!("{:?}", results)),
-        )]))
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "search_bytes",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(
@@ -2820,115 +1300,44 @@ impl IdaMcpServer {
         Parameters(req): Parameters<SearchRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: search_text");
-        if let ServerMode::Router(ref router) = self.mode {
-            let db_handle = req.db_handle.as_deref();
-            let kind = req.kind.as_deref().unwrap_or("auto").to_lowercase();
-            let targets = match Self::value_to_strings(&req.targets) {
-                Ok(v) => v,
-                Err(e) => return Ok(e.to_tool_result()),
-            };
-            let mut results = Vec::new();
-            for target in &targets {
-                let (method, params) = if kind == "imm" || kind == "immediate" {
-                    (
-                        "search_imm",
-                        json!({"imm": target.parse::<u64>().unwrap_or(0), "max_results": req.limit, "timeout_secs": req.timeout_secs}),
-                    )
-                } else if kind == "text" || kind == "string" {
-                    (
-                        "search_text",
-                        json!({"text": target, "max_results": req.limit, "timeout_secs": req.timeout_secs}),
-                    )
-                } else if Self::parse_address(target).is_ok() {
-                    (
-                        "search_imm",
-                        json!({"imm": Self::parse_address(target).unwrap_or(0), "max_results": req.limit, "timeout_secs": req.timeout_secs}),
-                    )
-                } else {
-                    (
-                        "search_text",
-                        json!({"text": target, "max_results": req.limit, "timeout_secs": req.timeout_secs}),
-                    )
-                };
-                match router.route_request(db_handle, method, params).await {
-                    Ok(v) => results.push(json!({"target": target, "result": v})),
-                    Err(e) => results.push(json!({"target": target, "error": e.to_string()})),
-                }
-            }
-            return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({"results": results})).unwrap_or_default(),
-            )]));
-        }
+        let router = &self.router;
+
+        let db_handle = req.db_handle.as_deref();
+        let kind = req.kind.as_deref().unwrap_or("auto").to_lowercase();
         let targets = match Self::value_to_strings(&req.targets) {
             Ok(v) => v,
             Err(e) => return Ok(e.to_tool_result()),
         };
-        let limit = req.limit.unwrap_or(100).min(10000);
-        let offset = req.offset.unwrap_or(0);
-        let timeout_secs = req.timeout_secs;
-        let kind = req.kind.as_deref().unwrap_or("auto").to_lowercase();
-
         let mut results = Vec::new();
-        for target in targets {
-            let max_results = (offset + limit).min(20000);
-            let search_result = if kind == "imm" || kind == "immediate" {
-                match Self::parse_address(&target) {
-                    Ok(val) => self.worker.search_imm(val, max_results, timeout_secs).await,
-                    Err(e) => {
-                        results.push(json!({
-                            "target": target,
-                            "error": e.to_string()
-                        }));
-                        continue;
-                    }
-                }
+        for target in &targets {
+            let (method, params) = if kind == "imm" || kind == "immediate" {
+                (
+                    "search_imm",
+                    json!({"imm": target.parse::<u64>().unwrap_or(0), "max_results": req.limit, "timeout_secs": req.timeout_secs}),
+                )
             } else if kind == "text" || kind == "string" {
-                self.worker
-                    .search_text(target.clone(), max_results, timeout_secs)
-                    .await
-            } else if let Ok(val) = Self::parse_address(&target) {
-                self.worker.search_imm(val, max_results, timeout_secs).await
+                (
+                    "search_text",
+                    json!({"text": target, "max_results": req.limit, "timeout_secs": req.timeout_secs}),
+                )
+            } else if Self::parse_address(target).is_ok() {
+                (
+                    "search_imm",
+                    json!({"imm": Self::parse_address(target).unwrap_or(0), "max_results": req.limit, "timeout_secs": req.timeout_secs}),
+                )
             } else {
-                self.worker
-                    .search_text(target.clone(), max_results, timeout_secs)
-                    .await
+                (
+                    "search_text",
+                    json!({"text": target, "max_results": req.limit, "timeout_secs": req.timeout_secs}),
+                )
             };
-
-            match search_result {
-                Ok(value) => {
-                    let matches = value
-                        .get("matches")
-                        .and_then(|m| m.as_array())
-                        .cloned()
-                        .unwrap_or_default();
-                    let total = matches.len();
-                    let sliced = matches
-                        .into_iter()
-                        .skip(offset)
-                        .take(limit)
-                        .collect::<Vec<_>>();
-                    let next_offset = if offset + limit < total {
-                        Some(offset + limit)
-                    } else {
-                        None
-                    };
-                    results.push(json!({
-                        "target": target,
-                        "matches": sliced,
-                        "total": total,
-                        "next_offset": next_offset
-                    }));
-                }
-                Err(e) => results.push(json!({
-                    "target": target,
-                    "error": e.to_string()
-                })),
+            match router.route_request(db_handle, method, params).await {
+                Ok(v) => results.push(json!({"target": target, "result": v})),
+                Err(e) => results.push(json!({"target": target, "error": e.to_string()})),
             }
         }
-
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({ "results": results }))
-                .unwrap_or_else(|_| format!("{:?}", results)),
+            serde_json::to_string_pretty(&json!({"results": results})).unwrap_or_default(),
         )]))
     }
 
@@ -2938,17 +1347,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<AddressRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "read_int",
-                    json!({"address": req.address, "size": 1}),
-                )
-                .await;
-        }
-        get_int_values(&self.worker, req.address, 1).await
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "read_int",
+                json!({"address": req.address, "size": 1}),
+            )
+            .await;
     }
 
     #[tool(description = "Read u16 values at address(es)")]
@@ -2957,17 +1365,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<AddressRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "read_int",
-                    json!({"address": req.address, "size": 2}),
-                )
-                .await;
-        }
-        get_int_values(&self.worker, req.address, 2).await
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "read_int",
+                json!({"address": req.address, "size": 2}),
+            )
+            .await;
     }
 
     #[tool(description = "Read u32 values at address(es)")]
@@ -2976,17 +1383,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<AddressRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "read_int",
-                    json!({"address": req.address, "size": 4}),
-                )
-                .await;
-        }
-        get_int_values(&self.worker, req.address, 4).await
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "read_int",
+                json!({"address": req.address, "size": 4}),
+            )
+            .await;
     }
 
     #[tool(description = "Read u64 values at address(es)")]
@@ -2995,17 +1401,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<AddressRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "read_int",
-                    json!({"address": req.address, "size": 8}),
-                )
-                .await;
-        }
-        get_int_values(&self.worker, req.address, 8).await
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "read_int",
+                json!({"address": req.address, "size": 8}),
+            )
+            .await;
     }
 
     #[tool(description = "Read string(s) at address(es)")]
@@ -3015,49 +1420,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<GetStringRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: read_string");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "read_string",
-                    json!({"address": req.address, "max_len": req.max_len}),
-                )
-                .await;
-        }
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        let max_len = req.max_len.unwrap_or(256).min(0x10000);
+        let router = &self.router;
 
-        if addrs.len() == 1 {
-            match self.worker.get_string(addrs[0], max_len).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self.worker.get_string(addr, max_len).await {
-                    Ok(result) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "string": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "read_string",
+                json!({"address": req.address, "max_len": req.max_len}),
+            )
+            .await;
     }
 
     #[tool(description = "Get global value(s) by name or address")]
@@ -3067,48 +1439,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<GetGlobalValueRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: read_global_variable");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "read_global_variable",
-                    json!({"query": req.query}),
-                )
-                .await;
-        }
-        let queries = match Self::value_to_strings(&req.query) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
+        let router = &self.router;
 
-        if queries.len() == 1 {
-            match self.worker.get_global_value(queries[0].clone()).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for query in queries {
-                match self.worker.get_global_value(query.clone()).await {
-                    Ok(result) => results.push(json!({
-                        "query": query,
-                        "value": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "query": query,
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "read_global_variable",
+                json!({"query": req.query}),
+            )
+            .await;
     }
 
     #[tool(description = "Find paths between two addresses (CFG)")]
@@ -3118,37 +1458,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<FindPathsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: find_control_flow_paths");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "find_control_flow_paths",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let start = match Self::value_to_single_address(&req.start) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        let end = match Self::value_to_single_address(&req.end) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        let max_paths = req.max_paths.unwrap_or(8).min(128);
-        let max_depth = req.max_depth.unwrap_or(64).min(2048);
+        let router = &self.router;
 
-        match self
-            .worker
-            .find_paths(start, end, max_paths, max_depth)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "find_control_flow_paths",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Build a callgraph rooted at an address")]
@@ -3158,50 +1477,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<CallGraphRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: build_callgraph");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "build_callgraph",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let roots = match Self::value_to_addresses(&req.roots) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        let max_depth = req.max_depth.unwrap_or(2).min(16);
-        let max_nodes = req.max_nodes.unwrap_or(256).min(10000);
+        let router = &self.router;
 
-        if roots.len() == 1 {
-            match self.worker.callgraph(roots[0], max_depth, max_nodes).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for root in roots {
-                match self.worker.callgraph(root, max_depth, max_nodes).await {
-                    Ok(result) => results.push(json!({
-                        "root": format!("{:#x}", root),
-                        "callgraph": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "root": format!("{:#x}", root),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "build_callgraph",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Compute xref matrix for a set of addresses")]
@@ -3211,26 +1496,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<XrefMatrixRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: build_xref_matrix");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "build_xref_matrix",
-                    json!({"addrs": req.addrs}),
-                )
-                .await;
-        }
-        let addrs = match Self::value_to_addresses(&req.addrs) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        match self.worker.xref_matrix(addrs).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "build_xref_matrix",
+                json!({"addrs": req.addrs}),
+            )
+            .await;
     }
 
     #[tool(description = "Export functions (ida-pro-mcp compatibility)")]
@@ -3240,48 +1515,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<ExportFuncsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: export_functions");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "export_functions",
-                    json!({"offset": req.offset, "limit": req.limit}),
-                )
-                .await;
-        }
-        if let Some(fmt) = req.format.as_deref() {
-            if fmt.to_lowercase() != "json" {
-                return Ok(ToolError::NotSupported(format!(
-                    "format {} not supported (only json)",
-                    fmt
-                ))
-                .to_tool_result());
-            }
-        }
-        if let Some(addrs) = req.addrs {
-            let queries = match Self::value_to_strings(&addrs) {
-                Ok(v) => v,
-                Err(e) => return Ok(e.to_tool_result()),
-            };
-            match self.worker.lookup_funcs(queries).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let limit = req.limit.unwrap_or(100).min(10000);
-            let offset = req.offset.unwrap_or(0);
-            match self.worker.export_funcs(offset, limit).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "export_functions",
+                json!({"offset": req.offset, "limit": req.limit}),
+            )
+            .await;
     }
 
     #[tool(description = "Convert integers between bases")]
@@ -3333,28 +1576,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<LocalTypesRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "list_local_types",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let offset = req.offset.unwrap_or(0);
-        let limit = req.limit.unwrap_or(100);
-        match self
-            .worker
-            .local_types(offset, limit, req.filter.clone(), req.timeout_secs)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "list_local_types",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Get xrefs to a struct field")]
@@ -3362,33 +1593,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<XrefsToFieldRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_xrefs_to_struct_field",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let limit = req.limit.unwrap_or(1000).min(10000);
-        match self
-            .worker
-            .xrefs_to_field(
-                req.ordinal,
-                req.name.clone(),
-                req.member_index,
-                req.member_name.clone(),
-                limit,
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_xrefs_to_struct_field",
+                serde_json::to_value(&req).unwrap_or_default(),
             )
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+            .await;
     }
 
     #[tool(description = "Set comments at an address")]
@@ -3396,41 +1610,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<SetCommentsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "set_comment",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let repeatable = req.repeatable.unwrap_or(false);
-        let offset = req.offset.unwrap_or(0);
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
-        };
-        match self
-            .worker
-            .set_comments(
-                addr,
-                req.target_name.clone(),
-                offset,
-                req.comment.clone(),
-                repeatable,
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "set_comment",
+                serde_json::to_value(&req).unwrap_or_default(),
             )
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+            .await;
     }
 
     #[tool(description = "Set a function-level comment (visible at function entry)")]
@@ -3438,31 +1627,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<SetFunctionCommentRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "set_function_comment",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let addr = req
-            .address
-            .as_ref()
-            .and_then(crate::rpc_dispatch::parse_address_value);
-        let repeatable = req.repeatable.unwrap_or(false);
-        match self
-            .worker
-            .set_function_comment(addr, req.name.clone(), req.comment.clone(), repeatable)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "set_function_comment",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Patch instructions with assembly text")]
@@ -3470,34 +1644,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<PatchAsmRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "patch_assembly",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let offset = req.offset.unwrap_or(0);
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
-        };
-        match self
-            .worker
-            .patch_asm(addr, req.target_name.clone(), offset, req.line.clone())
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "patch_assembly",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Declare a type in the local type library")]
@@ -3505,29 +1661,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<DeclareTypeRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "declare_c_type",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let relaxed = req.relaxed.unwrap_or(false);
-        let replace = req.replace.unwrap_or(false);
-        let multi = req.multi.unwrap_or(false);
-        match self
-            .worker
-            .declare_type(req.decl.clone(), relaxed, replace, multi)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "declare_c_type",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Get stack frame info")]
@@ -3535,26 +1678,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<AddressRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_stack_frame",
-                    json!({"address": req.address}),
-                )
-                .await;
-        }
-        let addr = match Self::value_to_single_address(&req.address) {
-            Ok(addr) => addr,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        match self.worker.stack_frame(addr).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_stack_frame",
+                json!({"address": req.address}),
+            )
+            .await;
     }
 
     #[tool(description = "Declare a stack variable in a function frame")]
@@ -3562,41 +1695,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<DeclareStackRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "create_stack_variable",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
-        };
-        let relaxed = req.relaxed.unwrap_or(false);
-        match self
-            .worker
-            .declare_stack(
-                addr,
-                req.target_name.clone(),
-                req.offset,
-                req.var_name.clone(),
-                req.decl.clone(),
-                relaxed,
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "create_stack_variable",
+                serde_json::to_value(&req).unwrap_or_default(),
             )
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+            .await;
     }
 
     #[tool(description = "Delete a stack variable from a function frame")]
@@ -3604,38 +1712,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<DeleteStackRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "delete_stack_variable",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
-        };
-        match self
-            .worker
-            .delete_stack(
-                addr,
-                req.target_name.clone(),
-                req.offset,
-                req.var_name.clone(),
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "delete_stack_variable",
+                serde_json::to_value(&req).unwrap_or_default(),
             )
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+            .await;
     }
 
     #[tool(description = "Rename a stack frame variable in a function")]
@@ -3643,31 +1729,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<RenameStackVariableRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "rename_stack_variable",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        let func_addr = req
-            .func_address
-            .as_ref()
-            .and_then(crate::rpc_dispatch::parse_address_value);
-        match self
-            .worker
-            .rename_stack_variable(func_addr, req.func_name, req.name, req.new_name)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "rename_stack_variable",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Set the type of a stack frame variable")]
@@ -3675,31 +1746,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<SetStackVariableTypeRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "set_stack_variable_type",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        let func_addr = req
-            .func_address
-            .as_ref()
-            .and_then(crate::rpc_dispatch::parse_address_value);
-        match self
-            .worker
-            .set_stack_variable_type(func_addr, req.func_name, req.name, req.type_decl)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "set_stack_variable_type",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "List all enum types in the database")]
@@ -3707,25 +1763,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<ListEnumsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "list_enums",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        let offset = req.offset.unwrap_or(0);
-        let limit = req.limit.unwrap_or(100);
-        match self.worker.list_enums(req.filter, offset, limit).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "list_enums",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Create an enum type from a C declaration")]
@@ -3733,24 +1780,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<CreateEnumRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "create_enum",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        let replace = req.replace.unwrap_or(false);
-        match self.worker.create_enum(req.decl, replace).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "create_enum",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(
@@ -3763,29 +1802,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<StructsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_structs");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "list_structs",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let limit = req.limit.unwrap_or(100).min(10000);
-        let offset = req.offset.unwrap_or(0);
+        let router = &self.router;
 
-        match self
-            .worker
-            .structs(offset, limit, req.filter, req.timeout_secs)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "list_structs",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Get info about a struct by ordinal or name")]
@@ -3795,22 +1821,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<StructInfoRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: get_struct_info");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "get_struct_info",
-                    json!({"ordinal": req.ordinal, "name": req.name}),
-                )
-                .await;
-        }
-        match self.worker.struct_info(req.ordinal, req.name).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "get_struct_info",
+                json!({"ordinal": req.ordinal, "name": req.name}),
+            )
+            .await;
     }
 
     #[tool(description = "Read values of a struct instance at an address")]
@@ -3820,56 +1840,16 @@ impl IdaMcpServer {
         Parameters(req): Parameters<ReadStructRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: read_struct_at_address");
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "read_struct_at_address",
-                    json!({"address": req.address, "ordinal": req.ordinal, "name": req.name}),
-                )
-                .await;
-        }
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(a) => a,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
+        let router = &self.router;
 
-        if addrs.len() == 1 {
-            match self
-                .worker
-                .read_struct(addrs[0], req.ordinal, req.name)
-                .await
-            {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self
-                    .worker
-                    .read_struct(addr, req.ordinal, req.name.clone())
-                    .await
-                {
-                    Ok(result) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "struct": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "read_struct_at_address",
+                json!({"address": req.address, "ordinal": req.ordinal, "name": req.name}),
+            )
+            .await;
     }
 
     #[tool(description = "Search structs by name")]
@@ -3877,28 +1857,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<StructsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "list_structs",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let offset = req.offset.unwrap_or(0);
-        let limit = req.limit.unwrap_or(100);
-        match self
-            .worker
-            .structs(offset, limit, req.filter.clone(), req.timeout_secs)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "list_structs",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Find instruction sequences by mnemonic")]
@@ -3906,35 +1874,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<FindInsnsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "search_instructions",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let patterns = match Self::value_to_strings(&req.patterns) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        if patterns.is_empty() {
-            return Ok(ToolError::InvalidParams("empty patterns".to_string()).to_tool_result());
-        }
-        let max_results = req.limit.unwrap_or(100);
-        let case_insensitive = req.case_insensitive.unwrap_or(false);
-        match self
-            .worker
-            .find_insns(patterns, max_results, case_insensitive, req.timeout_secs)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "search_instructions",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Find instruction operands")]
@@ -3942,35 +1891,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<FindInsnOperandsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "search_instruction_operands",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let patterns = match Self::value_to_strings(&req.patterns) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        if patterns.is_empty() {
-            return Ok(ToolError::InvalidParams("empty patterns".to_string()).to_tool_result());
-        }
-        let max_results = req.limit.unwrap_or(100);
-        let case_insensitive = req.case_insensitive.unwrap_or(false);
-        match self
-            .worker
-            .find_insn_operands(patterns, max_results, case_insensitive, req.timeout_secs)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "search_instruction_operands",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Apply a type to an address")]
@@ -3978,48 +1908,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<ApplyTypesRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "apply_type",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
-        };
-        let offset = req.offset.unwrap_or(0);
-        let relaxed = req.relaxed.unwrap_or(false);
-        let delay = req.delay.unwrap_or(false);
-        let strict = req.strict.unwrap_or(false);
-        match self
-            .worker
-            .apply_types(
-                addr,
-                req.target_name.clone(),
-                offset,
-                req.stack_offset,
-                req.stack_name.clone(),
-                req.decl.clone(),
-                req.type_name.clone(),
-                relaxed,
-                delay,
-                strict,
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "apply_type",
+                serde_json::to_value(&req).unwrap_or_default(),
             )
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+            .await;
     }
 
     #[tool(description = "Apply a C prototype declaration to a function")]
@@ -4027,30 +1925,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<SetFunctionPrototypeRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "set_function_prototype",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let addr = req
-            .address
-            .as_ref()
-            .and_then(crate::rpc_dispatch::parse_address_value);
-        match self
-            .worker
-            .set_function_prototype(addr, req.name.clone(), req.prototype.clone())
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "set_function_prototype",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Infer/guess type at an address")]
@@ -4058,34 +1942,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<InferTypesRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "infer_type",
-                    json!({"addr": req.address, "name": req.target_name, "offset": req.offset}),
-                )
-                .await;
-        }
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
-        };
-        let offset = req.offset.unwrap_or(0);
-        match self
-            .worker
-            .infer_types(addr, req.target_name.clone(), offset)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "infer_type",
+                json!({"addr": req.address, "name": req.target_name, "offset": req.offset}),
+            )
+            .await;
     }
 
     #[tool(description = "Analyze functions (not supported)")]
@@ -4093,22 +1959,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<AnalyzeFuncsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "run_auto_analysis",
-                    json!({"timeout_secs": req.timeout_secs}),
-                )
-                .await;
-        }
-        match self.worker.analyze_funcs(req.timeout_secs).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "run_auto_analysis",
+                json!({"timeout_secs": req.timeout_secs}),
+            )
+            .await;
     }
 
     #[tool(description = "Rename symbols")]
@@ -4116,34 +1976,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<RenameRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "rename_symbol",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
-        };
-        let flags = req.flags.unwrap_or(0);
-        match self
-            .worker
-            .rename(addr, req.current_name.clone(), req.name.clone(), flags)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "rename_symbol",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Rename multiple symbols at once")]
@@ -4151,35 +1993,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<BatchRenameRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "batch_rename",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        let entries: Vec<(Option<u64>, Option<String>, String)> = req
-            .renames
-            .iter()
-            .map(|e| {
-                let addr = e
-                    .address
-                    .as_ref()
-                    .and_then(crate::rpc_dispatch::parse_address_value);
-                (addr, e.current_name.clone(), e.new_name.clone())
-            })
-            .collect();
-
-        match self.worker.batch_rename(entries).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "batch_rename",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Rename a local variable in decompiled pseudocode")]
@@ -4187,30 +2010,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<RenameLvarRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "rename_local_variable",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let func_addr = match Self::value_to_single_address(&req.func_address) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        match self
-            .worker
-            .rename_lvar(func_addr, req.lvar_name.clone(), req.new_name.clone())
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "rename_local_variable",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Set the type of a local variable in decompiled pseudocode")]
@@ -4218,30 +2027,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<SetLvarTypeRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "set_local_variable_type",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let func_addr = match Self::value_to_single_address(&req.func_address) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        match self
-            .worker
-            .set_lvar_type(func_addr, req.lvar_name.clone(), req.type_str.clone())
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "set_local_variable_type",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Set a comment in decompiled pseudocode")]
@@ -4249,35 +2044,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<SetDecompilerCommentRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "set_decompiler_comment",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let func_addr = match Self::value_to_single_address(&req.func_address) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        let addr = match Self::value_to_single_address(&req.address) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        let itp = req.itp.unwrap_or(69);
-        match self
-            .worker
-            .set_decompiler_comment(func_addr, addr, itp, req.comment.clone())
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "set_decompiler_comment",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(description = "Patch bytes at an address")]
@@ -4285,38 +2061,16 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<PatchRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "patch_bytes",
-                    serde_json::to_value(&req).unwrap_or_default(),
-                )
-                .await;
-        }
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
-        };
-        let offset = req.offset.unwrap_or(0);
-        let bytes = match Self::value_to_bytes(&req.bytes) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-        match self
-            .worker
-            .patch_bytes(addr, req.target_name.clone(), offset, bytes)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "patch_bytes",
+                serde_json::to_value(&req).unwrap_or_default(),
+            )
+            .await;
     }
 
     #[tool(
@@ -4334,154 +2088,7 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<OpenDscRequest>,
     ) -> Result<CallToolResult, McpError> {
-        debug!("Tool call: open_dsc");
-        if let ServerMode::Router(router) = &self.mode {
-            if router.uses_nexus() {
-                return self.open_dsc_nexus(router, req).await;
-            }
-        }
-
-        let preparation = crate::preprocess::Preparation::new(std::time::Duration::from_secs(3600));
-
-        if !Self::validate_path(&req.path) {
-            return Ok(ToolError::InvalidPath(req.path).to_tool_result());
-        }
-
-        let ida_version = req.ida_version.unwrap_or(9);
-        if ida_version != 8 && ida_version != 9 {
-            return Ok(
-                ToolError::InvalidParams("ida_version must be 8 or 9".into()).to_tool_result(),
-            );
-        }
-
-        let file_type = crate::dsc::dsc_file_type(&req.arch, ida_version);
-        let frameworks = req.frameworks.unwrap_or_default();
-        let dsc_path = std::path::Path::new(&req.path);
-        let out_i64 = dsc_path.with_extension("i64");
-
-        // If .i64 already exists, open synchronously (fast path).
-        if out_i64.exists() {
-            return self
-                .open_dsc_i64(&out_i64, &req.module, &frameworks, preparation)
-                .await;
-        }
-
-        // .i64 doesn't exist — need to run idat, which takes minutes.
-        // Validate idat exists and write the load script before spawning.
-        let idat = match crate::dsc::find_idat() {
-            Ok(path) => path,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-
-        let script = crate::dsc::dsc_load_script(&req.module, &frameworks);
-        let destination = out_i64.clone();
-        let stage = match preparation
-            .wait(crate::blocking::run(
-                crate::blocking::WorkClass::Prepare,
-                move || crate::preprocess::StagedArtifact::create(&destination),
-            ))
-            .await
-        {
-            Ok(Ok(stage)) => stage,
-            other => {
-                return Ok(ToolError::IdaError(format!("DSC staging: {other:?}")).to_tool_result())
-            }
-        };
-        let script_path = stage.directory.join("load.py");
-        let script_destination = script_path.clone();
-        match preparation
-            .wait(crate::blocking::run(
-                crate::blocking::WorkClass::Prepare,
-                move || std::fs::write(script_destination, script),
-            ))
-            .await
-        {
-            Ok(Ok(())) => {}
-            other => {
-                return Ok(
-                    ToolError::IdaError(format!("DSC script write: {other:?}")).to_tool_result()
-                )
-            }
-        }
-
-        let log_path = req.log_path.map(std::path::PathBuf::from);
-        if let Some(ref lp) = log_path {
-            if lp.to_string_lossy().contains("..") {
-                return Ok(ToolError::InvalidParams(
-                    "log_path must not contain '..' path traversal".into(),
-                )
-                .to_tool_result());
-            }
-        }
-        let idat_args = crate::dsc::idat_dsc_args(
-            dsc_path,
-            &stage.output,
-            &script_path,
-            &file_type,
-            log_path.as_deref(),
-        );
-
-        // Create a background task and return immediately.
-        // Use the .i64 path as dedup key to prevent concurrent idat
-        // processes writing the same output file.
-        let dedup_key = out_i64.display().to_string();
-        let task_id = match self
-            .task_registry
-            .create_keyed(&dedup_key, "Running idat to create .i64 from DSC...")
-        {
-            Ok(id) => id,
-            Err(existing_id) => {
-                return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&json!({
-                        "status": "already_running",
-                        "task_id": existing_id,
-                        "message": "A DSC loading task for this path is already in progress. Poll task_status(task_id) for progress.",
-                    }))
-                    .unwrap_or_default(),
-                )]));
-            }
-        };
-
-        info!(
-            task_id = %task_id,
-            idat = %idat.display(),
-            module = %req.module,
-            "Spawning background idat for DSC loading"
-        );
-
-        let registry = self.task_registry.clone();
-        let worker = Arc::clone(&self.worker);
-        let mode = self.mode.clone();
-        let module = req.module.clone();
-        let tid = task_id.clone();
-
-        self.task_registry
-            .set_cancellation(&task_id, preparation.cancel.clone());
-        let ctx = DscBackgroundCtx {
-            idat,
-            idat_args,
-            preparation,
-            stage,
-            script_path,
-            log_path,
-            out_i64,
-            module,
-            frameworks,
-        };
-
-        let handle = tokio::spawn(async move {
-            Self::run_dsc_background(tid, registry, worker, mode, ctx).await;
-        });
-        self.task_registry.set_handle(&task_id, handle);
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({
-                "status": "started",
-                "task_id": task_id,
-                "message": "DSC loading started in background. Poll task_status(task_id) for progress.",
-            }))
-            .unwrap_or_default(),
-        )]))
+        self.open_dsc_nexus(&self.router, req).await
     }
 
     #[tool(
@@ -4519,60 +2126,16 @@ impl IdaMcpServer {
         let timeout = Some(req.timeout_secs.unwrap_or(300).min(600));
         let script = crate::dsc::dsc_add_dylib_script(&module);
 
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "run_script",
-                    json!({"code": script, "timeout_secs": timeout}),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        match self.worker.run_script(&script, timeout).await {
-            Ok(result) => {
-                if !run_script_succeeded(&result) {
-                    let message = run_script_failure_message(&result);
-                    warn!(module = %module, error = %message, "dsc_add_dylib failed");
-                    return Ok(ToolError::IdaError(message).to_tool_result());
-                }
-                let stdout = run_script_field(&result, "stdout").unwrap_or_default();
-                let analysis_status = match self.worker.analysis_status().await {
-                    Ok(status) => Some(status),
-                    Err(err) => {
-                        warn!(module = %module, error = %err, "failed to fetch analysis_status after dsc_add_dylib");
-                        None
-                    }
-                };
-                let analysis_ready = analysis_status.as_ref().map(|s| s.auto_is_ok);
-                let next_steps = dsc_analysis_next_steps(
-                    analysis_ready,
-                    "Proceed with xrefs/decompile/list_functions for the newly loaded module.",
-                );
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&json!({
-                        "success": true,
-                        "module": module,
-                        "message": format!(
-                            "Successfully loaded {module} into the database. \
-                             Lightweight ObjC analysis ran; full auto-analysis was not forced."
-                        ),
-                        "stdout": stdout,
-                        "analysis_status": analysis_status,
-                        "analysis_ready": analysis_ready,
-                        "next_steps": next_steps,
-                    }))
-                    .unwrap_or_default(),
-                )]))
-            }
-            Err(ToolError::Timeout(secs)) => {
-                let message = run_script_timeout_message(secs, &script);
-                warn!(module = %module, timeout_secs = secs, "dsc_add_dylib timed out");
-                Ok(ToolError::IdaError(message).to_tool_result())
-            }
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "run_script",
+                json!({"code": script, "timeout_secs": timeout}),
+            )
+            .await;
     }
 
     #[tool(
@@ -4606,77 +2169,19 @@ impl IdaMcpServer {
             );
         }
         let ea = addrs[0];
-        let ea_hex = format!("0x{ea:x}");
         let timeout = Some(req.timeout_secs.unwrap_or(300).min(600));
         let script = crate::dsc::dsc_add_region_script(ea);
 
-        if let ServerMode::Router(ref router) = self.mode {
-            return self
-                .route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "run_script",
-                    json!({"code": script, "timeout_secs": timeout}),
-                )
-                .await;
-        }
+        let router = &self.router;
 
-        match self.worker.run_script(&script, timeout).await {
-            Ok(result) => {
-                if !run_script_succeeded(&result) {
-                    let message = run_script_failure_message(&result);
-                    warn!(
-                        address = %ea_hex,
-                        error = %message,
-                        "dsc_add_region failed"
-                    );
-                    return Ok(ToolError::IdaError(message).to_tool_result());
-                }
-                let stdout = run_script_field(&result, "stdout").unwrap_or_default();
-                let analysis_status = match self.worker.analysis_status().await {
-                    Ok(status) => Some(status),
-                    Err(err) => {
-                        warn!(
-                            address = %ea_hex,
-                            error = %err,
-                            "failed to fetch analysis_status after dsc_add_region"
-                        );
-                        None
-                    }
-                };
-                let analysis_ready = analysis_status.as_ref().map(|s| s.auto_is_ok);
-                let next_steps = dsc_analysis_next_steps(
-                    analysis_ready,
-                    "Proceed with xrefs/decompile/list_functions for symbols near this region.",
-                );
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&json!({
-                        "success": true,
-                        "address": ea_hex,
-                        "address_value": ea,
-                        "message": format!(
-                            "Successfully loaded DSC region at 0x{ea:x}. \
-                             Full auto-analysis was not forced."
-                        ),
-                        "stdout": stdout,
-                        "analysis_status": analysis_status,
-                        "analysis_ready": analysis_ready,
-                        "next_steps": next_steps,
-                    }))
-                    .unwrap_or_default(),
-                )]))
-            }
-            Err(ToolError::Timeout(secs)) => {
-                let message = run_script_timeout_message(secs, &script);
-                warn!(
-                    address = %ea_hex,
-                    timeout_secs = secs,
-                    "dsc_add_region timed out"
-                );
-                Ok(ToolError::IdaError(message).to_tool_result())
-            }
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        return self
+            .route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "run_script",
+                json!({"code": script, "timeout_secs": timeout}),
+            )
+            .await;
     }
 
     #[tool(
@@ -4792,45 +2297,16 @@ impl IdaMcpServer {
             }
         };
         let timeout = req.timeout_secs.map(|t| t.min(600));
-        if let ServerMode::Router(ref router) = self.mode {
-            return preparation
-                .scope(self.route_or_err(
-                    router,
-                    req.db_handle.as_deref(),
-                    "run_script",
-                    json!({"code": code, "timeout_secs": timeout}),
-                ))
-                .await;
-        }
-        match preparation
-            .native(self.worker.run_script(&code, timeout))
-            .await
-        {
-            Ok(result) => {
-                let code_len = code.len();
-                match crate::blocking::response(move || {
-                    if !run_script_succeeded(&result) {
-                        let message = run_script_failure_message(&result);
-                        warn!(code_len, error = %message, "run_script failed");
-                        return Err(ToolError::IdaError(message));
-                    }
-                    serde_json::to_string_pretty(&result).map_err(|error| {
-                        ToolError::IdaError(format!("MCP script response encoding: {error}"))
-                    })
-                })
-                .await
-                {
-                    Ok(Ok(encoded)) => Ok(CallToolResult::success(vec![Content::text(encoded)])),
-                    Ok(Err(error)) | Err(error) => Ok(error.to_tool_result()),
-                }
-            }
-            Err(ToolError::Timeout(timeout_secs)) => {
-                let message = run_script_timeout_message(timeout_secs, &code);
-                warn!(timeout_secs, code_len = code.len(), "run_script timed out");
-                Ok(ToolError::IdaError(message).to_tool_result())
-            }
-            Err(e) => Ok(e.to_tool_result()),
-        }
+        let router = &self.router;
+
+        return preparation
+            .scope(self.route_or_err(
+                router,
+                req.db_handle.as_deref(),
+                "run_script",
+                json!({"code": code, "timeout_secs": timeout}),
+            ))
+            .await;
     }
 
     #[tool(
@@ -5371,176 +2847,6 @@ impl IdaMcpServer {
     }
 }
 
-const RUN_SCRIPT_PREVIEW_CHARS: usize = 220;
-const RUN_SCRIPT_TAIL_LINES: usize = 12;
-const RUN_SCRIPT_TAIL_CHARS: usize = 1600;
-
-fn run_script_succeeded(result: &Value) -> bool {
-    result.get("success").and_then(Value::as_bool) == Some(true)
-}
-
-fn run_script_field<'a>(result: &'a Value, field: &str) -> Option<&'a str> {
-    result.get(field).and_then(Value::as_str)
-}
-
-fn run_script_last_non_empty_line(text: &str) -> Option<&str> {
-    text.lines().rev().find_map(|line| {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    })
-}
-
-fn run_script_truncate_chars(input: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (count, ch) in input.chars().enumerate() {
-        if count >= max_chars {
-            out.push_str("...");
-            return out;
-        }
-        out.push(ch);
-    }
-    out
-}
-
-fn run_script_tail_lines(text: &str, max_lines: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..].join("\n")
-}
-
-fn run_script_error_hint(error_details: &str) -> Option<&'static str> {
-    let lowered = error_details.to_ascii_lowercase();
-    if lowered.contains("syntaxerror") || lowered.contains("invalid syntax") {
-        return Some("Python syntax error detected. Regenerate valid Python and retry.");
-    }
-    if lowered.contains("nameerror") {
-        return Some("NameError detected. Check variable/module names before rerunning.");
-    }
-    if lowered.contains("attributeerror") {
-        return Some("AttributeError detected. Verify IDA API object names/methods.");
-    }
-    if lowered.contains("importerror") || lowered.contains("modulenotfounderror") {
-        return Some("Import failure detected. Ensure the required module exists in IDAPython.");
-    }
-    if lowered.contains("failed to execute wrapper") {
-        return Some(
-            "IDAPython wrapper execution failed before user code completed. Check stderr for details.",
-        );
-    }
-    None
-}
-
-fn run_script_failure_message(result: &Value) -> String {
-    let stderr = run_script_field(result, "stderr").unwrap_or_default();
-    let stdout = run_script_field(result, "stdout").unwrap_or_default();
-    let summary = run_script_field(result, "error_summary")
-        .or_else(|| run_script_field(result, "error"))
-        .or_else(|| run_script_last_non_empty_line(stderr))
-        .unwrap_or("Unknown IDAPython script failure (no error details captured)");
-
-    let stderr_tail = run_script_truncate_chars(
-        &run_script_tail_lines(stderr, RUN_SCRIPT_TAIL_LINES),
-        RUN_SCRIPT_TAIL_CHARS,
-    );
-    let stdout_tail = run_script_truncate_chars(
-        &run_script_tail_lines(stdout, RUN_SCRIPT_TAIL_LINES),
-        RUN_SCRIPT_TAIL_CHARS,
-    );
-
-    let mut parts = vec![format!("IDAPython script execution failed: {summary}")];
-    if let Some(kind) = run_script_field(result, "error_kind") {
-        parts.push(format!("Error kind: {kind}"));
-    }
-    if !stderr_tail.is_empty() {
-        parts.push(format!("stderr (tail):\n{stderr_tail}"));
-    }
-    if !stdout_tail.is_empty() {
-        parts.push(format!("stdout (tail):\n{stdout_tail}"));
-    }
-    let combined_details = format!("{summary}\n{stderr_tail}");
-    if let Some(hint) = run_script_error_hint(&combined_details) {
-        parts.push(format!("Hint: {hint}"));
-    }
-    parts.join("\n\n")
-}
-
-fn run_script_timeout_message(timeout_secs: u64, code: &str) -> String {
-    let compact_preview = code
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let preview = if compact_preview.is_empty() {
-        "<empty script>".to_string()
-    } else {
-        run_script_truncate_chars(&compact_preview, RUN_SCRIPT_PREVIEW_CHARS)
-    };
-    format!(
-        "run_script timed out after {timeout_secs} seconds.\n\
-         The script may be blocked in a long-running loop or waiting on IDA state.\n\
-         Script preview: {preview}\n\
-         Hint: while iterating with LLM-generated code, use a smaller timeout_secs and avoid scripts that block indefinitely."
-    )
-}
-
-fn dsc_analysis_next_steps(
-    analysis_ready: Option<bool>,
-    ready_message: &'static str,
-) -> Vec<String> {
-    if analysis_ready == Some(true) {
-        vec![ready_message.to_string()]
-    } else {
-        vec![
-            "Call analysis_status to check auto-analysis progress.".to_string(),
-            "If auto_is_ok is false, run analyze_funcs and wait for completion before xrefs/decompile."
-                .to_string(),
-        ]
-    }
-}
-
-async fn get_int_values(
-    worker: &IdaWorker,
-    address: Value,
-    size: usize,
-) -> Result<CallToolResult, McpError> {
-    let addrs = match IdaMcpServer::value_to_addresses(&address) {
-        Ok(v) => v,
-        Err(e) => return Ok(e.to_tool_result()),
-    };
-
-    if addrs.len() == 1 {
-        match worker.read_int(addrs[0], size).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
-    } else {
-        let mut results = Vec::new();
-        for addr in addrs {
-            match worker.read_int(addr, size).await {
-                Ok(result) => results.push(json!({
-                    "address": format!("{:#x}", addr),
-                    "value": result
-                })),
-                Err(e) => results.push(json!({
-                    "address": format!("{:#x}", addr),
-                    "error": e.to_string()
-                })),
-            }
-        }
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({ "results": results }))
-                .unwrap_or_else(|_| format!("{:?}", results)),
-        )]))
-    }
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
@@ -6025,49 +3331,9 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        run_script_failure_message, run_script_succeeded, run_script_timeout_message,
-        run_script_truncate_chars, task_payload_result_value,
-    };
+    use super::task_payload_result_value;
     use rmcp::model::CallToolResult;
     use serde_json::json;
-
-    #[test]
-    fn run_script_succeeded_only_for_explicit_true() {
-        assert!(run_script_succeeded(&json!({ "success": true })));
-        assert!(!run_script_succeeded(&json!({ "success": false })));
-        assert!(!run_script_succeeded(&json!({})));
-    }
-
-    #[test]
-    fn run_script_failure_message_adds_syntax_hint() {
-        let value = json!({
-            "success": false,
-            "stdout": "",
-            "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1\nSyntaxError: invalid syntax",
-            "error": "invalid syntax"
-        });
-        let message = run_script_failure_message(&value);
-        assert!(message.contains("IDAPython script execution failed"));
-        assert!(message.contains("SyntaxError"));
-        assert!(message.contains("Hint: Python syntax error detected"));
-    }
-
-    #[test]
-    fn run_script_timeout_message_includes_preview() {
-        let code = "import idaapi\nfor _ in range(1000000000):\n    pass\n";
-        let message = run_script_timeout_message(120, code);
-        assert!(message.contains("run_script timed out after 120 seconds"));
-        assert!(message.contains("Script preview: import idaapi for _ in range(1000000000): pass"));
-    }
-
-    #[test]
-    fn run_script_truncate_chars_appends_ellipsis() {
-        let truncated = run_script_truncate_chars("abcdef", 3);
-        assert_eq!(truncated, "abc...");
-        let unchanged = run_script_truncate_chars("abc", 10);
-        assert_eq!(unchanged, "abc");
-    }
 
     #[test]
     fn task_payload_preserves_valid_call_tool_result() {
@@ -6091,10 +3357,6 @@ mod tests {
         assert_eq!(parsed.content.len(), 1);
     }
 }
-
-#[cfg(test)]
-#[path = "../../tests/support/n2_f1_server.rs"]
-mod n2_f1_regressions;
 
 #[cfg(all(test, feature = "nexus-test-support"))]
 #[path = "../../tests/support/r2_server.rs"]
@@ -6123,18 +3385,81 @@ static SCRIPT_READ_BARRIERS: std::sync::LazyLock<
 
 #[cfg(test)]
 mod list_idbs_tests {
-    use super::{IdaMcpServer, ServerMode};
-    use crate::ida::IdaWorker;
+    use super::IdaMcpServer;
     use crate::router::RouterState;
     use serde_json::{json, Value};
-    use std::sync::{mpsc, Arc};
 
     fn server_on(router: &RouterState) -> IdaMcpServer {
-        let (tx, _rx) = mpsc::sync_channel(1);
-        IdaMcpServer::new(
-            Arc::new(IdaWorker::new(tx)),
-            ServerMode::Router(router.clone()),
-        )
+        IdaMcpServer::new(router.clone())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nexus_script_file_read_retains_job_and_cannot_send_after_deadline() {
+        use super::{Parameters, SCRIPT_READ_BARRIERS};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let base = std::env::temp_dir().join(format!("n9-script-{}", std::process::id()));
+        std::fs::create_dir(&base).expect("private script directory");
+        let path = base.join("blocked.py");
+        std::fs::write(&path, b"print('fixture')").expect("private script");
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        SCRIPT_READ_BARRIERS
+            .lock()
+            .expect("barriers")
+            .insert(path.display().to_string(), (started, released));
+        let router = RouterState::new().expect("Nexus router");
+        let server = Arc::new(server_on(&router));
+        let preparation = crate::preprocess::Preparation::new(Duration::from_millis(150));
+        let observed = preparation.clone();
+        let request =
+            serde_json::from_value(json!({"file":path,"timeout_secs":1})).expect("request");
+        let mut task = tokio::spawn(async move {
+            preparation
+                .scope(server.run_script(Parameters(request)))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .expect("read admitted")
+            .expect("read started");
+        let result = tokio::time::timeout(Duration::from_millis(400), &mut task).await;
+        let tracked = observed.active_input_jobs();
+        release.send(()).expect("release owned read closure");
+        assert!(
+            result.is_ok(),
+            "script read consumes original total deadline"
+        );
+        assert!(result
+            .expect("bounded result")
+            .expect("request task")
+            .expect("MCP result")
+            .is_error
+            .unwrap_or(false));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed.active_input_jobs() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned read finishes");
+        assert_eq!(
+            tracked, 1,
+            "abandoned file closure retains tracking until EOF"
+        );
+        assert!(
+            router.status_snapshot().await.nexus_lifecycle.is_none(),
+            "expired file read never starts a bridge"
+        );
+        assert_eq!(
+            router
+                .nexus_endpoint()
+                .transition(|s, _| s.retention_status())
+                .total_used,
+            0,
+            "expired read reserves no Nexus operation"
+        );
+        std::fs::remove_dir_all(base).expect("remove owned script");
     }
 
     async fn call_list_idbs(server: &IdaMcpServer) -> (Value, String) {
@@ -6170,49 +3495,34 @@ mod list_idbs_tests {
     }
 
     #[tokio::test]
-    async fn list_idbs_tool_tells_sessions_apart_and_marks_the_callers_own() {
+    async fn nexus_listing_groups_leases_and_preserves_caller_and_token_privacy() {
         let router = RouterState::new().expect("router");
         let first = server_on(&router);
         let second = server_on(&router);
-        assert_ne!(first.client, second.client);
-        let (a, a_token) = router.register_test_worker("/db/a.so", &first.client).await;
-        let (b, b_token) = router
-            .register_test_worker("/db/b.so", &second.client)
-            .await;
-
-        let (as_first, text) = call_list_idbs(&first).await;
-        assert_eq!(as_first["count"], 2);
-        let idbs = as_first["idbs"].as_array().expect("array");
-        let find = |handle: &str| {
-            idbs.iter()
-                .find(|idb| idb["db_handle"] == handle)
-                .expect("handle listed")
-        };
-        assert_eq!(find(&a)["opened_by_caller"], true);
-        assert_eq!(find(&b)["opened_by_caller"], false);
-        assert_eq!(find(&a)["opened_by"]["kind"], "mcp");
-        assert_ne!(
-            find(&a)["opened_by"]["client_id"],
-            find(&b)["opened_by"]["client_id"]
-        );
-        assert!(!text.contains(&a_token) && !text.contains(&b_token));
-        assert!(!text.contains("close_token"));
-
-        let (as_second, _) = call_list_idbs(&second).await;
-        let from_second = as_second["idbs"].as_array().expect("array");
-        let mine: Vec<&str> = from_second
+        let (_, token_a) = router.register_test_lease("/db/a", &first.client).await;
+        let (_, token_b) = router.register_test_lease("/db/a", &second.client).await;
+        router.register_test_lease("/db/b", &second.client).await;
+        let (value, text) = call_list_idbs(&first).await;
+        assert_eq!(value["count"], 2);
+        let items = value["idbs"].as_array().expect("listing");
+        let shared = items
             .iter()
-            .filter(|idb| idb["opened_by_caller"] == true)
-            .filter_map(|idb| idb["db_handle"].as_str())
-            .collect();
-        assert_eq!(mine, vec![b.as_str()]);
-    }
-
-    #[tokio::test]
-    async fn list_idbs_tool_refuses_outside_the_multi_database_daemon() {
-        let (tx, _rx) = mpsc::sync_channel(1);
-        let server = IdaMcpServer::new(Arc::new(IdaWorker::new(tx)), ServerMode::Stdio);
-        let result = server.list_idbs().await.expect("tool call succeeds");
-        assert_eq!(result.is_error, Some(true));
+            .find(|item| item["input_path"] == "/db/a")
+            .expect("shared database");
+        assert_eq!(shared["ref_count"], 2);
+        assert_eq!(shared["worker"]["backend"], "nexus");
+        let holders = shared["holders"].as_array().expect("holders");
+        assert_eq!(holders.len(), 2);
+        assert_eq!(
+            holders
+                .iter()
+                .filter(|item| item["is_caller"] == true)
+                .count(),
+            1
+        );
+        assert!(!text.contains(&token_a) && !text.contains(&token_b));
+        assert!(!text.contains("close_token"));
+        let (other, _) = call_list_idbs(&second).await;
+        assert_eq!(other["count"], 2);
     }
 }

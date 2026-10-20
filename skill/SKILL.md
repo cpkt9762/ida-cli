@@ -33,13 +33,11 @@ a live server running.
 ### Runtime Rule
 
 - Before real analysis, run `scripts/ida-cli.sh probe-runtime`.
-- Do not guess whether the host will pick `native-linked` or `idat-compat`.
+- All database execution uses Nexus; missing dependencies fail explicitly.
 - If multiple IDA installations are present, export `IDADIR` explicitly:
   - `export IDADIR="/Applications/IDA Professional 9.5.app/Contents/MacOS"`
   - `export IDADIR=/opt/ida-pro-9.5`
-- `native-linked` is only picked for IDA 9.3 / 9.5 when the runtime matches
-  the SDK the binary was built with; otherwise the probe reports
-  `idat-compat`, which supports a smaller method set.
+- Runtime requires IDA >=9.4, Python >=3.11 and the dedicated pinned Nexus environment.
 
 ### Use Rule
 
@@ -488,8 +486,7 @@ Dispatch through `raw` when needed:
 
 The `dbg_*` method family covers debugger loading, process start/attach,
 breakpoints, stepping, register inspection, memory reads/writes, and thread
-inspection. It is only available on runtimes that expose the debugger; the
-headless `idat-compat` path does not.
+inspection through the leased Nexus owner on runtimes that expose the debugger.
 
 When ASLR is active, address-based debug operations must use rebased runtime
 addresses unless the method explicitly accepts IDB addresses.

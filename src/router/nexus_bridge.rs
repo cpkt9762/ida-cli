@@ -388,7 +388,7 @@ impl NexusBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        json!({"resources":resources.len(),"startup_and_pre_attach":startups.len(),
+        json!({"ready": !state.failed.load(std::sync::atomic::Ordering::SeqCst) && !state.stop.is_cancelled(), "resources":resources.len(),"startup_and_pre_attach":startups.len(),
             "bridge_dir":self.installation,"prepared_python":self.prepared_python,
             "maintenance_launcher":self.installation.join("maintenance-launch"),
             "resource_details":resources,"startup_details":startups,"blocked":blocked,"acquisitions":acquisitions,

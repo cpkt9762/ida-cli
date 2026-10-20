@@ -14,7 +14,7 @@ async fn explicit_save_public_rpc_refusal_reaches_mcp_and_cli_without_prefill() 
         let output=tokio::process::Command::new("timeout")
             .arg("30s").arg(std::env::current_exe().expect("lib executable"))
             .args(["--exact","server::r2_lifecycle::explicit_save_public_rpc_refusal_reaches_mcp_and_cli_without_prefill","--nocapture"])
-            .env("R6_SAVE_CHILD","1").env("IDA_CLI_NEXUS_DEV","1")
+            .env("R6_SAVE_CHILD","1")
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
             .kill_on_drop(true).spawn_recorded().expect("private MCP/CLI child")
             .output_recorded().await.expect("child reaped");
@@ -47,11 +47,7 @@ async fn explicit_save_public_rpc_refusal_reaches_mcp_and_cli_without_prefill() 
         })
         .await
         .expect("production bridge/helper");
-    let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-    let server = IdaMcpServer::new(
-        Arc::new(IdaWorker::new(tx)),
-        ServerMode::Router(router.clone()),
-    );
+    let server = IdaMcpServer::new(router.clone());
     let result: anyhow::Result<Value> = async {
         let path = root.join("tiny.i64");
         let (handle, token) = router
@@ -130,7 +126,6 @@ async fn close_preserves_text_error_and_lifecycle() {
                     "--nocapture",
                 ])
                 .env("R2_MCP_CHILD", "1")
-                .env("IDA_CLI_NEXUS_DEV", "1")
                 .env("R3A_CASE_ROOT", private.join("cases"))
                 .env("HOME", private.join("home"))
                 .env("TMPDIR", private.join("tmp"))
@@ -177,11 +172,7 @@ async fn close_preserves_text_error_and_lifecycle() {
             })
             .await
             .expect("production bridge/helper");
-        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let server = IdaMcpServer::new(
-            Arc::new(IdaWorker::new(tx)),
-            ServerMode::Router(router.clone()),
-        );
+        let server = IdaMcpServer::new(router.clone());
         let mut owner_wait_reference = None;
         let mut events = bridge.subscribe();
         let result: anyhow::Result<Value> = async {
@@ -377,7 +368,7 @@ async fn public_proof_before_terminal_keeps_actual_mcp_and_cli_error_responsibil
         use crate::preprocess::SpawnRecorded as _;
         let output=tokio::process::Command::new(std::env::current_exe().expect("lib test"))
             .args(["--exact","server::r2_lifecycle::public_proof_before_terminal_keeps_actual_mcp_and_cli_error_responsibility","--nocapture"])
-            .env("R2_MCP_CHILD","1").env("IDA_CLI_NEXUS_DEV","1")
+            .env("R2_MCP_CHILD","1")
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
             .kill_on_drop(true).spawn_recorded().expect("isolated MCP child")
             .output_recorded().await.expect("reaped child");
@@ -440,11 +431,7 @@ async fn public_proof_before_terminal_keeps_actual_mcp_and_cli_error_responsibil
                         )
                         .await
                     } else {
-                        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-                        let server = IdaMcpServer::new(
-                            Arc::new(IdaWorker::new(tx)),
-                            ServerMode::Router(caller_router.clone()),
-                        );
+                        let server = IdaMcpServer::new(caller_router.clone());
                         serde_json::to_value(
                             server
                                 .close_idb_routed(
@@ -538,7 +525,7 @@ async fn eight_owner_waits_share_real_listener_without_starving_status_or_cancel
         }
         let output = tokio::process::Command::new(std::env::current_exe().expect("lib executable"))
             .args(["--exact", "server::r2_lifecycle::eight_owner_waits_share_real_listener_without_starving_status_or_cancel", "--nocapture"])
-            .env("R2_MCP_CHILD", "1").env("IDA_CLI_NEXUS_DEV", "1")
+            .env("R2_MCP_CHILD", "1")
             .env("R3A_CASE_ROOT", private.join("cases"))
             .env("HOME", private.join("home")).env("TMPDIR", private.join("tmp"))
             .env("IDA_CLI_HOME", private.join("home/.ida"))

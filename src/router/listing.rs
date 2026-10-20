@@ -1,12 +1,9 @@
 //! Types behind `list_idbs`: who opened which database, and what is listed.
 //!
-//! The router keeps one worker per open database. This module holds the
-//! per-worker open record, the opaque client identity attached to every
-//! reference, and the serializable listing built from them. Close tokens are
-//! credentials: nothing in here stores or serializes one.
+//! Nexus leases carry opaque client identities; listings group them by database.
+//! Close tokens are credentials and are never serialized here.
 
 use serde::Serialize;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,98 +98,6 @@ pub enum DbState {
     Failed,
 }
 
-/// What happened to an `open` request, as seen by the router.
-#[derive(Debug, Clone)]
-pub enum OpenOutcome {
-    /// The worker answered; `reported_path` is the `path` of its answer.
-    Opened { reported_path: Option<PathBuf> },
-    /// The worker answered with an error or exited.
-    Failed,
-    /// The router stopped waiting; the worker may still finish opening.
-    TimedOut,
-}
-
-/// The router's record of the database held by one worker.
-#[derive(Debug, Clone)]
-pub struct DbRecord {
-    pub state: DbState,
-    pub idb_path: Option<PathBuf>,
-    pub opened_at: Option<SystemTime>,
-}
-
-impl DbRecord {
-    /// A worker that was just spawned and is about to open its database.
-    pub fn new() -> Self {
-        Self {
-            state: DbState::Opening,
-            idb_path: None,
-            opened_at: None,
-        }
-    }
-
-    /// An `open` request is about to be sent. A database that is already open
-    /// stays open: a repeated `open` of the same path is answered from the
-    /// existing session.
-    pub fn begin_open(&mut self) {
-        if self.state != DbState::Open {
-            self.state = DbState::Opening;
-        }
-    }
-
-    /// Fold in the result of an `open` request for `input`, the path the
-    /// worker was asked to open.
-    ///
-    /// The first answer that confirms the open names the database file and
-    /// later ones never replace it: a worker that is asked again to open a
-    /// database it already holds reports the original input file, which for a
-    /// raw binary is not the database. For the same reason a raw binary that
-    /// is reported as itself is not taken for the database file.
-    pub fn finish_open(&mut self, outcome: OpenOutcome, input: Option<&Path>, now: SystemTime) {
-        match outcome {
-            OpenOutcome::Opened { reported_path } => {
-                if self.state != DbState::Open {
-                    self.state = DbState::Open;
-                    self.opened_at = Some(now);
-                }
-                if self.idb_path.is_none() {
-                    self.idb_path = reported_path.filter(|reported| {
-                        is_database_file(reported) || Some(reported.as_path()) != input
-                    });
-                }
-            }
-            OpenOutcome::Failed => {
-                if self.state != DbState::Open {
-                    self.state = DbState::Failed;
-                }
-            }
-            OpenOutcome::TimedOut => {}
-        }
-    }
-
-    /// Whether `list_idbs` reports this worker: it holds, or is acquiring, a
-    /// database.
-    pub fn is_listed(&self) -> bool {
-        matches!(self.state, DbState::Opening | DbState::Open)
-    }
-}
-
-/// Whether `path` names an IDA database rather than a binary to analyse.
-fn is_database_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| {
-            ["i64", "idb", "id0"]
-                .iter()
-                .any(|database| ext.eq_ignore_ascii_case(database))
-        })
-}
-
-impl Default for DbRecord {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// The worker process behind a listed database.
 #[derive(Debug, Clone, Serialize)]
 pub struct ListedWorker {
@@ -254,12 +159,6 @@ impl IdbListing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    fn at(secs: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(secs)
-    }
-
     #[test]
     fn mcp_sessions_get_distinct_opaque_ids() {
         let first = ClientIdentity::mcp_session();
@@ -294,107 +193,6 @@ mod tests {
         let rpc = opaque_id(ClientKind::Rpc, &[b"x"]);
         let mcp = opaque_id(ClientKind::Mcp, &[b"x"]);
         assert_ne!(rpc, mcp);
-    }
-
-    #[test]
-    fn new_record_is_listed_as_opening() {
-        let record = DbRecord::new();
-        assert_eq!(record.state, DbState::Opening);
-        assert!(record.is_listed());
-        assert!(record.idb_path.is_none());
-        assert!(record.opened_at.is_none());
-    }
-
-    fn opened(path: &str) -> OpenOutcome {
-        OpenOutcome::Opened {
-            reported_path: Some(PathBuf::from(path)),
-        }
-    }
-
-    #[test]
-    fn successful_open_records_path_and_time() {
-        let mut record = DbRecord::new();
-        record.begin_open();
-        record.finish_open(opened("/db/a.i64"), Some(Path::new("/in/a")), at(100));
-        assert_eq!(record.state, DbState::Open);
-        assert_eq!(record.idb_path, Some(PathBuf::from("/db/a.i64")));
-        assert_eq!(record.opened_at, Some(at(100)));
-    }
-
-    #[test]
-    fn repeated_open_keeps_first_open_time_and_database_path() {
-        let mut record = DbRecord::new();
-        let input = Some(Path::new("/in/a"));
-        record.finish_open(opened("/db/a.i64"), input, at(100));
-        record.begin_open();
-        assert_eq!(record.state, DbState::Open);
-        // Asked again, the worker names the original input, not the database.
-        record.finish_open(opened("/in/a"), input, at(500));
-        assert_eq!(record.opened_at, Some(at(100)));
-        assert_eq!(record.idb_path, Some(PathBuf::from("/db/a.i64")));
-    }
-
-    #[test]
-    fn a_raw_binary_reported_as_itself_is_not_a_database_path() {
-        let mut record = DbRecord::new();
-        record.finish_open(opened("/in/a"), Some(Path::new("/in/a")), at(1));
-        assert_eq!(record.state, DbState::Open);
-        assert!(record.idb_path.is_none());
-    }
-
-    #[test]
-    fn a_database_opened_directly_is_its_own_database_path() {
-        let mut record = DbRecord::new();
-        let input = Some(Path::new("/db/a.I64"));
-        record.finish_open(opened("/db/a.I64"), input, at(1));
-        assert_eq!(record.idb_path, Some(PathBuf::from("/db/a.I64")));
-    }
-
-    #[test]
-    fn failed_open_is_not_listed_but_failed_reopen_keeps_open_db() {
-        let mut record = DbRecord::new();
-        record.finish_open(OpenOutcome::Failed, None, at(1));
-        assert_eq!(record.state, DbState::Failed);
-        assert!(!record.is_listed());
-
-        let mut open = DbRecord::new();
-        open.finish_open(
-            OpenOutcome::Opened {
-                reported_path: None,
-            },
-            None,
-            at(1),
-        );
-        open.begin_open();
-        open.finish_open(OpenOutcome::Failed, None, at(2));
-        assert_eq!(open.state, DbState::Open);
-        assert!(open.is_listed());
-    }
-
-    #[test]
-    fn timed_out_open_stays_opening() {
-        let mut record = DbRecord::new();
-        record.begin_open();
-        record.finish_open(OpenOutcome::TimedOut, None, at(1));
-        assert_eq!(record.state, DbState::Opening);
-        assert!(record.is_listed());
-    }
-
-    #[test]
-    fn failed_worker_can_recover_on_a_later_open() {
-        let mut record = DbRecord::new();
-        record.finish_open(OpenOutcome::Failed, None, at(1));
-        record.begin_open();
-        assert_eq!(record.state, DbState::Opening);
-        record.finish_open(
-            OpenOutcome::Opened {
-                reported_path: None,
-            },
-            None,
-            at(9),
-        );
-        assert_eq!(record.state, DbState::Open);
-        assert_eq!(record.opened_at, Some(at(9)));
     }
 
     #[test]

@@ -14,24 +14,20 @@ use hyper::http::{header::ORIGIN, Request, Response, StatusCode};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use ida_mcp::ida::{IdaBackend, WorkerBackendKind};
-use ida_mcp::{federation, ida, rpc_dispatch, IdaMcpServer, IdaWorker, ServerMode};
+use ida_mcp::{federation, IdaMcpServer};
 use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use rmcp::ServiceExt;
 use std::net::SocketAddr;
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tower_service::Service;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter, Layer};
-
-const REQUEST_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Parser)]
 #[command(name = "ida-cli", version, about = "Headless IDA CLI and MCP Server")]
@@ -46,10 +42,7 @@ enum Command {
     Serve(ServeArgs),
     /// Run the MCP server over Streamable HTTP (SSE)
     ServeHttp(ServeHttpArgs),
-    /// Internal: worker subprocess controlled by a router.
-    /// Reads JSON-RPC requests from stdin, dispatches to IDA worker, writes responses to stdout.
-    ServeWorker(ServeWorkerArgs),
-    /// Internal: probe the active IDA runtime and select the worker backend.
+    /// Check the dedicated Nexus environment without opening a database.
     #[command(hide = true)]
     ProbeRuntime,
 
@@ -97,13 +90,6 @@ struct ServeHttpArgs {
     /// Maximum number of in-flight HTTP requests before returning 503.
     #[arg(long, default_value_t = 256)]
     max_inflight_requests: usize,
-}
-
-#[derive(Args, Clone)]
-struct ServeWorkerArgs {
-    /// Internal backend selection used by the router.
-    #[arg(long, value_enum, default_value_t = WorkerBackendKind::NativeLinked, hide = true)]
-    backend: WorkerBackendKind,
 }
 
 #[derive(Clone)]
@@ -175,10 +161,9 @@ where
                 if path == "/readyz" {
                     let status = router.status_snapshot().await;
                     let ready = status
-                        .runtime_probe
+                        .nexus_lifecycle
                         .as_ref()
-                        .map(|probe| probe.supported)
-                        .unwrap_or(false);
+                        .is_some_and(|lifecycle| lifecycle["ready"] == true);
                     let code = if ready {
                         StatusCode::OK
                     } else {
@@ -533,23 +518,6 @@ fn metrics_response(
         ));
     }
 
-    if let Some(runtime_probe) = &status.runtime_probe {
-        let supported = if runtime_probe.supported { 1 } else { 0 };
-        let backend = runtime_probe
-            .backend
-            .map(|b| b.to_string())
-            .unwrap_or_default();
-        let version = runtime_probe
-            .runtime
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        lines.push(format!(
-            "ida_cli_runtime_probe{{backend=\"{}\",version=\"{}\"}} {}",
-            backend, version, supported
-        ));
-    }
-
     let body = lines.join("\n") + "\n";
     Response::builder()
         .status(StatusCode::OK)
@@ -637,7 +605,7 @@ fn main() -> anyhow::Result<()> {
         let first_arg = std::env::args().nth(1);
         let is_server_mode = matches!(
             first_arg.as_deref(),
-            Some("serve" | "serve-http" | "serve-worker" | "probe-runtime")
+            Some("serve" | "serve-http" | "probe-runtime")
         );
 
         if !is_server_mode {
@@ -654,7 +622,6 @@ fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Serve(ServeArgs::default())) {
         Command::Serve(args) => run_server(args),
         Command::ServeHttp(args) => run_server_http(args),
-        Command::ServeWorker(args) => run_serve_worker(args),
         Command::ProbeRuntime => run_probe_runtime(),
 
         Command::Cli(args) => run_cli(args),
@@ -662,17 +629,20 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_probe_runtime() -> anyhow::Result<()> {
-    let probe = match std::panic::catch_unwind(|| {
-        ida::native_backend().init_library();
-        ida::native_backend().version()
-    }) {
-        Ok(Ok(version)) => ida::probe_native_runtime(version),
-        Ok(Err(err)) => ida::RuntimeProbeResult::error(err.to_string()),
-        Err(_) => ida::RuntimeProbeResult::error("native runtime probe panicked"),
-    };
-
-    println!("{}", serde_json::to_string(&probe)?);
-    Ok(())
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let router = ida_mcp::router::RouterState::new()?;
+        router.initialize_nexus().await?;
+        let status = router.status_snapshot().await;
+        let result = serde_json::to_string(
+            &serde_json::json!({"backend":"nexus","supported":true,"metadata":status.metadata}),
+        )?;
+        router.shutdown_nexus().await?;
+        println!("{result}");
+        Ok(())
+    })
 }
 
 fn run_cli(args: ida_mcp::cli::CliArgs) -> anyhow::Result<()> {
@@ -737,9 +707,6 @@ fn run_server_multi() -> anyhow::Result<()> {
 
     let router = ida_mcp::router::RouterState::new()?;
 
-    let (tx, _rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
-    let worker = Arc::new(IdaWorker::new(tx));
-
     let server_handle = thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -747,13 +714,14 @@ fn run_server_multi() -> anyhow::Result<()> {
             .expect("Failed to create tokio runtime");
 
         rt.block_on(async move {
+            router.initialize_nexus().await?;
             let _ = std::fs::write(
                 ida_mcp::idb_store::pid_path(),
                 std::process::id().to_string(),
             );
 
             info!("ida-cli server (router mode) listening on stdio");
-            let server = IdaMcpServer::new(worker.clone(), ServerMode::Router(router.clone()));
+            let server = IdaMcpServer::new(router.clone());
             router.start_watchdog(
                 std::time::Duration::from_secs(8 * 3600),
                 std::time::Duration::from_secs(5 * 60),
@@ -834,97 +802,12 @@ fn run_server_multi() -> anyhow::Result<()> {
         })
     });
 
-    if let Err(e) = server_handle.join() {
-        error!("Server thread panicked: {:?}", e);
+    match server_handle.join() {
+        Ok(result) => result?,
+        Err(panic) => anyhow::bail!("server thread panicked: {panic:?}"),
     }
 
     info!("Server stopped");
-    Ok(())
-}
-
-fn run_serve_worker(args: ServeWorkerArgs) -> anyhow::Result<()> {
-    info!(backend = %args.backend, "Starting ida-cli worker");
-
-    if matches!(args.backend, WorkerBackendKind::IdatCompat) {
-        return ida_mcp::idat_compat::run_worker();
-    }
-
-    let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
-    let worker = IdaWorker::new(tx);
-
-    // Oneshot channel: main thread signals after IDA loop exits (DB closed & lock released).
-    // The orphan monitor awaits this before calling process::exit.
-    let (ida_done_tx, ida_done_rx) = tokio::sync::oneshot::channel::<()>();
-
-    let worker_for_rpc = worker.clone();
-    let server_handle = thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime");
-
-        rt.block_on(async move {
-            info!("Worker RPC handler starting on stdin/stdout");
-
-            let stdin = tokio::io::stdin();
-            let stdout = tokio::io::stdout();
-
-            // Orphan detection: monitor parent process liveness.
-            // When the parent (router) is killed/crashed, getppid() changes
-            // (reparented to init). The monitor triggers shutdown so the
-            // worker doesn't linger as an orphan holding IDB locks.
-            #[cfg(unix)]
-            {
-                let worker_for_monitor = worker_for_rpc.clone();
-                tokio::spawn(async move {
-                    let parent_pid = unsafe { libc::getppid() };
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-                    loop {
-                        interval.tick().await;
-                        let current = unsafe { libc::getppid() };
-                        if current != parent_pid {
-                            warn!(
-                                "Parent process died (ppid {} -> {}), worker self-terminating",
-                                parent_pid, current
-                            );
-                            let _ = worker_for_monitor.shutdown().await;
-                            // Wait for IDA loop to confirm DB closure, or timeout.
-                            tokio::select! {
-                                _ = ida_done_rx => {
-                                    info!("IDA loop confirmed done, exiting");
-                                }
-                                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                                    warn!("IDA loop did not finish within 30s, forcing exit");
-                                }
-                            }
-                            std::process::exit(1);
-                        }
-                    }
-                });
-            }
-
-            let dispatcher = worker_for_rpc.clone();
-            let result = ida_mcp::router::worker_io::serve(stdin, stdout, move |request| {
-                let worker = dispatcher.clone();
-                async move { rpc_dispatch::dispatch_rpc(&request, &worker).await }
-            })
-            .await;
-            let _ = worker_for_rpc.shutdown().await;
-            result?;
-            Ok::<_, anyhow::Error>(())
-        })
-    });
-
-    // Main thread: IDA worker loop (IDA requires main thread)
-    info!("Starting IDA worker loop (worker mode)");
-    ida::run_ida_loop(rx);
-    info!("IDA worker loop finished");
-    let _ = ida_done_tx.send(());
-    if let Err(e) = server_handle.join() {
-        error!("Worker RPC handler thread panicked: {:?}", e);
-    }
-
-    info!("Worker stopped");
     Ok(())
 }
 
@@ -954,14 +837,8 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
 
-    let (tx, _rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
-    let worker = Arc::new(IdaWorker::new(tx));
-
     let router = ida_mcp::router::RouterState::new()?;
 
-    let worker_for_factory = worker.clone();
-    let worker_for_shutdown = worker.clone();
-    let worker_for_mcp_socket = worker.clone();
     let router_for_factory = router.clone();
     let router_for_shutdown = router.clone();
     let router_for_final = router.clone();
@@ -972,6 +849,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             .build()?;
 
         rt.block_on(async move {
+            router.initialize_nexus().await?;
             let _ = std::fs::write(
                 ida_mcp::idb_store::pid_path(),
                 std::process::id().to_string(),
@@ -994,10 +872,8 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
 
             let service = StreamableHttpService::new(
                 move || {
-                    let mode = ServerMode::Router(router_for_factory.clone());
                     Ok(ida_mcp::server::SanitizedIdaServer(IdaMcpServer::new(
-                        worker_for_factory.clone(),
-                        mode,
+                        router_for_factory.clone(),
                     )))
                 },
                 session_manager,
@@ -1060,8 +936,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             tokio::spawn(async move {
                 let make_server = move || {
                     ida_mcp::server::SanitizedIdaServer(IdaMcpServer::new(
-                        worker_for_mcp_socket.clone(),
-                        ServerMode::Router(router_for_mcp_socket.clone()),
+                        router_for_mcp_socket.clone(),
                     ))
                 };
                 if let Err(e) = ida_mcp::server::mcp_socket::run_bound_mcp_socket_listener(
@@ -1075,15 +950,12 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 }
             });
 
-            let shutdown_worker = worker_for_shutdown.clone();
             let cancel_for_shutdown = cancel.clone();
             let router_for_signal = router_for_shutdown.clone();
             tokio::spawn(async move {
                 if wait_for_shutdown_signal().await.is_ok() {
                     info!("Shutdown signal received");
                     router_for_signal.shutdown_all().await;
-                    let _ = shutdown_worker.close_for_shutdown().await;
-                    let _ = shutdown_worker.shutdown().await;
                     ida_mcp::server::socket_listener::cleanup_socket_files(&socket_path_cleanup);
                     cancel_for_shutdown.cancel();
                 }

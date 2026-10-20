@@ -56,7 +56,7 @@ This gives you:
 
 - multiple databases open concurrently
 - one worker crashing does not take down the whole server
-- backend-specific worker behaviour (`idat-compat` vs `native-linked`)
+- one Nexus backend and independent client leases
 
 ## Multi-IDB
 

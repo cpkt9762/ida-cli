@@ -566,7 +566,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     function entry for the outermost braces). The sub_ rename hint is not added in \
                     this mode. Hex-Rays can print a very large function differently from one call \
                     to the next, so use `code` and `lines` from the same answer only. Needs the \
-                    native-linked backend (the idat backend answers NotSupported). Default is off \
+                    Nexus backend. Default is off \
                     and the answer is unchanged.",
         example: r#"{"address": "0x1000", "line_addresses": true}"#,
         default: false,

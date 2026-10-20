@@ -2,7 +2,6 @@
 use ida_mcp::idb_store::IdbStore;
 #[test]
 fn mixed_indices_preserve_each_healthy_target() {
-    assert_eq!(std::env::var("IDA_CLI_NEXUS_DEV").unwrap(), "1");
     let root = std::env::temp_dir().join(format!("n7f2-store-{}", std::process::id()));
     std::fs::create_dir_all(root.join("generations/live")).unwrap();
     let good = root.join("generations/live/input.i64");

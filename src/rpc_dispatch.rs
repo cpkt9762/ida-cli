@@ -164,7 +164,7 @@ pub async fn dispatch_rpc<W: WorkerDispatch>(
         // ── Database management ──────────────────────────────────────────
         "open" => {
             let path = p["path"].as_str().unwrap_or("").to_string();
-            // Default matches the `idat-compat` worker and the higher
+            // Default preserves the fixed baseline contract and the higher
             // `open_idb` tool handler (both set true). Opening a raw
             // binary without auto-analysis would produce an empty
             // function list, which is never what the caller wants.

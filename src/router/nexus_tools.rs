@@ -1,4 +1,4 @@
-//! N4 tool wiring. The development-only selector is removed in N9.
+//! Nexus tool wiring.
 mod owner_resources;
 use super::{nexus_bridge::BridgeConfig, RouterState};
 use crate::{error::ToolError, nexus::*, preprocess::Preparation};
@@ -123,7 +123,6 @@ struct CleanupReference {
     _cache_guard: Option<Arc<super::nexus_bridge::cache_lock::CacheGuard>>,
 }
 pub struct Tools {
-    selected: bool,
     databases: Mutex<HashMap<String, Database>>,
     owner_resources: Mutex<HashMap<String, owner_resources::OwnerResources>>,
     owner_diagnostics: Mutex<HashMap<SessionLease, PathBuf>>,
@@ -135,16 +134,53 @@ pub struct Tools {
     close_observers: Mutex<HashSet<SessionLease>>,
 }
 impl Tools {
+    #[cfg(test)]
+    pub(crate) async fn register_test_lease(
+        &self,
+        path: &str,
+        client: &super::listing::ClientIdentity,
+    ) -> (String, String) {
+        let handle = id();
+        let token = id();
+        let root = std::env::temp_dir().join(id());
+        std::fs::create_dir(&root).expect("private listing fixture");
+        let guard = super::nexus_bridge::cache_lock::acquire(
+            &root,
+            &Preparation::new(Duration::from_secs(2)),
+        )
+        .await
+        .expect("fixture cache guard");
+        std::fs::remove_dir_all(&root).expect("unlink private listing fixture");
+        self.records().insert(
+            handle.clone(),
+            Database {
+                path: PathBuf::from(path),
+                lease: SessionLease {
+                    client_id: ClientId::new(handle.clone()).expect("client identity"),
+                    lease_id: LeaseId::new(handle.clone()).expect("lease identity"),
+                    instance_id: InstanceId::new(path.replace('/', "-")).expect("owner identity"),
+                    generation: 1,
+                    owner: OwnerKind::Managed,
+                },
+                idb: format!("{path}.i64"),
+                token: token.clone(),
+                pid: None,
+                opened_at: Instant::now(),
+                last_active: Instant::now(),
+                cache_hit: false,
+                client: client.clone(),
+                opener: client.clone(),
+                origin: "existing".into(),
+                opened_wall: std::time::SystemTime::now(),
+                _cache_guard: guard,
+            },
+        );
+        (handle, token)
+    }
+
     /// Bounds concurrent open supervisors, not lifetime N1 identity retention.
     pub fn new(capacity: usize) -> anyhow::Result<Self> {
-        // N9 MUST DELETE: migration validation only; default keeps the old path.
-        let selected = match std::env::var("IDA_CLI_NEXUS_DEV") {
-            Err(std::env::VarError::NotPresent) => false,
-            Ok(value) if value == "1" => true,
-            _ => anyhow::bail!("IDA_CLI_NEXUS_DEV must be unset or 1 (N9 removal)"),
-        };
         Ok(Self {
-            selected,
             databases: Mutex::new(HashMap::new()),
             owner_resources: Mutex::default(),
             owner_diagnostics: Mutex::default(),
@@ -156,9 +192,7 @@ impl Tools {
             close_observers: Mutex::default(),
         })
     }
-    pub fn selected(&self) -> bool {
-        self.selected
-    }
+
     fn records(&self) -> std::sync::MutexGuard<'_, HashMap<String, Database>> {
         self.databases.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -342,22 +376,22 @@ impl Tools {
         paths.insert(path.to_path_buf(), Arc::downgrade(&gate));
         gate
     }
-    async fn bridge(
+    pub(crate) async fn bridge(
         router: &RouterState,
     ) -> Result<Arc<super::nexus_bridge::NexusBridge>, ToolError> {
-        let required = |name| {
-            std::env::var_os(name).map(PathBuf::from).ok_or_else(|| {
-                diagnostic(format!("{name} is required for isolated Nexus development"))
-            })
-        };
-        let python = required("IDA_NEXUS_PYTHON")?;
-        let ipc = required("IDA_NEXUS_IPC_ROOT")?;
+        let python = runtime_python().map_err(diagnostic)?;
+        let ipc = std::env::var_os("IDA_NEXUS_IPC_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
         let script = std::env::var_os("IDA_NEXUS_BRIDGE_SCRIPT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("nexus_bridge/bridge.py")
-            });
-        let environment: BTreeMap<_, _> = std::env::vars().collect();
+            .unwrap_or_else(|| PathBuf::from("bridge.py"));
+        let mut environment: BTreeMap<_, _> = std::env::vars().collect();
+        if !environment.contains_key("IDADIR") {
+            let ida = crate::ida::install::find_runtime_dir()
+                .ok_or_else(|| diagnostic("IDA >=9.4 runtime missing; set IDADIR"))?;
+            environment.insert("IDADIR".into(), ida.to_string_lossy().into_owned());
+        }
         router
             .connect_nexus(BridgeConfig {
                 python,
@@ -1785,7 +1819,6 @@ mod n4_fix_regressions {
     use super::*;
     #[test]
     fn n6_every_registered_tool_and_old_capability_has_an_explicit_path() {
-        use crate::ida::{capabilities::supported_methods_for, runtime::WorkerBackendKind};
         let local = [
             "open_idb",
             "close_idb",
@@ -1808,14 +1841,13 @@ mod n4_fix_regressions {
             }
         }
         assert_eq!(count, 107);
-        for backend in [
-            WorkerBackendKind::NativeLinked,
-            WorkerBackendKind::IdatCompat,
-        ] {
-            for method in supported_methods_for(backend) {
-                if !["open", "close", "shutdown"].contains(method) {
-                    Tools::require(method).unwrap_or_else(|e| panic!("{backend:?}/{method}: {e}"));
-                }
+        let baseline: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/pre-n9-methods.json"))
+                .expect("fixed pre-N9 method inventory");
+        for method in baseline["methods"].as_array().expect("methods") {
+            let method = method.as_str().expect("method");
+            if !["open", "close", "shutdown"].contains(&method) {
+                Tools::require(method).unwrap_or_else(|error| panic!("pre-N9/{method}: {error}"));
             }
         }
         for method in ["unknown_n6", "dbg_unknown_n6"] {
@@ -1854,3 +1886,20 @@ mod n4_f2_regressions;
 #[cfg(feature = "nexus-test-support")]
 #[path = "../../tests/support/n7_fix2_publish.rs"]
 pub mod n7_fix2_publish;
+
+/// Resolve the dedicated installed environment, with explicit development override.
+pub fn runtime_python() -> anyhow::Result<PathBuf> {
+    let path = match std::env::var_os("IDA_NEXUS_PYTHON") {
+        Some(path) => PathBuf::from(path),
+        None => std::env::current_exe()?
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("executable parent missing"))?
+            .join("nexus/venv/bin/python"),
+    };
+    anyhow::ensure!(
+        path.is_file(),
+        "Nexus Python environment missing at {}; install the Nexus runtime or set IDA_NEXUS_PYTHON",
+        path.display()
+    );
+    Ok(path)
+}

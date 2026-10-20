@@ -50,7 +50,7 @@ where
 /// Wraps a future and unsafely marks it as Send.
 /// Used to satisfy AsyncTool's + Send requirement when calling WorkerDispatch
 /// methods whose futures are not declared Send (AFIT limitation).
-/// SAFETY: WorkerDispatch impls (IdaWorker, MockWorker) are all Send + Sync,
+/// SAFETY: WorkerDispatch test adapters are all Send + Sync,
 /// and their internal state is protected by Mutex/channels. The futures they
 /// produce do not escape across threads during polling.
 pub(crate) struct Sendified<F>(pub F);

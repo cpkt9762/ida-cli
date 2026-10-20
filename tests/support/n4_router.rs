@@ -15,7 +15,6 @@ pub(crate) async fn isolated(name: &str) -> bool {
         .arg(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
         .env("IDA_N4_FIX_CASE", name)
-        .env("IDA_CLI_NEXUS_DEV", "1")
         .env("IDA_CLI_MAX_IDB_CACHE_BYTES", "0")
         .env("IDA_CLI_HOME", &home)
         .env("IDA_NEXUS_STATE_DIR", home.join("state"))
@@ -42,7 +41,6 @@ async fn n4_fix_gc_preserves_nexus_idb_at_zero_limit() {
     if !isolated("router::n4_fix_regressions::n4_fix_gc_preserves_nexus_idb_at_zero_limit").await {
         return;
     }
-    assert_eq!(std::env::var("IDA_CLI_NEXUS_DEV").unwrap(), "1");
     assert_eq!(std::env::var("IDA_CLI_MAX_IDB_CACHE_BYTES").unwrap(), "0");
     let router = RouterState::new().unwrap();
     let root = crate::idb_store::idb_root();

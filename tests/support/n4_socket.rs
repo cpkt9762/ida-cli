@@ -11,7 +11,6 @@ async fn n4_fix_busy_shutdown_does_not_exit() {
         return;
     }
     let router = RouterState::new().unwrap();
-    assert!(router.uses_nexus());
     let shutdown = CancellationToken::new();
     let signal = shutdown.clone();
     let (client, server) = tokio::net::UnixStream::pair().unwrap();

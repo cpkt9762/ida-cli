@@ -19,7 +19,6 @@ async fn run_case(fault: &str) {
             .env("N4_F2_OPEN_FAULT", fault)
             .env("IDA_CLI_HOME", &root)
             .env("IDA_NEXUS_STATE_DIR", root.join("state"))
-            .env("IDA_CLI_NEXUS_DEV", "1")
             .env(
                 "IDA_NEXUS_PYTHON",
                 std::env::var_os("F1_PYTHON").unwrap_or_else(|| "/usr/bin/python3".into()),

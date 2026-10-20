@@ -3,12 +3,12 @@
 //! Builds the IDA file type selector string and the IDAPython script
 //! that drives the dscu plugin to load individual modules from a DSC.
 //!
-//! idalib's headless mode cannot handle the DSC loader's module
+//! The ordinary database path cannot handle the DSC loader's module
 //! selection — `init_database()` calls `exit(1)`. So DSC loading is
 //! a two-phase process:
 //!   1. Run `idat -a- -A -S<script> -T<loader> -o<out.i64> <dsc>`
 //!      to create the database via IDA's autonomous CLI mode.
-//!   2. Open the resulting `.i64` with idalib for interactive analysis.
+//!   2. Open the resulting `.i64` through Nexus for interactive analysis.
 
 use std::path::{Path, PathBuf};
 

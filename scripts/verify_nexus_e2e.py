@@ -22,7 +22,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--target", type=Path, required=True)
-    parser.add_argument("--sdk", type=Path, required=True)
     parser.add_argument("--ipc-root", type=Path, help="short private directory for per-router Unix sockets")
     parser.add_argument("--tmp-root", type=Path, help="short alias of the prepared environment's tmp directory")
     parser.add_argument("--cleanup", action="store_true")
@@ -57,19 +56,18 @@ def main():
                 parser.error("--tmp-root must resolve to this environment's tmp directory")
             variables["TMPDIR"] = str(args.tmp_root.absolute())
         cargo_path = shutil.which("cargo")
-        if cargo_path is None or not args.sdk.is_dir() or not args.target.is_dir():
-            parser.exit(1, "BLOCKED: cargo, SDK or target directory missing\n")
+        if cargo_path is None or not args.target.is_dir():
+            parser.exit(1, "BLOCKED: cargo or target directory missing\n")
         ipc_root = (args.ipc_root or env.root / "ipc").absolute()
         if len(str(ipc_root).encode()) > 65:
             parser.exit(1, "BLOCKED: provide a shorter --ipc-root for Unix sockets\n")
         cargo = Path(cargo_path).absolute()
         variables.update({"PATH": str(cargo.parent) + os.pathsep + variables["PATH"],
-                          "IDASDKDIR": str(args.sdk.resolve(strict=True)),
                           "CARGO_TARGET_DIR": str(args.target.resolve(strict=True)),
                           "IDA_TEST": "1", "RUSTC_WRAPPER": "", "N3_ENV_ROOT": str(env.root),
                           "N3_IPC_ROOT": str(ipc_root)})
         if args.suite in {"concurrency", "n6", "special_inputs"}:
-            variables.update({"IDA_CLI_NEXUS_DEV": "1",
+            variables.update({
                 "IDA_NEXUS_PYTHON": str(env.root / "venv/bin/python"),
                 "IDA_NEXUS_IPC_ROOT": str(ipc_root),
                 "IDA_NEXUS_BRIDGE_SCRIPT": str(REPO / "tests/support/nexus_client_fixture.py")})

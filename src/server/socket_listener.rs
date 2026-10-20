@@ -105,7 +105,7 @@ async fn handle_cli_connection(
                 | "task_status"
                 | "cancel_task"
                 | "wait_owner_exit"
-        ) || (router.uses_nexus() && primary_name_for(&request.method) == "get_task_status")
+        ) || (primary_name_for(&request.method) == "get_task_status")
     });
     let shutdown_request = parsed
         .as_ref()
@@ -187,13 +187,7 @@ impl Drop for CliRefGuard {
     fn drop(&mut self) {
         let router = self.router.clone();
         let token = self.token.clone();
-        if router.uses_nexus() {
-            crate::router::nexus_tools::Tools::abandon(router, token);
-            return;
-        }
-        tokio::spawn(async move {
-            router.release_ref_token(&token).await;
-        });
+        crate::router::nexus_tools::Tools::abandon(router, token);
     }
 }
 
@@ -202,9 +196,9 @@ async fn dispatch_cli_request(
     router: &RouterState,
     _shutdown: &CancellationToken,
 ) -> (RpcResponse, Option<CliRefGuard>) {
-    let method = match (router.uses_nexus(), primary_name_for(&req.method)) {
-        (true, "get_task_status") => "task_status",
-        (_, method) => method,
+    let method = match primary_name_for(&req.method) {
+        "get_task_status" => "task_status",
+        method => method,
     };
 
     let path = req
@@ -227,14 +221,7 @@ async fn dispatch_cli_request(
                 // never hit a worker keyed on `/home/user/foo`.
                 let expanded = crate::expand_path(p);
                 let canonical = std::fs::canonicalize(&expanded).unwrap_or(expanded);
-                let (result, lifecycle) = if router.uses_nexus() {
-                    router.nexus_close_path_detailed(&canonical).await
-                } else {
-                    (
-                        router.close_by_path(&canonical, tenant_id.as_deref()).await,
-                        None,
-                    )
-                };
+                let (result, lifecycle) = router.nexus_close_path_detailed(&canonical).await;
                 let mut response = match result {
                     Ok(()) => RpcResponse::ok(&req.id, serde_json::json!({"ok": true})),
                     Err(crate::error::ToolError::Nexus(error)) => {
@@ -258,13 +245,10 @@ async fn dispatch_cli_request(
         }
 
         "shutdown" => {
-            if router.uses_nexus() {
-                if let Err(error) = router.shutdown_nexus().await {
-                    return (RpcResponse::err(&req.id, -32000, error.to_string()), None);
-                }
-            } else {
-                router.shutdown_all().await;
+            if let Err(error) = router.shutdown_nexus().await {
+                return (RpcResponse::err(&req.id, -32000, error.to_string()), None);
             }
+
             // The connection signals service shutdown after flushing this reply.
             let resp = RpcResponse::ok(
                 &req.id,
@@ -274,12 +258,6 @@ async fn dispatch_cli_request(
         }
 
         "wait_owner_exit" => {
-            if !router.uses_nexus() {
-                return (
-                    RpcResponse::err(&req.id, -32601, "owner exit observation requires Nexus"),
-                    None,
-                );
-            }
             let Some(reference) = req
                 .params
                 .get("owner_observation_ref")
@@ -497,7 +475,7 @@ async fn dispatch_cli_request(
         }
 
         _ => {
-            if router.uses_nexus() {
+            {
                 if let Err(error) = crate::router::nexus_tools::Tools::require(method) {
                     return (RpcResponse::err(&req.id, -32000, error.to_string()), None);
                 }
@@ -753,7 +731,7 @@ mod tests {
         for n in 0..6 {
             let client = ClientIdentity::mcp_session();
             let path = format!("/db/some/rather/long/directory/name/sample-{n}.so");
-            router.register_test_worker(&path, &client).await;
+            router.register_test_lease(&path, &client).await;
         }
         let reply = call(&router, "list_idbs", json!({})).await;
         let result = &reply["result"];
@@ -774,8 +752,8 @@ mod tests {
         let router = RouterState::new().expect("router");
         let team = ClientIdentity::rpc_tenant(Some("team-a"));
         let other = ClientIdentity::rpc_tenant(Some("team-b"));
-        router.register_test_worker("/db/mine", &team).await;
-        router.register_test_worker("/db/theirs", &other).await;
+        router.register_test_lease("/db/mine", &team).await;
+        router.register_test_lease("/db/theirs", &other).await;
 
         let reply = call(&router, "list_idbs", json!({"tenant_id": "team-a"})).await;
         let idbs = reply["result"]["idbs"].as_array().expect("idbs array");

@@ -78,7 +78,7 @@ def main():
                 parser.error("--idasdk required for rust")
             extra = {"CARGO_HOME":str(args.cargo_home), "RUSTUP_HOME":str(args.rustup_home),
                 "CARGO_TARGET_DIR":str(args.target_dir or root / "target"), "IDASDK":str(args.idasdk), "IDADIR":manifest["ida_dir"],
-                "IDA_CLI_NEXUS_DEV":"1", "IDA_CLI_HOME":str(root / "rust/cli"),
+                 "IDA_CLI_HOME":str(root / "rust/cli"),
                 "R0_CASE_ROOT":str(root / "rust"), "R0_PYTHON":python,
                 "IDA_NEXUS_PYTHON":python, "IDA_NEXUS_IPC_ROOT":str(root / "rust/ipc")}
             target = ["--features","nexus-test-support","--test","nexus_r0_prototypes"]

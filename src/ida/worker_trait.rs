@@ -1,9 +1,3 @@
-//! Trait abstraction over [`IdaWorker`] for testable RPC dispatch.
-//!
-//! [`WorkerDispatch`] mirrors every async method that [`super::worker::IdaWorker`]
-//! exposes to [`crate::dispatch_rpc_request`], enabling mock-based unit tests
-//! without a live IDA instance.
-
 use crate::error::ToolError;
 use crate::ida::types::*;
 use serde_json::Value;

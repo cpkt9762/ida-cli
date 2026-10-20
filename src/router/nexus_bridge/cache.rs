@@ -791,7 +791,11 @@ mod f1_regressions {
         let cache = root.join("cache");
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(&source, b"A").unwrap();
-        let idb = IdbStore::with_root(cache.clone()).idb_path(&source);
+        let idb = cache.join(format!(
+            "{}.{}.dylib.i64",
+            source.file_name().expect("basename").to_string_lossy(),
+            IdbStore::try_compute_hash(&source).expect("fixture hash")
+        ));
         std::fs::write(&idb, b"unrelated database").unwrap();
         assert!(
             prepare(source, cache, &Preparation::new(Duration::from_secs(2))).is_err(),

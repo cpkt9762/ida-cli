@@ -32,7 +32,6 @@ pub async fn released_waiter_retains_content_until_publication_syscall_returns()
                 "--nocapture",
             ])
             .env("N7_FIX2_PROTOCOL", "1")
-            .env("IDA_CLI_NEXUS_DEV", "1")
             .env("IDA_CLI_HOME", root.join("home"))
             .env("IDA_NEXUS_STATE_DIR", root.join("state"))
             .env("F1_ROOT", &root)

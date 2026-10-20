@@ -189,7 +189,6 @@ async fn e09_same_database_short_request_queues_without_result_mixup() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e10_actual_router_batch_yields_to_short_query() {
     let router = ida_mcp::router::RouterState::new().unwrap();
-    assert!(router.uses_nexus());
     let mut b = Client::new().await;
     let (lb, _) = b.open(&sample("n5-e10-b"), json!({})).await;
     let many = root().join("fixtures/e10-many");

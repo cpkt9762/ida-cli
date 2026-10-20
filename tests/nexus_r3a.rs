@@ -1167,10 +1167,6 @@ async fn tools_future_drop_keeps_acquired_preparation_custody() {
     let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private Tools root"));
     std::fs::create_dir_all(&root).expect("private root");
     let router = RouterState::new().expect("real router");
-    assert!(
-        router.uses_nexus(),
-        "run this isolated target with IDA_CLI_NEXUS_DEV=1"
-    );
     let mut environment: BTreeMap<String, String> = std::env::vars().collect();
     environment.insert("R3A_SCENARIO".into(), "tools-barrier".into());
     let bridge = router

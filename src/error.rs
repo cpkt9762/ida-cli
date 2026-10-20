@@ -91,12 +91,6 @@ impl ToolError {
     }
 }
 
-impl From<idalib::IDAError> for ToolError {
-    fn from(e: idalib::IDAError) -> Self {
-        ToolError::IdaError(e.to_string())
-    }
-}
-
 impl<T> From<std::sync::mpsc::SendError<T>> for ToolError {
     fn from(_: std::sync::mpsc::SendError<T>) -> Self {
         ToolError::WorkerClosed

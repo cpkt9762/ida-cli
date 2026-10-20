@@ -1,5 +1,11 @@
 # Testing
 
+N9 当前统一使用 Nexus，没有开发期开关。Rust 构建/检查不需要 IDA SDK。下文各阶段记录中的 SDK 与 native 比较描述属于历史证据；旧版本对照只调用固定 N0 二进制。最终 E29 与 E00–E28 统一总验收由编排者另行执行，N9 定向门禁不替代它们。
+
+N9 定向回归：`tests/nexus_n9.rs` 与 `tests/test_nexus_n9.py` 在 PATH 不含 GNU timeout 的子环境核对维护成功/超时、TERM 回滚指引与精确收尸；N7 混合索引、N4 MCP/CLI、N1、R5 协议及四补丁安装链保留。`scripts/package_release.py` 打包完整 runtime-lock 资产；安装演练使用 `--bundle` 和私有前缀，检查实际加载的四个补丁输出及篡改负例。只读旧平铺元数据仍用于迁移，不是数据库执行后端。
+
+历史 worker 池配置 `IDA_CLI_MAX_WORKERS`、`IDA_CLI_MAX_WORKERS_PER_TENANT`、`IDA_CLI_MAX_PENDING_PER_WORKER`、`IDA_CLI_MAX_CONCURRENT_SPAWNS` 已移除；为兼容状态 JSON，它们对应字段保留为 0，表示不适用。Nexus 实际准入仍由 `IDA_CLI_MAX_PENDING_PER_TENANT` 控制，保留容量由 `IDA_CLI_NEXUS_RETENTION_CAPACITY` 控制；没有扩大额度。
+
 R6 的原语图不按初始成员数排除 owner 时序，逐轨迹 JSON 保留原始 ACK、错误、
 I1–I6 检查和 I5 的 pending 前提；Rust `nexus_r3b` 另记录真实 HTTP detach 后继集合，
 在同一 router 释放 owner barrier 后检查 I5。S1 已改用生产 custody/SDK/helper，
@@ -54,7 +60,7 @@ E20 对七类写入显式保存、关闭、重开并严格读回，还检查部�
 ln -s "$N0_ROOT/tmp" "$N6_TMP"
 uptime
 timeout 210s "$N0_ROOT/venv/bin/python" scripts/verify_nexus_e2e.py \
-  --root "$N0_ROOT" --target "$CARGO_TARGET_DIR" --sdk "$IDASDKDIR" \
+  --root "$N0_ROOT" --target "$CARGO_TARGET_DIR" \
   --tmp-root "$N6_TMP" --ipc-root "$N6_TMP/i" --suite n6 --baseline "$N0_BASELINE"
 result=$?; uptime; test "$result" -eq 0
 ```
@@ -336,7 +342,7 @@ N3_TEST_IPC_ROOT="$N3_ROOT/i" timeout 30s "$N0_ROOT/venv/bin/python" -m pytest t
 ```
 
 The real lifecycle verifier requires another fresh patched environment and
-explicit absolute target/SDK paths. Its suite has a 180-second shell timeout
+explicit absolute target paths. Its suite has a 180-second shell timeout
 for multiple IDA starts, save/reopen and crash repair; an outer 210-second
 supervisor leaves 30 seconds for owned cleanup. It runs this worktree's absolute
 Rust integration executable via cargo and disables daemon discovery by exercising
@@ -344,7 +350,7 @@ only the internal router endpoint. It never invokes the installed CLI.
 
 ```bash
 timeout 210s "$N0_ROOT/venv/bin/python" scripts/verify_nexus_e2e.py \
-  --root "$N0_ROOT" --target "$CARGO_TARGET_DIR" --sdk "$IDASDKDIR" --ipc-root "$N3_ROOT/i"
+  --root "$N0_ROOT" --target "$CARGO_TARGET_DIR" --ipc-root "$N3_ROOT/i"
 ```
 
 Exactly nine real tests and nine distinct PASS records are required: E02
@@ -369,11 +375,11 @@ E08/E18/E19 full real-chain coverage remains later work.
 N4 adds `tests/nexus_contract_e2e.rs`. Prepare a separate fresh patched environment
 and use the fixed N0 binary recorded below; the verifier rejects a missing baseline
 and the comparison driver verifies its SHA256. No installed CLI or old source is
-used. Run from this worktree, with the same explicit target and SDK as N3:
+used. Run from this worktree, with the same explicit target as N3:
 
 ```bash
 timeout 210s "$N4_ROOT/venv/bin/python" scripts/verify_nexus_e2e.py \
-  --root "$N4_ROOT" --target "$CARGO_TARGET_DIR" --sdk "$IDASDKDIR" \
+  --root "$N4_ROOT" --target "$CARGO_TARGET_DIR" \
   --ipc-root /tmp/n4-contract --suite contract --baseline "$N0_BASELINE"
 ```
 
@@ -712,7 +718,7 @@ for S1_CASE in s1_dropped_close_releases_root_without_another_close s1_expired_o
   S1_ROOT=$(mktemp -d /tmp/n7s1.XXXXXX)
   mkdir -p "$S1_ROOT"/home "$S1_ROOT"/state "$S1_ROOT"/tmp "$S1_ROOT"/proof
   uptime
-  env -i HOME="$HOME" USER="$USER" PATH="$PATH" LANG=C.UTF-8 IDADIR='/Applications/IDA Professional 9.5.app/Contents/MacOS' IDASDKDIR=/Users/pingzi/Developer/tools/ida-sdk-9.5/src CARGO_TARGET_DIR=/tmp/ida-nexus-run-20261015.98rmfb/n1/target IDA_CLI_NEXUS_DEV=1 IDA_NEXUS_PYTHON="$S1_PYTHON" IDA_NEXUS_IPC_ROOT="$S1_ROOT/ipc" F1_ROOT="$S1_ROOT/proof" IDA_CLI_HOME="$S1_ROOT/home" IDA_NEXUS_STATE_DIR="$S1_ROOT/state" TMPDIR="$S1_ROOT/tmp" timeout 150s cargo test --locked --test nexus_n7_fix1 "$S1_CASE" -- --exact --test-threads=1
+  env -i HOME="$HOME" USER="$USER" PATH="$PATH" LANG=C.UTF-8 IDADIR='/Applications/IDA Professional 9.5.app/Contents/MacOS' IDASDKDIR=/Users/pingzi/Developer/tools/ida-sdk-9.5/src CARGO_TARGET_DIR=/tmp/ida-nexus-run-20261015.98rmfb/n1/target IDA_NEXUS_PYTHON="$S1_PYTHON" IDA_NEXUS_IPC_ROOT="$S1_ROOT/ipc" F1_ROOT="$S1_ROOT/proof" IDA_CLI_HOME="$S1_ROOT/home" IDA_NEXUS_STATE_DIR="$S1_ROOT/state" TMPDIR="$S1_ROOT/tmp" timeout 150s cargo test --locked --test nexus_n7_fix1 "$S1_CASE" -- --exact --test-threads=1
   S1_EXIT=$?; uptime; test "$S1_EXIT" = 0 || break
 done
 ```
@@ -1252,8 +1258,8 @@ timeout 30s "$R3A_PYTHON" -m pytest -q tests/nexus_bridge/test_custody_target.py
 The 120-second allowance is for the explicit fault matrix or 128 actual
 open/close/public-proof rounds. The real tiny Tools and startup targets allow
 180 seconds for IDA initialization. `tools_future_drop` additionally requires
-`IDA_CLI_NEXUS_DEV=1`, `IDA_NEXUS_PYTHON` and `IDA_NEXUS_IPC_ROOT`; do not enable
-the dev selector for unrelated lib tests. Python bootstrap attacks require
+`IDA_NEXUS_PYTHON` and `IDA_NEXUS_IPC_ROOT`; there is no
+separate backend selector. Python bootstrap attacks require
 `R3A_INSTALLATION` naming an installation produced by the current Rust build.
 Run fmt/check/all-target Clippy `-D warnings`, affected Python/R5/R1 and explicit
 `nexus_bridge_regressions` targets with shell timeout and before/after uptime.
@@ -1339,9 +1345,7 @@ Public proof does not replace original caller errors;
 verified boot retirement only settles current old-boot resources. Unknown attach,
 detach and business effects never replay, and the original open budget never resets.
 
-Keep `IDA_CLI_NEXUS_DEV` unset for the general library suite. The actual MCP R2
-fixture selects Nexus in its own child process, avoiding process-global selector
-contamination. Create the private `R5_ROOT` before receiver evidence output.
+The library and MCP fixtures use the same Nexus path without a selector. Create the private `R5_ROOT` before receiver evidence output.
 `F1_PYTHON`, `R3A_PYTHON`, `IDA_NEXUS_PYTHON` name the new formal SDK interpreter;
 bootstrap tests also require `R3A_INSTALLATION` from the current Rust-produced
 installation. The existing test-support process ledger records pre-spawn intent

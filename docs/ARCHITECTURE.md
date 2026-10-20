@@ -2,74 +2,11 @@
 
 ## Current Shape
 
-`ida-cli` now has a runtime-adaptive middle layer instead of a single hard-coded IDA backend.
+Flat CLI, stdio MCP, HTTP MCP and background jobs share RouterState and the Nexus session coordinator. The Rust binary has no native IDA linkage. A persistent, verified Python bridge uses the fixed public Nexus client, with independent business/control lanes and a separate custody proof helper. IDA itself is owned by Nexus or an attached GUI instance.
 
-### Layers
+Each client receives a lease. Requests carry immutable operation identities and total deadlines; unknown outcomes are never replayed. Close acknowledges lease detach separately from owner lifetime/save completion. Startup, recovery and owner observations retain their existing durable gates, Root Node protection and exact proof rules; see the release protocol.
 
-1. Frontends
-- Flat CLI
-- MCP over stdio
-- MCP over Streamable HTTP
-
-2. Router
-- Spawns per-database workers
-- Routes JSON-RPC requests
-- Keeps active handle / per-path handle mapping
-- Reuses workers when a path is already open
-
-3. Runtime Probe
-- Detects the active IDA runtime
-- Selects a worker backend before worker startup
-- Prevents known crash paths from being entered blindly
-
-4. Worker Backends
-- `native-linked`
-- `idat-compat`
-
-5. Storage and caches
-- Database cache: `~/.ida/idb/`
-- Response cache: `/tmp/ida-cli-out/`
-- Socket discovery: `/tmp/ida-cli.socket`
-
-## Why This Matters
-
-This split is the foundation for long-running RE server workloads:
-
-- old runtimes and new runtimes no longer share one unsafe code path
-- the router can evolve independently from backend implementation details
-- IDA database caching is no longer tied to the source binary directory
-- backend support can be declared and tested explicitly
-
-## Current Backends
-
-### `native-linked`
-
-Used for IDA 9.3 and 9.5 when the runtime matches the SDK version the binary was built against, so the vendored `idalib` line can safely open databases in-process.
-
-### `idat-compat`
-
-Used for IDA 9.0–9.2, IDA 9.4, and runtimes that differ from the build SDK, where the vendored `idalib` line would crash or lose the decompiler.
-
-This backend:
-
-- shells out to `idat`
-- runs short IDAPython snippets
-- emits structured JSON back to the router
-- reuses cached database artifacts in `~/.ida/idb/`
-
-## Concurrency Model Today
-
-Today the router model is:
-
-- one server process
-- many worker subprocesses
-- one worker per open database handle
-
-This already supports:
-
-- multiple databases in parallel
-- backend-specific worker behavior
-- independent worker crashes without taking down the whole server
+Cache generations, root/content/open locks, retained failure evidence and conservative GC are shared by all transports. Legacy flat groups remain migration inputs and are never an alternate execution backend. Offline sbx/idat calls only prepare sBPF/DSC artifacts. Runtime and patch mismatches fail explicitly; version rollback invokes a separate frozen executable and a closed backup.
 
 ## What Is Still Needed For “1000 Agents”
 
@@ -82,13 +19,13 @@ The current code is a strong base, but “1000 agents” needs another layer abo
 
 2. Job Queue
 - durable task scheduling
-- retries
+- explicit terminal outcomes without write replay
 - cancellation
 - fair sharing across users and binaries
 
 3. Worker Pool Manager
 - warm workers
-- backend-specific pools
+- Nexus owner capacity
 - CPU / memory caps
 - queue depth limits
 
@@ -149,8 +86,4 @@ This is a federation status and discovery skeleton, not yet a full remote execut
 
 ## Validation
 
-The repository now includes a 9.x compatibility verification script:
-
-`scripts/verify_9x_compat.py`
-
-It probes the selected backend and runs a worker-level compatibility pass for the currently declared `idat-compat` supported method set.
+The N1, bridge, CLI/MCP and offline-preparation contracts run against Nexus. Behavioral comparison invokes the independently supplied, hashed N0 binary. Full final E2E and version rollback are separate acceptance gates; see TESTING.md.
