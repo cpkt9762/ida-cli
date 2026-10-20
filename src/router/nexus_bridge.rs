@@ -170,6 +170,28 @@ struct State {
     failed: std::sync::atomic::AtomicBool,
     stop: tokio_util::sync::CancellationToken,
 }
+fn take_closed_history(
+    history: &mut std::collections::VecDeque<Value>,
+    keep: usize,
+    ready: impl Fn(&Value) -> bool,
+) -> Vec<Value> {
+    let closed: Vec<_> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| ready(item))
+        .map(|(index, _)| index)
+        .collect();
+    let remove = closed.len().saturating_sub(keep);
+    let mut discarded = Vec::new();
+    for index in closed.into_iter().take(remove).rev() {
+        if let Some(old) = history.remove(index) {
+            discarded.push(old);
+        }
+    }
+    discarded.reverse();
+    discarded
+}
+
 impl State {
     fn observations_empty(&self) -> bool {
         let resources_empty = self
@@ -221,35 +243,32 @@ impl State {
     fn compact_closed_history(&self) {
         self.endpoint
             .transition(|sessions, _| sessions.compact_closed_diagnostics(128));
-        let mut history = self
-            .closed_history
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        while history.len() > 128 {
-            let Some(old) = history.front() else {
-                break;
-            };
-            let Ok(acquisition) = decode::<AcquisitionId>(old["acquisition"].clone()) else {
-                break;
-            };
+        let discarded = {
+            let mut history = self
+                .closed_history
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            take_closed_history(&mut history, 128, |old| {
+                let Ok(acquisition) = decode::<AcquisitionId>(old["acquisition"].clone()) else {
+                    return false;
+                };
+                self.endpoint
+                    .transition(|sessions, _| {
+                        sessions
+                            .acquisition_sdk_finished(&acquisition)
+                            .and_then(|finished| {
+                                Ok(finished && sessions.acquisition_closed(&acquisition)?)
+                            })
+                    })
+                    .unwrap_or(false)
+            })
+        };
+        for old in discarded {
             let Ok(lease) = decode::<Option<SessionLease>>(old["lease"].clone()) else {
-                break;
+                continue;
             };
-            if !self
-                .endpoint
-                .transition(|sessions, _| {
-                    sessions
-                        .acquisition_sdk_finished(&acquisition)
-                        .and_then(|finished| {
-                            Ok(finished && sessions.acquisition_closed(&acquisition)?)
-                        })
-                })
-                .unwrap_or(false)
-            {
-                break;
-            }
             let watch = old["watch"].as_str().unwrap_or_default().to_owned();
-            history.pop_front();
+
             if let Some(lease) = lease {
                 self.owner_proofs
                     .lock()

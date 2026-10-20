@@ -61,3 +61,21 @@ async fn raw_shutdown_waits_for_exact_helper_retirement() {
     );
     result.expect("natural shutdown after retirement");
 }
+
+#[test]
+fn pending_history_head_cannot_block_retirement_of_later_closed_records() {
+    let mut history = std::collections::VecDeque::from([
+        json!({"name":"pending", "ready":false}),
+        json!({"name":"closed-old", "ready":true}),
+        json!({"name":"closed-new", "ready":true}),
+    ]);
+    let retired = take_closed_history(&mut history, 1, |item| item["ready"] == true);
+    assert_eq!(retired, vec![json!({"name":"closed-old", "ready":true})]);
+    assert_eq!(
+        history,
+        std::collections::VecDeque::from([
+            json!({"name":"pending", "ready":false}),
+            json!({"name":"closed-new", "ready":true}),
+        ])
+    );
+}
