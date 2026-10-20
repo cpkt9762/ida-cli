@@ -1657,7 +1657,9 @@ host boot, directory identities, action, selected group, backup path and exact
 current files/indices; it is revalidated under locks and before each deletion.
 This attestation cannot be auto-generated as proof by the tool.
 
-Apply holds every declared `.startup.lock`, cache-root `.cache.lock` EX and
+Apply preserves old CLI startup-lock modes (including 0644) while requiring
+a single-link regular file owned by this uid with no group/other write access.
+It holds every declared `.startup.lock`, cache-root `.cache.lock` EX and
 stable target EX until backup/publication/removal or rollback finishes. Live PID
 or remaining router sockets, public owner discovery/registration incompleteness,
 nonpacked/component locks, unsettled custody and recovery obligations veto it.

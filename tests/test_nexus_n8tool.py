@@ -237,6 +237,14 @@ class GovernanceTests(unittest.TestCase):
         self.assert_original()
         self.assertFalse(self.backup.exists())
 
+    def test_legacy_startup_lock_mode_0644_is_accepted_without_chmod(self):
+        lock = self.home/'.startup.lock'
+        lock.write_bytes(b'')
+        lock.chmod(0o644)
+        self.apply('clean')
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o644)
+        self.assertFalse((self.cache/self.group).exists())
+
     def test_preexisting_backup_is_never_overwritten(self):
         self.backup.mkdir(mode=0o700)
         (self.backup/'unknown').write_bytes(b'keep')

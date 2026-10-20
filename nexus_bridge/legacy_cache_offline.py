@@ -4,10 +4,12 @@ Public probes are vetoes, never an offline proof. Independent IDA and remote
 writers must be stopped and prevented throughout the declared offline window.
 """
 from contextlib import ExitStack, contextmanager
+import fcntl
 import json
 import math
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import time
@@ -76,6 +78,28 @@ def assert_daemon_offline(home):
     raise RuntimeError('router PID is still alive or reused: ' + str(pidfile))
 
 
+def startup_lock(handle):
+    # Older CLI releases create this lock with 0666 & umask (usually 0644).
+    # Its empty bytes are not authority; stable inode, owner and write access
+    # are. Preserve its mode while flocking the exact existing description.
+    fd = os.open('.startup.lock', os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o600, dir_fd=handle.fd)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or info.st_mode & 0o022):
+            raise RuntimeError('unsafe legacy startup lock')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        current = os.stat('.startup.lock', dir_fd=handle.fd, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+            raise RuntimeError('startup lock identity changed')
+        handle.verify()
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 @contextmanager
 def locked(root, homes, targets):
     """Hold all guards for the complete backup/publication/removal/rollback."""
@@ -85,7 +109,7 @@ def locked(root, homes, targets):
         for home in homes:
             handle = Directory(home, private=False)
             stack.callback(handle.close)
-            fd = handle.lock('.startup.lock', nb=True)
+            fd = startup_lock(handle)
             stack.callback(os.close, fd)
             assert_daemon_offline(home)
         handle = Directory(root, private=False)

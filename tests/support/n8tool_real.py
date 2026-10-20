@@ -75,6 +75,8 @@ def main():
     home, cache, state, backups = run/'home', run/'home/idb', run/'state', run/'backups'
     for path in (home, cache, state, backups):
         path.mkdir(mode=0o700)
+    (home/'.startup.lock').touch(mode=0o644)
+    (home/'.startup.lock').chmod(0o644)
     python = environment/'venv/bin/python'
     env = {k: os.environ[k] for k in ('PATH', 'USER', 'LOGNAME') if k in os.environ}
     env.update(HOME=str(home), IDA_CLI_HOME=str(home), IDA_NEXUS_STATE_DIR=str(state),
