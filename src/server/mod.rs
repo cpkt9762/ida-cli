@@ -960,8 +960,10 @@ impl IdaMcpServer {
             };
             if let Some(lifecycle) = lifecycle {
                 result
-                    .content
-                    .push(Content::text(json!({"lifecycle":lifecycle}).to_string()));
+                    .meta
+                    .get_or_insert_with(Default::default)
+                    .0
+                    .insert("nexus".into(), json!({"lifecycle":lifecycle}));
             }
             return Ok(result);
         }

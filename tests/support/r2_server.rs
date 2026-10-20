@@ -253,12 +253,11 @@ async fn close_preserves_text_error_and_lifecycle() {
                     );
                 }
             }
-            let body: Value = serde_json::from_str(
-                &response.content[1]
-                    .as_text()
-                    .expect("lifecycle content")
-                    .text,
-            )?;
+            anyhow::ensure!(
+                response.content.len() == 1,
+                "close has one legacy text item"
+            );
+            let body = &response.meta.as_ref().expect("lifecycle meta").0["nexus"];
             anyhow::ensure!(
                 body["lifecycle"]["lease_detached"]
                     == (!matches!(scenario, "lost-ack" | "r2-save-refused-notsent"))

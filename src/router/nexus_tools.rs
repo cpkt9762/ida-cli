@@ -995,6 +995,13 @@ impl Tools {
         router: &RouterState,
         path: &Path,
     ) -> Result<(), ToolError> {
+        self.close_path_detailed(router, path).await.0
+    }
+    pub async fn close_path_detailed(
+        self: &Arc<Self>,
+        router: &RouterState,
+        path: &Path,
+    ) -> (Result<(), ToolError>, Option<Value>) {
         let tokens: Vec<_> = self
             .records()
             .values()
@@ -1002,16 +1009,23 @@ impl Tools {
             .map(|db| db.token.clone())
             .collect();
         if tokens.len() > 1 {
-            return Err(NexusError::new(
-                NexusErrorCode::ExclusiveCloseRequired,
-                "close requires the opener's close_token while other sessions exist",
-            )
-            .into());
+            return (
+                Err(NexusError::new(
+                    NexusErrorCode::ExclusiveCloseRequired,
+                    "close requires the opener's close_token while other sessions exist",
+                )
+                .into()),
+                None,
+            );
         }
-        let token = tokens.first().ok_or(ToolError::NoDatabaseOpen)?;
-        self.close_token(router, token).await?;
-        router.warm_pool.lock().await.remove(path);
-        Ok(())
+        let Some(token) = tokens.first() else {
+            return (Err(ToolError::NoDatabaseOpen), None);
+        };
+        let (result, lifecycle) = self.close_token_detailed(router, token).await;
+        if result.is_ok() {
+            router.warm_pool.lock().await.remove(path);
+        }
+        (result.map(|_| ()), lifecycle)
     }
     pub async fn shutdown(self: &Arc<Self>, router: &RouterState) -> Result<(), ToolError> {
         let tokens: Vec<_> = self.records().values().map(|db| db.token.clone()).collect();

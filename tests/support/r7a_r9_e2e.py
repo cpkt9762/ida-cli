@@ -19,13 +19,10 @@ class ReleaseClient(Candidate):
         response = self.client.rpc('tools/call', {'name': method, 'arguments': params})
         result = response['result']
         content = result['content']
-        assert len(content) in (1, 2) and all(item['type'] == 'text' for item in content), result
-        lifecycle = None
-        if len(content) == 2:
-            extra = json.loads(content[1]['text'])
-            assert set(extra) == {'lifecycle'} and isinstance(extra['lifecycle'], dict), extra
-            lifecycle = extra['lifecycle']
-            assert lifecycle['lease']['lease_id'] and lifecycle['owner']['record_id'], lifecycle
+        assert len(content) == 1 and content[0]['type'] == 'text', result
+        lifecycle = result['_meta']['nexus']['lifecycle']
+        assert isinstance(lifecycle, dict), lifecycle
+        assert lifecycle['lease']['lease_id'] and lifecycle['owner']['record_id'], lifecycle
         return {'error' if result.get('isError') else 'result': content[0]['text'],
                 'lifecycle': lifecycle}
 

@@ -227,13 +227,30 @@ async fn dispatch_cli_request(
                 // never hit a worker keyed on `/home/user/foo`.
                 let expanded = crate::expand_path(p);
                 let canonical = std::fs::canonicalize(&expanded).unwrap_or(expanded);
-                match router.close_by_path(&canonical, tenant_id.as_deref()).await {
+                let (result, lifecycle) = if router.uses_nexus() {
+                    router.nexus_close_path_detailed(&canonical).await
+                } else {
+                    (
+                        router.close_by_path(&canonical, tenant_id.as_deref()).await,
+                        None,
+                    )
+                };
+                let mut response = match result {
                     Ok(()) => RpcResponse::ok(&req.id, serde_json::json!({"ok": true})),
                     Err(crate::error::ToolError::Nexus(error)) => {
                         RpcResponse::nexus_error(&req.id, &error)
                     }
                     Err(e) => RpcResponse::err(&req.id, -32000, e.to_string()),
+                };
+                if let Some(lifecycle) = lifecycle {
+                    if let Some(result) = response.result.as_mut() {
+                        result["lifecycle"] = lifecycle;
+                    } else if let Some(error) = response.error.as_mut() {
+                        error.data.get_or_insert_with(|| serde_json::json!({}))["lifecycle"] =
+                            lifecycle;
+                    }
                 }
+                response
             } else {
                 RpcResponse::err(&req.id, -32001, "close requires 'path' parameter")
             };

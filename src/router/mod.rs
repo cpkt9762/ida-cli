@@ -2062,6 +2062,16 @@ impl RouterState {
         Ok(())
     }
 
+    pub(crate) async fn nexus_close_path_detailed(
+        &self,
+        path: &std::path::Path,
+    ) -> (
+        Result<(), crate::error::ToolError>,
+        Option<serde_json::Value>,
+    ) {
+        self.nexus_tools.close_path_detailed(self, path).await
+    }
+
     pub async fn close_by_path(
         &self,
         path: &std::path::Path,
