@@ -201,3 +201,104 @@ pub async fn released_waiter_retains_content_until_publication_syscall_returns()
         "next opener must see committed new index"
     );
 }
+
+pub async fn real_default_request_ignores_releasing_sibling() {
+    let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private real root"));
+    let input = root.join("default-input");
+    std::fs::copy(
+        std::env::var_os("R2_REAL_INPUT").expect("private raw sample"),
+        &input,
+    )
+    .expect("copy sample");
+    let router = RouterState::new().expect("real default router");
+    let mut environment: BTreeMap<String, String> = std::env::vars().collect();
+    environment.insert("R7X_DEFAULT_ROOT".into(), root.display().to_string());
+    environment.insert(
+        "R7A_ROOT_TRACE".into(),
+        root.join("root-trace.jsonl").display().to_string(),
+    );
+    let bridge = router
+        .connect_nexus(BridgeConfig {
+            python: PathBuf::from(std::env::var_os("R3A_PYTHON").expect("formal SDK")),
+            script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/r7a_real_bridge.py"),
+            directory: root.join("i"),
+            environment,
+        })
+        .await
+        .expect("real installed bridge");
+    let path = input.to_str().expect("UTF8 input");
+    for _ in 0..2 {
+        router
+            .ensure_worker_prepared(path, None, None, Preparation::new(Duration::from_secs(30)))
+            .await
+            .expect("independent real lease");
+    }
+    let (closing, healthy) = {
+        let records = router.nexus_tools.records();
+        let mut rows = records.iter();
+        let (h, a) = rows.next().expect("default first record");
+        let (other, b) = rows.next().expect("healthy sibling");
+        (
+            (h.clone(), a.token.clone(), a.lease.clone()),
+            (other.clone(), b.token.clone(), b.lease.clone()),
+        )
+    };
+    std::fs::write(
+        root.join("default-pause-lease.json"),
+        serde_json::to_vec(&closing.2).expect("lease binding"),
+    )
+    .expect("arm exact lease");
+    let active = router.clone();
+    let token = closing.1.clone();
+    let close = tokio::spawn(async move { active.nexus_close_token(&token).await });
+    until(|| root.join("default-release.arrived").exists()).await;
+    let result: Result<Value, ToolError> = async {
+        let phase = bridge
+            .endpoint()
+            .transition(|s, _| s.status(&closing.2.client_id, &closing.2))?
+            .phase;
+        assert_eq!(phase, SessionPhase::ReleaseRequested);
+        let explicit = router
+            .route_request(Some(&healthy.0), "get_analysis_status", json!({}))
+            .await?;
+        let inferred = router
+            .route_request(None, "get_analysis_status", json!({}))
+            .await?;
+        Ok(json!({"explicit":explicit,"inferred":inferred}))
+    }
+    .await;
+    std::fs::write(root.join("default-release.release"), b"")
+        .expect("finally unblock exact release");
+    close
+        .await
+        .expect("close supervisor")
+        .expect("nonlast real ACK");
+    router
+        .nexus_close_token(&healthy.1)
+        .await
+        .expect("last real ACK");
+    until(|| {
+        let s = bridge.lifecycle_status();
+        s["resources"] == 0 && s["startup_and_pre_attach"] == 0 && s["retirement_acks"] == 0
+    })
+    .await;
+    bridge
+        .shutdown()
+        .await
+        .expect("natural helper/bridge shutdown");
+    std::fs::write(
+        root.join("default-result.json"),
+        serde_json::to_vec_pretty(
+            &json!({"result":format!("{result:?}"),"status":bridge.lifecycle_status()}),
+        )
+        .expect("encode evidence"),
+    )
+    .expect("persist evidence");
+    let value = result.expect("default request must select the healthy sibling, without replay");
+    assert!(
+        value["explicit"]["auto_is_ok"].is_boolean()
+            && value["inferred"]["auto_is_ok"].is_boolean(),
+        "{value}"
+    );
+}

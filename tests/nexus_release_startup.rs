@@ -85,3 +85,10 @@ async fn worker_start_timeout_retains_guard_until_real_worker_grace_exit() {
     shutdown.expect("natural helper shutdown after startup settlement");
     result.expect("native startup remains protected after WorkerStartError");
 }
+
+#[cfg(feature = "nexus-test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_request_uses_active_sibling_while_reference_is_releasing() {
+    ida_mcp::router::nexus_tools::n7_fix2_publish::real_default_request_ignores_releasing_sibling()
+        .await;
+}

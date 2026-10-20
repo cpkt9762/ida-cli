@@ -66,4 +66,24 @@ def receive(self, channel, message):
 
 
 runtime.Bridge.receive = receive
+
+original_invoke = runtime.Bridge.invoke
+
+def default_release_barrier(self, channel, attempt, command, deadline, public_started):
+    root = os.environ.get('R7X_DEFAULT_ROOT')
+    if root and command.get('command') == 'release':
+        directory = Path(root)
+        armed = directory/'default-pause-lease.json'
+        if armed.exists() and json.loads(armed.read_text()) == command.get('lease', command.get('identity', {}).get('lease')):
+            import time
+            (directory/'default-release.arrived').touch()
+            limit = time.monotonic()+15
+            while not (directory/'default-release.release').exists():
+                if time.monotonic() >= limit:
+                    raise TimeoutError('exact default selection release barrier')
+                time.sleep(.005)
+    return original_invoke(self, channel, attempt, command, deadline, public_started)
+
+runtime.Bridge.invoke = default_release_barrier
+
 runtime.main()

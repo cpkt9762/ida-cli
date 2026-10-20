@@ -293,6 +293,44 @@ impl Tools {
             .map(|db| db.cache_hit)
             .ok_or(ToolError::NoDatabaseOpen)
     }
+    fn business_record(
+        &self,
+        router: &RouterState,
+        handle: Option<&str>,
+    ) -> Result<(String, Database), ToolError> {
+        let records = self.records();
+        if let Some(handle) = handle {
+            return records
+                .get(handle)
+                .cloned()
+                .map(|db| (handle.to_owned(), db))
+                .ok_or_else(|| ToolError::InvalidParams(format!("Unknown db_handle: {handle}")));
+        }
+        let endpoint = router.nexus_endpoint();
+        let active = endpoint.transition(|state, _| {
+            let mut active = Vec::new();
+            for (key, db) in records.iter() {
+                if state.status(&db.lease.client_id, &db.lease)?.phase == SessionPhase::Active {
+                    active.push((key.clone(), db.clone()));
+                }
+            }
+            Ok::<_, NexusError>(active)
+        })?;
+        let first = active
+            .iter()
+            .min_by_key(|(_, db)| db.opened_at)
+            .ok_or(ToolError::NoDatabaseOpen)?;
+        if active
+            .iter()
+            .any(|(_, db)| db.lease.instance_id != first.1.lease.instance_id)
+        {
+            return Err(ToolError::InvalidParams(
+                "db_handle is required when multiple databases are open".into(),
+            ));
+        }
+        Ok(first.clone())
+    }
+
     fn path_gate(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
         let mut paths = self.paths.lock().unwrap_or_else(|e| e.into_inner());
         paths.retain(|_, gate| gate.strong_count() > 0);
@@ -678,21 +716,7 @@ impl Tools {
                 .remove("_n5_checkpoint");
             let job = id();
             params["_n5_job"] = json!(job);
-            let target = if let Some(handle) = handle {
-                handle.to_owned()
-            } else {
-                let records = self.records();
-                let (key, first) = records.iter().next().ok_or(ToolError::NoDatabaseOpen)?;
-                if records
-                    .values()
-                    .any(|db| db.lease.instance_id != first.lease.instance_id)
-                {
-                    return Err(ToolError::InvalidParams(
-                        "db_handle is required when multiple databases are open".into(),
-                    ));
-                }
-                key.clone()
-            };
+            let target = self.business_record(router, handle)?.0;
             let mut cleanup = SliceCleanup {
                 tools: self.clone(),
                 router: router.clone(),
@@ -771,23 +795,7 @@ impl Tools {
         if matches!(method, "disassemble" | "decompile_function") {
             params["address"] = normalize_addresses(&params["address"])?;
         }
-        let database = {
-            let records = self.records();
-            if let Some(handle) = handle {
-                records.get(handle).cloned().ok_or_else(|| {
-                    ToolError::InvalidParams(format!("Unknown db_handle: {handle}"))
-                })?
-            } else {
-                let mut values = records.values();
-                let first = values.next().cloned().ok_or(ToolError::NoDatabaseOpen)?;
-                if values.any(|db| db.lease.instance_id != first.lease.instance_id) {
-                    return Err(ToolError::InvalidParams(
-                        "db_handle is required when multiple databases are open".into(),
-                    ));
-                }
-                first
-            }
-        };
+        let (_, database) = self.business_record(router, handle)?;
         params
             .as_object_mut()
             .ok_or_else(|| ToolError::InvalidParams("params must be an object".into()))?
