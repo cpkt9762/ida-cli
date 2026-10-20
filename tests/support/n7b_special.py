@@ -59,6 +59,21 @@ def release(client, opened):
     assert proof['owner_released'], proof
 
 
+def cache_disk_usage(cache):
+    seen = set()
+    allocated = logical = payload = 0
+    for path in cache.rglob('*'):
+        meta = path.lstat()
+        if not path.is_file() or path.is_symlink() or (meta.st_dev, meta.st_ino) in seen:
+            continue
+        seen.add((meta.st_dev, meta.st_ino))
+        allocated += meta.st_blocks * 512
+        logical += meta.st_size
+        if 'dsc-inputs' in path.parts or path.name == 'data' and path.parent.parent.name == 'dsc-members':
+            payload += meta.st_size
+    return {'unique_file_bytes': logical, 'allocated_file_bytes': allocated, 'unique_member_bytes': payload}
+
+
 def e25(env, binary, sample):
     module = '/usr/lib/system/libsystem_blocks.dylib'
     client = Candidate(env, binary, env.root/'fixtures/mini', 'E25')
@@ -74,6 +89,7 @@ def e25(env, binary, sample):
     opened = None
     try:
         request = {'path': str(sample), 'arch': 'arm64e', 'module': module}
+        build_started = time.monotonic()
         started = client.mcp('open_dsc', request)
         assert started['result']['status'] == 'started', started
         task_id = started['result']['task_id']
@@ -89,6 +105,7 @@ def e25(env, binary, sample):
                 checked_running.add(task_id)
             return state if state['status'] == 'completed' else None
         done = wait_until(terminal)
+        build_seconds = time.monotonic() - build_started
         assert task_id in checked_running, 'new DSC build must expose a running task'
         opened = done['result']
         assert opened['db_handle'] != client.opened['db_handle'], opened
@@ -111,14 +128,18 @@ def e25(env, binary, sample):
         release(client, opened)
         opened = None
         # Same source/module: the original generation is reused.
+        reopen_started = time.monotonic()
         reopened = client.mcp('open_dsc', request)
         task_id = reopened['result']['task_id']
         again = wait_until(terminal)
+        reopen_seconds = time.monotonic() - reopen_started
         opened = again['result']
         assert Path(opened['path']) == first_path, again
         release(client, opened)
         opened = None
-        return {'module': module, 'source': str(sample), 'started': started, 'states': states, 'query': query, 'added': added, 'existing': existing, 'reopen': again}
+        return {'module': module, 'source': str(sample), 'started': started, 'states': states, 'query': query, 'added': added, 'existing': existing, 'reopen': again,
+                'timing': {'new_build_seconds': build_seconds, 'cache_hit_reopen_seconds': reopen_seconds},
+                'disk': cache_disk_usage(client.home/'idb')}
     finally:
         if opened:
             release(client, opened)

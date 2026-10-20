@@ -100,6 +100,26 @@ async fn different_module_generations_share_one_read_only_member_inode() {
     );
     let a = std::fs::metadata(member(&first)).expect("first input");
     let b = std::fs::metadata(member(&second)).expect("second input");
+    if let Some(destination) = std::env::var_os("N7BF_MEMBER_USAGE") {
+        let mut seen = std::collections::HashSet::new();
+        let mut unique = 0;
+        let mut logical = 0;
+        for idb in [&first, &second] {
+            for entry in std::fs::read_dir(idb.parent().expect("generation").join("dsc-inputs"))
+                .expect("generation bundle")
+            {
+                let meta = entry
+                    .expect("bundle member")
+                    .metadata()
+                    .expect("bundle metadata");
+                logical += meta.len();
+                if seen.insert((meta.dev(), meta.ino())) {
+                    unique += meta.len();
+                }
+            }
+        }
+        std::fs::write(destination,serde_json::to_vec_pretty(&serde_json::json!({"modules":2,"logical_generation_member_bytes":logical,"unique_member_bytes":unique,"private_mode":a.mode()&0o777,"primary_nlink":a.nlink()})).expect("storage evidence JSON")).expect("persist functional disk evidence");
+    }
     assert_eq!(
         (a.dev(), a.ino()),
         (b.dev(), b.ino()),

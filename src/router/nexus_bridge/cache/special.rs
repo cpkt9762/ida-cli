@@ -1,6 +1,7 @@
 //! Offline special-input builders; the returned open still uses ordinary N1 custody.
 use super::*;
 use serde::{Deserialize, Serialize};
+mod hashes;
 mod storage;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -83,16 +84,28 @@ fn members(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
     }
     Ok(files)
 }
+#[cfg(test)]
+thread_local! { static HASH_READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+fn source_identity(
+    files: &[PathBuf],
+    config: &DscInput,
+    root: &std::path::Path,
+    preparation: &Preparation,
+) -> anyhow::Result<Vec<u8>> {
+    hashes::identity(files, config, root, preparation)
+}
+
 fn content_hash(path: &std::path::Path, preparation: &Preparation) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
     let mut input = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
     anyhow::ensure!(
         input.metadata()?.is_file(),
         "DSC member is not a regular file"
     );
+    let before = storage::Binding::of(&input.metadata()?)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0; 65536];
     loop {
@@ -101,10 +114,18 @@ fn content_hash(path: &std::path::Path, preparation: &Preparation) -> anyhow::Re
         if size == 0 {
             break;
         }
+        #[cfg(test)]
+        HASH_READ_BYTES.with(|n| n.set(n.get() + size));
         hasher.update(&buffer[..size]);
     }
+    anyhow::ensure!(
+        storage::Binding::of(&input.metadata()?)? == before
+            && storage::Binding::of(&std::fs::symlink_metadata(path)?)? == before,
+        "DSC file changed during hashing"
+    );
     Ok(format!("{:x}", hasher.finalize()))
 }
+#[cfg(test)]
 fn identity(
     files: &[PathBuf],
     config: &DscInput,
@@ -137,11 +158,18 @@ pub async fn prepare(
     let parameters = config.clone();
     let preparing = preparation.clone();
     let hashing_guard = guard.clone();
+    let hashing_member_guard = super::super::cache_lock::acquire_content(
+        &cache,
+        "dsc-shared-member-store-v1",
+        preparation,
+    )
+    .await?;
+    let memo_root = cache.clone();
     let (files, bytes) = preparation
         .wait(blocking::run(blocking::WorkClass::Prepare, move || {
-            let _guard = hashing_guard;
+            let _guards = (hashing_guard, hashing_member_guard);
             let files = members(&original)?;
-            let bytes = identity(&files, &parameters, &preparing)?;
+            let bytes = source_identity(&files, &parameters, &memo_root, &preparing)?;
             Ok::<_, anyhow::Error>((files, bytes))
         }))
         .await?
@@ -190,12 +218,20 @@ pub async fn prepare(
                     std::fs::read(&input)? == expected,
                     "DSC cached input identity changed"
                 );
-                let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
-                    input
-                        .parent()
-                        .ok_or_else(|| anyhow::anyhow!("generation parent missing"))?
-                        .join("generation.json"),
-                )?)?;
+                let manifest_file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                    .open(
+                        input
+                            .parent()
+                            .ok_or_else(|| anyhow::anyhow!("generation parent missing"))?
+                            .join("generation.json"),
+                    )?;
+                anyhow::ensure!(
+                    manifest_file.metadata()?.is_file(),
+                    "generation manifest is not regular"
+                );
+                let manifest: serde_json::Value = serde_json::from_reader(manifest_file)?;
                 if let Some(version) = manifest.get("dsc_store") {
                     anyhow::ensure!(
                         version.as_u64() == Some(1),
@@ -216,7 +252,10 @@ pub async fn prepare(
                                 .ok_or_else(|| anyhow::anyhow!("DSC name missing"))?,
                         ),
                     )?;
-                    Ok(identity(&cached_members, &cached_config, &preparing)? == expected)
+                    Ok(
+                        source_identity(&cached_members, &cached_config, &member_root, &preparing)?
+                            == expected,
+                    )
                 }
             }))
             .await?
@@ -379,5 +418,93 @@ mod tests {
         changed.module = "/usr/lib/../invalid".into();
         assert!(changed.validate().is_err());
         std::fs::remove_dir_all(root).expect("remove private identity fixtures");
+    }
+}
+
+#[cfg(test)]
+mod nb2_regressions {
+    use super::*;
+    #[test]
+    fn stable_source_metadata_avoids_payload_rehash_but_changes_are_rehashed() {
+        let root = std::env::temp_dir().join(format!("b1-source-hashes-{}", std::process::id()));
+        std::fs::create_dir(&root).expect("private hash-cache root");
+        let source = root.join("dyld_shared_cache_arm64e");
+        std::fs::write(&source, b"primary file").expect("source fixture");
+        let files = vec![source.clone()];
+        let config = DscInput {
+            arch: "arm64e".into(),
+            module: "/usr/lib/a.dylib".into(),
+            frameworks: vec![],
+            ida_version: 9,
+            log_path: None,
+        };
+        let prep = Preparation::new(std::time::Duration::from_secs(10));
+        let first = source_identity(&files, &config, &root, &prep).expect("initial source hash");
+        assert_eq!(
+            first,
+            identity(&files, &config, &prep).expect("unchanged content identity wire format")
+        );
+        HASH_READ_BYTES.with(|n| n.set(0));
+        assert_eq!(
+            first,
+            source_identity(&files, &config, &root, &prep).expect("cached source hash")
+        );
+        let eligible = hashes::metadata_reusable(&std::fs::File::open(&source).expect("source fd"))
+            .expect("filesystem qualification");
+        assert_eq!(HASH_READ_BYTES.with(|n|n.get())==0,eligible,"unchanged qualified metadata avoids rereads; unsupported filesystems still verify bytes");
+        let old = source.with_extension("old");
+        std::fs::rename(&source, &old).expect("hold old inode");
+        std::fs::write(&source, b"another file").expect("replaced source");
+        HASH_READ_BYTES.with(|n| n.set(0));
+        assert_ne!(
+            first,
+            source_identity(&files, &config, &root, &prep).expect("replacement rehash")
+        );
+        assert!(HASH_READ_BYTES.with(|n| n.get()) > 0);
+        let current = source_identity(&files, &config, &root, &prep).expect("current identity");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .expect("source timestamp handle");
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(3600));
+        file.set_times(times)
+            .expect("deterministic timestamp change");
+        HASH_READ_BYTES.with(|n| n.set(0));
+        assert_eq!(
+            current,
+            source_identity(&files, &config, &root, &prep).expect("timestamp-only rehash")
+        );
+        assert!(
+            HASH_READ_BYTES.with(|n| n.get()) > 0,
+            "metadata change must force payload verification"
+        );
+        let saved_time = source
+            .metadata()
+            .expect("source metadata")
+            .modified()
+            .expect("source mtime");
+        std::fs::write(&source, b"mutated file").expect("same-size source mutation");
+        file.set_times(std::fs::FileTimes::new().set_modified(saved_time))
+            .expect("restore original mtime");
+        HASH_READ_BYTES.with(|n| n.set(0));
+        assert_ne!(
+            current,
+            source_identity(&files, &config, &root, &prep).expect("ctime detects restored mtime")
+        );
+        assert!(HASH_READ_BYTES.with(|n| n.get()) > 0);
+        let memo = root.join("dsc-source-hashes.json");
+        std::fs::remove_file(&memo).expect("replace test ledger");
+        std::os::unix::fs::symlink(&old, &memo).expect("foreign symlink memo");
+        assert!(
+            source_identity(&files, &config, &root, &prep).is_err(),
+            "a replaced ledger cannot grant cached digests"
+        );
+        assert_eq!(
+            std::fs::read(&old).expect("foreign target survives"),
+            b"primary file"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove private hash fixtures");
     }
 }

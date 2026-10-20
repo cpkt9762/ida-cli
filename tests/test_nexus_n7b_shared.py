@@ -4,7 +4,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import sys
 import tempfile
 import unittest
 
@@ -108,6 +107,15 @@ class SharedMembers(unittest.TestCase):
         self.assertIsNotNone(self.store.check(group))
         self.store.collect(0)
         self.assertTrue(self.data.is_symlink())
+
+    def test_shared_store_tag_requires_an_explicit_member_inventory(self):
+        group = self.root/'generations/broken'
+        group.mkdir(parents=True)
+        (group/'input.i64').write_bytes(b'unknown retained database')
+        (group/'generation.json').write_text(json.dumps({'version': 1, 'key': 'broken', 'dsc_store': 1}))
+        self.store.collect(0)
+        self.assertTrue(group.exists(), 'an incomplete new-format manifest cannot authorize isolation')
+        self.assertTrue(self.data.exists())
 
 
 if __name__ == '__main__':

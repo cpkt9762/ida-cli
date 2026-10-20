@@ -119,6 +119,14 @@ def valid_digest(value):
     return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
 
 
+def valid_inventory(bundle):
+    return (isinstance(bundle, dict) and 0 < len(bundle) <= 1024
+            and all(isinstance(name, str) and 0 < len(name) <= 255
+                    and name not in ('.', '..') and '/' not in name
+                    and '\\' not in name and '\x00' not in name and valid_digest(digest)
+                    for name, digest in bundle.items()))
+
+
 def unique_bytes(root):
     seen = set()
     total = 0
@@ -156,6 +164,7 @@ def private_file(path, mode):
         named = path.lstat()
         if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.geteuid()
                 or stat.S_IMODE(meta.st_mode) != mode
+                or mode == 0o600 and (meta.st_nlink != 1 or meta.st_size > 16384)
                 or (named.st_dev, named.st_ino) != (meta.st_dev, meta.st_ino)):
             raise ValueError('unsafe DSC object file')
         return descriptor, meta
@@ -228,13 +237,11 @@ class Store:
         except (OSError, ValueError, TypeError) as error:
             return f'invalid generation manifest: {error}'
         bundle = manifest.get('dsc_inputs')
+        if 'dsc_store' in manifest and (type(manifest['dsc_store']) is not int
+                or manifest['dsc_store'] != 1 or not valid_inventory(bundle)):
+            return 'invalid DSC shared reference inventory'
         if bundle is not None:
-            if (not isinstance(bundle, dict) or not bundle or len(bundle) > 1024
-                    or any(not isinstance(name, str) or name in ('', '.', '..')
-                           or '/' in name or '\\' in name or '\x00' in name
-                           or not isinstance(digest, str) or len(digest) != 64
-                           or any(c not in '0123456789abcdef' for c in digest)
-                           for name, digest in bundle.items())):
+            if not valid_inventory(bundle):
                 return 'invalid retained DSC bundle manifest'
             directory = group/'dsc-inputs'
             if directory.is_symlink() or not directory.is_dir():
@@ -401,7 +408,7 @@ class Store:
                         if type(manifest['dsc_store']) is not int or manifest['dsc_store'] != 1:
                             raise ValueError('unknown DSC store reference version')
                         bundle = manifest.get('dsc_inputs')
-                        if not isinstance(bundle, dict) or not bundle or any(not valid_digest(v) for v in bundle.values()):
+                        if not valid_inventory(bundle):
                             raise ValueError('invalid DSC shared reference inventory')
                         references.update(bundle.values())
         except (OSError, ValueError, TypeError) as error:
