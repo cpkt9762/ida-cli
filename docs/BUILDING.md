@@ -1,6 +1,6 @@
 # Building from Source
 
-Rust builds need a host Rust toolchain; no IDA SDK, native IDA libraries or LLVM headers are linked. Database execution uses only Nexus. IDA >=9.4, Python >=3.11 and a legally prepared IDA runtime are required for analysis. Missing dependencies and patch mismatches fail explicitly at startup.
+Rust builds need a host Rust toolchain; no IDA SDK, native IDA libraries or LLVM headers are linked. Database execution uses only Nexus. IDA 9.4/9.5, Python >=3.11 and a legally prepared IDA runtime are required for analysis. Missing dependencies and patch mismatches fail explicitly at startup.
 
 ```bash
 timeout 180s cargo build --locked --release --bin ida-cli
@@ -22,7 +22,7 @@ Rollback is version-level: retain the fixed N0 executable, matching IDA runtime 
 
 App versions are the ASCII dotted integer components immediately after `IDA Professional `; comparison is numeric from left to right, with missing trailing components treated as zero (`9.10 > 9.9`, `10.0 > 9.50`, `9.5 == 9.5.0`). Suffixes after that numeric prefix do not affect ordering. Names without a numeric version rank below numeric versions. Canonical aliases are deduplicated, retaining their highest named version; ties select the lexicographically smallest canonical runtime path.
 
-Before creating a new installation prefix, the selected runtime must pass the existing Python >=3.11, IDA bundle version >=9.4 and exact IDA-provided idapro wheel version/SHA256 checks. Preparation then validates the pinned Nexus/Domain dependency environment and patched modules. A failed selected runtime stops installation; it never silently selects an older candidate. Failed preparation leaves the previous launcher active.
+Before creating a new installation prefix, the selected runtime must pass the existing Python >=3.11, IDA bundle version 9.4/9.5 and exact IDA-provided idapro wheel version/SHA256 checks. Preparation then validates the pinned Nexus/Domain dependency environment and patched modules. A failed selected runtime stops installation; it never silently selects an older candidate. Failed preparation leaves the previous launcher active.
 
 唯一 Nexus 后端在 CLI 发现 daemon 或服务启动前拒绝已删除配置（包括空值）：`IDA_CLI_NEXUS_DEV`、`IDA_CLI_WORKER_BACKEND`、`IDA_CLI_SDK_VERSION`、`IDA_CLI_MAX_WORKERS`、`IDA_CLI_MAX_WORKERS_PER_TENANT`、`IDA_CLI_MAX_PENDING_PER_WORKER`、`IDA_CLI_MAX_CONCURRENT_SPAWNS`。请删除这些变量；按实际需求配置 `IDA_CLI_MAX_PENDING_PER_TENANT`、`IDA_CLI_NEXUS_RETENTION_CAPACITY` 或 `IDA_CLI_HELPER_CAPACITY`。它们是独立限制，不与旧 worker 数量一一对应。
 

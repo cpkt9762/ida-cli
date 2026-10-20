@@ -159,6 +159,25 @@ class RuntimeLockTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'unsupported IDA'):
                 module.validate_runtime(runtime, lock)
 
+    def test_94_exception_accepts_no_other_conflict_or_changed_code(self):
+        from unittest.mock import patch
+        module, _, _, _ = self.runtime()
+        conflict = 'ida-domain 0.5.1 has requirement idapro>=0.0.10, but you have idapro 0.0.9.'
+        hashes = {'__init__.py':'registered-init', 'config.py':'registered-config'}
+        entry = {'code_sha256':hashes, 'compatibility':{'pip_check_exception':conflict}}
+        def invoke(output, actual=hashes):
+            def runner(root, label, args):
+                if label == 'idapro-code':return json.dumps(actual)
+                result = subprocess.run(args,capture_output=True,text=True,timeout=5)
+                if result.returncode:raise RuntimeError('pip check rejected conflict')
+                return result.stdout
+            pip = [sys.executable,'-c', 'import sys; print('+repr(output)+'); sys.exit(1)']
+            with patch.object(module,'run',side_effect=runner):
+                module.check_dependencies(self.root, Path(sys.executable), pip, entry)
+        invoke(conflict)
+        with self.assertRaisesRegex(RuntimeError,'rejected conflict'):invoke(conflict+'\nextra dependency conflict')
+        with self.assertRaisesRegex(RuntimeError,'code hash mismatch'):invoke(conflict,hashes|{'config.py':'changed'})
+
 
 class LauncherTests(unittest.TestCase):
     def setUp(self):

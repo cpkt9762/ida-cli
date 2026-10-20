@@ -614,6 +614,15 @@ def legacy_cache(env,baseline,binary):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE), ['ida94-seed', str(private)])
             stdout, stderr = child.communicate(timeout=20)
             assert child.returncode == 0 and stdout == b'USER_EDIT_SAVED\n', (stdout, stderr)
+            key_command=['timeout','10s',str(binary),'cache-legacy','--content-key',str(sample)]
+            keyed=env.spawn(lambda:subprocess.Popen(key_command,env=variables,
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE),key_command)
+            key_out,key_error=keyed.communicate(timeout=12)
+            key=key_out.decode().strip()
+            assert keyed.returncode==0 and len(key)==12 and all(c in '0123456789abcdef' for c in key),(key_out,key_error)
+            legacy_name=home/f'{sample.name}.{key}.dylib.i64'
+            shutil.copyfile(idb,legacy_name)
+            idb=legacy_name
         original_hash=digest(idb)
         client=Candidate(env,binary,sample,f"e22-{kind}",seed=idb,allow_open_error=True)
         try:

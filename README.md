@@ -25,7 +25,7 @@ when you actually want a long-lived, externally addressable service.
 
 ### IDA Runtime Policy
 
-Runtime requirements: IDA >=9.4 and Python >=3.11. All database operations use the dedicated pinned Nexus 0.13.4 / Domain 0.5.1 environment. Missing dependencies or mismatched patches fail explicitly. Rust builds need no IDA SDK.
+Runtime requirements: IDA 9.4/9.5 and Python >=3.11. All database operations use the dedicated pinned Nexus 0.13.4 / Domain 0.5.1 environment. Missing dependencies or mismatched patches fail explicitly. Rust builds need no IDA SDK.
 
 ## Current Capabilities
 
