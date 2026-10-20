@@ -9,6 +9,9 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn saturated_ordinary_release_queue_is_bounded_and_other_owner_still_progresses() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
     use ida_mcp::nexus::{NexusErrorCode, SessionLease};
     let root = PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root"));
     let router = RouterState::new().expect("router");

@@ -153,6 +153,10 @@ impl Tools {
             return Vec::new();
         };
         self.consume_released(bridge);
+        self.owner_diagnostics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|lease, _| bridge.retains_owner_observation(lease));
         let diagnostics = self
             .owner_diagnostics
             .lock()
@@ -242,7 +246,7 @@ impl Tools {
                 .owner_status(router)
                 .into_iter()
                 .find(|s| s["owner_observation_ref"] == reference)
-                .ok_or_else(|| diagnostic("unknown owner observation reference"))?;
+                .ok_or_else(|| diagnostic("unknown or retired owner observation reference; closed observation history is bounded to 128; immutable proof files remain in the bridge/target custody journals"))?;
             if status["owner_released"] == true || !status["resource_retirement"].is_null() {
                 return Ok(status);
             }

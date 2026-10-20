@@ -87,6 +87,8 @@ impl Rig {
             custody_replies: Mutex::new(HashMap::new()),
             startups: Mutex::new(HashMap::new()),
             custody_retirements: Mutex::new(HashMap::new()),
+            closed_history: Mutex::new(std::collections::VecDeque::new()),
+            proof_handoffs: Mutex::new(HashSet::new()),
             retired_open_resources: Mutex::new(HashSet::new()),
             endpoint,
             callbacks: Mutex::new(()),

@@ -416,8 +416,38 @@ impl<C: Clock> NexusSessions<C> {
                 .all(|watch| self.startup_retirements.contains_key(*watch))
     }
 
+    /// Compact only proven closed SDK acquisitions. Identity tombstones and
+    /// original public outcomes remain subject to the existing retention cap.
+    pub fn compact_closed_diagnostics(&mut self, keep: usize) {
+        let eligible: Vec<_> = self
+            .openings
+            .iter()
+            .filter(|(id, opening)| {
+                !self.compacted_openings.contains(*id)
+                    && !opening.acquisitions.is_empty()
+                    && opening
+                        .acquisitions
+                        .iter()
+                        .all(|acquisition| acquisition.closed && acquisition.sdk_finished)
+                    && opening.acquired.as_ref().is_none_or(|lease| {
+                        self.sessions
+                            .get(&lease.lease_id)
+                            .is_some_and(|session| session.phase == SessionPhase::Released)
+                    })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let remove = eligible.len().saturating_sub(keep);
+        for id in eligible.into_iter().take(remove) {
+            if let Some(opening) = self.openings.get_mut(&id) {
+                opening.request.params = serde_json::Value::Null;
+            }
+            self.compacted_openings.insert(id);
+        }
+    }
+
     pub fn acquisition_status(&self) -> serde_json::Value {
-        let parents: Vec<_> = self.openings.values().map(|opening| {
+        let parents: Vec<_> = self.openings.values().filter(|opening| !self.compacted_openings.contains(&opening.identity.operation_id)).map(|opening| {
             let acquisitions: Vec<_> = opening.acquisitions.iter().map(|a| {
                 let phase = a.lease.as_ref().and_then(|l| self.sessions.get(&l.lease_id)).map(|s| s.phase);
                 let retired = a.lease.as_ref().is_some_and(|l| self.resource_retirements.contains_key(&l.lease_id))
@@ -434,6 +464,106 @@ impl<C: Clock> NexusSessions<C> {
                 "failure":opening.failure,"post_exit_resolve_used":opening.post_exit_resolve_used,
                 "root_attempts":opening.root_attempts,"acquisitions":acquisitions})
         }).collect();
-        serde_json::json!({"tenant_physical_limit":self.capacity,"per_parent_physical_limit":2,"parents":parents})
+        serde_json::json!({"tenant_physical_limit":self.capacity,"per_parent_physical_limit":2,"parents":parents,"compacted_parent_tombstones":self.compacted_openings.len(),"closed_history_limit":128})
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    #[test]
+    fn closed_parent_compaction_preserves_identity_and_never_hides_live_sdk_custody() {
+        let mut sessions = NexusSessions::with_limits(
+            SystemClock,
+            Err(NexusError::new(
+                NexusErrorCode::BridgeUnavailable,
+                "no executor needed",
+            )),
+            4,
+            1024,
+        );
+        let mut first = None;
+        for index in 0..140 {
+            let request = AcceptedRequest::new(
+                &SystemClock,
+                RequestId::new(format!("request-{index}")).unwrap(),
+                None,
+                "open",
+                serde_json::json!({"retained_payload":"x".repeat(8192)}),
+            )
+            .unwrap();
+            let parent = OpenIdentity {
+                client_id: ClientId::new("compaction-client").unwrap(),
+                operation_id: OperationId::new(format!("operation-{index}")).unwrap(),
+                request_id: request.request_id.clone(),
+                task_id: None,
+            };
+            sessions
+                .reserve(&parent.request_id, &parent.operation_id)
+                .unwrap();
+            if first.is_none() {
+                first = Some(parent.clone());
+            }
+            let acquisition = AcquisitionId {
+                parent: parent.clone(),
+                purpose: AcquisitionPurpose::Final,
+                ordinal: 1,
+            };
+            sessions.openings.insert(
+                parent.operation_id.clone(),
+                super::super::session::Opening {
+                    identity: parent,
+                    request,
+                    uncertain: false,
+                    cancel_requested: false,
+                    failure: Some(NexusError::new(
+                        NexusErrorCode::OperationFailed,
+                        "known failed acquisition",
+                    )),
+                    acquired: None,
+                    acquisition_ordinal: 1,
+                    root_attempts: 0,
+                    post_exit_resolve_used: false,
+                    wait_analysis: false,
+                    acquisitions: vec![AcquisitionReservation {
+                        identity: acquisition,
+                        lease: None,
+                        closed: true,
+                        primary: None,
+                        publish_parent: true,
+                        owner_proof: false,
+                        sdk_finished: index != 139,
+                    }],
+                },
+            );
+        }
+        sessions.compact_closed_diagnostics(128);
+        assert_eq!(sessions.compacted_openings.len(), 11);
+        assert_eq!(
+            sessions.acquisition_status()["parents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            129
+        );
+        assert!(!sessions
+            .compacted_openings
+            .contains(&OperationId::new("operation-139").unwrap()));
+        let first = first.unwrap();
+        assert!(sessions
+            .open_progress(&first.client_id, &first)
+            .unwrap()
+            .1
+            .is_some());
+        assert_eq!(
+            sessions
+                .reserve(&first.request_id, &first.operation_id)
+                .unwrap_err()
+                .code,
+            NexusErrorCode::DuplicateIdentity
+        );
+        for id in &sessions.compacted_openings {
+            assert!(sessions.openings[id].request.params.is_null());
+        }
     }
 }

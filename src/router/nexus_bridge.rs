@@ -152,6 +152,8 @@ struct State {
     custody_replies: Mutex<HashMap<String, (Value, Value)>>,
     startups: Mutex<HashMap<String, Value>>,
     custody_retirements: Mutex<HashMap<String, Value>>,
+    closed_history: Mutex<std::collections::VecDeque<Value>>,
+    proof_handoffs: Mutex<HashSet<String>>,
     retired_open_resources: Mutex<HashSet<OperationId>>,
     callbacks: Mutex<()>,
     pending: Mutex<HashMap<u64, Pending>>,
@@ -180,16 +182,31 @@ impl State {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty();
-        let retirements_empty = self
+        let retirements: Vec<_> = self
             .custody_retirements
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-            || self
-                .bridge_exit
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some();
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let exited = self
+            .bridge_exit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some();
+        let retirements_empty = retirements.is_empty()
+            || (exited
+                && retirements.iter().all(|receipt| {
+                    let Ok(acquisition) = decode::<AcquisitionId>(receipt["acquisition"].clone())
+                    else {
+                        return false;
+                    };
+                    self.endpoint
+                        .transition(|sessions, _| sessions.acquisition_verifies_copy(&acquisition))
+                        .is_ok_and(|verification| {
+                            !verification || receipt["verification_removed"] == true
+                        })
+                }));
         let helper_empty = self.helper.as_ref().is_none_or(|helper| {
             let status = helper.status_snapshot();
             let snapshot = &status["snapshot"];
@@ -200,6 +217,74 @@ impl State {
                 && status["file_jobs_pending"] == 0
         });
         resources_empty && startups_empty && retirements_empty && helper_empty
+    }
+    fn compact_closed_history(&self) {
+        self.endpoint
+            .transition(|sessions, _| sessions.compact_closed_diagnostics(128));
+        let mut history = self
+            .closed_history
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while history.len() > 128 {
+            let Some(old) = history.front() else {
+                break;
+            };
+            let Ok(acquisition) = decode::<AcquisitionId>(old["acquisition"].clone()) else {
+                break;
+            };
+            let Ok(lease) = decode::<Option<SessionLease>>(old["lease"].clone()) else {
+                break;
+            };
+            if !self
+                .endpoint
+                .transition(|sessions, _| {
+                    sessions
+                        .acquisition_sdk_finished(&acquisition)
+                        .and_then(|finished| {
+                            Ok(finished && sessions.acquisition_closed(&acquisition)?)
+                        })
+                })
+                .unwrap_or(false)
+            {
+                break;
+            }
+            let watch = old["watch"].as_str().unwrap_or_default().to_owned();
+            history.pop_front();
+            if let Some(lease) = lease {
+                self.owner_proofs
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&lease.lease_id);
+                self.release_facts
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&lease.lease_id);
+                self.release_errors
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&lease.lease_id);
+                self.leases
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&lease.lease_id);
+                self.rejected_acquisitions
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&lease);
+            }
+            self.proof_handoffs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&watch);
+            self.startup_proofs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&watch);
+            self.observation_faults
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&watch);
+        }
     }
     /// Known save refusal is independent of sideband persistence and physical
     /// release. Call only after the exact observation/terminal is authorized.
@@ -500,6 +585,25 @@ impl NexusBridge {
         }
         value
     }
+    pub(crate) fn retains_owner_observation(&self, lease: &SessionLease) -> bool {
+        self.state
+            .custody_resources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&lease.lease_id)
+            || self
+                .state
+                .release_facts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&lease.lease_id)
+            || self
+                .state
+                .owner_proofs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&lease.lease_id)
+    }
     pub(crate) fn take_release_error(&self, lease: &SessionLease) -> Option<String> {
         self.state
             .release_errors
@@ -711,6 +815,8 @@ impl NexusBridge {
             custody_replies: Mutex::new(HashMap::new()),
             startups: Mutex::new(HashMap::new()),
             custody_retirements: Mutex::new(HashMap::new()),
+            closed_history: Mutex::new(std::collections::VecDeque::new()),
+            proof_handoffs: Mutex::new(HashSet::new()),
             retired_open_resources: Mutex::new(HashSet::new()),
             callbacks: Mutex::new(()),
             pending: Mutex::new(HashMap::new()),
@@ -995,7 +1101,7 @@ impl NexusBridge {
                 .emit(json!({"event":"shutdown_observations_pending"}));
             if preparation.check().is_err() {
                 return Err(NexusError::new(NexusErrorCode::CancelPending,
-                    "shutdown waits for existing custody retirement and helper observations; bridge retained").into());
+                    format!("shutdown waits for existing custody retirement and helper observations; bridge retained; inspect {}/helper-state.json and lifecycle blocked entries, restore the exact target storage, then retry shutdown with the same coordinator; never replay unknown database operations", self.directory.display())).into());
             }
             tokio::time::sleep_until(
                 preparation
@@ -1419,12 +1525,20 @@ async fn event_received(
                     && event.get("reason").is_none(),
                 "bridge producer ACK binding mismatch"
             );
-            helper
+            let committed = helper
                 .journal(
                     json!({"action":"bridge_closed","target":target,"coord_key":coord,
                 "watch":watch,"consumer":event["consumer"]}),
                 )
-                .await?;
+                .await;
+            if committed.is_err() {
+                state
+                    .proof_handoffs
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(watch);
+            }
+            committed?;
         }
         if let Some(resource) = resource {
             if let Some(current) = state
@@ -1462,6 +1576,11 @@ async fn event_received(
             let receipt = pending
                 .remove(watch)
                 .ok_or_else(|| anyhow::anyhow!("retirement disappeared"))?;
+            state
+                .closed_history
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push_back(receipt.clone());
             state.emit(json!({"event":"custody_settled", "lease":receipt["lease"], "acquisition":receipt["acquisition"], "watch":watch}));
         }
         return Ok(());

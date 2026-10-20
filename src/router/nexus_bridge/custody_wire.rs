@@ -106,6 +106,72 @@ fn release_observation_binding(
     Ok(binding)
 }
 
+async fn retain_observation(
+    event: &Value,
+    state: &Arc<State>,
+    helper: &helper::Helper,
+    action: &str,
+) -> anyhow::Result<()> {
+    let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
+    state
+        .endpoint
+        .transition(|s, _| s.open_progress(&acquisition.parent.client_id, &acquisition.parent))?;
+    let watch = event["watch"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("startup watch missing"))?;
+    let status = helper.call(json!({"kind":"lookup", "watch":watch})).await?;
+    anyhow::ensure!(
+        status["state_root"] == helper.state_root,
+        "startup state root mismatch"
+    );
+    let item = status
+        .get("item")
+        .filter(|item| !item.is_null())
+        .ok_or_else(|| anyhow::anyhow!("startup not signed by helper"))?;
+    anyhow::ensure!(
+        item["launch"] == event["launch"]
+            && (action != "observe" || item["owner"] == event["owner"])
+            && item["acquisition"] == event["acquisition"]
+            && item["target"] == event["target"]
+            && item["coord_key"] == event["coord_key"],
+        "startup binding mismatch"
+    );
+    let expected = if action == "spawned" {
+        &item["spawned"]
+    } else {
+        &item["receipt"]
+    };
+    anyhow::ensure!(
+        *expected == event["receipt"],
+        "startup durable receipt mismatch"
+    );
+    let verified = helper.journal(json!({"action":if action == "observe" {"verify_observe"} else {"verify_launch"}, "target":event["target"],
+                "coord_key":event["coord_key"], "watch":watch,"receipt":event["receipt"],
+                "launch":event["launch"],"owner":event["owner"],"acquisition":event["acquisition"]})).await?;
+    let mut startups = state.startups.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = startups.get(watch) {
+        anyhow::ensure!(
+            old["launch"] == event["launch"]
+                && old["owner"] == event["owner"]
+                && old["acquisition"] == event["acquisition"],
+            "conflicting startup responsibility"
+        );
+    } else {
+        anyhow::ensure!(
+            action != "spawned" && startups.len() < state.open_reply_capacity,
+            "startup/observation capacity full or unreserved spawn"
+        );
+    }
+    let mut retained = event.clone();
+    retained["origin_binding"] = verified["origin_binding"].clone();
+    let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
+    state.endpoint.transition(|s, _| {
+        s.bind_startup_origin(&acquisition, watch, verified["origin_binding"].clone())
+    })?;
+    startups.insert(watch.into(), retained);
+    Ok(())
+}
+
 pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result<Value> {
     let nonce = event["nonce"]
         .as_str()
@@ -130,12 +196,30 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
             let watches: Vec<String> = decode(event["watches"].clone())?;
             for watch in &watches {
-                anyhow::ensure!(
-                    state.endpoint.transition(|s, _| Ok::<_, NexusError>(
-                        s.acquisition_watch_bound(&acquisition, watch)
-                    ))?,
-                    "SDK completion lacks exact watch custody"
-                );
+                if !state.endpoint.transition(|s, _| {
+                    Ok::<_, NexusError>(s.acquisition_watch_bound(&acquisition, watch))
+                })? {
+                    // A signed helper watch can precede a failed/lost stage
+                    // handoff. Recover only that exact durable responsibility;
+                    // this grants no SDK call, retry or owner-release authority.
+                    let found = helper.call(json!({"kind":"lookup", "watch":watch})).await?;
+                    let item = &found["item"];
+                    anyhow::ensure!(item["watch"] == *watch && item["acquisition"] == json!(acquisition),
+                        "SDK completion lacks exact signed helper custody; restore target storage and reconnect the same helper incarnation");
+                    let binding = json!({"watch":watch,"acquisition":acquisition,"owner":item["owner"],
+                        "launch":item["launch"],"target":item["target"],"coord_key":item["coord_key"],"receipt":item["receipt"]});
+                    retain_observation(
+                        &binding,
+                        state,
+                        helper,
+                        if item["owner"].is_object() {
+                            "observe"
+                        } else {
+                            "launch"
+                        },
+                    )
+                    .await?;
+                }
             }
             #[cfg(feature = "nexus-test-support")]
             {
@@ -375,63 +459,7 @@ pub(super) async fn receive(event: &Value, state: &Arc<State>) -> anyhow::Result
             settle_unleased_acquisition(state, &acquisition, false)?;
         }
         "observe" | "launch" | "spawned" => {
-            let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
-            state.endpoint.transition(|s, _| {
-                s.open_progress(&acquisition.parent.client_id, &acquisition.parent)
-            })?;
-            let watch = event["watch"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("startup watch missing"))?;
-            let status = helper.call(json!({"kind":"lookup", "watch":watch})).await?;
-            anyhow::ensure!(
-                status["state_root"] == helper.state_root,
-                "startup state root mismatch"
-            );
-            let item = status
-                .get("item")
-                .filter(|item| !item.is_null())
-                .ok_or_else(|| anyhow::anyhow!("startup not signed by helper"))?;
-            anyhow::ensure!(
-                item["launch"] == event["launch"]
-                    && (action != "observe" || item["owner"] == event["owner"])
-                    && item["acquisition"] == event["acquisition"]
-                    && item["target"] == event["target"]
-                    && item["coord_key"] == event["coord_key"],
-                "startup binding mismatch"
-            );
-            let expected = if action == "spawned" {
-                &item["spawned"]
-            } else {
-                &item["receipt"]
-            };
-            anyhow::ensure!(
-                *expected == event["receipt"],
-                "startup durable receipt mismatch"
-            );
-            let verified = helper.journal(json!({"action":if action == "observe" {"verify_observe"} else {"verify_launch"}, "target":event["target"],
-                "coord_key":event["coord_key"], "watch":watch,"receipt":event["receipt"],
-                "launch":event["launch"],"owner":event["owner"],"acquisition":event["acquisition"]})).await?;
-            let mut startups = state.startups.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(old) = startups.get(watch) {
-                anyhow::ensure!(
-                    old["launch"] == event["launch"]
-                        && old["owner"] == event["owner"]
-                        && old["acquisition"] == event["acquisition"],
-                    "conflicting startup responsibility"
-                );
-            } else {
-                anyhow::ensure!(
-                    action != "spawned" && startups.len() < state.open_reply_capacity,
-                    "startup/observation capacity full or unreserved spawn"
-                );
-            }
-            let mut retained = event.clone();
-            retained["origin_binding"] = verified["origin_binding"].clone();
-            let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
-            state.endpoint.transition(|s, _| {
-                s.bind_startup_origin(&acquisition, watch, verified["origin_binding"].clone())
-            })?;
-            startups.insert(watch.into(), retained);
+            retain_observation(event, state, helper, action).await?;
         }
         "acquired" => {
             let acquisition: AcquisitionId = decode(event["acquisition"].clone())?;
@@ -1132,6 +1160,7 @@ async fn consolidate_resource(
 /// Independent of command pending and bridge health. A public proof is first
 /// committed by the target writer, then consumed by N1, then acknowledged.
 pub(super) async fn proofs(state: &Arc<State>, writer: &Writer) -> anyhow::Result<()> {
+    state.compact_closed_history();
     let Some(helper) = &state.helper else {
         return Ok(());
     };
@@ -1693,8 +1722,26 @@ async fn observe_resource(
         // A lost acknowledgement cannot authorize compaction while the
         // original bridge may still retain a producer/reference. Actual
         // public proof has already discharged N1's resource obligations.
-        if !state.failed.load(std::sync::atomic::Ordering::Acquire) {
-            send(writer, &json!({"owner_proof_custody":{"owner":resource.owner,"watch":resource.watch,"proof":resource.proof,"target":resource.target}})).await?;
+        let already_closed = state
+            .custody_resources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&resource.lease.lease_id)
+            .is_some_and(|current| current.bridge_proof_ack);
+        if !already_closed
+            && !state.failed.load(std::sync::atomic::Ordering::Acquire)
+            && state
+                .proof_handoffs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(resource.watch.clone())
+        {
+            // One reliable control handoff per watch. A slow target writer
+            // must not turn 100ms proof polling into an unbounded ACK backlog.
+            if let Err(error) = send(writer, &json!({"owner_proof_custody":{"owner":resource.owner,"watch":resource.watch,"proof":resource.proof,"target":resource.target}})).await {
+                state.proof_handoffs.lock().unwrap_or_else(|error|error.into_inner()).remove(&resource.watch);
+                return Err(error);
+            }
         }
         return Ok(());
     }
