@@ -77,6 +77,7 @@ impl Protocol {
                 "two_phase_release_v1",
                 "unstarted_absence_v1",
                 "verification_removal_v1",
+                "verification_reuse_v1",
             ]
             .into_iter()
             .map(String::from)

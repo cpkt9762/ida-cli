@@ -149,4 +149,59 @@ class VerificationScope(unittest.TestCase):
             self.assertTrue((target.directory.path/'lock').exists())
 
 
+    def test_repeated_verification_renews_scope_without_replacing_locks_or_epochs(self):
+        from target_journal import require_verification_scope
+        locks=set()
+        for n in range(16):
+            parent=dict(PARENT,operation_id='verification-'+str(n),request_id=str(n))
+            if n:
+                shutil.copyfile(os.environ['R3F1_SAMPLE'],self.probe)
+                (self.root/'input').write_bytes(b'new immutable input')
+            with Target(self.probe) as target,target.locked():
+                journal=verification_scope(target,parent,reuse=n > 0)
+                epoch=journal.begin({'parent':parent,'purpose':'verification','ordinal':1},'unstarted-'+str(n))
+                self.assertEqual(epoch,n+1,'reuse must retain the monotonic epoch namespace')
+                journal.abort_unstarted('unstarted-'+str(n))
+                lock=(target.directory.path/'lock').stat()
+                locks.add((lock.st_dev,lock.st_ino))
+                if n:
+                    before=(target.directory.path/'custody.json').read_bytes()
+                    with self.assertRaisesRegex(RuntimeError,'ownership changed'):
+                        require_verification_scope(target,dict(PARENT,operation_id='verification-'+str(n-1),request_id=str(n-1)))
+                    self.assertEqual((target.directory.path/'custody.json').read_bytes(),before)
+                verification_probe_cleanup(target,state_identity(),parent)
+            # File-consumer half is independently checked by Rust exact tests.
+            (self.root/'input').unlink();(self.root/'closed').unlink()
+        self.assertEqual(len(locks),1)
+        self.assertEqual(len(list(self.root.glob('.ida-cli-txn-*'))),1)
+
+    def test_reuse_rejects_pending_failure_producer_and_unpublished_obligations(self):
+        for variant in ('entry','compaction','file-intent','pending','scratch','producer','failure','closed'):
+            with self.subTest(variant=variant):
+                child=self.root/variant;child.mkdir(mode=0o700)
+                probe=child/'probe.i64';shutil.copyfile(self.probe,probe)
+                with Target(probe) as target,target.locked():
+                    self.initialize(target)
+                    journal=Journal(target)
+                    if variant=='entry':
+                        journal.begin({'parent':PARENT,'purpose':'verification','ordinal':1},'pending')
+                    elif variant=='compaction':
+                        journal.value['compaction']={'epochs':[],'files':[]};journal.save()
+                    elif variant=='file-intent':
+                        journal.value['file_intents']={'a'*64:{'path':str(child/'txn'),'status':'snapshotting'}};journal.save()
+                    elif variant=='failure':
+                        journal.value['verification_cleanup_conflict']=True;journal.save()
+                    elif variant=='closed':(child/'closed').write_bytes(b'old receipt')
+                    elif variant=='pending':(target.directory.path/'custody.json.new').write_bytes(b'pending')
+                    elif variant=='scratch':(target.directory.path/('.ida-cli-unpublished-'+'a'*32)).write_bytes(b'referenced scratch')
+                    elif variant=='producer':
+                        (target.directory.path/'proofs').mkdir(mode=0o700)
+                        (target.directory.path/'proofs'/'pending').write_bytes(b'producer remains')
+                    before=(target.directory.path/'custody.json').read_bytes()
+                    with self.assertRaises(RuntimeError):
+                        verification_scope(target,dict(PARENT,operation_id='new-parent'),reuse=True)
+                    self.assertEqual((target.directory.path/'custody.json').read_bytes(),before)
+                    self.assertTrue(probe.exists())
+
+
 if __name__=='__main__':unittest.main()

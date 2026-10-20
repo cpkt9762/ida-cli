@@ -854,3 +854,57 @@ async fn f3_actual_consumer_retains_new_owner_and_new_journal_after_issuer_unloc
     cross::finish(&root, &bridge, &result, "f3-owner").await;
     result.expect("old authorization must preserve new owner and journal");
 }
+
+#[cfg(feature = "nexus-test-support")]
+#[test]
+fn verification_reuse_refuses_unsettled_and_unknown_namespace() {
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        path::PathBuf,
+    };
+    let root =
+        PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private root")).join("reuse");
+    fs::create_dir(&root).expect("private reuse root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private mode");
+    fs::write(root.join("probe.i64"), b"synthetic packed boundary").expect("private probe");
+    fs::write(root.join("input"), b"private immutable input").expect("private input");
+    actual_verification::issue_unit_receipt(&root);
+    let meta = fs::metadata(&root).expect("copy identity");
+    let cleanup = actual_verification::Cleanup::new(root.clone(), (meta.dev(), meta.ino()), None);
+    assert!(cleanup.complete(true).expect("fixture closure"));
+    fs::remove_file(root.join(".ida-cli-txn-unit/proof")).expect("retire synthetic sentinel");
+    assert!(actual_verification::reuse_directory(&root)
+        .expect("idle reuse")
+        .is_some());
+    for variant in ["entry", "compaction", "file_intent", "scratch"] {
+        let coord = root.join(".ida-cli-txn-unit");
+        let original = fs::read(coord.join("custody.json")).expect("journal");
+        if variant == "scratch" {
+            fs::write(coord.join("custody.json.new"), b"pending").expect("pending record");
+        } else {
+            let mut value: serde_json::Value = serde_json::from_slice(&original).expect("JSON");
+            match variant {
+                "entry" => value["entries"] = json!({"1":{"watch":"pending"}}),
+                "compaction" => value["compaction"] = json!({"epochs":[],"files":[]}),
+                "file_intent" => value["file_intents"] = json!({"pending":true}),
+                _ => unreachable!("fixed variants"),
+            }
+            fs::write(
+                coord.join("custody.json"),
+                serde_json::to_vec(&value).expect("JSON"),
+            )
+            .expect("fault boundary");
+        }
+        let before = fs::read(coord.join("custody.json")).expect("before");
+        assert!(
+            actual_verification::reuse_directory(&root).is_err(),
+            "{variant}"
+        );
+        assert_eq!(fs::read(coord.join("custody.json")).expect("after"), before);
+        fs::write(coord.join("custody.json"), original).expect("reset owned boundary");
+        if variant == "scratch" {
+            fs::remove_file(coord.join("custody.json.new")).expect("owned pending input");
+        }
+    }
+}

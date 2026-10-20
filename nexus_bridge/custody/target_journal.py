@@ -1226,12 +1226,23 @@ def require_verification_scope(target,parent):
     return journal
 
 
-def verification_scope(target,parent):
-    """Initialize once, before any persisted journal or acquisition history."""
+def verification_scope(target,parent,*,reuse=False):
+    """Initialize once; explicitly renew only a fully closed verification copy."""
     verification_parent(parent)
-    journal=Journal(target,recover=False)
+    if type(reuse) is not bool:
+        raise RuntimeError('VerificationCleanupBlocked: invalid reuse flag')
+    journal=Journal(target,recover=False,compact=False)
     if 'verification_scope' in journal.value:
+        if reuse:
+            scope=validate_verification_scope(journal.value['verification_scope'],target)
+            if scope['parent'] != parent:
+                verification_reusable(target,journal)
+                journal.value['verification_scope']={'schema':1,'parent':parent,'directory':list(target.key['parent'])}
+                journal.save()
+                return journal
         return require_verification_scope(target,parent)
+    if reuse:
+        raise RuntimeError('VerificationCleanupBlocked: reuse requires existing copy authority')
     if (journal.info is not None or journal.value['next_epoch'] != 1
             or journal.value['closed_through'] != 0 or journal.value['entries']
             or journal.value['summary'] or journal.value['closed_after_holes']
@@ -1241,6 +1252,29 @@ def verification_scope(target,parent):
     journal.value['verification_scope']={'schema':1,'parent':parent,'directory':list(target.key['parent'])}
     journal.save()
     return journal
+
+
+def verification_reusable(target,journal):
+    """Under root SH and target EX, keep every lock/epoch and reject live refs."""
+    value=journal.value
+    if (value['entries'] or value.get('compaction') or value.get('file_intents')
+            or value.get('verification_cleanup_conflict') or value['closed_after_holes']
+            or value['closed_through'] != value['next_epoch']-1):
+        raise RuntimeError('VerificationCleanupBlocked: reuse has unsettled obligations')
+    allowed={'lock','root.lock','target.json','custody.json','volume.json','observations','proofs','retained'}
+    names=set(os.listdir(target.directory.fd))
+    if names-allowed:
+        raise RuntimeError('VerificationCleanupBlocked: reuse has unknown/pending evidence')
+    for name in names & {'observations','proofs','retained'}:
+        directory=target.directory.child(name,create=False)
+        try:
+            with directory.fact_view(shared=True):
+                if os.listdir(directory.fd):
+                    raise RuntimeError('VerificationCleanupBlocked: reuse has producer/evidence/scratch references')
+        finally:
+            directory.close()
+    if set(os.listdir(target.target.parent))-{'input',target.target.name,target.directory.path.name}:
+        raise RuntimeError('VerificationCleanupBlocked: reuse has stale payload/closure receipt')
 
 
 def verification_probe_cleanup(target, state_root, parent):

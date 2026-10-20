@@ -713,6 +713,7 @@ class Bridge(LifetimeListener):
             wait_analysis = options.pop("wait_analysis", False)
             verification = options.pop("verification_idb", None)
             snapshot = options.pop("verify_input_snapshot", None)
+            verification_reuse = options.pop("verification_reuse", False)
             attach = options.pop("attach_instance", None)
             options["startup_timeout"] = max(0.001, deadline - time.monotonic())
             options["worker_env"] = dict(os.environ)
@@ -748,7 +749,7 @@ class Bridge(LifetimeListener):
                 from target_coordination import Target
                 from target_journal import verification_scope
                 with Target(verification,for_open=True) as copy_target, copy_target.locked(deadline=deadline):
-                    verification_scope(copy_target,custodian.acquisition['parent'])
+                    verification_scope(copy_target,custodian.acquisition['parent'],reuse=verification_reuse)
                 original = Path(command["path"])
                 copy_hash = hashlib.sha256(Path(verification).read_bytes()).digest()
                 if hashlib.sha256(original.read_bytes()).digest() != copy_hash:

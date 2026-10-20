@@ -73,6 +73,137 @@ fn file_hash(path: &Path) -> anyhow::Result<String> {
     );
     Ok(binding(path)?.sha256)
 }
+
+/// Cache root/content rights are already held by preparation. Reuse the
+/// verification namespace only with its own root SH then stable target EX.
+pub(super) fn reuse_directory(path: &Path) -> anyhow::Result<Option<(fs::File, fs::File)>> {
+    let parent = fs::symlink_metadata(path)?;
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    let uid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        parent.is_dir() && parent.uid() == uid && parent.mode() & 0o077 == 0,
+        "verification reuse directory identity refused"
+    );
+    let entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        entries.len() == 1,
+        "verification reuse has pending payload/unknown namespace; retained"
+    );
+    let coord = entries[0].path();
+    let coord_identity = fs::symlink_metadata(&coord)?;
+    anyhow::ensure!(
+        entries[0]
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".ida-cli-txn-")
+            && fs::symlink_metadata(&coord)?.is_dir(),
+        "verification reuse coordination refused"
+    );
+    let open_lock = |name: &str, mode: libc::c_int| -> anyhow::Result<fs::File> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(coord.join(name))?;
+        let meta = file.metadata()?;
+        anyhow::ensure!(
+            meta.is_file() && meta.nlink() == 1 && meta.uid() == uid && meta.mode() & 0o022 == 0,
+            "verification reuse lock refused"
+        );
+        // SAFETY: live owned descriptor; independent nonblocking flock.
+        anyhow::ensure!(
+            unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0,
+            "verification reuse writer active; retained"
+        );
+        let current = fs::symlink_metadata(coord.join(name))?;
+        anyhow::ensure!(
+            (meta.dev(), meta.ino()) == (current.dev(), current.ino()),
+            "verification reuse lock replaced"
+        );
+        Ok(file)
+    };
+    let root = open_lock("root.lock", libc::LOCK_SH)?;
+    let lock = open_lock("lock", libc::LOCK_EX)?;
+    let target: serde_json::Value =
+        serde_json::from_slice(&read_small(&coord.join("target.json"), uid)?)?;
+    let lock_meta = lock.metadata()?;
+    anyhow::ensure!(
+        target["schema"] == 1
+            && target["target"] == serde_json::json!(path.canonicalize()?.join("probe.i64"))
+            && target["coord_key"]["parent"]
+                == serde_json::json!([parent.dev(), parent.ino(), uid])
+            && target["lock_identity"]
+                == serde_json::json!([lock_meta.dev(), lock_meta.ino(), uid]),
+        "verification reuse target binding changed"
+    );
+    let journal: serde_json::Value =
+        serde_json::from_slice(&read_small(&coord.join("custody.json"), uid)?)?;
+    anyhow::ensure!(
+        journal["schema"] == 1
+            && journal["coord_key"] == target["coord_key"]
+            && journal["verification_scope"].is_object()
+            && journal["entries"].as_object().is_some_and(|v| v.is_empty())
+            && journal["compaction"].is_null()
+            && (journal["file_intents"].is_null()
+                || journal["file_intents"]
+                    .as_object()
+                    .is_some_and(|v| v.is_empty()))
+            && journal["closed_after_holes"]
+                .as_array()
+                .is_some_and(|v| v.is_empty())
+            && journal["next_epoch"]
+                .as_u64()
+                .is_some_and(|v| v > 0 && journal["closed_through"].as_u64() == Some(v - 1))
+            && journal["verification_cleanup_conflict"] != true,
+        "verification reuse has unsettled obligations; retained"
+    );
+    for entry in fs::read_dir(&coord)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let meta = fs::symlink_metadata(entry.path())?;
+        if ["observations", "proofs", "retained"]
+            .iter()
+            .any(|n| name == *n)
+        {
+            anyhow::ensure!(
+                meta.is_dir() && fs::read_dir(entry.path())?.next().is_none(),
+                "verification reuse has producer/evidence/scratch references; retained"
+            );
+        } else {
+            anyhow::ensure!(
+                [
+                    "lock",
+                    "root.lock",
+                    "target.json",
+                    "custody.json",
+                    "volume.json"
+                ]
+                .iter()
+                .any(|n| name == *n)
+                    && meta.is_file()
+                    && meta.uid() == uid
+                    && meta.nlink() == 1,
+                "verification reuse unknown/pending evidence retained"
+            );
+        }
+    }
+    anyhow::ensure!(
+        fs::read_dir(path)?.count() == 1,
+        "verification reuse namespace changed"
+    );
+    let current = fs::symlink_metadata(path)?;
+    let coord_current = fs::symlink_metadata(&coord)?;
+    anyhow::ensure!(
+        (current.dev(), current.ino()) == (parent.dev(), parent.ino())
+            && (coord_current.dev(), coord_current.ino())
+                == (coord_identity.dev(), coord_identity.ino()),
+        "verification reuse directory replaced"
+    );
+    Ok(Some((root, lock)))
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Removed {
@@ -461,13 +592,24 @@ fn read_small(path: &Path, uid: u32) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 pub(super) fn issue_unit_receipt(root: &Path) {
     let coord = root.join(".ida-cli-txn-unit");
-    fs::create_dir(&coord).expect("private coordinate");
-    fs::write(coord.join("lock"), b"").expect("stable lock");
-    fs::write(coord.join("custody.json"), b"{}").expect("closed fixture journal");
+    fs::create_dir_all(&coord).expect("private coordinate");
+    if !coord.join("lock").exists() {
+        fs::write(coord.join("lock"), b"").expect("stable lock");
+    }
+    if !coord.join("root.lock").exists() {
+        fs::write(coord.join("root.lock"), b"").expect("stable root lock");
+    }
     fs::write(coord.join("proof"), b"retained exact proof").expect("proof bytes");
     let lock = fs::metadata(coord.join("lock")).expect("lock identity");
     let parent = fs::metadata(root).expect("copy identity");
-    let key = serde_json::json!({"kind":"unit-file-consumer"});
+    let key = serde_json::json!({"kind":"unit-file-consumer","parent":[parent.dev(),parent.ino(),parent.uid()]});
+    let journal = serde_json::json!({"schema":1,"coord_key":key,"entries":{},"file_intents":{},"compaction":null,
+        "next_epoch":1,"closed_through":0,"closed_after_holes":[],"verification_scope":{}});
+    fs::write(
+        coord.join("custody.json"),
+        serde_json::to_vec(&journal).expect("journal JSON"),
+    )
+    .expect("closed fixture journal");
     let target = serde_json::json!({"schema":1,"target":root.canonicalize().expect("canonical").join("probe.i64"),
         "lock_identity":[lock.dev(),lock.ino(),lock.uid()],"coord_key":key});
     fs::write(

@@ -407,17 +407,23 @@ fn prepare_impl_inner(
             // Rejecting verification must never open/save the user's original.
             // Nexus inspects a packed copy with autoanalysis disabled first.
             let directory = cache.join(format!(
-                ".nexus-verify-{}-{}",
-                std::process::id(),
-                IDS.fetch_add(1, Ordering::Relaxed)
+                ".nexus-verify-{}",
+                blake3::hash(idb.as_os_str().as_encoded_bytes()).to_hex()
             ));
-            std::fs::create_dir(&directory)?;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+            match std::fs::create_dir(&directory) {
+                Ok(()) => {
+                    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            let reuse_guard = super::verification::reuse_directory(&directory)?;
+            let reuse = reuse_guard.is_some();
             let identity = std::fs::symlink_metadata(&directory)?;
             let prepared = PreparedOpen {
                 path: idb.clone(),
                 options: serde_json::json!({"verification_idb":directory.join("probe.i64"),
-                    "verify_input_snapshot":directory.join("input"),"auto_analysis":false}),
+                    "verify_input_snapshot":directory.join("input"),"verification_reuse":reuse,"auto_analysis":false}),
                 verification: Some(directory.clone()),
                 verification_handed_off: false,
                 verification_input_hash: Some(hash),
@@ -431,13 +437,22 @@ fn prepare_impl_inner(
                 content_guard: None,
                 cache_hit: true,
             };
-            std::fs::copy(&idb, directory.join("probe.i64"))?;
-            std::fs::rename(&staging, directory.join("input"))?;
+            let mut probe = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(directory.join("probe.i64"))?;
+            std::io::copy(&mut std::fs::File::open(&idb)?, &mut probe)?;
+            probe.sync_all()?;
+            std::fs::hard_link(&staging, directory.join("input"))?;
+            std::fs::remove_file(&staging)?;
             prepared
                 .verification_cleanup
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("verification cleanup binding missing"))?
                 .bind_created()?;
+            drop(reuse_guard);
             drop(remove);
             preparation.check()?;
             return Ok(prepared);
@@ -563,6 +578,57 @@ mod f1_regressions {
             }
         }
     }
+    #[test]
+    fn repeated_legacy_verification_reuses_one_stable_coordination_base() {
+        let root = root("verification-bounded");
+        let input = root.join("raw");
+        let cache = root.join("idb");
+        std::fs::write(&input, b"test input").expect("private source");
+        std::fs::create_dir(&cache).expect("private cache");
+        let short = blake3::hash(b"test input").to_hex()[..12].to_string();
+        let idb = cache.join(format!("raw.{short}.dylib.i64"));
+        std::fs::write(&idb, b"synthetic packed IDB").expect("private packed boundary");
+        let mut identities = std::collections::BTreeSet::new();
+        for _ in 0..16 {
+            let mut prepared = prepare_impl(
+                input.clone(),
+                cache.clone(),
+                &Preparation::new(Duration::from_secs(10)),
+                true,
+            )
+            .expect("repeat verification");
+            let directory = prepared.verification.clone().expect("copy path");
+            prepared.handed_off();
+            super::super::verification::issue_unit_receipt(&directory);
+            let lock =
+                std::fs::metadata(directory.join(".ida-cli-txn-unit/lock")).expect("stable lock");
+            identities.insert((lock.dev(), lock.ino()));
+            drop(prepared);
+            // The file-consumer fixture deliberately retains a synthetic proof.
+            // This boundary test retires its own sentinel to model healthy closure.
+            std::fs::remove_file(directory.join(".ida-cli-txn-unit/proof"))
+                .expect("retire unit sentinel");
+        }
+        let bases = std::fs::read_dir(&cache)
+            .expect("cache namespace")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".nexus-verify-")
+            })
+            .count();
+        assert_eq!(
+            bases, 1,
+            "verification history must not allocate another CoordKey"
+        );
+        assert_eq!(
+            identities.len(),
+            1,
+            "stable lock inode must never be recreated"
+        );
+    }
+
     #[tokio::test]
     async fn verified_legacy_input_survives_owner_save_without_reprobing_packed_idb() {
         let root = root("verified-input");
