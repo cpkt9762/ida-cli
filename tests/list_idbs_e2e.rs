@@ -333,10 +333,7 @@ fn sorted(mut handles: Vec<String>) -> Vec<String> {
 
 #[test]
 fn list_idbs_follows_two_clients_through_a_real_daemon() {
-    if !ida_available() {
-        eprintln!("skipping list_idbs e2e: set IDA_TEST=1 (needs an IDA runtime)");
-        return;
-    }
+    assert!(ida_available(), "BLOCKED: set IDA_TEST=1 and use an isolated prepared IDA environment");
 
     let work = Scratch(scratch_dir("work"));
     let alpha = build_fixture(&work.0, "alpha", "int main(void) { return 1; }\n");

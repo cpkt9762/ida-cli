@@ -405,10 +405,7 @@ fn normalized(text: &str) -> String {
 
 #[test]
 fn decompile_function_returns_line_addresses_through_a_real_daemon() {
-    if !ida_available() {
-        eprintln!("skipping decompile line_addresses e2e: set IDA_TEST=1 (needs an IDA runtime)");
-        return;
-    }
+    assert!(ida_available(), "BLOCKED: set IDA_TEST=1 and use an isolated prepared IDA environment");
 
     let work = Scratch(scratch_dir("work"));
     let fixture = build_fixture(&work.0, "collatz", FIXTURE);
