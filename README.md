@@ -237,3 +237,14 @@ independent leases and close tokens. Closed observation details retain at most
 128 settled records; active/unknown obligations are never evicted. Older proof
 files remain in custody journals, while request/operation identity tombstones
 keep the existing `IDA_CLI_NEXUS_RETENTION_CAPACITY` limit and no-replay rules.
+
+
+The default lifetime retention budgets are **262144 business**, **12582912
+internal** (48x) and **16777216 total** (64x). A positive
+`IDA_CLI_NEXUS_RETENTION_CAPACITY` overrides the business budget and scales the
+other two; unset, invalid or zero values use the default. Pending remains 512.
+Measured business tombstones cost about **4.5KB each**, or roughly **1.15GB**
+for 262144 entries; larger request parameters consume more memory, so this is
+not a memory ceiling. A full lifetime budget rejects new reservations until
+the daemon/bridge is restarted. Configure any override before restarting;
+never replay requests with unknown outcomes.

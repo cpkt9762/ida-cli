@@ -31,3 +31,12 @@ Before creating a new installation prefix, the selected runtime must pass the ex
 安装器按应用名称数字版本逐段比较、尾零等价、同版本按规范路径升序选择最新项，打印其他候选；最新不兼容时报错并提示用 `IDADIR` 指定其他候选，不自动退选。启动器保存安装时路径，显式 `IDADIR` 可覆盖到另一受支持版本；probe-runtime/status 分别报告实际 `ida_version` 和 `installed_ida_version`，建议按目标版本重新安装。实际版本由无数据库的有界子进程加载内核核实，并在每次 open 后核对 owner。
 
 N0 固定二进制链接 IDA 9.5，输出对照仅在 9.5 成立。9.4 下需要 N0 的 suite 明确 BLOCKED；contract 可用 `--case E16`、`E17`、`E22` 单独运行。E22 在 9.4 现场生成带标注的旧平铺布局库，核对缓存与预热契约，不宣称 N0 跨版本对照。
+
+
+RV8-1 的终身保留容量默认是 business **262144**、internal **12582912**（48 倍）、
+total **16777216**（64 倍）。`IDA_CLI_NEXUS_RETENTION_CAPACITY` 的正整数覆盖
+business 并同比派生其他两项；未设置、非法值或 0 使用默认值。pending 默认仍为 512。
+实测 business 墓碑约 **4.5KB/条**，262144 条约 **1.15GB**；请求参数越大占用越多，
+这不是内存硬上限，另有 internal 身份、分配器和其他生命周期数据。上限用满后继续拒绝
+新预留，必须重启 daemon/bridge 才能恢复；需要覆盖容量时应在重启前配置。
+重启不代表可以重放结果未知的请求。

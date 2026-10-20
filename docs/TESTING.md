@@ -4,7 +4,7 @@ N9 当前统一使用 Nexus，没有开发期开关。Rust 构建/检查不需�
 
 N9 定向回归：`tests/nexus_n9.rs` 与 `tests/test_nexus_n9.py` 在 PATH 不含 GNU timeout 的子环境核对维护成功/超时、TERM 回滚指引与精确收尸；N7 混合索引、N4 MCP/CLI、N1、R5 协议及四补丁安装链保留。`scripts/package_release.py` 打包完整 runtime-lock 资产；安装演练使用 `--bundle` 和私有前缀，检查实际加载的四个补丁输出及篡改负例。只读旧平铺元数据仍用于迁移，不是数据库执行后端。
 
-历史 worker 池配置 `IDA_CLI_MAX_WORKERS`、`IDA_CLI_MAX_WORKERS_PER_TENANT`、`IDA_CLI_MAX_PENDING_PER_WORKER`、`IDA_CLI_MAX_CONCURRENT_SPAWNS` 已移除；为兼容状态 JSON，它们对应字段保留为 0，表示不适用。Nexus 实际准入仍由 `IDA_CLI_MAX_PENDING_PER_TENANT` 控制，保留容量由 `IDA_CLI_NEXUS_RETENTION_CAPACITY` 控制；没有扩大额度。
+历史 worker 池配置 `IDA_CLI_MAX_WORKERS`、`IDA_CLI_MAX_WORKERS_PER_TENANT`、`IDA_CLI_MAX_PENDING_PER_WORKER`、`IDA_CLI_MAX_CONCURRENT_SPAWNS` 已移除；为兼容状态 JSON，它们对应字段保留为 0，表示不适用。Nexus 实际准入仍由 `IDA_CLI_MAX_PENDING_PER_TENANT` 控制，保留容量由 `IDA_CLI_NEXUS_RETENTION_CAPACITY` 控制；pending/物理准入额度不随 retention 改变。
 
 R6 的原语图不按初始成员数排除 owner 时序，逐轨迹 JSON 保留原始 ACK、错误、
 I1–I6 检查和 I5 的 pending 前提；Rust `nexus_r3b` 另记录真实 HTTP detach 后继集合，
@@ -96,7 +96,7 @@ result=$?; uptime; test "$result" -eq 0
 ## N1 retention and pending limits (RV8-1)
 
 `IDA_CLI_NEXUS_RETENTION_CAPACITY` independently sets the coordinator's lifetime
-business identity retention limit (positive integer, default **65536**). Unset,
+business identity retention limit (positive integer, default **262144**). Unset,
 invalid or zero values use the default, matching existing router configuration.
 `IDA_CLI_MAX_PENDING_PER_TENANT` remains **512** by default: it still bounds the
 legacy tenant's pending requests, Nexus business lane, physical acquisition/lease
@@ -108,7 +108,7 @@ entire lifetime. U6 retirement stops charging the business quota but retains the
 IDs against reuse. Internal diagnostic IDs have a separate `retention * 48`
 budget; all IDs, including retired and internal IDs, share the absolute
 `retention * 64` ceiling (saturating arithmetic). At defaults these limits are
-65536 business, 3145728 internal and 4194304 total. Both public and internal
+262144 business, 12582912 internal and 16777216 total. Both public and internal
 reservation paths enforce the absolute ceiling; no tombstones are evicted.
 
 Router JSON `status`, the MCP HTTP daemon's `/statusz`, and human CLI `status`
@@ -120,17 +120,16 @@ query. When full, Busy identifies the exhausted budget and usage/limit, explains
 lifetime retention, and directs an explicit daemon/bridge restart (optionally
 with a larger retention configuration). Unknown-outcome work must not be replayed.
 
-On the current 64-bit target, RequestId/OperationId each contain a 24-byte String,
-with up to 128 ASCII payload bytes. A business identity pair therefore holds
-304 bytes before hash-table slack/control bytes; an internal triple holds
-456 bytes. For the default total/internal ceilings, ID sets alone are about
-1.86 GiB at worst-length IDs including current hash-table bucket slack (excluding
-allocator bookkeeping). Allocations grow on demand, not at coordinator creation.
-These are identity-count bounds, not an RSS budget: retained Operation (600 bytes),
-Opening (384 bytes), delivery records (232 bytes), their keys, cloned identities,
-request JSON and other lifecycle metadata add workload-dependent memory. Choose
-retention against available memory; RV8-1 preserves terminal data and introduces
-no compaction or payload eviction.
+The observed workload retains about **4.5KB per business tombstone**; at
+262144 entries this is approximately **1.15GB**, allocated on demand. This is
+an estimate, not an RSS ceiling: larger request parameters retain more memory,
+and internal IDs, allocator overhead and other lifecycle data also consume
+memory. The business/internal/total limits count identities, not bytes. Choose
+retention against available memory. Once any lifetime budget is full, new
+reservations remain rejected until the daemon/bridge is restarted; increasing
+`IDA_CLI_NEXUS_RETENTION_CAPACITY` takes effect only on the next coordinator.
+No timeout or automatic eviction frees terminal IDs, and unknown-outcome work
+must not be replayed after a restart.
 
 Deterministic regressions cover the default 513th reservation, 513 completed
 business operations plus their open, small retention Busy, lifetime duplicate

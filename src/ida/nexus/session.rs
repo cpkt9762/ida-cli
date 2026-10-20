@@ -971,6 +971,16 @@ mod retention_tests {
             512
         );
         let endpoint = router.nexus_endpoint();
+        let usage = endpoint.transition(|sessions, _| sessions.retention_status());
+        assert_eq!(
+            (
+                usage.business_capacity,
+                usage.internal_capacity,
+                usage.total_capacity
+            ),
+            (262144, 12582912, 16777216),
+            "default lifetime limits scale independently of pending 512"
+        );
         for index in 1..=513 {
             endpoint
                 .transition(|sessions, _| {

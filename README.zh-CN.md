@@ -207,3 +207,12 @@ N0 固定二进制链接 IDA 9.5，输出对照仅在 9.5 成立。9.4 下需要
 仍持有独立 lease 和 close token。已结清观察明细保留最多 128 条，活动或未知
 义务不会被淘汰；旧证明文件仍在 custody journal 中。请求/操作身份墓碑仍遵守
 `IDA_CLI_NEXUS_RETENTION_CAPACITY` 的既有上限和禁止重放规则。
+
+
+RV8-1 的终身保留容量默认是 business **262144**、internal **12582912**（48 倍）、
+total **16777216**（64 倍）。`IDA_CLI_NEXUS_RETENTION_CAPACITY` 的正整数覆盖
+business 并同比派生其他两项；未设置、非法值或 0 使用默认值。pending 默认仍为 512。
+实测 business 墓碑约 **4.5KB/条**，262144 条约 **1.15GB**；请求参数越大占用越多，
+这不是内存硬上限，另有 internal 身份、分配器和其他生命周期数据。上限用满后继续拒绝
+新预留，必须重启 daemon/bridge 才能恢复；需要覆盖容量时应在重启前配置。
+重启不代表可以重放结果未知的请求。

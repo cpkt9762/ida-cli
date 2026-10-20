@@ -61,7 +61,7 @@ impl RouterConfig {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(65536);
+            .unwrap_or(262144);
         let max_concurrent_spawns = 0;
         let max_warm_workers = std::env::var("IDA_CLI_MAX_WARM_WORKERS")
             .ok()
@@ -2095,7 +2095,7 @@ mod tests {
         let mut router = RouterState::new().unwrap();
         let mut config = (*router.config).clone();
         config.max_pending_per_tenant = 3;
-        config.nexus_retention_capacity = 65536;
+        config.nexus_retention_capacity = 262144;
         router.config = Arc::new(config);
         let caps = crate::nexus::NexusCapabilities {
             runtime: crate::nexus::NexusRuntime {
@@ -2113,7 +2113,7 @@ mod tests {
         assert_eq!(lanes.control.max_capacity(), 8);
         assert_eq!(
             endpoint.transition(|s, _| s.retention_status().business_capacity),
-            65536
+            262144
         );
         for i in 0..4 {
             let request = crate::nexus::AcceptedRequest::new(
@@ -2154,6 +2154,17 @@ mod tests {
             assert_eq!(config.max_pending_per_tenant, 1);
             assert_eq!(config.nexus_retention_capacity, 3);
             let router = RouterState::new().expect("configured router");
+            let usage = router
+                .nexus_endpoint()
+                .transition(|sessions, _| sessions.retention_status());
+            assert_eq!(
+                (
+                    usage.business_capacity,
+                    usage.internal_capacity,
+                    usage.total_capacity
+                ),
+                (3, 144, 192)
+            );
             assert_eq!(
                 router
                     .nexus_endpoint()

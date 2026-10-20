@@ -1470,7 +1470,7 @@ fn r3a_custody_does_not_complete_open_and_ready_requires_exact_rpc_facts() {
 fn rv81_completed_business_operations_outlive_the_pending_default() {
     let config = ida_mcp::router::RouterConfig::from_env();
     assert_eq!(config.max_pending_per_tenant, 512);
-    assert_eq!(config.nexus_retention_capacity, 65536);
+    assert_eq!(config.nexus_retention_capacity, 262144);
     let mut rig = Rig::new();
     rig.sessions = NexusSessions::with_limits(
         rig.clock.clone(),
@@ -1497,7 +1497,9 @@ fn rv81_completed_business_operations_outlive_the_pending_default() {
             "open plus completed operations"
         );
         assert_eq!(usage.total_used, index + 2);
-        assert_eq!(usage.business_capacity, 65536);
+        assert_eq!(usage.business_capacity, 262144);
+        assert_eq!(usage.internal_capacity, 12582912);
+        assert_eq!(usage.total_capacity, 16777216);
     }
     let first = first.expect("first completed operation");
     assert_eq!(rig.snapshot(&first).status, OperationStatus::Succeeded);

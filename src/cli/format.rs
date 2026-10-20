@@ -298,13 +298,13 @@ mod tests {
     #[test]
     fn rv81_human_status_shows_retention_usage_and_limits() {
         let response = json!({"nexus_retention":{
-            "business_used":513,"business_capacity":65536,
-            "internal_used":4,"internal_capacity":3145728,
-            "total_used":517,"total_capacity":4194304}});
+            "business_used":513,"business_capacity":262144,
+            "internal_used":4,"internal_capacity":12582912,
+            "total_used":517,"total_capacity":16777216}});
         let text = format_response(&OutputMode::Human, "status", &response);
-        assert!(text.contains("nexus_retention_business: 513/65536"));
-        assert!(text.contains("nexus_retention_internal: 4/3145728"));
-        assert!(text.contains("nexus_retention_total: 517/4194304"));
+        assert!(text.contains("nexus_retention_business: 513/262144"));
+        assert!(text.contains("nexus_retention_internal: 4/12582912"));
+        assert!(text.contains("nexus_retention_total: 517/16777216"));
     }
 
     #[test]
