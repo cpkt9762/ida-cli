@@ -238,6 +238,14 @@ def exercise(env, binary, result):
             release=released, lifecycle=lifecycle, after_release=after_release,
             scene_before_release=before, scene_after_release=scene(gui_root),
             surviving_owner=check_owner([owner_record(x.instance) for x in discover_databases()], expected, gui.pid, database))
+        # CLI calls retained an independent warm lease. Detach it while the
+        # exact GUI owner is still available for the accepted release preflight.
+        warm_closed = client.control('close', {'path':str(database)})
+        assert warm_closed['ok'] is True and warm_closed['lifecycle']['lease_detached'] is True, warm_closed
+        assert warm_closed['lifecycle']['owner_released'] is False, warm_closed
+        assert same_process(identity(gui.pid), birth), 'CLI detach terminated the external GUI'
+        assert scene(gui_root) == before, 'CLI warm detach changed the GUI scene'
+        result['cli_warm_release'] = warm_closed
         result['native_before_cleanup'] = capture_ready(env)
         assert result['native_before_cleanup'], 'build with --features nexus-test-support for native accounting'
         assert not any('worker' in x['command'] or 'idalib_worker' in ' '.join(x['command'])
