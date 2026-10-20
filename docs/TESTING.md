@@ -981,7 +981,7 @@ fault shard is bounded at 120s and each ordinary check at 30s. Declare reasons
 in progress before increasing a limit. An explicit `--target-dir` may reuse
 only this task's private cache, with exactly one serial writer. Never count 124
 as a pass. The Rust target is `--features nexus-test-support --test
-nexus_r0_prototypes current_product_red_baselines -- --exact --test-threads=1`;
+nexus_r0_prototypes current_product_lifecycle_regressions -- --exact --test-threads=1`;
 the runner checks and Clippies that actual feature/target. Format-check the
 changed Rust test with `timeout 30s rustfmt --edition 2024 --check
 tests/nexus_r0_prototypes.rs`. Python checks use compile/AST plus Ruff F/E9;
@@ -1097,9 +1097,9 @@ private HOME/state/tmp/IPC, copied sample and a serial private Cargo target.
 Run affected N1/transport/bridge and Python regressions, fmt/check/Clippy and
 Python Ruff F/E9 plus syntax. Real tiny IDA permits 180s after recording why;
 fault shards permit 120s. Do not rerun GUI/large/full E2E for this stage.
-The mixed `nexus_r0_prototypes current_product_red_baselines` target now requires
+The mixed `nexus_r0_prototypes current_product_lifecycle_regressions` target now requires
 F2 B=Active plus real SDK query/control success (`R5-production-isolation`),
-while F1/F4 remain `current-product-expected-red`. `r0_freeze.py` records those
+while F1/F4 were historical `current-product-expected-red` cases (superseded by the final-fix green regressions below). `r0_freeze.py` records those
 separately and the current installation closure is 19 members. Historical R0
 freezes and logs remain immutable; neither replay nor the real tiny chain accepts
 N7a or supplies R1/R3 custody, R2 release, R4 transactions, R6 or R7 evidence.
@@ -1204,7 +1204,7 @@ SDK parameter or temporary custody is introduced. Preparing guard/analysis/
 verification RPC admission, durable launch/handle custody and proof helper are
 R3a dependencies. Production acquisition remains on its existing path pending
 that atomic admission. R2 owns two-phase Tools/N1 release; R4 owns transactions.
-F1/F4 remain explicit production expected-red cases. SDK raw facts, the F2
+F1/F4 were explicit production expected-red cases at that milestone; current green regressions supersede that expectation. SDK raw facts, the F2
 isolation green and these probes do not establish no-orphan or N7a acceptance.
 
 ### N7a-R R3a production custody (implementation, awaiting independent review)
@@ -1956,3 +1956,85 @@ owner proofs and the bridge/helper retirement counts converge, within a shared
 Busy lease release still fails before this wait. Pending or blocked observations
 return CancelPending with the bridge retained; no unproved cleanup is called
 success. E27 exercises this path without a preparatory close command.
+
+### Final-fix harness requirements
+
+E27 needs a release build with `nexus-test-support` to record exact daemon births;
+missing creation evidence is BLOCKED. E29 must run against the formal release
+artifact built without test features; use `verify_nexus_e2e.py --target` to select
+that build. Run these cases separately when their artifact requirements differ.
+E23 accepts a prepared environment containing `home`, and creates `gui-home` for
+its own GUI. The existing process ledger / `gui` reuse refusal still applies.
+
+`nexus_r3b_fix1` constructs its two-slot F2 router explicitly; it needs no
+`IDA_CLI_MAX_PENDING_PER_TENANT` override. Nexus opens return distinct lease
+handles, while `list_idbs` groups the same physical instance under its oldest
+live handle. Client identities in holders and opened_by share the same space;
+the active group is the one with the latest open time (not lexical handle order).
+
+The retired `ida_e2e` target used deleted `serve-worker` and is removed. Its
+open/database-info scenario is covered by `e04_fixed_n0_output_comparison`
+(`list_functions`, database metadata comparison); patch/readback and
+rename/prototype/lvar scenarios by `n6_e04_all_write_and_advanced_methods`
+(per-method strict N0 comparison including readback and owner evidence), with
+saved edits covered by `n6_e20_seven_categories_survive_save_close_reopen`.
+The smoke dispatch scenario is superseded by
+`n6_tools_and_aliases_preserve_mcp_contract` (every registered tool/alias).
+Use the contract and n6 verifier suites with their prepared 9.5 environment
+and fixed N0 baseline. These are real Nexus paths, with no legacy source.
+
+IDA_TEST audit: only `list_idbs_e2e` and `decompile_line_addresses_e2e` still had
+opt-out early returns after removing ida_e2e; they now fail explicitly with
+BLOCKED if opt-in is absent. Run each with `IDA_TEST=1` and prepared private
+HOME/IDA_CLI_HOME/IDAUSR/state/IPC plus IDA_NEXUS_PYTHON. The real
+`nexus_{lifecycle,contract,concurrency,n6,special_inputs,n7b}_e2e` targets already
+assert prerequisites (directly or in support/nexus_env.rs), never return early.
+A cargo summary alone without these prerequisites is not real IDA evidence.
+
+R0 current-product tests now assert green F1/F2/F4 lifecycle behavior. F1
+accepts parsed detach ACK and reopens a newly published controlled owner after
+public release. F4 reports analysis failure together with its acquired lease,
+keeps explicit ReleaseRequired custody while native stop is unconfirmed, and
+settles after public lifetime proof. F2 retains the other client's query/control
+after lost ACK. Controlled R0 HTTP/IDA inputs are not real-IDB reopen evidence;
+`real_ida95_saved_modification_immediate_reopen_and_shared_lease` provides that.
+
+FA13 soak uses one formal release daemon and fresh socket connections for
+2100 sequential list_functions/decompile_function/run_script requests. Record
+RSS and retention at each 100-request boundary, require stable owner identity,
+bounded live/closed diagnostics, and exact close/shutdown plus clean IPC.
+CLI warm references must be explicitly closed before harness custody-zero
+assertions; releasing one MCP token does not release the CLI's separate lease.
+A verification read races only atomic custody.json replacement: retry at most
+eight fully validated reads; corruption, identity mismatch and permanent churn
+still fail. SDK completion can recover a lost handoff only by validating its
+exact helper receipt and durable target binding, never by granting SDK work.
+Closed diagnostic payloads may compact, while terminal identity tombstones
+remain charged to the existing fixed retention quota.
+
+
+Signal regression: run `tests/test_nexus_signals.py` under shell `timeout 120s`
+with `N3_ENV_ROOT` pointing at a private prepared 9.5 environment and
+`N9_PROBE_BINARY` at this build. TERM and INT both request confirmed Nexus
+shutdown, with a 30s total budget. Busy/uncertain custody refuses visibly and
+retains the service; complete or cancel work, inspect status/helper-state.json,
+then retry shutdown. The test uses a script-start marker and release barrier,
+checks refusal without terminating work, then retries after its definite terminal.
+Idle HTTP and an uninitialized stdio peer must exit naturally; stdio runtime
+teardown has a separate 1s bound for its uncancellable stdin reader.
+Proof-helper TERM resets inherited ignore dispositions and uses the same durable
+abandonment handoff as orphan expiry: unresolved obligations remain recorded,
+publication failure is diagnostic, never fabricated owner-release proof.
+A SIGKILL can leave stale b/c/h files. A new generation does not scan/delete
+unrecorded old sockets: cleanup requires exact creator birth and inode evidence.
+
+E07 packed recovery deliberately arms one test-only Root Node initial-open
+failure after the crashed owner's disconnect and public proof. It requires
+initial_root_retry within R9's existing three-attempt budget and exactly one
+crash backup per actual acquisition ordinal (one crash restore, then its
+initial Root retries). No extra or missing backup is allowed. The crash
+marker still must contain exactly one write and the restored saved name must
+match the packed base. This makes the formerly intermittent R9/E07 composition
+explicit without widening backup-count or no-replay assertions.
+E23 releases the independent CLI warm lease while the recorded GUI owner is
+still alive, then confirms the scene is unchanged before exact GUI cleanup.
