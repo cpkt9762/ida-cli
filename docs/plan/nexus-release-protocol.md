@@ -815,6 +815,7 @@ timeout 150s cargo test --locked --test nexus_n7_fix1 s1_expired_observer_next_o
 | U5/U6证据 | 同boot前置撤销/共享权威epoch；核验整机boot-change可独立结旧lease/owner/执行当前存活前提 | 不改历史ACK/N1原结果或停止回执，不重放；PID/session/容器变化不冒充整机，身份/平台不合格blocked |
 | 保留量影响 | unknown保根SH挡同根GC，U6已结旧资源不再占活槽；失败证据配额满可能影响无关admission，routine先压缩，I/O失败单列 | 现有会话/清理/status继续；不删失败证据/稳定锁腾空间，常规维护不依赖人工 |
 | 恢复目录（U3 差异） | 直接用户 IDB 旁保留 0700 sibling；受管代际使用实际 store 根固定协调区，原/隔离路径共用同锁；不同 home 直接路径 opener 也遵守。目录不可写/同卷不足在 probe/open 前拒绝 | 单文件原子与协作 gate 保证，任意外部 opener 不受锁约束；旧 v1 要离线盘点导入 |
+| 卷与文件系统（R6，2026-10-20 用户裁定） | 非 APFS 与网络卷可打开，仅无 U6 能力并在 status 写明原因；不支持原子不覆盖 rename 或硬链接的卷（实测 exFAT errno45）在 Nexus probe/open/spawn 前拒绝并给出卷型与缺失能力，**旧后端可打开此类库，属已知差异**；设备号变化在无任何未结义务时按原 VolumeUUID 与协调目录身份先持久后重绑定 | 不用覆盖式 rename 或检查后 rename 模拟；有未结义务、UUID 缺失或不一致一律阻断；APFS/HFS+/网络卷的私有模式检查不放宽 |
 | 日志/诊断 | 删除 release_unconfirmed/donor；新增 watch/custody/disposition/stop/startup/restore 阶段与保留原因 | r9 首次取证、次数、默认 stat-only、显式 forensic hash 选项保留，不新增比较豁免 |
 
 新旧 Rust/bridge/helper IPC 不混用：readiness 要求 release/open/owner observation protocol version、能力集与客户端 hash；
