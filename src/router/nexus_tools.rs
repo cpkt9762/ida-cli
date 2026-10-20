@@ -465,7 +465,6 @@ impl Tools {
             super::nexus_bridge::cache_lock::acquire(&crate::idb_store::idb_root(), &preparation)
                 .await?;
         self.wait_draining(router, &canonical, &preparation).await?;
-        let endpoint = router.nexus_endpoint();
         let mut prepared = super::nexus_bridge::cache::prepare_n7_open(
             canonical.clone(),
             crate::idb_store::idb_root(),
@@ -480,6 +479,7 @@ impl Tools {
         )
         .await?;
         let bridge = preparation.wait(Self::bridge(router)).await?;
+        let endpoint = bridge.endpoint();
         let client = ClientId::new(id())?;
         let operation_id = OperationId::new(id())?;
         let mut reply = bridge.open_reply(&operation_id).map_err(diagnostic)?;
