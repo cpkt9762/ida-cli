@@ -506,13 +506,14 @@ def entrypoints(env, binary):
                 actual=stdio.call(method,params)
                 assert json_equal(normalized(actual,std_sample), normalized(baseline,sample), method),(method,baseline,actual)
             for candidate in (http,stdio):
-                refusal=candidate.call("open_dsc",{})
-                assert "not implemented by Nexus; no legacy fallback" in refusal["error"],refusal
+                refusal=candidate.client.rpc("tools/call", {"name":"open_dsc", "arguments":{}})
+                assert refusal["error"]["code"] == -32602, refusal
+                assert "missing field `path`" in refusal["error"]["message"], refusal
         finally:
             stdio.stop()
     finally:
         http.stop()
-    return {"calls_per_entry":len(matrix),"http_lease_isolation":True,"capability_refusal":True}
+    return {"calls_per_entry":len(matrix),"http_lease_isolation":True,"invalid_dsc_params_refused":True}
 
 
 def streams(env,binary):
