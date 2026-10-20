@@ -346,7 +346,8 @@ class Bridge(LifetimeListener):
                             raise ValueError('ProtocolMismatch: closed acquisition observation')
                         observation['proof'] = receipt['proof']
             self.control.send({'event':'owner_proof_ack', 'owner':owner, 'watch':receipt['watch'],
-                               'sha256':receipt['proof']['sha256'], 'consumer':closed})
+                               'sha256':receipt['proof']['sha256'], 'consumer':closed,
+                               **({'reason':'no_bridge_producer'} if closed is None else {})})
             return
         if 'custody_retired' in message:
             receipt = message['custody_retired']

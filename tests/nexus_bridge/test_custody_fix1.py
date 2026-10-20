@@ -252,6 +252,32 @@ class CustodyFix1(unittest.TestCase):
                     self.assertEqual(old['transferred_to'], successor_epoch)
                     self.assertTrue(old['producer_closed'] and old['consumer_closed'])
 
+    def test_late_public_proof_tombstones_absent_bridge_watch_without_reviving_it(self):
+        with Boundary(self.root/'absent-producer', stub_ida=False) as boundary:
+            observer = self.observer('startup-proof-helper')
+            value = self.subscribe(observer, boundary)
+            bridge = SimpleNamespace(lock=threading.RLock(), acquisitions={}, custodians={},
+                                     control=SimpleNamespace(send=lambda _:None))
+            backup = BackupSources(bridge, 8)
+            boundary.release_owner()
+            proof = until(lambda: observer.items['watch'].get('proof'))
+            receipt = dict(owner=value['owner'], watch=value['watch'],
+                           target=value['target'], proof=proof)
+            self.assertIsNone(backup.close(receipt))
+            self.assertIsNone(backup.close(receipt), 'ACK replay uses the same absence tombstone')
+            self.assertEqual(backup.items, {}, 'absence never allocates a producer')
+            for register in (lambda: backup.subscribe(boundary.instance, value['owner'], 'watch'),
+                             lambda: backup.register(value['owner'], 'watch'),
+                             lambda: backup.bind(value)):
+                with self.assertRaisesRegex(ValueError, 'ObservationClosed'):
+                    register()
+            backup.retire('watch')
+            with self.assertRaisesRegex(ValueError, 'ObservationClosed'):
+                backup.subscribe(boundary.instance, value['owner'], 'watch')
+            wrong = dict(receipt, owner=dict(value['owner'], record_id='foreign'))
+            with self.assertRaisesRegex(ValueError, 'ProtocolMismatch'):
+                backup.close(wrong)
+
     def test_two_authorized_public_sources_keep_first_durable_proof_and_both_facts(self):
         with Boundary(self.root/'two-public-sources', stub_ida=False) as boundary:
             observer = self.observer('two-source-helper')

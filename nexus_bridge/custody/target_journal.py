@@ -730,6 +730,26 @@ class Journal:
         self.save()
         return {}
 
+    def bridge_absent(self, value):
+        record = value['proof']['record']
+        item = self.item(value['watch'], record['subscription_epoch'])
+        if (not item.get('launch_identity', item.get('launch')) or item['lease'] is not None
+                or not item.get('proof') or item['proof']['sha256'] != value['proof']['sha256']
+                or item['owner'] != record['owner']
+                or item['acquisition'] != record['acquisition']
+                or record.get('evidence_type') != 'public_owner_lifetime'
+                or self.authorized_producers(item, ('BridgeSubscribed',))
+                or not self.authorized_producers(item, ('StartupOwnerSubscribed',))):
+            raise RuntimeError('CoordinationBlocked: absent bridge producer lacks startup/public proof')
+        fact(value['proof'], self.target, kind='PublicOwnerLifetime')
+        absence = {'incarnation':value['incarnation'], 'proof_sha256':value['proof']['sha256']}
+        if item.get('bridge_absent', absence) != absence:
+            raise RuntimeError('CoordinationBlocked: conflicting absent bridge producer')
+        item['bridge_absent'] = absence
+        item['bridge_closed'] = True
+        self.save()
+        return {}
+
     def bridge_process_closed(self, value):
         """Exact waitpid closes only this producer, never an IDA owner/lease."""
         item = next((i for i in self.value['entries'].values() if i['watch'] == value['watch']), None)
@@ -1229,6 +1249,8 @@ def main():
                 result = journal.proof(value)
             elif action == 'producer_closed':
                 result = journal.producer_closed(value)
+            elif action == 'bridge_absent':
+                result = journal.bridge_absent(value)
             elif action == 'bridge_closed':
                 result = journal.bridge_closed(value)
             elif action == 'no_attach':

@@ -1195,14 +1195,48 @@ async fn event_received(
             )
         };
         anyhow::ensure!(
-            owner == event["owner"]
-                && proof["sha256"] == event["sha256"]
-                && state.bridge_observer.as_deref()
-                    == event["consumer"]["record"]["helper"].as_str(),
+            owner == event["owner"] && proof["sha256"] == event["sha256"],
             "owner proof ACK binding mismatch"
         );
-        state.helper.as_ref().ok_or_else(|| anyhow::anyhow!("proof ACK helper missing"))?.journal(json!({
-            "action":"bridge_closed","target":target,"coord_key":coord,"watch":watch,"consumer":event["consumer"]})).await?;
+        let helper = state
+            .helper
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("proof ACK helper missing"))?;
+        if event["consumer"].is_null() {
+            anyhow::ensure!(
+                resource.is_none() && event["reason"] == "no_bridge_producer",
+                "absent bridge producer is only valid for unleased startup"
+            );
+            let status = helper.call(json!({"kind":"lookup", "watch":watch})).await?;
+            let item = &status["item"];
+            anyhow::ensure!(
+                status["state_root"] == helper.state_root
+                    && item["owner"] == owner
+                    && item["acquisition"] == proof["record"]["acquisition"]
+                    && item["owner_receipt"]["record"]["kind"] == "StartupOwnerSubscribed"
+                    && item["owner_receipt"]["record"]["helper"] == helper.incarnation
+                    && item["launch"].is_object(),
+                "absent bridge producer startup binding mismatch"
+            );
+            helper
+                .journal(
+                    json!({"action":"bridge_absent","target":target,"coord_key":coord,
+                "watch":watch,"proof":proof,"incarnation":state.bridge_observer}),
+                )
+                .await?;
+        } else {
+            anyhow::ensure!(
+                state.bridge_observer.as_deref() == event["consumer"]["record"]["helper"].as_str()
+                    && event.get("reason").is_none(),
+                "bridge producer ACK binding mismatch"
+            );
+            helper
+                .journal(
+                    json!({"action":"bridge_closed","target":target,"coord_key":coord,
+                "watch":watch,"consumer":event["consumer"]}),
+                )
+                .await?;
+        }
         if let Some(resource) = resource {
             if let Some(current) = state
                 .custody_resources

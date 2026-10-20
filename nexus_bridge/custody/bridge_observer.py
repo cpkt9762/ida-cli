@@ -12,11 +12,19 @@ class BackupSources:
     def __init__(self, bridge, capacity):
         self.bridge, self.capacity = bridge, capacity
         self.items = {}
+        self.absent = {}
         self.publisher = Observer(INCARNATION, capacity)
+
+    def reject_closed(self, owner, watch):
+        if watch in self.absent:
+            if self.absent[watch]['owner'] != owner:
+                raise ValueError('ProtocolMismatch: closed watch owner mismatch')
+            raise ValueError('ObservationClosed: cannot revive an unregistered watch')
 
     def subscribe(self, instance, owner, watch=None):
         key = digest(owner)
         with self.bridge.lock:
+            self.reject_closed(owner, watch)
             if key in self.items:
                 if watch is not None:
                     self.items[key]['watches'].add(watch)
@@ -38,10 +46,12 @@ class BackupSources:
 
     def register(self, owner, watch):
         with self.bridge.lock:
+            self.reject_closed(owner, watch)
             self.items[digest(owner)]['watches'].add(watch)
 
     def bind(self, value):
         with self.bridge.lock:
+            self.reject_closed(value['owner'], value['watch'])
             entry = self.items[digest(value['owner'])]
             watch = value['watch']
             if watch not in entry['watches']:
@@ -107,8 +117,23 @@ class BackupSources:
         owner, watch = value['owner'], value['watch']
         with self.bridge.lock:
             entry = self.items.get(digest(owner))
+            record = value['proof']['record']
+            if (record.get('owner') != owner or record.get('watch') != watch
+                    or record.get('kind') != 'PublicOwnerLifetime'
+                    or record.get('evidence_type') != 'public_owner_lifetime'):
+                raise ValueError('ProtocolMismatch: owner proof custody identity/type')
             if entry is None or watch not in entry['watches']:
-                raise ValueError('ObservationClosed: closure cannot revive an unregistered watch')
+                # There was no producer to close. Pin the complete receipt so a
+                # late subscribe cannot turn absence into a revived observation.
+                from target_coordination import Target
+                from target_journal import fact
+                with Target(value['target']) as target:
+                    fact(value['proof'], target, kind='PublicOwnerLifetime')
+                previous = self.absent.get(watch)
+                if previous is not None and previous != value:
+                    raise ValueError('ProtocolMismatch: conflicting absent producer receipt')
+                self.absent[watch] = dict(value)
+                return None
             previous = [proof for key,proof in entry['proofs'].items() if key == watch] if entry is not None else []
             record = value['proof']['record']
             item = {'watch':watch, 'target':value['target'], 'coord_key':record['coord_key'],
