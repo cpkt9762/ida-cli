@@ -17,7 +17,7 @@ sys.dont_write_bytecode = True
 sys.path[:0] = [str(REPO / 'tests'), str(REPO / 'tests/support'), str(REPO / 'scripts')]
 from nexus_env import Environment
 from process_identity import identity, same_process
-from compare_nexus_baseline import Process, unwrap_cache
+from compare_nexus_baseline import BASELINE_SHA, digest, Process, unwrap_cache
 from verify_nexus_gui import capture_native_processes
 
 
@@ -281,6 +281,65 @@ def assert_dead(rows):
     assert dead(rows), 'recorded process identity is still live'
 
 
+def e28(env, binary, baseline, case, result):
+    assert env.manifest['installed_ida_version'] == '9.5', 'BLOCKED: N0 links IDA 9.5'
+    fixed = case / 'n0'
+    shutil.copyfile(baseline, fixed);fixed.chmod(0o700)
+    assert digest(fixed) == BASELINE_SHA, 'N0 checksum mismatch'
+    home = case / 'old-home';home.mkdir()
+    variables = env.variables() | {'HOME':str(home), 'IDA_CLI_HOME':str(home/'cli'),
+        'TMPDIR':str(case), 'IDADIR':env.manifest['ida_dir']}
+    original = sample(env, case, 'original')
+    old_opens=[]
+    def old_open(process, path, permitted):
+        assert path == permitted and path.is_relative_to(case), 'N0 path outside its approved backup scene'
+        old_opens.append(str(path))
+        return process.rpc('open',{'path':str(path)})['result']
+    old = Process(env, [str(fixed), 'serve-worker'], variables, 'e28-before')
+    opened = old_open(old, original, original)
+    functions = old.rpc('list_functions')['result']['functions']
+    target = next(row for row in functions if row['name'] in ('add','_add'))
+    address = int(target['address'],16)
+    before = 'E28_PRE_BACKUP'
+    old.rpc('run_script', {'code':f"import ida_name,ida_bytes; assert ida_name.set_name({address},{before!r},ida_name.SN_CHECK); assert ida_bytes.set_cmt({address},{before!r},False)"})
+    old.rpc('close');old.rpc('shutdown');old.wait()
+    backup = case / 'backup.i64';shutil.copyfile(opened['path'], backup)
+    backup_hash = digest(backup)
+    result.update(backup={'sha256':backup_hash,'created_at':time.time(),'origin':'generated during this case'},
+        baseline={'sha256':digest(fixed),'source_sha':'97ec918','runtime':env.manifest['ida_dir']})
+    work = case / 'working.i64';shutil.copyfile(backup, work)
+    product = Product(env, binary, case/'migration')
+    read = f"import ida_name,ida_bytes; print(ida_name.get_name({address})); print(ida_bytes.get_cmt({address},False))"
+    assert product.script(work, read) == before+'\n'+before+'\n'
+    product.script(work, f"import ida_name,ida_bytes,ida_loader; assert ida_name.set_name({address},'E28_POST_BACKUP',ida_name.SN_CHECK); assert ida_bytes.set_cmt({address},'E28_POST_BACKUP',False); assert ida_loader.save_database(ida_loader.get_path(ida_loader.PATH_TYPE_IDB),0)")
+    product.raw(work, 'close');product.stop();product.clean(product.entries())
+    retained = case/'retained-migrated.i64';shutil.copyfile(work, retained)
+    retained_hash = digest(retained)
+    restore = case/'restore';restore.mkdir()
+    restored = restore/'restored.i64';shutil.copyfile(backup,restored)
+    assert digest(restored) == backup_hash
+    restore_home = case/'restore-home';restore_home.mkdir()
+    restored_variables = variables | {'HOME':str(restore_home),'IDA_CLI_HOME':str(restore_home/'cli')}
+    old = Process(env,[str(fixed),'serve-worker'],restored_variables,'e28-restored')
+    assert old_open(old, restored, restored)
+    listing = old.rpc('list_functions')['result']
+    assert any(f['name'] == before for f in listing['functions']), listing
+    assert old.rpc('decompile_function',{'address':target['address']})['result']
+    saved = old.rpc('run_script',{'code':read})['result']
+    assert saved['success'] and saved['stdout'] == before+'\n'+before+'\n',saved
+    assert 'E28_POST_BACKUP' not in json.dumps(listing)+saved['stdout']
+    old.rpc('close');old.rpc('shutdown');old.wait()
+    assert digest(backup) == backup_hash and digest(retained) == retained_hash, 'preserved scene changed'
+    assert str(retained) not in old_opens and str(work) not in old_opens
+    result['n0_open_paths']=old_opens
+    result.update(backup_unchanged=True, retained={'sha256':retained_hash,'never_opened_by_n0':True}, restored=saved)
+    damaged = case/'damaged-backup-control.i64'
+    shutil.copyfile(backup,damaged)
+    with damaged.open('ab') as stream:stream.write(b'broken backup control')
+    result['negative_witness'] = negative_witness('restored backup has recorded bytes',
+        lambda: assert_annotations(digest(damaged), backup_hash))
+
+
 def assert_annotations(actual, expected):
     assert actual == expected, (actual, expected)
 
@@ -299,7 +358,7 @@ def main():
     parser.add_argument('--root',type=Path,required=True)
     parser.add_argument('--binary',type=Path,required=True)
     parser.add_argument('--baseline',type=Path)
-    parser.add_argument('--case',choices=('E27',),required=True)
+    parser.add_argument('--case',choices=('E27','E28'),required=True)
     args=parser.parse_args()
     env=Environment(args.root)
     case=env.root/args.case;case.mkdir(mode=0o700)
@@ -318,6 +377,7 @@ def main():
     try:
         assert os.environ.get('IDA_TEST')=='1','BLOCKED: explicit IDA_TEST=1 required'
         if args.case=='E27':e27(env,args.binary,case,result)
+        elif args.case=='E28':e28(env,args.binary,args.baseline,case,result)
         capture(env)
         env.assert_clean()
         result['status']='PASS'

@@ -227,3 +227,7 @@ fn release_case(case: &str) {
 fn e27_shutdown_and_same_product_restart() {
     release_case("E27");
 }
+#[test]
+fn e28_version_rollback_from_private_backup() {
+    release_case("E28");
+}
