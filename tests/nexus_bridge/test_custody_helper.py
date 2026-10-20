@@ -14,7 +14,7 @@ import uuid
 REPO = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(REPO / 'nexus_bridge/custody'), str(REPO / 'tests/support')]
 from owner_identity import owner_key, state_identity
-from proof_helper import Observer, request
+from proof_helper import Observer, bind_private_listener, request
 from r0_transport import Boundary
 from target_coordination import Target
 from target_journal import Journal
@@ -100,15 +100,12 @@ class HelperCustody(unittest.TestCase):
                 raise RuntimeError('helper startup endpoint replaced')
             published_inode = inode
             if stat.S_IMODE(info.st_mode) != 0o600:
-                # bind precedes chmod/listen. Only this owned child's pinned
-                # socket may still be publishing; request remains fully strict.
-                time.sleep(.002)
-                continue
+                raise RuntimeError('untrusted helper startup endpoint mode')
             try:
                 status = request(endpoint, self.identity, {'kind':'heartbeat'},
                                  timeout=max(.001, deadline-time.monotonic()))
             except ConnectionRefusedError:
-                time.sleep(.002)  # chmod may precede listen on the same inode.
+                time.sleep(.002)  # Trusted bind may precede listen on the same inode.
                 continue
             after = endpoint.lstat()
             if ((after.st_dev, after.st_ino) != published_inode
@@ -138,6 +135,38 @@ class HelperCustody(unittest.TestCase):
 
     def test_bind_publication_regular_file_is_not_a_readiness_retry(self):
         self.bind_window_case('file')
+
+    def test_bind_restores_umask_on_success_and_failure(self):
+        from unittest.mock import Mock
+        original = os.umask(0o027)
+        try:
+            for failure in (None, OSError('controlled bind failure')):
+                observed = []
+                def bind(_endpoint):
+                    mask = os.umask(0o177)
+                    observed.append(mask)
+                    if failure is not None:
+                        raise failure
+                listener = Mock(bind=bind)
+                if failure is None:
+                    bind_private_listener(listener, self.root/'unused')
+                else:
+                    with self.assertRaisesRegex(OSError, 'controlled bind failure'):
+                        bind_private_listener(listener, self.root/'unused')
+                self.assertEqual(os.umask(0o027), 0o027, 'caller umask restored')
+                self.assertEqual(observed, [0o177], 'restrict before actual bind')
+        finally:
+            os.umask(original)
+
+    def test_wrong_mode_is_rejected_without_readiness_retry(self):
+        endpoint = self.start_helper()
+        try:
+            endpoint.chmod(0o640)
+            with self.assertRaisesRegex(RuntimeError, '^ProtocolMismatch: untrusted helper endpoint$'):
+                request(endpoint, self.identity, {'kind':'heartbeat'})
+        finally:
+            endpoint.chmod(0o600)
+            request(endpoint, self.identity, {'kind':'finish'})
 
     def bind_window_case(self, fault=None):
         bind_window_case(self, fault)

@@ -46,11 +46,17 @@ def bind_window_case(self, fault=None):
         self.assertTrue(select.select([bound_r], [], [], 2)[0], 'real helper bind reached')
         with os.fdopen(bound_r, 'r') as source:
             evidence['bound'] = json.loads(source.readline())
-        self.assertEqual(evidence['bound']['mode'], 0o755)
         self.assertEqual(evidence['bound']['uid'], os.getuid())
-        with self.assertRaisesRegex(RuntimeError, '^ProtocolMismatch: untrusted helper endpoint$') as error:
+        try:
             request(endpoint, self.identity, {'kind':'heartbeat'})
-        evidence['early_request_error'] = str(error.exception)
+        except ConnectionRefusedError as error:
+            evidence['early_request_error'] = type(error).__name__
+        except RuntimeError as error:
+            evidence['early_request_error'] = str(error)
+            raise
+        else:
+            self.fail('paused helper must not accept requests before listen')
+        self.assertEqual(evidence['bound']['mode'], 0o600)
         armed = True
         return child
 
@@ -118,5 +124,5 @@ def bind_window_case(self, fault=None):
             (self.root/'readiness-publication.json').write_text(json.dumps(evidence, indent=2))
             self.assertEqual(evidence['exit'], 0, 'same helper finishes naturally')
     self.assertEqual(evidence['bound']['inode'], evidence['published']['inode'])
-    self.assertEqual(evidence['fixture_observed_mode'], 0o755)
+    self.assertEqual(evidence['fixture_observed_mode'], 0o600)
     self.assertEqual(evidence['published']['mode'], 0o600)

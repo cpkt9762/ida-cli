@@ -10,15 +10,14 @@ import sys
 
 script, endpoint, incarnation, capacity, bound_fd, release_fd = sys.argv[1:]
 bound_fd, release_fd = int(bound_fd), int(release_fd)
+os.umask(0o022)  # Reproduce a normal permissive launch, in this test child only.
 actual_bind = socket.socket.bind
 
 
 def paused_bind(stream, address):
     result = actual_bind(stream, address)
     if str(address) == endpoint:
-        # Controlled unpublished-mode input, regardless of the caller's umask.
-        # The production main still performs its original chmod(0600)/listen.
-        os.chmod(endpoint, 0o755)
+        # Sample actual creation permissions before production chmod/listen.
         info = Path(endpoint).lstat()
         data = json.dumps(dict(uid=info.st_uid, mode=stat.S_IMODE(info.st_mode),
                                inode=[info.st_dev, info.st_ino])).encode() + b'\n'

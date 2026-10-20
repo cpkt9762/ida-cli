@@ -711,6 +711,16 @@ class Observer:
 
 
 
+def bind_private_listener(listener, endpoint):
+    # Startup only, before owner observation threads: umask is process-wide.
+    # Publish a trusted inode at bind, and restore even when bind fails.
+    previous = os.umask(0o177)
+    try:
+        listener.bind(endpoint)
+    finally:
+        os.umask(previous)
+
+
 def main():
     terminating = threading.Event()
     # The daemon deliberately ignores TERM. Exec preserves SIG_IGN, so the
@@ -750,7 +760,7 @@ def main():
         if not stat.S_ISSOCK(previous.st_mode) or previous.st_uid != os.getuid():
             raise RuntimeError('ObservationRecoveryBlocked: endpoint identity/type')
         Path(endpoint).unlink()
-    listener.bind(endpoint)
+    bind_private_listener(listener, endpoint)
     os.chmod(endpoint, 0o600)
     bound = Path(endpoint).lstat()
     listener.listen(8)
