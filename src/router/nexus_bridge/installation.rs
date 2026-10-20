@@ -49,6 +49,18 @@ impl Drop for Temporary {
 
 const SOURCES: &[(&str, &[u8])] = &[
     (
+        "legacy_cache.py",
+        include_bytes!("../../../nexus_bridge/legacy_cache.py"),
+    ),
+    (
+        "legacy_cache_files.py",
+        include_bytes!("../../../nexus_bridge/legacy_cache_files.py"),
+    ),
+    (
+        "legacy_cache_offline.py",
+        include_bytes!("../../../nexus_bridge/legacy_cache_offline.py"),
+    ),
+    (
         "volume_identity.py",
         include_bytes!("../../../nexus_bridge/custody/volume_identity.py"),
     ),
