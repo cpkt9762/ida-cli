@@ -124,6 +124,7 @@ impl Rig {
             serde_json::to_vec_pretty(&value).expect("encode evidence"),
         )
         .expect("write evidence");
+        shutdown.expect("confirmed natural shutdown after public owner proof");
         let pid: Value = serde_json::from_slice(
             &std::fs::read(self.root.join("process.json")).expect("owned process record"),
         )
@@ -202,7 +203,10 @@ async fn current_product_lifecycle_regressions() {
         "F1: reopen succeeds after actual public lifetime released: {reopen:?}"
     );
     let (_, reopened_token) = reopen.as_ref().expect("F1 reopened lease");
-    slow.router.nexus_close_token(reopened_token).await.expect("close reopened reference");
+    slow.router
+        .nexus_close_token(reopened_token)
+        .await
+        .expect("close reopened reference");
     slow.finish(json!({"id":"F1", "close":format!("{close:?}"),
         "reopen_after_public_lifetime":format!("{reopen:?}")}))
         .await;
@@ -215,13 +219,38 @@ async fn current_product_lifecycle_regressions() {
     );
     let open = early.event("failed").await;
     assert_eq!(open["error"]["code"], "operation_failed");
-    assert!(open["error"]["message"].as_str().expect("analysis error").contains("wait_autoanalysis"));
-    let lease: SessionLease = serde_json::from_value(open["lease"].clone()).expect("F4 acquired lease is retained explicitly");
-    let identity: OpenIdentity = serde_json::from_value(open["attempt"]["target"]["identity"].clone()).expect("actual N1 open identity");
-    let progress = early.bridge.endpoint().transition(|state, _| state.open_progress(&identity.client_id, &identity)).expect("N1 open outcome");
-    assert!(progress.1.is_some(), "caller receives a definite analysis failure");
-    assert_eq!(early.bridge.lifecycle_status()["resources"], 1, "F4 acquired lease remains in explicit custody until public proof");
-    assert_eq!(early.bridge.endpoint().transition(|s,_|s.status(&lease.client_id,&lease)).expect("retained N1 lease").phase, SessionPhase::ReleaseRequired);
+    assert!(open["error"]["message"]
+        .as_str()
+        .expect("analysis error")
+        .contains("wait_autoanalysis"));
+    let lease: SessionLease = serde_json::from_value(open["lease"].clone())
+        .expect("F4 acquired lease is retained explicitly");
+    let identity: OpenIdentity =
+        serde_json::from_value(open["attempt"]["target"]["identity"].clone())
+            .expect("actual N1 open identity");
+    let progress = early
+        .bridge
+        .endpoint()
+        .transition(|state, _| state.open_progress(&identity.client_id, &identity))
+        .expect("N1 open outcome");
+    assert!(
+        progress.1.is_some(),
+        "caller receives a definite analysis failure"
+    );
+    assert_eq!(
+        early.bridge.lifecycle_status()["resources"],
+        1,
+        "F4 acquired lease remains in explicit custody until public proof"
+    );
+    assert_eq!(
+        early
+            .bridge
+            .endpoint()
+            .transition(|s, _| s.status(&lease.client_id, &lease))
+            .expect("retained N1 lease")
+            .phase,
+        SessionPhase::ReleaseRequired
+    );
     early.signal("snapshot-request");
     early.marker("snapshot.json").await;
     let snapshot: Value = serde_json::from_slice(

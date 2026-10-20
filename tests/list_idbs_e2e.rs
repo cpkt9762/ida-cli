@@ -333,7 +333,10 @@ fn sorted(mut handles: Vec<String>) -> Vec<String> {
 
 #[test]
 fn list_idbs_follows_two_clients_through_a_real_daemon() {
-    assert!(ida_available(), "BLOCKED: set IDA_TEST=1 and use an isolated prepared IDA environment");
+    assert!(
+        ida_available(),
+        "BLOCKED: set IDA_TEST=1 and use an isolated prepared IDA environment"
+    );
 
     let work = Scratch(scratch_dir("work"));
     let alpha = build_fixture(&work.0, "alpha", "int main(void) { return 1; }\n");
@@ -473,7 +476,10 @@ fn list_idbs_follows_two_clients_through_a_real_daemon() {
 
     // A second client takes a reference on b's database: still one entry, two holders.
     let (shared_handle, shared_token) = client_a.open_idb(&beta);
-    assert_ne!(shared_handle, handle_b, "Nexus opens hold distinct lease handles");
+    assert_ne!(
+        shared_handle, handle_b,
+        "Nexus opens hold distinct lease handles"
+    );
     assert_ne!(shared_token, token_b, "independent close authority");
     let (shared, shared_text) = client_b.list_idbs();
     record("a also opened beta", "mcp (as b)", &shared);

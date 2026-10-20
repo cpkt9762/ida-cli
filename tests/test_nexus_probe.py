@@ -42,6 +42,7 @@ os.execv({real_python!r},[{real_python!r},*sys.argv[1:]])
         env.pop('IDA_NEXUS_BRIDGE_SCRIPT', None)
         result = subprocess.run([os.environ['N9_PROBE_BINARY'], 'probe-runtime'],
                                 env=env, capture_output=True, text=True, timeout=30)
+        self.assertTrue(ledger.is_file(), f'probe did not start its Python boundary: exit={result.returncode}; stderr={result.stderr}')
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
         self.assertEqual(len(rows), 2, rows)
         self.assertEqual(sum('proof_helper' in row['argv'] for row in rows), 1)
