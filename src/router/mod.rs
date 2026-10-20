@@ -366,8 +366,12 @@ impl RouterState {
     }
 
     pub fn new() -> anyhow::Result<Self> {
-        let config = Arc::new(RouterConfig::from_env());
+        Self::with_config(RouterConfig::from_env())
+    }
 
+    /// Construct a router with explicit admission settings.
+    pub fn with_config(config: RouterConfig) -> anyhow::Result<Self> {
+        let config = Arc::new(config);
         Ok(Self {
             config: config.clone(),
             nexus: Arc::new(std::sync::Mutex::new((

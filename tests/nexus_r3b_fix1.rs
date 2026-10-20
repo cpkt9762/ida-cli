@@ -231,7 +231,7 @@ mod cross {
         preprocess::Preparation,
         router::{
             nexus_bridge::{BridgeConfig, NexusBridge},
-            RouterState,
+            RouterConfig, RouterState,
         },
     };
     use serde_json::Value;
@@ -242,7 +242,9 @@ mod cross {
         time::Duration,
     };
     pub(super) async fn bridge(root: &Path, mode: &str) -> (RouterState, Arc<NexusBridge>) {
-        let router = RouterState::new().expect("router");
+        let mut config = RouterConfig::from_env();
+        config.max_pending_per_tenant = 2;
+        let router = RouterState::with_config(config).expect("explicit two-slot router");
         let mut environment: BTreeMap<String, String> = std::env::vars().collect();
         environment.insert("R3A_CASE_ROOT".into(), root.display().to_string());
         environment.insert(
