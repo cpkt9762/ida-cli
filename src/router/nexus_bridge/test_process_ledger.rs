@@ -120,7 +120,15 @@ pub(super) fn spawn(
         &json!({"kind":"intent", "intent":intent, "parent":std::process::id(),
         "program":native.get_program(), "argv":native.get_args().collect::<Vec<_>>()}),
     )?;
-    let child = crate::process_spawn::with_spawn_fence(|| command.spawn())?;
+    let child = match crate::process_spawn::with_spawn_fence(|| command.spawn()) {
+        Ok(child) => child,
+        Err(error) => {
+            append(
+                &json!({"kind":"spawn_failed","intent":intent,"error":error.to_string(),"errno":error.raw_os_error()}),
+            )?;
+            return Err(error.into());
+        }
+    };
     let evidence = match child.id() {
         Some(pid) => match identity(pid) {
             Ok(identity) => json!({"kind":"started","intent":intent,"parent":std::process::id(),
@@ -159,7 +167,15 @@ pub(super) fn spawn_std(
         &json!({"kind":"intent","intent":intent,"parent":std::process::id(),
         "program":command.get_program(),"argv":command.get_args().collect::<Vec<_>>()}),
     )?;
-    let child = crate::process_spawn::with_spawn_fence(|| command.spawn())?;
+    let child = match crate::process_spawn::with_spawn_fence(|| command.spawn()) {
+        Ok(child) => child,
+        Err(error) => {
+            append(
+                &json!({"kind":"spawn_failed","intent":intent,"error":error.to_string(),"errno":error.raw_os_error()}),
+            )?;
+            return Err(error.into());
+        }
+    };
     let evidence = match identity(child.id()) {
         Ok(identity) => {
             json!({"kind":"started","intent":intent,"parent":std::process::id(),"pid":child.id(),"identity":identity})

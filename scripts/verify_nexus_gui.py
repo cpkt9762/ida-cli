@@ -97,9 +97,9 @@ def native_command(intent):
     return [decode(value) for value in [intent['program'], *intent.get('argv', [])]]
 
 
-def capture_native_processes(env):
+def capture_native_processes(env, ledger=None):
     """Import test-only creation identities before failure/timeout cleanup."""
-    ledger = env.root / 'native-processes.jsonl'
+    ledger = ledger or env.root / 'native-processes.jsonl'
     if not ledger.exists():
         return []
     lines = ledger.read_text().splitlines(keepends=True)
@@ -108,7 +108,10 @@ def capture_native_processes(env):
     intents = {row['intent']: row for row in rows if row['kind'] == 'intent'}
     started = [row for row in rows if row['kind'] == 'started']
     assert not any(row['kind'] == 'capture_failed' for row in rows), rows
-    assert set(intents) == {row['intent'] for row in started}, 'unfinished native creation intent'
+    failed = [row for row in rows if row['kind'] == 'spawn_failed']
+    assert all(type(row.get('errno')) is int and row.get('error') and 'pid' not in row for row in failed), failed
+    terminals = [row['intent'] for row in started+failed]
+    assert len(set(terminals)) == len(terminals) and set(intents) == set(terminals), 'unfinished or duplicate native creation intent'
     known = {(row['pid'], json.dumps(row['identity'], sort_keys=True)) for row in env.entries()}
     with env.ledger.open('a') as output:
         for row in started:

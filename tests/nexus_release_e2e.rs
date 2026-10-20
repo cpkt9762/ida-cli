@@ -1,4 +1,5 @@
 //! Real large-database release through Tools/N1, with one unchanged router.
+use ida_mcp::process_spawn::StdOutputFenced;
 use ida_mcp::{
     preprocess::Preparation,
     router::{nexus_bridge::BridgeConfig, RouterState},
@@ -184,4 +185,45 @@ print('r7a-large-saved-comment')"#, trace=trace.to_str().expect("utf8"),
     .expect("write release evidence");
     shutdown.expect("natural bridge shutdown");
     result.expect("large saved readback on the original router");
+}
+
+fn release_case(case: &str) {
+    let root =
+        PathBuf::from(std::env::var_os("N3_ENV_ROOT").expect("fresh prepared release environment"));
+    let variables: std::collections::BTreeMap<String, String> = serde_json::from_str(
+        &std::fs::read_to_string(root.join("rust-env.json")).expect("release runtime variables"),
+    )
+    .expect("valid private environment");
+    let status = std::process::Command::new("timeout")
+        .arg("180s")
+        .arg(root.join("venv/bin/python"))
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/verify_nexus_release.py"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--binary")
+        .arg(std::env::var_os("N9_RELEASE_BINARY").expect("explicit release binary"))
+        .arg("--baseline")
+        .arg(std::env::var_os("N4_BASELINE").expect("fixed N0 baseline"))
+        .arg("--case")
+        .arg(case)
+        .env_clear()
+        .envs(variables)
+        .status_fenced()
+        .expect("bounded real release driver");
+    assert!(
+        status.success(),
+        "{case} failed with {status}; inspect persisted case result"
+    );
+    let evidence: Value = serde_json::from_slice(
+        &std::fs::read(root.join(format!("{case}-result.json"))).expect("release case evidence"),
+    )
+    .expect("valid release evidence JSON");
+    assert_eq!(evidence["case"], case);
+    assert_eq!(evidence["status"], "PASS");
+    assert_eq!(evidence["cleanup"], "PASS");
+}
+
+#[test]
+fn e27_shutdown_and_same_product_restart() {
+    release_case("E27");
 }

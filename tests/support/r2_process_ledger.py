@@ -38,8 +38,13 @@ def install():
         def __init__(self, args, *positional, **options):
             self._r2_intent = 'python-'+uuid.uuid4().hex
             record({'kind':'intent', 'intent':self._r2_intent,
-                    'program':str(args[0] if isinstance(args, (list, tuple)) else args)})
-            super().__init__(args, *positional, **options)
+                    'program':str(args[0] if isinstance(args, (list, tuple)) else args),
+                    'argv':[str(part) for part in args[1:]] if isinstance(args,(list,tuple)) else []})
+            try:
+                super().__init__(args, *positional, **options)
+            except OSError as error:
+                record({'kind':'spawn_failed','intent':self._r2_intent,'error':str(error),'errno':error.errno})
+                raise
             captured = identity(self.pid)
             record({'kind':'started', 'intent':self._r2_intent, 'pid':self.pid,
                     'identity':captured, 'already_exited':self.poll() is not None})
