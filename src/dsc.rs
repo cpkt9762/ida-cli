@@ -122,11 +122,13 @@ def dscu_load_module(module):
     node = idaapi.netnode()
     node.create(\"$ dscu\")
     node.supset(2, module)
-    load_and_run_plugin(\"dscu\", 1)
+    run_plugin_checked(\"dscu\", 1, f\"loading module {module}\", True)
 ",
     );
 
     let escaped_module = escape_python_string(module);
+
+    script.push_str(run_plugin_checked_python());
 
     // Load primary module
     script.push_str(&format!(
@@ -149,9 +151,9 @@ def dscu_load_module(module):
         "\
 \n# ObjC type analysis
 print(\"[ida-cli] analyzing objc types\")
-load_and_run_plugin(\"objc\", 1)
+run_plugin_checked(\"objc\", 1, \"objc type analysis\", False)
 print(\"[ida-cli] analyzing NSConcreteGlobalBlock objects\")
-load_and_run_plugin(\"objc\", 4)
+run_plugin_checked(\"objc\", 4, \"objc global block analysis\", False)
 
 # Auto-analysis
 print(\"[ida-cli] performing auto-analysis...\")
@@ -160,13 +162,17 @@ auto_wait()
 
 # Stack block analysis
 print(\"[ida-cli] analyzing NSConcreteStackBlock objects\")
-load_and_run_plugin(\"objc\", 5)
+run_plugin_checked(\"objc\", 5, \"objc stack block analysis\", False)
 
 print(\"[ida-cli] DSC module loading complete\")
 ",
     );
 
-    script
+    let body = script
+        .lines()
+        .map(|line| format!("    {line}\n"))
+        .collect::<String>();
+    format!("import traceback\ntry:\n{body}except BaseException:\n    traceback.print_exc()\n    qexit(1)\nelse:\n    qexit(0)\n")
 }
 
 /// Python helper that wraps `load_and_run_plugin` with error checking.
@@ -313,7 +319,7 @@ mod tests {
     fn script_no_frameworks() {
         let script = dsc_load_script("/usr/lib/libobjc.A.dylib", &[]);
         assert!(script.contains("dscu_load_module(\"/usr/lib/libobjc.A.dylib\")"));
-        assert!(script.contains("load_and_run_plugin(\"objc\", 1)"));
+        assert!(script.contains("run_plugin_checked(\"objc\", 1"));
         assert!(script.contains("auto_wait()"));
     }
 

@@ -495,23 +495,34 @@ impl IdbStore {
             }
         }
         if Self::nexus_selected() {
-            let mut directories = vec![self.root.join("generations"), self.root.join("quarantine")];
+            use std::os::unix::fs::MetadataExt;
+            let mut seen = std::collections::HashSet::new();
+            // Recompute unique inode bytes across root files and managed trees.
+            total_size_bytes = 0;
+            let mut directories = vec![self.root.clone()];
+            file_count = 0;
             while let Some(directory) = directories.pop() {
-                if !directory.exists() {
-                    continue;
-                }
-                for entry in std::fs::read_dir(directory)? {
+                for entry in std::fs::read_dir(&directory)? {
                     let entry = entry?;
                     let meta = entry.path().symlink_metadata()?;
-                    if meta.is_dir() {
+                    if meta.is_dir()
+                        && (directory != self.root
+                            || matches!(
+                                entry.file_name().to_str(),
+                                Some("generations" | "quarantine" | "dsc-members")
+                            ))
+                    {
                         directories.push(entry.path());
                     } else if meta.is_file() {
                         file_count += 1;
-                        total_size_bytes = total_size_bytes.saturating_add(meta.len());
+                        if seen.insert((meta.dev(), meta.ino())) {
+                            total_size_bytes = total_size_bytes.saturating_add(meta.len());
+                        }
                     }
                 }
             }
         }
+
         let mut entry_count = match std::fs::read(self.root.join("index.json")) {
             Ok(bytes) => serde_json::from_slice::<HashMap<String, IdbEntry>>(&bytes)?.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,

@@ -1,6 +1,7 @@
 //! MCP server implementation with IDA Pro tools.
 
 pub mod mcp_socket;
+mod nexus_dsc;
 mod requests;
 pub mod response_cache;
 pub mod socket_listener;
@@ -4334,6 +4335,12 @@ impl IdaMcpServer {
         Parameters(req): Parameters<OpenDscRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: open_dsc");
+        if let ServerMode::Router(router) = &self.mode {
+            if router.uses_nexus() {
+                return self.open_dsc_nexus(router, req).await;
+            }
+        }
+
         let preparation = crate::preprocess::Preparation::new(std::time::Duration::from_secs(3600));
 
         if !Self::validate_path(&req.path) {

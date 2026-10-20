@@ -1,4 +1,5 @@
 //! Prepare a canonical cache input before acquiring any Nexus lease.
+pub mod special;
 #[cfg(test)]
 use crate::idb_store::IdbStore;
 #[cfg(test)]
@@ -201,6 +202,12 @@ pub async fn prepare_n7_open(
     let source = processed
         .as_ref()
         .map_or(path, |stage| stage.output.clone());
+    let classify = source.clone();
+    let path_for_sbpf = preparation
+        .wait(blocking::run(blocking::WorkClass::Prepare, move || {
+            crate::router::is_sbpf_elf(&classify)
+        }))
+        .await?;
     let hash_source = source.clone();
     let preparing = preparation.clone();
     let hash = preparation
@@ -241,7 +248,12 @@ pub async fn prepare_n7_open(
         drop(processed);
         receipt.wait().await?;
     }
-    result
+    let prepared = result?;
+    if path_for_sbpf {
+        special::sbpf(prepared, preparation).await
+    } else {
+        Ok(prepared)
+    }
 }
 
 /// Existing IDBs retain their canonical identity. Raw input is published without

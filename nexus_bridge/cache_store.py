@@ -8,6 +8,8 @@ import math
 import os
 from pathlib import Path
 import shutil
+import stat
+from collections import Counter
 import sys
 import time
 import uuid
@@ -113,6 +115,86 @@ def public_probe(path):
     return None
 
 
+def valid_digest(value):
+    return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
+
+
+def valid_inventory(bundle):
+    return (isinstance(bundle, dict) and 0 < len(bundle) <= 1024
+            and all(isinstance(name, str) and 0 < len(name) <= 255
+                    and name not in ('.', '..') and '/' not in name
+                    and '\\' not in name and '\x00' not in name and valid_digest(digest)
+                    for name, digest in bundle.items()))
+
+
+def unique_bytes(root):
+    seen = set()
+    total = 0
+    for path in root.rglob('*'):
+        meta = path.lstat()
+        if stat.S_ISREG(meta.st_mode) and (meta.st_dev, meta.st_ino) not in seen:
+            seen.add((meta.st_dev, meta.st_ino))
+            total += meta.st_size
+    return total
+
+
+def reclaimable_bytes(group):
+    files = {}
+    links = Counter()
+    for path in group.rglob('*'):
+        meta = path.lstat()
+        if stat.S_ISREG(meta.st_mode):
+            key = (meta.st_dev, meta.st_ino)
+            files[key] = meta
+            links[key] += 1
+    return sum(meta.st_size for key, meta in files.items() if meta.st_nlink == links[key])
+
+
+def private_directory(path):
+    meta = path.lstat()
+    if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.geteuid()
+            or stat.S_IMODE(meta.st_mode) & 0o077):
+        raise ValueError('unsafe DSC object directory')
+
+
+def private_file(path, mode):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        meta = os.fstat(descriptor)
+        named = path.lstat()
+        if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.geteuid()
+                or stat.S_IMODE(meta.st_mode) != mode
+                or mode == 0o600 and (meta.st_nlink != 1 or meta.st_size > 16384)
+                or (named.st_dev, named.st_ino) != (meta.st_dev, meta.st_ino)):
+            raise ValueError('unsafe DSC object file')
+        return descriptor, meta
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def shared_object(root, digest):
+    private_directory(root/'dsc-members')
+    directory = root/'dsc-members'/digest
+    private_directory(directory)
+    if {p.name for p in directory.iterdir()} != {'data', 'verified.json'}:
+        raise ValueError('unknown DSC object contents')
+    receipt_fd, _ = private_file(directory/'verified.json', 0o600)
+    with os.fdopen(receipt_fd) as receipt_file:
+        receipt = json.load(receipt_file)
+    if (not isinstance(receipt, dict) or type(receipt.get('version')) is not int or receipt['version'] != 1
+            or receipt.get('sha256') != digest or not isinstance(receipt.get('identity'), dict)):
+        raise ValueError('invalid DSC object receipt')
+    data_fd, meta = private_file(directory/'data', 0o400)
+    os.close(data_fd)
+    expected = receipt['identity']
+    actual = dict(dev=meta.st_dev, ino=meta.st_ino, size=meta.st_size,
+                  mtime_ns=meta.st_mtime_ns, uid=meta.st_uid, mode=stat.S_IMODE(meta.st_mode))
+    if any(type(expected.get(key)) is not int or expected[key] != value for key, value in actual.items()):
+        raise ValueError('replaced or changed DSC object refused')
+    return directory, meta
+
+
 class Store:
     def __init__(self, root, *, grace=60, epoch=None, probe=public_probe,
                  clock=time.time, hook=lambda *_: None):
@@ -150,7 +232,39 @@ class Store:
         if group.is_symlink() or not group.is_dir():
             return 'generation is not a regular directory'
         allowed = {'input', 'input.i64', 'generation.json', 'quarantine.json'}
+        try:
+            manifest = self.manifest(group)
+        except (OSError, ValueError, TypeError) as error:
+            return f'invalid generation manifest: {error}'
+        bundle = manifest.get('dsc_inputs')
+        if 'dsc_store' in manifest and (type(manifest['dsc_store']) is not int
+                or manifest['dsc_store'] != 1 or not valid_inventory(bundle)):
+            return 'invalid DSC shared reference inventory'
+        if bundle is not None:
+            if not valid_inventory(bundle):
+                return 'invalid retained DSC bundle manifest'
+            directory = group/'dsc-inputs'
+            if directory.is_symlink() or not directory.is_dir():
+                return 'retained DSC bundle is missing or replaced'
+            entries = list(directory.iterdir())
+            if ({p.name for p in entries} != set(bundle)
+                    or any(p.is_symlink() or not p.is_file() for p in entries)):
+                return 'unexpected retained DSC bundle member'
+            if 'dsc_store' in manifest:
+                if type(manifest['dsc_store']) is not int or manifest['dsc_store'] != 1:
+                    return 'unknown DSC shared-store version'
+                try:
+                    for name, digest in bundle.items():
+                        _, shared = shared_object(self.root, digest)
+                        linked = (directory/name).lstat()
+                        if (shared.st_dev, shared.st_ino) != (linked.st_dev, linked.st_ino):
+                            return 'replaced DSC generation hardlink'
+                except (OSError, ValueError, TypeError) as error:
+                    return 'invalid DSC shared member: ' + str(error)
+            allowed.add('dsc-inputs')
         for item in group.iterdir():
+            if item.name == 'dsc-inputs' and bundle is not None:
+                continue
             if item.is_symlink() or not item.is_file() or item.name not in allowed:
                 return 'unexpected or unpacked generation component: ' + item.name
         if not missing and not (group/'input.i64').is_file():
@@ -272,8 +386,56 @@ class Store:
                 self._collect(limit, key, result)
         except BlockingIOError:
             result['rejected'].append({'path':str(self.root), 'reason':'router lease/open/publication or another GC holds cache lock'})
-        result['remaining_bytes'] = sum(p.stat().st_size for p in self.root.rglob('*') if p.is_file() and not p.is_symlink())
+        result['remaining_bytes'] = unique_bytes(self.root)
         return result
+
+    def prune_members(self, result):
+        store = self.root/'dsc-members'
+        if not store.exists() and not store.is_symlink():
+            return
+        rejected = result['rejected']
+        try:
+            private_directory(store)
+            references = Counter()
+            # A malformed/unknown manifest might contain an unobservable reference.
+            # Only member reclamation stops; unrelated generation GC still proceeds.
+            for container in (self.generations, self.quarantine):
+                for group in container.iterdir():
+                    if group.is_symlink() or not group.is_dir():
+                        raise ValueError('unknown generation reference container')
+                    manifest = self.manifest(group)
+                    if 'dsc_store' in manifest:
+                        if type(manifest['dsc_store']) is not int or manifest['dsc_store'] != 1:
+                            raise ValueError('unknown DSC store reference version')
+                        bundle = manifest.get('dsc_inputs')
+                        if not valid_inventory(bundle):
+                            raise ValueError('invalid DSC shared reference inventory')
+                        references.update(bundle.values())
+        except (OSError, ValueError, TypeError) as error:
+            rejected.append({'path': str(store), 'reason': 'DSC members retained: ' + str(error)})
+            return
+        for directory in sorted(store.iterdir()):
+            try:
+                if not valid_digest(directory.name):
+                    raise ValueError('unknown DSC object name')
+                checked, meta = shared_object(self.root, directory.name)
+                if references[directory.name] or meta.st_nlink != 1:
+                    continue
+                # root EX excludes all publishers and link creation; nlink also
+                # protects unpublished staging and hard links outside generations.
+                current = (checked/'data').lstat()
+                if (current.st_dev, current.st_ino, current.st_nlink) != (meta.st_dev, meta.st_ino, 1):
+                    raise ValueError('DSC object identity changed before reclamation')
+                receipt = checked/'verified.json'
+                receipt_size = receipt.lstat().st_size
+                (checked/'data').unlink()
+                receipt.unlink()
+                checked.rmdir()
+                sync_directory(store)
+                result['evicted_files'] += 2
+                result['evicted_bytes'] += meta.st_size + receipt_size
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                rejected.append({'path': str(directory), 'reason': 'DSC object retained: ' + str(error)})
 
     def _collect(self, limit, key, result):
         for directory in (self.generations, self.quarantine):
@@ -285,7 +447,8 @@ class Store:
         if recovery.exists() or recovery.is_symlink():
             rejected.append({'path':str(recovery), 'reason':
                 'recovery snapshots and failed products retained; no automatic deletion proof'})
-        total = sum(p.stat().st_size for p in self.root.rglob('*') if p.is_file() and not p.is_symlink())
+        self.prune_members(result)
+        total = unique_bytes(self.root)
         budget = max(0, total - limit)
         planned = 0
         # Recovery always precedes new isolation, including explicit clean.
@@ -296,7 +459,7 @@ class Store:
                 if key is not None and self.manifest(isolated)['key'] != key:
                     continue
                 files = list(isolated.iterdir())
-                size = sum(p.stat().st_size for p in files if p.is_file())
+                size = reclaimable_bytes(isolated)
                 with self.target_gate(isolated):
                     if self.retire(isolated, rejected, allow_delete=key is not None or budget > 0):
                         result['evicted_groups'] += 1
@@ -318,9 +481,10 @@ class Store:
                     self.isolate(group, rejected)
                     isolated = self.quarantine/group.name
                     if isolated.exists() and not group.exists():
-                        planned += sum(p.stat().st_size for p in isolated.iterdir() if p.is_file())
+                        planned += reclaimable_bytes(isolated)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
                 rejected.append({'path':str(group), 'reason':'generation retained: ' + str(error)})
+        self.prune_members(result)
         for legacy in self.root.glob('*.i64'):
             rejected.append({'path':str(legacy), 'reason':'legacy flat group has no atomic directory container; retained'})
 

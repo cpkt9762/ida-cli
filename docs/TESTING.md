@@ -1799,3 +1799,80 @@ N8 工具返修的 R5 receiver 回归保持每个 socket 读取 2s 屏障。独�
 feature lib 的既有维护夹具还需要私有 `IDA_NEXUS_STATE_DIR`、`R3A_CASE_ROOT`、
 `R3F1_SAMPLE`、静态测试 telemetry，以及 `R4_BASELINE_SOURCE` 指向固定
 `5d8a215f92b4405e6db99af8e7f86c72ae95861f` 的 v1 producer 源码归档。
+
+### N7b real sBPF and DSC directed cases
+
+`nexus_n7b_e2e` has three independent exact cases: E24 first build/query/decompile/
+cached reopen, E24 cancellation inside real sbx-launched IDAPython, and E25 new DSC
+build/existing database/cached reopen. Each needs a fresh prepared environment,
+`IDA_TEST=1`, its `rust-env.json`, private home/state/tmp/IPC, and explicit
+`N7B_SBPF_SAMPLE` or `N7B_DSC_SAMPLE`. Samples remain read-only; sBPF is copied.
+Use `N7B_E2E_BINARY` to name this checkout's absolute release binary for large DSC
+inputs. It must exist; a supplied invalid path never selects another binary.
+
+The DSC case selects `/usr/lib/system/libsystem_blocks.dylib`, adds
+`libsystem_kernel.dylib` through Nexus, and retains the complete input bundle for
+later dscu operations. The current system cache has about 6.56 GiB of companions.
+Its source/member hashes and loader selection determine a distinct content key;
+all copies, build and index publication use the existing root/content/open locks.
+The retained `dsc-inputs` inventory is declared in `generation.json`; GC rejects
+unexpected members, symlinks and incomplete packed groups. Legacy adjacent IDBs
+and direct existing IDBs keep their original identity.
+
+Run one exact case per fresh root, with before/after uptime. Ordinary real cases
+use shell `timeout 180s`; allow `timeout 360s` for E25's complete bundle integrity,
+offline IDA build and repeated loads (inner driver330s). No complete E2E matrix is
+implied. Missing runtime/sample is a failure, never an ignored pass. Each driver
+writes `<case>-result.json` and must finish with PASS plus cleanup CLEAN; the
+Rust wrapper also requires one passed test and zero failures/ignored cases.
+The cancel case blocks actual IDAPython on a FIFO, then requires confirmed stop,
+exact sbx/idat identities gone, no output or staging/temp inputs, and a healthy
+second library. It does not replace sbx/idat with a fake compiler.
+
+`nexus_n7b` separately checks capability admission, generated offline-plugin
+failure and task-owned temporary files. `test_nexus_n7b_cache.py` covers the
+strict bundle inventory. These are deterministic contracts, not real E24/E25.
+N7b delivery and independent acceptance are recorded in the external report.
+
+N7b fix1 stores new DSC members once as private, non-overwriting SHA256 objects
+under `dsc-members/<digest>/{data,verified.json}`. The data mode is 0400; each
+`dsc-inputs/<loader-name>` is a same-volume hard link. Existing content identities
+and the loader's generation path do not change. Old private-copy generations
+remain readable and are not rewritten while they may be in use. Root SH plus
+module-content EX remain; one additional member-store EX serializes publishing
+and verification records. Under root EX, GC derives reference counts from all
+generation/quarantine manifests and also requires nlink=1 before deleting an
+unreferenced object. Unknown manifests, files, replacements or extra links retain
+objects. Byte accounting deduplicates inodes.
+
+Source SHA256 records bind dev/ino/size/mtime_ns/ctime_ns plus uid/mode/nlink.
+Unchanged FD and path metadata allow reuse; changed source metadata requires a
+new hash, while changes during reading or a symlink are refused. New immutable
+objects bind the same fields to their write-time verified digest. A replaced
+private inode/data binding is refused. Other namespace/ctime changes force hash
+verification; serialized internal hard-link creation can refresh the binding
+only while the same read-only FD/data/mtime binding remains unchanged. GC unlink
+changes will therefore require verification on the next use. Old private-copy
+inputs use the metadata-bound source cache after their first validation too.
+Corrupt records, unsafe memo/receipt replacements and inconsistent data bindings
+fail explicitly, without silently rebuilding them. This assumes the private cache and kernel
+metadata are trusted; it does not defend against a same-privilege actor forging
+verification records or kernel metadata.
+
+`nexus_n7b_fix1` uses a controlled offline IDA boundary to prove that distinct
+module generations share member inodes and refuse unknown objects. The unit
+`nb2_regressions` and `storage::tests` cover unchanged metadata, source inode
+replacement, timestamp-only changes, restored mtime after a write, private inode
+replacement and forced verification after link changes. The payload-read counter
+exists only in unit tests. `test_nexus_n7b_shared.py` exercises real filesystem
+links/locks with a no-owner probe boundary, including last-reference reclamation,
+unknown manifests, symlinks and unfinished/external references. These fixtures do
+not claim native IDA or N1 owner proofs. The real E25 driver separately records
+functional new-build/cache-hit intervals and unique/allocated cache bytes; it
+adds no benchmark framework. Use short fresh environment names for SUN_LEN.
+
+Metadata reuse is qualified for local APFS on macOS and ext4/XFS/Btrfs/tmpfs on
+Linux. Other source/cache filesystems retain complete hashing with a diagnostic;
+failed filesystem qualification is an error. Coarse or remotely cached timestamps
+therefore cannot authorize a hash hit. Linux qualification is implementation
+policy only; this delivery's real E25 evidence remains macOS/APFS.

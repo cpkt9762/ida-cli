@@ -552,6 +552,16 @@ impl RouterState {
     ) {
         self.nexus_tools.close_token_detailed(self, token).await
     }
+    pub(crate) async fn open_nexus_dsc(
+        &self,
+        path: &str,
+        config: nexus_bridge::cache::special::DscInput,
+        preparation: crate::preprocess::Preparation,
+    ) -> Result<(String, String), crate::error::ToolError> {
+        self.nexus_tools
+            .open_dsc(self, path, preparation, config)
+            .await
+    }
     pub async fn nexus_open_details(
         &self,
         handle: &str,

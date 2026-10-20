@@ -380,13 +380,15 @@ impl Tools {
         }
     }
     pub fn require_tool(method: &str) -> Result<(), ToolError> {
-        if method == "list_idbs" {
+        if matches!(method, "list_idbs" | "open_dsc") {
             return Ok(());
         }
         // These existing MCP adapters generate Python and route run_script.
         // Database execution still passes the same Execute capability check.
-        if matches!(method, "decompile_structured" | "search_structs")
-            || (method.starts_with("dbg_") && crate::tool_registry::get_tool(method).is_some())
+        if matches!(
+            method,
+            "decompile_structured" | "search_structs" | "dsc_add_dylib" | "dsc_add_region"
+        ) || (method.starts_with("dbg_") && crate::tool_registry::get_tool(method).is_some())
         {
             Self::require("run_script")
         } else if matches!(
@@ -412,6 +414,28 @@ impl Tools {
         path: &str,
         preparation: Preparation,
         refresh: bool,
+    ) -> Result<(String, String), ToolError> {
+        self.open_input(router, path, preparation, refresh, None)
+            .await
+    }
+    pub async fn open_dsc(
+        self: &Arc<Self>,
+        router: &RouterState,
+        path: &str,
+        preparation: Preparation,
+        config: super::nexus_bridge::cache::special::DscInput,
+    ) -> Result<(String, String), ToolError> {
+        config.validate()?;
+        self.open_input(router, path, preparation, false, Some(config))
+            .await
+    }
+    async fn open_input(
+        self: &Arc<Self>,
+        router: &RouterState,
+        path: &str,
+        preparation: Preparation,
+        refresh: bool,
+        dsc: Option<super::nexus_bridge::cache::special::DscInput>,
     ) -> Result<(String, String), ToolError> {
         if let Some(bridge) = router.nexus_bridge.get() {
             self.consume_released(bridge);
@@ -443,7 +467,7 @@ impl Tools {
         let task_id = CURRENT_TASK_ID.try_with(Clone::clone).ok();
         tokio::spawn(async move {
             let _permit = permit;
-            let work = tools.open_owned(&router, path, preparation, refresh);
+            let work = tools.open_owned(&router, path, preparation, refresh, dsc);
             let result = match task_id {
                 Some(task_id) => CURRENT_TASK_ID.scope(task_id, work).await,
                 None => work.await,
@@ -480,37 +504,46 @@ impl Tools {
         path: PathBuf,
         preparation: Preparation,
         refresh: bool,
+        dsc: Option<super::nexus_bridge::cache::special::DscInput>,
     ) -> Result<(String, String), ToolError> {
         let accepted = accepted("open", json!({"timeout_secs":120}), &preparation)?;
-        let (canonical, sbpf) = preparation
+        let canonical = preparation
             .wait(crate::blocking::run(
                 crate::blocking::WorkClass::Prepare,
                 move || {
                     let canonical = path
                         .canonicalize()
                         .map_err(|e| ToolError::InvalidPath(format!("{}: {e}", path.display())))?;
-                    Ok::<_, ToolError>((canonical, super::is_sbpf_elf(&path)))
+                    Ok::<_, ToolError>(canonical)
                 },
             ))
             .await??;
-        if sbpf {
-            return Err(ToolError::NotSupported(
-                "Nexus sBPF preparation belongs to N7".into(),
-            ));
-        }
         let gate = self.path_gate(&canonical);
         let mut path_guard = Some(preparation.wait(async { Ok(gate.lock().await) }).await?);
         let cache_guard =
             super::nexus_bridge::cache_lock::acquire(&crate::idb_store::idb_root(), &preparation)
                 .await?;
         self.wait_draining(router, &canonical, &preparation).await?;
-        let mut prepared = super::nexus_bridge::cache::prepare_n7_open(
-            canonical.clone(),
-            crate::idb_store::idb_root(),
-            &preparation,
-            refresh,
-        )
-        .await?;
+        let mut prepared = match dsc {
+            Some(config) => {
+                super::nexus_bridge::cache::special::prepare(
+                    canonical.clone(),
+                    crate::idb_store::idb_root(),
+                    config,
+                    &preparation,
+                )
+                .await?
+            }
+            None => {
+                super::nexus_bridge::cache::prepare_n7_open(
+                    canonical.clone(),
+                    crate::idb_store::idb_root(),
+                    &preparation,
+                    refresh,
+                )
+                .await?
+            }
+        };
         let open_guard = super::nexus_bridge::cache_lock::acquire_open(
             &crate::idb_store::idb_root(),
             &prepared.path,
@@ -1761,7 +1794,6 @@ mod n4_fix_regressions {
             "get_task_status",
             "convert_number",
         ];
-        let n7 = ["open_dsc", "dsc_add_dylib", "dsc_add_region"];
         let mut count = 0;
         for tool in crate::tool_registry::all_tools() {
             count += 1;
@@ -1772,15 +1804,7 @@ mod n4_fix_regressions {
                     continue;
                 }
                 let result = Tools::require_tool(primary);
-                if n7.contains(&primary) {
-                    let error = result.expect_err("N7 must reject before execution");
-                    assert!(
-                        error.to_string().contains("no legacy fallback"),
-                        "{name}: {error}"
-                    );
-                } else {
-                    result.unwrap_or_else(|e| panic!("{name} missing Nexus path: {e}"));
-                }
+                result.unwrap_or_else(|e| panic!("{name} missing Nexus path: {e}"));
             }
         }
         assert_eq!(count, 107);
@@ -1794,13 +1818,7 @@ mod n4_fix_regressions {
                 }
             }
         }
-        for method in [
-            "unknown_n6",
-            "dbg_unknown_n6",
-            "open_dsc",
-            "dsc_add_dylib",
-            "dsc_add_region",
-        ] {
+        for method in ["unknown_n6", "dbg_unknown_n6"] {
             assert!(Tools::require_tool(method).is_err(), "must reject {method}");
         }
     }
