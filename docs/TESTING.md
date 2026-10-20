@@ -1949,3 +1949,10 @@ This isolates macOS first-execution delay from the unchanged 1s product budget.
 Expiry, rollback guidance and exact PID ESRCH assertions are retained. Directed
 qualification runs that exact test 20 consecutive times against unchanged test
 and product binaries, recording each command's uptime; no retry selects a pass.
+
+Normal shutdown retains the existing bridge until the released paths' physical
+owner proofs and the bridge/helper retirement counts converge, within a shared
+15s wait. It observes the existing protocol and does not stop external owners.
+Busy lease release still fails before this wait. Pending or blocked observations
+return CancelPending with the bridge retained; no unproved cleanup is called
+success. E27 exercises this path without a preparatory close command.

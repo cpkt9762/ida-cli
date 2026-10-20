@@ -905,6 +905,54 @@ impl NexusBridge {
     pub async fn status(&self, id: &str) -> anyhow::Result<()> {
         send(&self.control, &json!({"local_status":id})).await
     }
+    pub(crate) async fn wait_shutdown_ready(
+        &self,
+        preparation: &crate::preprocess::Preparation,
+    ) -> Result<(), crate::error::ToolError> {
+        loop {
+            let resources_empty = self
+                .state
+                .custody_resources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            let startups_empty = self
+                .state
+                .startups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            let retirements_empty = self
+                .state
+                .custody_retirements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            let helper_empty = self.state.helper.as_ref().is_none_or(|helper| {
+                let status = helper.status_snapshot();
+                let snapshot = &status["snapshot"];
+                snapshot.is_object()
+                    && ["used", "parent_count", "live_ref_bytes"]
+                        .iter()
+                        .all(|field| snapshot[field] == 0)
+                    && status["file_jobs_pending"] == 0
+            });
+            if resources_empty && startups_empty && retirements_empty && helper_empty {
+                return Ok(());
+            }
+            if preparation.check().is_err() {
+                return Err(NexusError::new(NexusErrorCode::CancelPending,
+                    "shutdown waits for existing custody retirement and helper observations; bridge retained").into());
+            }
+            tokio::time::sleep_until(
+                preparation
+                    .deadline
+                    .min(std::time::Instant::now() + Duration::from_millis(20))
+                    .into(),
+            )
+            .await;
+        }
+    }
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.lifetime.lock().await.take();
         let mut child = self.child.lock().await;

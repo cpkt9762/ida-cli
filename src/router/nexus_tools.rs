@@ -1104,11 +1104,23 @@ impl Tools {
         (result.map(|_| ()), lifecycle)
     }
     pub async fn shutdown(self: &Arc<Self>, router: &RouterState) -> Result<(), ToolError> {
-        let tokens: Vec<_> = self.records().values().map(|db| db.token.clone()).collect();
-        for token in tokens {
-            self.close_token(router, &token).await?;
+        let records: Vec<_> = self
+            .records()
+            .values()
+            .map(|db| (db.token.clone(), db.path.clone()))
+            .collect();
+        for (token, _) in &records {
+            self.close_token(router, token).await?;
+        }
+        // A lease ACK does not finish the existing physical-owner retirement.
+        // Keep the bridge available for those proofs before asking its helper
+        // to finish. Busy release still returns above without stopping work.
+        let preparation = Preparation::new(Duration::from_secs(15));
+        for (_, path) in records {
+            self.wait_draining(router, &path, &preparation).await?;
         }
         if let Some(bridge) = router.nexus_bridge.get() {
+            bridge.wait_shutdown_ready(&preparation).await?;
             bridge.shutdown().await.map_err(diagnostic)?;
         }
         Ok(())
