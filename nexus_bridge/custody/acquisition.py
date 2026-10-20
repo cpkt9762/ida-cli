@@ -9,7 +9,7 @@ from owner_identity import owner_key, state_identity
 from custody_process_identity import capture
 from proof_helper import request
 from target_coordination import Target, canonical, digest
-from target_journal import Journal, OwnerDraining, ObservationPending
+from target_journal import Journal, OwnerDraining, ObservationPending, StartupPending
 
 
 class CleanupPending(TimeoutError):
@@ -126,7 +126,7 @@ class Custodian:
                 Journal(self.target).gate(self.helper['state_root'],
                     self.acquisition if cleanup_owner is not None else acquisition, cleanup_owner=cleanup_owner)
                 return
-            except (OwnerDraining, ObservationPending) as exc:
+            except (OwnerDraining, ObservationPending, StartupPending) as exc:
                 self.unlock_target()
                 remaining = self.deadline-time.monotonic()
                 if remaining <= 0:

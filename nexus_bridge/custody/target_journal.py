@@ -24,6 +24,10 @@ class OwnerDraining(RuntimeError):
     """A confirmed last ACK retains its physical owner until public proof."""
 
 
+class StartupPending(RuntimeError):
+    """Another exact launch must finish or settle before a new resolution."""
+
+
 class ObservationPending(RuntimeError):
     """An immutable producer has not finished publishing its reserved fact."""
 
@@ -276,7 +280,7 @@ class Journal:
             if item.get('detach_outcome', {}).get('ack_kind') == 'last' and not item.get('proof') and not cleanup:
                 raise OwnerDraining('OwnerDraining: last ACK recorded; public owner proof pending')
             if item.get('launch') and not item.get('transferred') and item['acquisition'] != acquisition:
-                raise RuntimeError('StartupUnconfirmed: exact launch responsibility pending')
+                raise StartupPending('StartupUnconfirmed: exact launch responsibility pending')
             if item.get('owner') and not item.get('proof'):
                 if state_root is None or item['owner']['state_root'] != state_root:
                     raise RuntimeError('ObservationRecoveryBlocked: unresolved owner in another state root')

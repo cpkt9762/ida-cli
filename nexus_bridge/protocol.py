@@ -15,7 +15,8 @@ def verify_client():
     import ida_nexus
     versions=[importlib.metadata.version(name) for name in ('ida-nexus','ida-domain')]
     if versions != ['0.13.4','0.5.1']:
-        raise ValueError('ProtocolMismatch: fixed Nexus 0.13.4/Domain 0.5.1 required')
+        raise ValueError('ProtocolMismatch: fixed Nexus 0.13.4/Domain 0.5.1 required; '
+                         + f'actual Nexus {versions[0]}/Domain {versions[1]}')
     package=Path(ida_nexus.__file__).resolve().parent
     modules={}
     for name,expected in SDK_FILES.items():

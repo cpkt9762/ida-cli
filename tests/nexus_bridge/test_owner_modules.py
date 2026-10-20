@@ -45,6 +45,24 @@ class OwnerModules(unittest.TestCase):
         self.assertEqual(classify(SOURCES,cleanup=False),'current')
         self.assertEqual(classify(SOURCES,cleanup=True),'current')
 
+    def test_complete_production_slice_namespace_remains_current_after_first_slice(self):
+        from bridge import SLICE_SOURCE, OWNER_SOURCES
+        self.install()
+        module = types.ModuleType(NAMES[2])
+        exec(compile(SLICE_SOURCE, '<production-slice>', 'exec'), vars(module))
+        sys.modules[NAMES[2]] = module
+        self.assertEqual(classify(OWNER_SOURCES, cleanup=False), 'current')
+        # A second freshly inspected namespace must agree with the first actual
+        # install as well as reuse of the already present release module.
+        second = types.ModuleType(NAMES[2])
+        exec(compile(SLICE_SOURCE, '<production-slice-reuse>', 'exec'), vars(second))
+        sys.modules[NAMES[2]] = second
+        self.assertEqual(classify(OWNER_SOURCES, cleanup=False), 'current')
+        sys.modules.pop(NAMES[1])
+        with self.assertRaisesRegex(RuntimeError, 'missing slices release dependency'):
+            classify(OWNER_SOURCES, cleanup=False)
+        self.assertNotIn(NAMES[1], sys.modules, 'inspection must not install a missing dependency')
+
     def test_changed_code_signature_defaults_dependencies_and_hook_never_execute(self):
         for fault in ('code','parameter','default','dependency','hook','extra','constant','missing'):
             with self.subTest(fault=fault):

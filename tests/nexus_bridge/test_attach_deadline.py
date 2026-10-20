@@ -108,6 +108,7 @@ class RetirementAck(unittest.TestCase):
         stopped, progress = threading.Event(), threading.Event()
         listener = socket.socket(socket.AF_UNIX)
         listener.bind(str(path))
+        bound = path.lstat()
         listener.listen(1)
         ack = {'event':event,'receipt':{'watch':'same-watch','evidence':'x'*200000}}
         def receive(channel, message):
@@ -150,5 +151,8 @@ class RetirementAck(unittest.TestCase):
             peer.close()
             channel.socket.close()
             listener.close()
+            current = path.lstat()
+            self.assertEqual((current.st_dev, current.st_ino), (bound.st_dev, bound.st_ino))
+            path.unlink()  # The exact local listener created and closed above.
             self.assertFalse(channel.reader.is_alive(),'control reader did not naturally stop')
             self.assertFalse(channel.writer.is_alive(),'control writer did not naturally stop')

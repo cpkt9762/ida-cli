@@ -95,7 +95,10 @@ SLICE_SOURCE = ("import sys, types\n"
     "    _release_module = types.ModuleType('_ida_cli_release_protocol_v1')\n"
     f"    exec({RELEASE_SOURCE!r}, _release_module.__dict__)\n"
     "    sys.modules['_ida_cli_release_protocol_v1'] = _release_module\n"
+    "_release_module = sys.modules['_ida_cli_release_protocol_v1']\n"
     + module_source("slices.py"))
+# Match the complete compiled installation, including its import context.
+OWNER_SOURCES["_ida_cli_nexus_slices_v1"] = SLICE_SOURCE
 SLICE_METHODS = {"batch_decompile", "search_pseudocode", "run_auto_analysis", "batch_rename", "_n5_cleanup"}
 
 

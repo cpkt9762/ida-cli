@@ -125,6 +125,8 @@ LEGACY = {'ida': '9.5', 'modules': {'_ida_cli_nexus_slices_v1': {'dependencies':
 def current_module(name, source, actual):
     expected = types.ModuleType(name)
     if name == NAMES[2]:
+        if NAMES[1] not in sys.modules:
+            raise ValueError('missing slices release dependency')
         vars(expected).update(sys=sys, types=types,
             _release_module=sys.modules.get(NAMES[1]))
     exec(compile(source, '<known-current-owner>', 'exec'), vars(expected))
