@@ -94,10 +94,7 @@ fn auto_start_server() -> Result<(), String> {
             .try_wait()
             .map_err(|error| format!("Cannot observe Nexus daemon startup: {error}"))?
         {
-            return Err(format!(
-                "Nexus daemon exited during startup ({status}); check IDA_NEXUS_PYTHON and its runtime dependencies; see {}",
-                crate::idb_store::log_path().display()
-            ));
+            return startup_child_exited(status, read_discovery_file());
         }
         if read_discovery_file().is_some() {
             eprintln!("Server ready ({:.1}s)", (i + 1) as f64 * 0.25);
@@ -106,4 +103,31 @@ fn auto_start_server() -> Result<(), String> {
     }
 
     Err("Server did not become ready within 10s".into())
+}
+
+fn startup_child_exited(
+    status: std::process::ExitStatus,
+    discovered: Option<PathBuf>,
+) -> Result<(), String> {
+    if discovered.is_some() {
+        return Ok(());
+    }
+    Err(format!("Nexus daemon exited during startup ({status}); check IDA_NEXUS_PYTHON and its runtime dependencies; see {}",
+        crate::idb_store::log_path().display()))
+}
+
+#[cfg(all(test, unix))]
+mod startup_exit_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn independently_ready_daemon_wins_over_failed_contending_child() {
+        let exited = std::process::ExitStatus::from_raw(1 << 8);
+        startup_child_exited(exited, Some(PathBuf::from("private-ready-socket")))
+            .expect("discovery is rechecked after observing child exit");
+        let error = startup_child_exited(exited, None).expect_err("no ready daemon");
+        assert!(error.contains("exit status: 1"), "{error}");
+        assert!(error.contains("Nexus daemon exited"), "{error}");
+    }
 }
