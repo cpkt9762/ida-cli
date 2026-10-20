@@ -262,7 +262,7 @@ impl Tools {
                 .or_default()
                 .push((handle, db));
         }
-        let active = records.keys().max();
+        let active = records.iter().max_by_key(|(_, db)| db.opened_at).map(|(handle, _)| handle);
         let mut idbs = Vec::new();
         for mut group in groups.into_values() {
             group.sort_by_key(|(handle, db)| (db.opened_at, *handle));
@@ -314,7 +314,7 @@ impl Tools {
     }
 
     pub fn active(&self) -> Option<String> {
-        self.handles().into_iter().max()
+        self.records().iter().max_by_key(|(_, db)| db.opened_at).map(|(handle, _)| handle.clone())
     }
     pub fn handle_for_token(&self, token: &str) -> Option<String> {
         self.records()

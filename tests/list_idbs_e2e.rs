@@ -476,7 +476,8 @@ fn list_idbs_follows_two_clients_through_a_real_daemon() {
 
     // A second client takes a reference on b's database: still one entry, two holders.
     let (shared_handle, shared_token) = client_a.open_idb(&beta);
-    assert_eq!(shared_handle, handle_b);
+    assert_ne!(shared_handle, handle_b, "Nexus opens hold distinct lease handles");
+    assert_ne!(shared_token, token_b, "independent close authority");
     let (shared, shared_text) = client_b.list_idbs();
     record("a also opened beta", "mcp (as b)", &shared);
     assert_eq!(shared["count"], 1);
