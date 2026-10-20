@@ -24,7 +24,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tokio::sync::Notify;
 use tower_service::Service;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter, Layer};
@@ -679,23 +678,87 @@ fn run_cli(args: ida_mcp::cli::CliArgs) -> anyhow::Result<()> {
     rt.block_on(ida_mcp::cli::run(args))
 }
 
-async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigint = signal(SignalKind::interrupt())?;
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {})
+    }
+
+    async fn recv(&mut self) -> anyhow::Result<()> {
+        #[cfg(unix)]
         tokio::select! {
-            _ = sigint.recv() => {},
-            _ = tokio::signal::ctrl_c() => {},
+            _ = self.interrupt.recv() => {},
+            _ = self.terminate.recv() => {},
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await?;
+        Ok(())
+    }
+}
+
+async fn shutdown_with_deadline(
+    shutdown: impl std::future::Future<Output = Result<(), ida_mcp::error::ToolError>>,
+    budget: Duration,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(budget, shutdown).await.map_err(|_| {
+        anyhow::anyhow!("CancelPending: signal shutdown exceeded its total deadline")
+    })??;
+    Ok(())
+}
+
+async fn handle_shutdown_signals(
+    mut signals: ShutdownSignals,
+    router: ida_mcp::router::RouterState,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = signals.recv() => {
+                if let Err(error) = result {
+                    warn!(target: "ida_mcp::shutdown", %error, "Shutdown signal listener failed; use ida-cli shutdown");
+                    return;
+                }
+            }
+        }
+        info!(target: "ida_mcp::shutdown", "Shutdown signal received");
+        match shutdown_with_deadline(router.shutdown_nexus(), Duration::from_secs(30)).await {
+            Ok(()) => {
+                // Only a confirmed shutdown may stop the public listeners.
+                cancel.cancel();
+                return;
+            }
+            Err(error) => warn!(target: "ida_mcp::shutdown", %error,
+                "Signal shutdown refused; service retained. Complete/cancel active work, inspect status and helper-state.json, then retry ida-cli shutdown or the signal; do not replay unknown outcomes"),
         }
     }
+}
 
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await?;
-    }
-
-    Ok(())
+#[tokio::test]
+async fn signal_shutdown_deadline_reports_pending_without_false_success() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        shutdown_with_deadline(std::future::pending(), Duration::from_millis(10)),
+    )
+    .await
+    .expect("the total signal shutdown budget must be bounded");
+    let error = result.expect_err("unsettled custody cannot report shutdown success");
+    assert!(error.to_string().contains("CancelPending"));
 }
 
 fn run_server(args: ServeArgs) -> anyhow::Result<()> {
@@ -729,7 +792,6 @@ fn run_server_multi() -> anyhow::Result<()> {
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
-        libc::signal(libc::SIGTERM, libc::SIG_IGN);
     }
 
     let router = ida_mcp::router::RouterState::new()?;
@@ -740,7 +802,8 @@ fn run_server_multi() -> anyhow::Result<()> {
             .build()
             .expect("Failed to create tokio runtime");
 
-        rt.block_on(async move {
+        let result = rt.block_on(async move {
+            let signals = ShutdownSignals::new()?;
             router.initialize_nexus().await?;
             let _ = std::fs::write(
                 ida_mcp::idb_store::pid_path(),
@@ -757,7 +820,6 @@ fn run_server_multi() -> anyhow::Result<()> {
 
             let cancel = tokio_util::sync::CancellationToken::new();
             let socket_path = ida_mcp::idb_store::socket_path();
-            let socket_path_cleanup = socket_path.clone();
             let router_for_socket = router.clone();
             let cancel_for_socket = cancel.clone();
             tokio::spawn(async move {
@@ -772,36 +834,21 @@ fn run_server_multi() -> anyhow::Result<()> {
                 }
             });
 
+            tokio::spawn(handle_shutdown_signals(
+                signals,
+                router.clone(),
+                cancel.clone(),
+            ));
             let sanitized = ida_mcp::server::SanitizedIdaServer(server);
-            let mut service = Some(sanitized.serve(stdio()).await?);
-            let shutdown_notify = Arc::new(Notify::new());
-            let shutdown_signal = shutdown_notify.clone();
-            let router_for_signal = router.clone();
-            let cancel_for_signal = cancel.clone();
-
-            tokio::spawn(async move {
-                if wait_for_shutdown_signal().await.is_ok() {
-                    info!("Shutdown signal received (router mode)");
-                    router_for_signal.shutdown_all().await;
-                    // Cancel first so the socket listener stops accepting,
-                    // then remove the unix socket files last to avoid racing
-                    // with an in-flight connection attempt.
-                    cancel_for_signal.cancel();
-                    ida_mcp::server::socket_listener::cleanup_socket_files(&socket_path_cleanup);
-                    shutdown_signal.notify_one();
-                }
-            });
-
-            let cancel_watch = cancel.clone();
-            let shutdown_signal_cancel = shutdown_notify.clone();
-            tokio::spawn(async move {
-                cancel_watch.cancelled().await;
-                shutdown_signal_cancel.notify_one();
-            });
+            // An uninitialized stdio peer must not prevent signal shutdown.
+            let mut service = tokio::select! {
+                result = sanitized.serve(stdio()) => Some(result?),
+                _ = cancel.cancelled() => None,
+            };
 
             loop {
                 tokio::select! {
-                    _ = shutdown_notify.notified() => {
+                    _ = cancel.cancelled() => {
                         if let Some(mut running) = service.take() {
                             let _ = running.close().await?;
                         }
@@ -826,7 +873,11 @@ fn run_server_multi() -> anyhow::Result<()> {
                 &ida_mcp::idb_store::socket_path(),
             );
             Ok::<_, anyhow::Error>(())
-        })
+        });
+        // Tokio stdin uses an uncancellable blocking read. A peer which never
+        // completes MCP initialization must not hold runtime destruction open.
+        rt.shutdown_timeout(Duration::from_secs(1));
+        result
     });
 
     match server_handle.join() {
@@ -856,7 +907,6 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
-        libc::signal(libc::SIGTERM, libc::SIG_IGN);
     }
 
     let bind_addr: SocketAddr = args
@@ -867,15 +917,16 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     let router = ida_mcp::router::RouterState::new()?;
 
     let router_for_factory = router.clone();
-    let router_for_shutdown = router.clone();
     let router_for_final = router.clone();
     let router_for_mcp_socket = router.clone();
-    let server_handle = thread::spawn(move || -> anyhow::Result<()> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
+    let server_handle =
+        thread::spawn(move || -> anyhow::Result<()> {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
 
-        rt.block_on(async move {
+            rt.block_on(async move {
+            let signals = ShutdownSignals::new()?;
             router.initialize_nexus().await?;
             let _ = std::fs::write(
                 ida_mcp::idb_store::pid_path(),
@@ -944,7 +995,6 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             );
 
             let socket_path = ida_mcp::idb_store::socket_path();
-            let socket_path_cleanup = socket_path.clone();
             let router_for_socket = router.clone();
             let cancel_for_socket = cancel.clone();
             tokio::spawn(async move {
@@ -977,16 +1027,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 }
             });
 
-            let cancel_for_shutdown = cancel.clone();
-            let router_for_signal = router_for_shutdown.clone();
-            tokio::spawn(async move {
-                if wait_for_shutdown_signal().await.is_ok() {
-                    info!("Shutdown signal received");
-                    router_for_signal.shutdown_all().await;
-                    ida_mcp::server::socket_listener::cleanup_socket_files(&socket_path_cleanup);
-                    cancel_for_shutdown.cancel();
-                }
-            });
+            tokio::spawn(handle_shutdown_signals(signals, router.clone(), cancel.clone()));
 
             loop {
                 tokio::select! {
@@ -1013,7 +1054,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
         })
-    });
+        });
 
     let server_result = match server_handle.join() {
         Ok(result) => result,
