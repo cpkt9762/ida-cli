@@ -169,6 +169,38 @@ struct State {
     stop: tokio_util::sync::CancellationToken,
 }
 impl State {
+    fn observations_empty(&self) -> bool {
+        let resources_empty = self
+            .custody_resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        let startups_empty = self
+            .startups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        let retirements_empty = self
+            .custody_retirements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            || self
+                .bridge_exit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+        let helper_empty = self.helper.as_ref().is_none_or(|helper| {
+            let status = helper.status_snapshot();
+            let snapshot = &status["snapshot"];
+            snapshot.is_object()
+                && ["used", "parent_count", "live_ref_bytes"]
+                    .iter()
+                    .all(|field| snapshot[field] == 0)
+                && status["file_jobs_pending"] == 0
+        });
+        resources_empty && startups_empty && retirements_empty && helper_empty
+    }
     /// Known save refusal is independent of sideband persistence and physical
     /// release. Call only after the exact observation/terminal is authorized.
     fn remember_save_guard_error(
@@ -730,6 +762,28 @@ impl NexusBridge {
                 if let Err(error) = custody_wire::proofs(&state, &proof_writer).await {
                     tracing::warn!(%error, "owner observation retained; proof custody not complete");
                 }
+                // EOF/Drop owns no caller to request finish. Exact waitpid plus
+                // empty custody/helper state authorizes only our helper's exit.
+                if state.failed.load(std::sync::atomic::Ordering::Acquire)
+                    && state
+                        .bridge_exit
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some()
+                    && state.observations_empty()
+                {
+                    if let Some(helper) = &state.helper {
+                        match helper.finish().await {
+                            Ok(()) => {
+                                state.observer_stop.cancel();
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "closed bridge helper retirement pending")
+                            }
+                        }
+                    }
+                }
             }
         });
         let ticking = state.clone();
@@ -910,36 +964,35 @@ impl NexusBridge {
         preparation: &crate::preprocess::Preparation,
     ) -> Result<(), crate::error::ToolError> {
         loop {
-            let resources_empty = self
-                .state
-                .custody_resources
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty();
-            let startups_empty = self
-                .state
-                .startups
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty();
-            let retirements_empty = self
-                .state
-                .custody_retirements
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty();
-            let helper_empty = self.state.helper.as_ref().is_none_or(|helper| {
-                let status = helper.status_snapshot();
-                let snapshot = &status["snapshot"];
-                snapshot.is_object()
-                    && ["used", "parent_count", "live_ref_bytes"]
-                        .iter()
-                        .all(|field| snapshot[field] == 0)
-                    && status["file_jobs_pending"] == 0
-            });
-            if resources_empty && startups_empty && retirements_empty && helper_empty {
+            if let Some(helper) = &self.state.helper {
+                if !helper.is_finished() {
+                    tokio::time::timeout_at(
+                        preparation.deadline.into(),
+                        helper.call(json!({"kind":"heartbeat", "summary_only":true})),
+                    )
+                    .await
+                    .map_err(|_| {
+                        NexusError::new(
+                            NexusErrorCode::CancelPending,
+                            "shutdown observation deadline expired; bridge retained",
+                        )
+                    })?
+                    .map_err(|error| {
+                        NexusError::new(
+                            NexusErrorCode::CancelPending,
+                            format!(
+                                "shutdown helper observation unconfirmed: {error}; bridge retained"
+                            ),
+                        )
+                    })?;
+                }
+            }
+            if self.state.observations_empty() {
                 return Ok(());
             }
+            #[cfg(test)]
+            self.state
+                .emit(json!({"event":"shutdown_observations_pending"}));
             if preparation.check().is_err() {
                 return Err(NexusError::new(NexusErrorCode::CancelPending,
                     "shutdown waits for existing custody retirement and helper observations; bridge retained").into());
@@ -954,6 +1007,10 @@ impl NexusBridge {
         }
     }
     pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.wait_shutdown_ready(&crate::preprocess::Preparation::new(Duration::from_secs(
+            15,
+        )))
+        .await?;
         self.lifetime.lock().await.take();
         let mut child = self.child.lock().await;
         match tokio::time::timeout(Duration::from_secs(12), wait_child(&mut child)).await {
@@ -2178,3 +2235,7 @@ mod n4_fix_regressions;
 #[cfg(test)]
 #[path = "../../tests/support/r5_receiver.rs"]
 mod r5_receiver_tests;
+
+#[cfg(test)]
+#[path = "../../tests/support/fa_shutdown.rs"]
+mod final_shutdown_tests;

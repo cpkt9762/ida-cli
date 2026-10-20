@@ -286,6 +286,10 @@ impl Helper {
         result
     }
 
+    pub(super) fn is_finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn status_snapshot(&self) -> Value {
         let mut status = self
             .last_heartbeat
