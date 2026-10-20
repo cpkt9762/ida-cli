@@ -1636,7 +1636,8 @@ uptime
 Use a fresh physical `/private/tmp` prepared root for each run; do not reuse a
 venv or process ledger. The result is exactly one `E23` PASS/FAIL/BLOCKED in
 `e23-result.json`, with before/after uptime, binary/source identities, public
-owner records, visibility/release witnesses and cleanup. `native-processes.jsonl`
+owner records, visibility/release witnesses and cleanup; control-capable close
+tokens and Nexus authentication fields are never serialized. `native-processes.jsonl`
 and `processes.jsonl` retain precise births; Python bind telemetry journals exact
 socket inodes before interruption cleanup. A refused reused environment never
 signals its existing processes. Run `test_nexus_gui_driver.py` for owner ambiguity,

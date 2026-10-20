@@ -173,7 +173,8 @@ def exercise(env, binary, result):
         client = Candidate(env, binary, database, 'e23', defer_open=True,
             extra={'HOME': variables['HOME']})
         opened = client.mcp('open_idb', {'path': str(database)})
-        result['open'] = opened
+        result['open'] = {'succeeded': 'result' in opened,
+            'path': opened.get('result', {}).get('path')}
         assert 'result' in opened, opened
         client.opened = opened['result']
         runtime = client.call('run_script', {'code':
