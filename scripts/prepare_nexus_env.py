@@ -21,6 +21,49 @@ RUNTIME_LOCK = json.loads((REPO / "scripts/nexus/runtime-lock.json").read_text()
 SDK_CONTRACT = json.loads((REPO / "scripts/nexus/client-sdk-contract.json").read_text())
 
 
+def discover_ida(environment=None):
+    """An explicit runtime wins; discovery never guesses between installations."""
+    environment = os.environ if environment is None else environment
+
+    def normalized(path):
+        path = Path(path).expanduser()
+        if path.suffix == '.app':
+            path = path / 'Contents/MacOS'
+        elif path.name == 'Contents':
+            path = path / 'MacOS'
+        path = path.resolve(strict=True)
+        if not path.is_dir():
+            raise ValueError('runtime is not a directory: ' + str(path))
+        return path
+
+    explicit = environment.get('IDADIR')
+    if explicit:
+        try:
+            return normalized(explicit)
+        except (OSError, ValueError) as error:
+            raise ValueError(f'invalid IDADIR {explicit}: {error}; set IDADIR to an IDA runtime directory') from error
+    override = environment.get('IDA_CLI_IDA_SEARCH_ROOTS')
+    roots = json.loads(override) if override is not None else [
+        '/Applications', str(Path(environment.get('HOME', str(Path.home()))) / 'Applications')]
+    if (not isinstance(roots, list) or not roots
+            or any(not isinstance(path, str) or not Path(path).is_absolute() for path in roots)):
+        raise ValueError('IDA_CLI_IDA_SEARCH_ROOTS must be a JSON array of absolute directories')
+    candidates = set()
+    for root in map(Path, roots):
+        if not root.exists():
+            continue
+        for app in sorted(root.iterdir()):
+            if app.name.startswith('IDA Professional') and app.suffix == '.app' and (app / 'Contents/MacOS').is_dir():
+                candidates.add(normalized(app))
+    if len(candidates) == 1:
+        return candidates.pop()
+    description = 'multiple IDA installations' if candidates else 'no IDA installation'
+    listed = '\n'.join('  ' + str(path) for path in sorted(candidates)) or '  (none)'
+    raise ValueError(description + '\nCandidates:\n' + listed + '\nSearched:\n'
+                     + '\n'.join('  ' + path for path in roots)
+                     + '\nset IDADIR to the intended .app, Contents, or runtime directory')
+
+
 def accepted_eula_entries(data: bytes) -> list[str]:
     """Identify existing accepted records; do not synthesize registry files."""
     if not data.startswith(b"iDa7"):
@@ -200,8 +243,9 @@ def prepare(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, required=True, help="new directory outside the repository")
-    parser.add_argument("--ida-dir", type=Path, required=True)
+    parser.add_argument("--root", type=Path, help="new directory outside the repository")
+    parser.add_argument("--ida-dir", type=Path)
+    parser.add_argument("--detect-ida", action="store_true", help="resolve IDADIR or a unique local IDA installation")
     parser.add_argument("--runtime-only", action="store_true", help="install dependencies without reading a user profile")
     parser.add_argument("--eula-registry", type=Path, help="existing legally prepared ida.reg")
     parser.add_argument("--source", type=Path, help="optional local fixed upstream clone (read only)")
@@ -216,6 +260,11 @@ def main() -> None:
     if args.runtime_only and (args.sdk_baseline or args.without_client_cancel_patch or args.without_client_close_patch):
         parser.error("runtime installation requires the complete four-patch chain")
     try:
+        if args.detect_ida:
+            print(discover_ida())
+            return
+        if args.root is None or args.ida_dir is None:
+            parser.error('--root and --ida-dir are required for environment preparation')
         prepare(args)
     except (OSError, ValueError, RuntimeError) as error:
         parser.exit(1, f"BLOCKED: {error}\n")

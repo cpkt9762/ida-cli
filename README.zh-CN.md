@@ -86,7 +86,7 @@ curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/ins
 - 安装器默认把 launcher 放到 `~/.local/bin/ida-cli`
 - `--add-path` 会把这个目录追加到当前 shell 的 rc 文件
 - 安装器创建专用 Nexus Python 环境，并校验四个本地补丁、依赖与已安装模块的 SHA256。
-- 机器上同时存在多套 IDA 时，建议在安装 / 运行前显式导出 `IDADIR`
+- macOS 安装器和启动器会检测 `/Applications` 与 `~/Applications`：唯一安装自动使用，多个或没有候选时列出路径并要求设置 `IDADIR`。显式 `IDADIR` 优先，支持 `.app`、`Contents` 或运行时目录。
 
 ### 从源码构建
 

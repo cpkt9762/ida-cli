@@ -96,8 +96,7 @@ Notes:
 - The installer places the launcher in `~/.local/bin/ida-cli` by default.
 - `--add-path` appends that bin directory to your shell rc file.
 - The installer creates a dedicated Python environment and verifies all four patches, dependency hashes and installed module hashes.
-- When multiple IDA installations are present, export `IDADIR` explicitly
-  before installing or running `ida-cli`.
+- On macOS, the installer and launcher select the unique installation under `/Applications` or `~/Applications`. Missing or multiple installations report candidates and require `IDADIR`. An explicit `IDADIR` takes priority; `.app`, `Contents` and runtime paths are accepted.
 
 ### Build from Source
 
