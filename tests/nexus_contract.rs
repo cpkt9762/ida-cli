@@ -1552,3 +1552,24 @@ fn rv81_small_retention_is_independent_of_physical_admission() {
         "refusal retains every ID"
     );
 }
+
+#[test]
+fn runtime_support_is_exactly_ida_94_and_95() {
+    let mut caps = capabilities();
+    for version in [Version(9, 4, 0), Version(9, 5, 0)] {
+        caps.runtime.ida = version;
+        caps.runtime
+            .validate()
+            .expect("explicitly supported runtime");
+    }
+    for version in [Version(9, 3, 0), Version(9, 6, 0), Version(10, 0, 0)] {
+        caps.runtime.ida = version;
+        assert_eq!(
+            caps.runtime
+                .validate()
+                .expect_err("unknown runtime must fail")
+                .code,
+            NexusErrorCode::RuntimeUnavailable
+        );
+    }
+}

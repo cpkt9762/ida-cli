@@ -175,6 +175,13 @@ fn format_status(v: &Value) -> String {
             .and_then(|value| value.as_str())
             .unwrap_or("-");
         lines.push(format!("daemon_version: {version}"));
+        for field in ["ida_version", "installed_ida_version"] {
+            let value = metadata
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            lines.push(format!("{field}: {value}"));
+        }
         lines.push(format!("rpc_socket: {rpc_socket}"));
         lines.push(format!("mcp_socket: {mcp_socket}"));
         lines.push(format!("http_address: {http_address}"));
