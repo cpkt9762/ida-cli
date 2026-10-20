@@ -1,12 +1,80 @@
 //! Product maintenance entrypoints must work with no GNU timeout on PATH.
-use ida_mcp::process_spawn::StdOutputFenced;
+use ida_mcp::process_spawn::{SpawnFenced, StdOutputFenced};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 fn root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("n9-{}-{name}", std::process::id()));
     std::fs::create_dir(&root).expect("private maintenance fixture");
     root
+}
+
+fn first_execution(python: &std::path::Path, root: &std::path::Path) {
+    // New script inodes can spend the one-second tested budget before their
+    // first statement on macOS. Complete one separately bounded execution of
+    // this exact inode before testing maintenance's unchanged one-second limit.
+    let marker = root.join("warmup-pid");
+    let started = Instant::now();
+    let mut child = std::process::Command::new(python)
+        .env("N9_PID", &marker)
+        .env("PATH", "")
+        .process_group(0)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn_fenced()
+        .expect("owned first fixture execution");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut exited = None;
+    while !marker.exists() && Instant::now() < deadline {
+        exited = child.try_wait().expect("observe first execution");
+        if exited.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let reached = marker.exists();
+    let elapsed = started.elapsed();
+    if exited.is_none() {
+        // SAFETY: this unreaped owned Child pins the private process group.
+        assert_eq!(
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) },
+            0
+        );
+        let grace = Instant::now() + Duration::from_secs(3);
+        while exited.is_none() && Instant::now() < grace {
+            exited = child.try_wait().expect("reap first execution");
+            if exited.is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if exited.is_none() {
+            // SAFETY: still-unreaped group leader, no unrelated PID lookup.
+            assert_eq!(
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) },
+                0
+            );
+        }
+    }
+    let status = child.wait().expect("reap first fixture execution");
+    assert!(
+        reached,
+        "first fixture statement did not execute within ten seconds"
+    );
+    assert!(
+        status.success(),
+        "first execution must cooperatively finish: {status}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("first PID").trim(),
+        child.id().to_string()
+    );
+    eprintln!(
+        "N9 first fixture statement after {} us; exact first child {} reaped",
+        elapsed.as_micros(),
+        child.id()
+    );
 }
 
 #[test]
@@ -20,6 +88,7 @@ fn legacy_entrypoint_has_no_timeout_dependency_and_reports_expiry_after_reap() {
     .expect("private Python boundary");
     std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o700))
         .expect("executable fixture");
+    first_execution(&python, &root);
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_ida-cli"))
         .args(["cache-legacy", "--help"])
         .env("IDA_NEXUS_PYTHON", &python)
