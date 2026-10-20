@@ -89,6 +89,8 @@ pub mod federation;
 pub mod ida;
 pub mod idat_compat;
 pub mod idb_store;
+/// Explicit, reversible offline maintenance of legacy flat cache groups.
+pub mod legacy_cache;
 pub mod preprocess;
 pub mod process_spawn;
 pub mod router;

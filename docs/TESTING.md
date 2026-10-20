@@ -1701,3 +1701,101 @@ prepared root. The driver does not accept terms, copy licenses, patch installed
 IDA, use the user's daemon, or close other GUI instances. Always run the cleanup
 command after an interrupted outer timeout; unresolved creation identities remain
 a failure requiring inspection, never guessed process-name cleanup.
+
+### N8 legacy flat cache maintenance (implementation; review pending)
+
+`ida-cli cache-legacy` is a local maintenance entrypoint, bypassing router,
+logging and automatic daemon startup. Set `IDA_NEXUS_PYTHON` to the prepared
+Nexus interpreter. `IDA_CLI_LEGACY_TIMEOUT_SECS` explicitly selects a 1–3600s
+maintenance budget (default 1800s). Dry-run and action plans show the effective
+`maintenance_timeout`; changing it requires a new reviewed plan/evidence. The
+Rust supervisor forwards SIGTERM/SIGINT and allows 35s for rollback before its
+last-resort kill. Use an outer timeout longer than the selected budget plus
+that grace. The configured budget also bounds large input hashing and private
+IDA-copy inspection; owner probes retain their short individual limit. Default is dry-run; it lists only root-level legacy `.i64`
+groups, component names, byte counts, file hashes/identities, filename content
+key, both index entries, packed state and public opener observations. Missing
+SDK/state information is reported as unknown and cannot authorize execution.
+It does not traverse `generations/`, `quarantine/` or recovery data.
+
+Select `--mode migrate|clean --group <exact-flat-name> --backup <new-private-dir>`
+to preview an exact plan. `--mode restore --backup <existing-backup>` previews
+restoration, including after interruption. Every mode remains dry-run until
+`--apply --offline-evidence <private-json>` is supplied. Backup must be outside
+the cache, with a 0700 parent; existing backup directories and unknown files are
+never overwritten. File bytes and both original index byte streams are copied,
+fsynced and SHA256 verified before original data is changed. Migration additionally
+opens a disposable packed copy without analysis/save, checks its embedded input
+SHA256 against the existing flat input snapshot and checks that snapshot's
+streaming BLAKE3 content key. Missing snapshots, components/unpacked databases,
+unknown group members, symlinks and a pre-existing generation index refuse
+migration. Clean also verifies a private packed copy, then removes the group
+and its legacy index entry; any existing generation index remains unchanged.
+Neither mode opens/saves the original IDB. Packed database bytes, including user
+edits, are preserved exactly in backups and migrated generations. Generated
+`{input,input.i64,generation.json}` and content-key pointers use the existing GC
+format; existing healthy generations and quarantine are never processed.
+
+The offline evidence is **operator-maintained exclusion**, matching explicit
+manual offline maintenance, not an owner-release proof. Before apply the
+operator must stop all routers/daemons, independent IDA/Nexus openers and remote
+writers, and prevent new openers/automatic restarts for the entire window.
+A single negative public probe cannot establish this. The JSON must contain
+`schema=1`, `plan_sha256`, `root`, `router_homes`, `state_roots`, `boot_id` copied
+from the reviewed plan, current `uid`, nonempty `operator` and `exclusion_method`,
+`confirmation="I established and maintain this exclusive offline window"`,
+`offline_scope` equal to the preview's `required_offline_scope`, and numeric
+`started_at`/`expires_at` covering now with at most 3600 seconds between them.
+Use repeated `--router-home` and `--state-root` to declare the complete inventory;
+defaults are the selected IDA CLI home and `IDA_NEXUS_STATE_DIR`. These directories
+must exist at canonical, absolute, symlink-free paths. Evidence is bound to
+host boot, directory identities, action, selected group, backup path and exact
+current files/indices; it is revalidated under locks and before each deletion.
+This attestation cannot be auto-generated as proof by the tool.
+
+Apply preserves old CLI startup-lock modes (including 0644) while requiring
+a single-link regular file owned by this uid with no group/other write access.
+It holds every declared `.startup.lock`, cache-root `.cache.lock` EX and
+stable target EX until backup/publication/removal or rollback finishes. Live PID
+or remaining router sockets, public owner discovery/registration incompleteness,
+nonpacked/component locks, unsettled custody and recovery obligations veto it.
+Public state checks run in fresh bounded processes for each declared state
+root. Ordinary caught failures restore exact original bytes/indices under these
+locks. Unknown replacement bytes cause a visible collision refusal and retain
+all copies. SIGTERM/SIGINT are checked between streaming chunks and mutation stages;
+owned helper process groups are reaped before rollback. Restore copies stage
+verified bytes before non-replacing publication, so an interrupted restore
+does not expose a partial original. If forced termination prevents rollback,
+the CLI prints the backup/restore instructions; a missing completed manifest
+means original files/indices were never changed by that attempt. After a hard
+process interruption, explicitly preview/apply restore
+with a fresh offline window. Restore is idempotent and retains backups; migration
+products left by an interrupted/rolled-back operation stay available for the
+existing GC rather than being recursively removed by this tool. Hash manifests
+and verification copies remain in the private backup for review.
+
+```sh
+timeout 30s ida-cli cache-legacy --root "$CACHE" --state-root "$STATE"
+timeout 30s ida-cli cache-legacy --root "$CACHE" --mode migrate --group "$GROUP" --backup "$BACKUP"
+timeout 1840s ida-cli cache-legacy --root "$CACHE" --mode migrate --group "$GROUP" --backup "$BACKUP" --apply --offline-evidence "$EVIDENCE"
+timeout 1840s ida-cli cache-legacy --root "$CACHE" --mode restore --backup "$BACKUP" --apply --offline-evidence "$RESTORE_EVIDENCE"
+timeout 120s python3 -B tests/test_nexus_n8tool.py -v
+```
+
+Tests use private HOME/cache/state and synthetic bytes for deterministic safety
+branches; `tests/support/n8tool_real.py` additionally creates an isolated real
+small IDB with a comment and patched byte, invokes the built entrypoint,
+reopens the migrated/restored IDB and reads both edits back. This targeted
+validation does not replace N8 full E2E or independent review.
+
+
+N8 工具返修的 R5 receiver 回归保持每个 socket 读取 2s 屏障。独立 Rig 在 N1
+入队前通过同样有界的 2s fixture admission 同步，避免互不相关的测试同时
+抢占全进程两个非等待 Encode 名额。单场景的全部 A/B peers、原189轨迹
+和诊断断言仍走相同生产 N1/reader。合法的 Busy/NotSent 不产生 wire frame，
+旧 fixture 却无界等首帧；超时现在打印阶段和 N1 open_progress。没有增加
+生产编码容量或等待策略，也不重试 Busy、不放宽断言。
+
+feature lib 的既有维护夹具还需要私有 `IDA_NEXUS_STATE_DIR`、`R3A_CASE_ROOT`、
+`R3F1_SAMPLE`、静态测试 telemetry，以及 `R4_BASELINE_SOURCE` 指向固定
+`5d8a215f92b4405e6db99af8e7f86c72ae95861f` 的 v1 producer 源码归档。

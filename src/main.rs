@@ -562,6 +562,11 @@ fn metrics_response(
 }
 
 fn main() -> anyhow::Result<()> {
+    // Maintenance must bypass log/daemon initialization: even dry-run must not
+    // create cache, profile, log or startup files in the selected user home.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("cache-legacy")) {
+        return ida_mcp::legacy_cache::run(std::env::args_os().skip(2).collect());
+    }
     // Initialize logging:
     //   stderr : RUST_LOG  or  ida_mcp=info  (low-noise)
     //   ~/.ida/logs/server.log : RUST_LOG  or  ida_mcp=debug  (verbose, for post-mortem)

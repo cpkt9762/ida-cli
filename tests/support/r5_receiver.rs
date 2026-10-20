@@ -1,10 +1,17 @@
 use super::*;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
+// These independent fixtures share the process-wide two-slot Encode pool.
+// Admit one Rig at a time, while keeping every scenario's A/B concurrency.
+// This is synchronization before N1 enqueue, never a retry after Busy/NotSent.
+static FIXTURE_GATE: AsyncMutex<()> = AsyncMutex::const_new(());
+
 struct Peer {
     read: BufReader<OwnedReadHalf>,
     write: OwnedWriteHalf,
     adapter_writer: Writer,
+    state: Arc<State>,
+    opening: Option<OpenIdentity>,
 }
 impl Peer {
     async fn send(&mut self, value: Value) {
@@ -15,20 +22,28 @@ impl Peer {
             .await
             .expect("write external bridge input");
     }
-    async fn grant(&mut self) -> DeliveryAttempt {
-        let frame = receiver::read_line(&mut self.read)
+    async fn read_frame(&mut self, stage: &str) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(2), receiver::read_line(&mut self.read))
             .await
+            .unwrap_or_else(|_| {
+                let progress = self.opening.as_ref().map(|identity| {
+                    self.state
+                        .endpoint
+                        .transition(|s, _| s.open_progress(&identity.client_id, identity))
+                });
+                panic!("receiver fixture await timed out: {stage}; open_progress={progress:?}")
+            })
             .expect("read production frame")
-            .expect("frame before EOF");
+            .expect("frame before EOF")
+    }
+    async fn grant(&mut self) -> DeliveryAttempt {
+        let frame = self.read_frame("delivery frame").await;
         let frame: Value = serde_json::from_slice(&frame).expect("production frame JSON");
         let attempt =
             serde_json::from_value(frame["attempt"].clone()).expect("exact production attempt");
         self.send(json!({"event":"dispatch_ready","frame":frame}))
             .await;
-        let grant = receiver::read_line(&mut self.read)
-            .await
-            .expect("read grant")
-            .expect("grant before EOF");
+        let grant = self.read_frame("dispatch grant").await;
         let grant: Value = serde_json::from_slice(&grant).expect("grant JSON");
         assert_eq!(grant["grant"], true);
         attempt
@@ -40,9 +55,13 @@ struct Rig {
     control: Peer,
     events: broadcast::Receiver<Value>,
     caps: NexusCapabilities,
+    _fixture: tokio::sync::MutexGuard<'static, ()>,
 }
 impl Rig {
-    fn new() -> Self {
+    async fn new() -> Self {
+        let fixture = tokio::time::timeout(Duration::from_secs(2), FIXTURE_GATE.lock())
+            .await
+            .expect("receiver fixture admission barrier");
         let caps = NexusCapabilities {
             runtime: NexusRuntime {
                 ida: Version(9, 5, 0),
@@ -91,12 +110,14 @@ impl Rig {
         ) -> Peer {
             let (stream, peer) = UnixStream::pair().expect("private physical stream pair");
             let writer = start_channel(stream, state.clone(), control);
-            tokio::spawn(pump(deliveries, writer.clone(), state));
+            tokio::spawn(pump(deliveries, writer.clone(), state.clone()));
             let (read, write) = peer.into_split();
             Peer {
                 read: BufReader::new(read),
                 write,
                 adapter_writer: writer,
+                state,
+                opening: None,
             }
         }
         let business = lane(state.clone(), lanes.business, false);
@@ -107,6 +128,7 @@ impl Rig {
             control,
             events: receive,
             caps,
+            _fixture: fixture,
         }
     }
     async fn event(&mut self, name: &str) -> Value {
@@ -149,6 +171,7 @@ impl Rig {
                 )
             })
             .expect("real N1 open");
+        self.business.opening = Some(identity.clone());
         let attempt = self.business.grant().await;
         let lease = SessionLease {
             client_id: identity.client_id.clone(),
@@ -179,10 +202,7 @@ impl Rig {
         )
         .await
         .expect("production control write");
-        let frame = receiver::read_line(&mut self.control.read)
-            .await
-            .expect("control frame")
-            .expect("control before EOF");
+        let frame = self.control.read_frame("control barrier").await;
         let frame: Value = serde_json::from_slice(&frame).expect("control JSON");
         assert_eq!(frame["local_status"], "b-control");
         self.control
@@ -238,7 +258,7 @@ async fn r5_original_189_full_sequences_through_production_reader() {
         .expect("frozen full legacy matrix");
     let mut records = Vec::new();
     for row in input["rows"].as_array().expect("rows") {
-        let mut rig = Rig::new();
+        let mut rig = Rig::new().await;
         let (a, _) = rig.open("a").await;
         let (b, _) = rig.open("b").await;
         let attempt = rig.release(&a).await;
@@ -294,7 +314,7 @@ async fn r5_original_189_full_sequences_through_production_reader() {
 
 #[tokio::test]
 async fn r5_bad_lines_identity_sideband_and_real_eof() {
-    let mut rig = Rig::new();
+    let mut rig = Rig::new().await;
     let (a, _) = rig.open("a").await;
     let (b, _) = rig.open("b").await;
     let attempt = rig.release(&a).await;
@@ -365,7 +385,7 @@ fn r5_home_matches_python_table() {
 
 #[tokio::test]
 async fn r5_late_acquisition_and_stop_remain_n1_responsibilities() {
-    let mut rig = Rig::new();
+    let mut rig = Rig::new().await;
     let (a, _) = rig.open("a").await;
     // A failed command no longer has pending, but N1's opening tombstone does.
     let client = ClientId::new("late").expect("client");
@@ -497,18 +517,12 @@ async fn r5_late_acquisition_and_stop_remain_n1_responsibilities() {
             )
         })
         .expect("queue open");
-    let frame = receiver::read_line(&mut rig.business.read)
-        .await
-        .expect("open frame")
-        .expect("frame");
+    let frame = rig.business.read_frame("blocked acquisition frame").await;
     let frame: Value = serde_json::from_slice(&frame).expect("JSON frame");
     rig.business
         .send(json!({"event":"dispatch_ready","frame":frame}))
         .await;
-    let grant = receiver::read_line(&mut rig.business.read)
-        .await
-        .expect("denied grant")
-        .expect("grant");
+    let grant = rig.business.read_frame("denied acquisition grant").await;
     assert_eq!(
         serde_json::from_slice::<Value>(&grant).expect("grant JSON")["grant"],
         false
@@ -526,7 +540,7 @@ async fn r5_frame_limits_and_partial_eof_are_connection_errors() {
         let mut reader = BufReader::new(bytes.as_slice());
         assert!(receiver::read_line(&mut reader).await.is_err());
     }
-    let mut rig = Rig::new();
+    let mut rig = Rig::new().await;
     let (a, _) = rig.open("a").await;
     rig.control
         .write
@@ -549,7 +563,7 @@ async fn r5_frame_limits_and_partial_eof_are_connection_errors() {
 
 #[tokio::test]
 async fn r5_late_stop_after_command_cache_removal_keeps_unknown_outcome() {
-    let mut rig = Rig::new();
+    let mut rig = Rig::new().await;
     let (lease, _) = rig.open("late-stop").await;
     let operation = rig
         .state
@@ -612,16 +626,13 @@ async fn r5_late_stop_after_command_cache_removal_keeps_unknown_outcome() {
 
 #[tokio::test]
 async fn r5_actual_grant_write_failure_remains_io_error() {
-    let mut rig = Rig::new();
+    let mut rig = Rig::new().await;
     let (lease, _) = rig.open("write-failure").await;
     rig.state
         .endpoint
         .transition(|s, t| s.release(&lease.client_id, &lease, t))
         .expect("release queued");
-    let frame = receiver::read_line(&mut rig.control.read)
-        .await
-        .expect("frame read")
-        .expect("frame");
+    let frame = rig.control.read_frame("grant write failure frame").await;
     let frame: Value = serde_json::from_slice(&frame).expect("frame JSON");
     let (stream, peer) = UnixStream::pair().expect("real failure stream");
     let (_, write) = stream.into_split();
@@ -642,7 +653,7 @@ async fn r5_actual_grant_write_failure_remains_io_error() {
 
 #[tokio::test]
 async fn r2_duplicate_release_failure_cannot_replace_original_diagnostics() {
-    let mut rig = Rig::new();
+    let mut rig = Rig::new().await;
     let (lease, _) = rig.open("release-history").await;
     let attempt = rig.release(&lease).await;
     let original = json!({"event":"uncertain", "attempt":attempt,
@@ -692,7 +703,7 @@ async fn r2_duplicate_release_failure_cannot_replace_original_diagnostics() {
 // fields. The production guard + SDK/helper/writer case lives in nexus_r3b_fix4.
 #[tokio::test]
 async fn rr3_accepted_terminal_keeps_guard_across_empty_observations_and_typed_errors() {
-    let mut rig = Rig::new();
+    let mut rig = Rig::new().await;
     let (lease, _) = rig.open("rr3-fields").await;
     let error = NexusError::caused_by(
         NexusErrorCode::OperationFailed,
@@ -758,7 +769,7 @@ async fn rr3_accepted_terminal_keeps_guard_across_empty_observations_and_typed_e
 
 #[tokio::test]
 async fn rr3_rejected_and_duplicate_terminals_cannot_poison_save_diagnostics() {
-    let mut rig = Rig::new();
+    let mut rig = Rig::new().await;
     let (a, _) = rig.open("rr3-a").await;
     let (b, _) = rig.open("rr3-b").await;
     let attempt = rig.release(&a).await;
