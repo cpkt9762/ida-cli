@@ -1,5 +1,6 @@
 """IDA discovery uses only injected private application roots."""
 import json
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -23,14 +24,16 @@ class DiscoveryTests(unittest.TestCase):
         (app / 'Contents/MacOS').mkdir(parents=True)
         return app
 
-    def detect(self, explicit=None):
+    def detect(self, explicit=None, check_runtime=False):
         env = os.environ | {'HOME': str(self.root),
             'IDA_CLI_IDA_SEARCH_ROOTS': json.dumps([str(self.applications)])}
         env.pop('IDADIR', None)
         if explicit is not None:
             env['IDADIR'] = str(explicit)
-        return subprocess.run([sys.executable, '-B', str(REPO / 'scripts/prepare_nexus_env.py'),
-                               '--detect-ida'], env=env, capture_output=True, text=True, timeout=10)
+        argv = [sys.executable, '-B', str(REPO / 'scripts/prepare_nexus_env.py'), '--detect-ida']
+        if check_runtime:
+            argv.append('--check-runtime')
+        return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
 
     def test_unique_install_is_detected(self):
         app = self.app("IDA Professional 9.5 ' private.app")
@@ -47,14 +50,52 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), str(app / 'Contents/MacOS'))
 
-    def test_multiple_candidates_fail_with_candidates_and_guidance(self):
+    def test_multiple_candidates_choose_newest_and_list_candidates(self):
         apps = [self.app(f'IDA Professional {version}.app') for version in ('9.4', '9.5')]
         result = self.detect()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('multiple IDA installations', result.stderr)
-        self.assertIn('set IDADIR', result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(apps[1] / 'Contents/MacOS'))
+        self.assertIn('Selected IDA', result.stderr)
+        self.assertIn('Other IDA candidates', result.stderr)
         for app in apps:
             self.assertIn(str(app / 'Contents/MacOS'), result.stderr)
+
+    def test_version_components_compare_as_integers(self):
+        self.app('IDA Professional 9.9.app')
+        newest = self.app('IDA Professional 9.10.app')
+        self.assertEqual(self.detect().stdout.strip(), str(newest / 'Contents/MacOS'))
+        self.app('IDA Professional 9.50.app')
+        newest = self.app('IDA Professional 10.0.app')
+        self.assertEqual(self.detect().stdout.strip(), str(newest / 'Contents/MacOS'))
+        self.app('IDA Professional 10.0.0.99.app')
+        newest = self.app('IDA Professional 10.0.1.app')
+        self.assertEqual(self.detect().stdout.strip(), str(newest / 'Contents/MacOS'))
+
+    def test_zero_padded_versions_tie_by_canonical_path(self):
+        apps = [self.app('IDA Professional ' + version + '.app') for version in ('9.5', '9.5.0')]
+        result = self.detect()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(min(apps) / 'Contents/MacOS'))
+
+    def test_unversioned_name_ranks_below_numeric_version(self):
+        self.app('IDA Professional.app')
+        newest = self.app('IDA Professional 9.5.app')
+        self.assertEqual(self.detect().stdout.strip(), str(newest / 'Contents/MacOS'))
+
+    def test_newest_incompatible_wheel_fails_without_selecting_older(self):
+        self.app('IDA Professional 9.4.app')
+        newest = self.app('IDA Professional 9.5.app')
+        runtime = newest / 'Contents/MacOS'
+        (runtime.parent / 'Info.plist').write_text(
+            '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleShortVersionString</key>'
+            '<string>9.5</string></dict></plist>')
+        wheel = runtime / 'idalib/python/idapro-0.0.10-py3-none-any.whl'
+        wheel.parent.mkdir(parents=True)
+        wheel.write_bytes(b'incompatible wheel')
+        result = self.detect(check_runtime=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('selected idapro wheel hash mismatch', result.stderr)
+        self.assertIn(str(wheel), result.stderr)
         self.assertEqual(result.stdout, '')
 
     def test_no_candidate_fails_with_search_roots_and_guidance(self):
@@ -80,6 +121,48 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn(str(missing), result.stderr)
         self.assertIn('set IDADIR', result.stderr)
         self.assertEqual(result.stdout, '')
+
+
+class LauncherTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve() / "version ' quoted"
+        self.root.mkdir()
+        binary = self.root / 'ida-cli.real'
+        binary.write_text('#!/bin/sh\nprintf \'%s\\n\' "$IDADIR"\n')
+        binary.chmod(0o700)
+        spec = importlib.util.spec_from_file_location('n9_install_preparer', REPO / 'scripts/prepare_nexus_env.py')
+        preparer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(preparer)
+        self.default = self.root / "IDA Professional 9.5 ' literal.app/Contents/MacOS"
+        self.launcher = self.root / 'launcher'
+        self.launcher.write_text(preparer.launcher_source(self.root, self.default))
+        self.launcher.chmod(0o700)
+
+    def launch(self, explicit=None):
+        env = os.environ | {'PATH': '/usr/bin:/bin', 'HOME': str(self.root), 'IDA_CLI_IDA_SEARCH_ROOTS': 'not JSON'}
+        env.pop('IDADIR', None)
+        if explicit is not None:
+            env['IDADIR'] = str(explicit)
+        return subprocess.run([str(self.launcher)], env=env, capture_output=True, text=True, timeout=10)
+
+    def test_install_default_is_used_without_python_or_rediscovery(self):
+        self.assertFalse((self.root / 'nexus/venv/bin/python').exists())
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.default))
+
+    def test_explicit_override_wins_and_normalizes_without_rediscovery(self):
+        app = self.root / 'IDA Professional 9.4.app'
+        paths = [str(path) + suffix for path in (app, app / 'Contents', app / 'Contents/MacOS')
+                 for suffix in ('', '/', '//')]
+        paths.append('~/IDA Professional 9.4.app/')
+        for path in paths:
+            with self.subTest(path=path):
+                result = self.launch(path)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), str(app / 'Contents/MacOS'))
 
 
 if __name__ == '__main__':

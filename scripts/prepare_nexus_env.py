@@ -9,6 +9,7 @@ import plistlib
 from pathlib import Path
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -21,8 +22,33 @@ RUNTIME_LOCK = json.loads((REPO / "scripts/nexus/runtime-lock.json").read_text()
 SDK_CONTRACT = json.loads((REPO / "scripts/nexus/client-sdk-contract.json").read_text())
 
 
-def discover_ida(environment=None):
-    """An explicit runtime wins; discovery never guesses between installations."""
+def launcher_source(root, ida):
+    """Freeze installation's selected runtime; an explicit override stays local."""
+    return ('#!/usr/bin/env bash\nset -euo pipefail\n'
+            'export IDA_NEXUS_PYTHON=' + shlex.quote(str(root / 'nexus/venv/bin/python')) + '\n'
+            'DEFAULT_IDADIR=' + shlex.quote(str(ida)) + '\n'
+            'IDADIR="${IDADIR:-$DEFAULT_IDADIR}"\n'
+            'case "$IDADIR" in "~/"*) IDADIR="$HOME/${IDADIR:2}" ;; esac\n'
+            'while [[ "$IDADIR" != / && "$IDADIR" == */ ]]; do IDADIR="${IDADIR%/}"; done\n'
+            'case "$IDADIR" in\n'
+            '  *.app) IDADIR="$IDADIR/Contents/MacOS" ;;\n'
+            '  */Contents) IDADIR="$IDADIR/MacOS" ;;\n'
+            'esac\n'
+            'export IDADIR\n'
+            'exec -a ida-cli ' + shlex.quote(str(root / 'ida-cli.real')) + ' "$@"\n')
+
+
+def app_version(name):
+    """Numeric dotted components; missing/trailing zero components are equal."""
+    match = re.match(r'^IDA Professional\s+([0-9]+(?:\.[0-9]+)*)', name)
+    parts = [int(part) for part in match.group(1).split('.')] if match else [0]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def discover_ida(environment=None, *, report=None):
+    """Explicit runtime wins; auto-selection uses newest numeric app version."""
     environment = os.environ if environment is None else environment
 
     def normalized(path):
@@ -39,7 +65,10 @@ def discover_ida(environment=None):
     explicit = environment.get('IDADIR')
     if explicit:
         try:
-            return normalized(explicit)
+            selected = normalized(explicit)
+            if report is not None:
+                print('Selected IDA (explicit IDADIR): ' + str(selected), file=report)
+            return selected
         except (OSError, ValueError) as error:
             raise ValueError(f'invalid IDADIR {explicit}: {error}; set IDADIR to an IDA runtime directory') from error
     override = environment.get('IDA_CLI_IDA_SEARCH_ROOTS')
@@ -48,18 +77,23 @@ def discover_ida(environment=None):
     if (not isinstance(roots, list) or not roots
             or any(not isinstance(path, str) or not Path(path).is_absolute() for path in roots)):
         raise ValueError('IDA_CLI_IDA_SEARCH_ROOTS must be a JSON array of absolute directories')
-    candidates = set()
+    candidates = {}
     for root in map(Path, roots):
         if not root.exists():
             continue
         for app in sorted(root.iterdir()):
             if app.name.startswith('IDA Professional') and app.suffix == '.app' and (app / 'Contents/MacOS').is_dir():
-                candidates.add(normalized(app))
-    if len(candidates) == 1:
-        return candidates.pop()
-    description = 'multiple IDA installations' if candidates else 'no IDA installation'
-    listed = '\n'.join('  ' + str(path) for path in sorted(candidates)) or '  (none)'
-    raise ValueError(description + '\nCandidates:\n' + listed + '\nSearched:\n'
+                path = normalized(app)
+                candidates[path] = max(candidates.get(path, (0,)), app_version(app.name))
+    if candidates:
+        newest = max(candidates.values())
+        selected = min(path for path, version in candidates.items() if version == newest)
+        if report is not None:
+            print('Selected IDA (newest numeric app version): ' + str(selected), file=report)
+            others = [str(path) for path in sorted(candidates) if path != selected]
+            print('Other IDA candidates:\n' + ('\n'.join('  ' + path for path in others) or '  (none)'), file=report)
+        return selected
+    raise ValueError('no IDA installation\nCandidates:\n  (none)\nSearched:\n'
                      + '\n'.join('  ' + path for path in roots)
                      + '\nset IDADIR to the intended .app, Contents, or runtime directory')
 
@@ -100,12 +134,8 @@ def run(root: Path, label: str, args: list[str], *, cwd: Path = REPO, env=None) 
     return stdout.strip()
 
 
-def prepare(args: argparse.Namespace) -> None:
-    root = args.root.expanduser().resolve()
-    installed_runtime = args.runtime_only and root == REPO / 'nexus'
-    if not installed_runtime and (root.is_relative_to(REPO) or REPO.is_relative_to(root)):
-        raise ValueError("environment root must be outside the repository")
-    ida = args.ida_dir.expanduser().resolve(strict=True)
+def validate_runtime(ida):
+    """Refuse an incompatible selected runtime instead of selecting an older one."""
     if sys.version_info < (3, 11):
         raise RuntimeError('Nexus requires Python >=3.11')
     info = ida.parent / 'Info.plist'
@@ -121,7 +151,17 @@ def prepare(args: argparse.Namespace) -> None:
         if digest(REPO / 'scripts/nexus' / name) != expected:
             raise RuntimeError('runtime asset hash mismatch: ' + name)
     if digest(wheel) != RUNTIME_LOCK['idapro_wheel_sha256']:
-        raise RuntimeError('selected idapro wheel hash mismatch')
+        raise RuntimeError('selected idapro wheel hash mismatch: ' + str(wheel))
+    return wheel
+
+
+def prepare(args: argparse.Namespace) -> None:
+    root = args.root.expanduser().resolve()
+    installed_runtime = args.runtime_only and root == REPO / 'nexus'
+    if not installed_runtime and (root.is_relative_to(REPO) or REPO.is_relative_to(root)):
+        raise ValueError("environment root must be outside the repository")
+    ida = args.ida_dir.expanduser().resolve(strict=True)
+    wheel = validate_runtime(ida)
     registry = None
     eula = []
     if not args.runtime_only:
@@ -245,7 +285,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, help="new directory outside the repository")
     parser.add_argument("--ida-dir", type=Path)
-    parser.add_argument("--detect-ida", action="store_true", help="resolve IDADIR or a unique local IDA installation")
+    parser.add_argument("--detect-ida", action="store_true", help="resolve IDADIR or the newest local IDA app version")
+    parser.add_argument("--check-runtime", action="store_true", help="validate the detected runtime before installation")
     parser.add_argument("--runtime-only", action="store_true", help="install dependencies without reading a user profile")
     parser.add_argument("--eula-registry", type=Path, help="existing legally prepared ida.reg")
     parser.add_argument("--source", type=Path, help="optional local fixed upstream clone (read only)")
@@ -261,8 +302,13 @@ def main() -> None:
         parser.error("runtime installation requires the complete four-patch chain")
     try:
         if args.detect_ida:
-            print(discover_ida())
+            selected = discover_ida(report=sys.stderr)
+            if args.check_runtime:
+                validate_runtime(selected)
+            print(selected)
             return
+        if args.check_runtime:
+            parser.error('--check-runtime requires --detect-ida')
         if args.root is None or args.ida_dir is None:
             parser.error('--root and --ida-dir are required for environment preparation')
         prepare(args)

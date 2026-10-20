@@ -13,8 +13,8 @@ Install the Nexus-only ida-cli release (IDA >=9.4, Python >=3.11).
   --bundle DIR          Install an already extracted release bundle
   --nexus-source DIR    Read-only pinned Nexus clone for offline preparation
   --wheels DIR          Read-only hashed wheel directory
-IDADIR overrides automatic discovery. A unique macOS IDA installation is selected;
-multiple or missing installations require an explicit IDADIR. Rust needs no SDK.
+IDADIR overrides automatic discovery. Otherwise the newest numeric app version
+is selected and validated, then stored as the launcher's default. Rust needs no SDK.
 EOF
 }
 while [[ $# -gt 0 ]]; do
@@ -93,7 +93,12 @@ for name, expected in lock['assets'].items():
     if pathlib.PurePath(name).name != name or hashlib.sha256((root/name).read_bytes()).hexdigest() != expected:
         raise SystemExit('runtime asset hash mismatch: '+name)
 PY
-IDADIR="$(python3 -I -B "$BUNDLE/scripts/prepare_nexus_env.py" --detect-ida)"
+if IDADIR="$(python3 -I -B "$BUNDLE/scripts/prepare_nexus_env.py" --detect-ida --check-runtime 2>"$TMP_DIR/ida-selection.log")"; then
+  cat "$TMP_DIR/ida-selection.log"
+else
+  cat "$TMP_DIR/ida-selection.log" >&2
+  exit 1
+fi
 export IDADIR
 mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
 INSTALL_ROOT="$(cd "$INSTALL_ROOT" && pwd -P)"
@@ -110,15 +115,12 @@ args=(--runtime-only --root "$VERSION_ROOT/nexus" --ida-dir "$IDADIR")
 [[ -z "$WHEELS" ]] || args+=(--wheels "$WHEELS")
 python3 "$VERSION_ROOT/scripts/prepare_nexus_env.py" "${args[@]}"
 # Generate quoted shell assignments without interpolating paths as shell code.
-python3 - "$VERSION_ROOT" "$BIN_DIR/ida-cli" <<'PY'
-import pathlib, shlex, sys
-root, launcher = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-quote = shlex.quote
-text = ('#!/usr/bin/env bash\nset -euo pipefail\n'
-        'export IDA_NEXUS_PYTHON='+quote(str(root/'nexus/venv/bin/python'))+'\n'
-        'IDADIR="$("$IDA_NEXUS_PYTHON" -I -B '+quote(str(root/'scripts/prepare_nexus_env.py'))+' --detect-ida)"\n'
-        'export IDADIR\n'
-        'exec -a ida-cli '+quote(str(root/'ida-cli.real'))+' "$@"\n')
+python3 -I -B - "$VERSION_ROOT" "$BIN_DIR/ida-cli" "$IDADIR" <<'PY'
+import pathlib, sys
+root, launcher, ida = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+sys.path.insert(0, str(root / 'scripts'))
+from prepare_nexus_env import launcher_source
+text = launcher_source(root, ida)
 staged = launcher.with_name('.ida-cli.new')
 with staged.open('x') as stream:
     stream.write(text)

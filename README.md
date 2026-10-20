@@ -96,7 +96,8 @@ Notes:
 - The installer places the launcher in `~/.local/bin/ida-cli` by default.
 - `--add-path` appends that bin directory to your shell rc file.
 - The installer creates a dedicated Python environment and verifies all four patches, dependency hashes and installed module hashes.
-- On macOS, the installer and launcher select the unique installation under `/Applications` or `~/Applications`. Missing or multiple installations report candidates and require `IDADIR`. An explicit `IDADIR` takes priority; `.app`, `Contents` and runtime paths are accepted.
+- On macOS, installation selects the newest numeric `.app` version under `/Applications` or `~/Applications` and prints the selected and other candidates. `9.10` is newer than `9.9`; trailing zero components are equal, with canonical path order breaking ties. Explicit `IDADIR` takes priority. An incompatible selected wheel/runtime fails explicitly. If no candidate is found, installation fails with instructions to set `IDADIR`.
+- The launcher stores the runtime selected at installation and uses it without rediscovery. Explicit `IDADIR` overrides it; `.app`, `Contents` and runtime paths are accepted. See [version comparison and runtime checks](docs/BUILDING.md).
 
 ### Build from Source
 
