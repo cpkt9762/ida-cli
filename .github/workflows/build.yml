@@ -12,45 +12,38 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  IDASDKDIR: ${{ github.workspace }}/ida-sdk
 
 jobs:
   validate:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # Lib tests run against the 9.3 SDK: from 9.4 on, the Linux stub
-        # libidalib.so exports libstdc++ symbols (so the test binary ends up
-        # depending on it) and its initializers crash without a real IDA.
-        # The 9.5 SDK is still compiled to cover its layout branches.
-        include:
-          - sdk: v9.3.1-release
-            cargo_args: ""
-          - sdk: releases/9.5
-            cargo_args: "--no-run"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           submodules: true
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with:
-          repository: HexRaysSA/ida-sdk
-          path: ida-sdk
-          ref: ${{ matrix.sdk }}
-          fetch-depth: 1
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev llvm-dev
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
+      # The library uses the public client without loading IDA. This is not a
+      # production runtime: idapro and real-IDB acceptance require a licensed host.
+      - name: Prepare fixed public client for isolated library fixtures
+        run: |
+          timeout 30s python3 -m venv /tmp/nexus-client
+          timeout 30s /tmp/nexus-client/bin/python -m pip install --no-deps --require-hashes -r scripts/nexus/requirements.lock
+          timeout 30s git clone --quiet https://github.com/HexRaysSA/ida-nexus.git /tmp/nexus-source
+          git -C /tmp/nexus-source checkout d60ff582fde90c59726336c0dbdf3e8286e9df7a
+          for patch in loopback-bind client-cancel-unknown client-close-proof client-acquisition; do
+            git -C /tmp/nexus-source apply "$GITHUB_WORKSPACE/scripts/nexus/$patch.patch"
+          done
+          timeout 30s /tmp/nexus-client/bin/python -m pip install --no-deps --no-build-isolation /tmp/nexus-source
+          echo /tmp/nexus-client/bin >> "$GITHUB_PATH"
+          echo IDA_NEXUS_PYTHON=/tmp/nexus-client/bin/python >> "$GITHUB_ENV"
+
       - name: Validate Rust library tests
-        run: cargo test --locked --lib ${{ matrix.cargo_args }} -- --nocapture
+        run: |
+          timeout 30s cargo check --locked --all-targets
+          timeout 30s cargo clippy --locked --all-targets -- -D warnings
+          timeout 120s cargo test --locked --lib -- --nocapture
 
       - name: Validate Python scripts
         run: |
@@ -59,7 +52,8 @@ jobs:
             scripts/run_dbg_test.py \
             scripts/stress_test.py \
             scripts/test_dbg_headless.py \
-            scripts/verify_9x_compat.py
+            scripts/prepare_nexus_env.py \
+            scripts/package_release.py
 
   build-linux:
     needs: validate
@@ -69,25 +63,11 @@ jobs:
         with:
           submodules: true
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with:
-          repository: HexRaysSA/ida-sdk
-          path: ida-sdk
-          # Release binaries only use native-linked on the IDA version whose
-          # SDK they were built with, so pin the SDK they target.
-          ref: releases/9.5
-          fetch-depth: 1
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev llvm-dev
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
       - name: Build release binary
-        run: cargo build --release --locked --bin ida-cli -vv
+        run: timeout 180s cargo build --release --locked --bin ida-cli -vv
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -103,18 +83,11 @@ jobs:
         with:
           submodules: true
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with:
-          repository: HexRaysSA/ida-sdk
-          path: ida-sdk
-          ref: releases/9.5
-          fetch-depth: 1
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
       - name: Build release binary
-        run: cargo build --release --locked --bin ida-cli
+        run: timeout 180s cargo build --release --locked --bin ida-cli
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -142,15 +115,9 @@ jobs:
         run: |
           mkdir -p release
 
-          chmod +x artifacts/ida-cli-linux-x86_64/ida-cli
-          tar -czf release/ida-cli-Linux_x86_64.tar.gz \
-            -C artifacts/ida-cli-linux-x86_64 ida-cli \
-            -C "${GITHUB_WORKSPACE}" README.md README.zh-CN.md LICENSE
-
-          chmod +x artifacts/ida-cli-darwin-arm64/ida-cli
-          tar -czf release/ida-cli-Darwin_arm64.tar.gz \
-            -C artifacts/ida-cli-darwin-arm64 ida-cli \
-            -C "${GITHUB_WORKSPACE}" README.md README.zh-CN.md LICENSE
+          chmod +x artifacts/ida-cli-linux-x86_64/ida-cli artifacts/ida-cli-darwin-arm64/ida-cli
+          python3 scripts/package_release.py --binary artifacts/ida-cli-linux-x86_64/ida-cli --output release/ida-cli-Linux_x86_64.tar.gz
+          python3 scripts/package_release.py --binary artifacts/ida-cli-darwin-arm64/ida-cli --output release/ida-cli-Darwin_arm64.tar.gz
 
           cp scripts/install.sh release/install.sh
           chmod +x release/install.sh

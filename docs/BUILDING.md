@@ -1,117 +1,21 @@
 # Building from Source
 
-## Requirements
-
-- macOS or Linux host
-- Rust 1.87+
-- LLVM / Clang
-- An IDA installation, provided via `IDADIR` or discoverable from common
-  install paths
-- An IDA SDK, provided via `IDASDKDIR` or `IDALIB_SDK`
-
-`ida-cli` links against the vendored `idalib` at build time. At runtime it
-probes the active IDA install and picks a backend automatically:
-
-- `idat-compat` — IDA 9.0–9.2, shells out to `idat` + IDAPython
-- `native-linked` — IDA 9.3 and 9.5, opens the database in-process via
-  `idalib`, chosen only when the runtime matches the SDK version used for the build
-- `idat-compat` is also used for IDA 9.4 (the public 9.4 SDK's Hex-Rays API
-  magic does not match the 9.4.260610 build) and for runtimes that differ
-  from the build SDK
-
-The vendored native layer calls private IDA structures whose layout is
-selected from `IDA_SDK_VERSION` at compile time (it changed in 9.4 and 9.5),
-so build with the SDK that matches the IDA you run, e.g. the `releases/9.5`
-branch of `HexRaysSA/ida-sdk` for IDA 9.5.
-
-## Clone and Build
+Rust builds need a host Rust toolchain; no IDA SDK, native IDA libraries or LLVM headers are linked. Database execution uses only Nexus. IDA >=9.4, Python >=3.11 and a legally prepared IDA runtime are required for analysis. Missing dependencies and patch mismatches fail explicitly at startup.
 
 ```bash
-git clone https://github.com/cpkt9762/ida-cli.git
-cd ida-cli
-
-export IDADIR="/Applications/IDA Professional 9.5.app/Contents/MacOS"   # or a Linux install
-export IDASDKDIR="/path/to/ida-sdk"   # root or ida-sdk/src, same version as IDADIR
-
-cargo build --bin ida-cli
+timeout 180s cargo build --locked --release --bin ida-cli
 ```
 
-Release build:
+Release archives contain the binary, installer, environment preparer, dependency lock, SDK contract and all four patches: loopback-bind, client-cancel-unknown, client-close-proof and client-acquisition. `scripts/nexus/runtime-lock.json` fixes their hashes, Nexus commit, dependency versions and installed module hashes. `scripts/package_release.py` refuses mismatched assets. No IDA proprietary files are distributed.
 
 ```bash
-cargo build --release --bin ida-cli
+python3 scripts/package_release.py --binary target/release/ida-cli --output /tmp/ida-cli-bundle.tar.gz
 ```
 
-## SDK Path Rules
+The installer creates a dedicated Python environment under its version directory, installs hashed dependencies, validates the selected IDA-provided idapro wheel, applies the fixed patch chain, verifies the resulting source and actual installed modules, then atomically replaces the launcher. It does not read an IDA profile or accept terms. Set `IDADIR` to the runtime directory before installation; `--bin-dir` and `--install-root` support private installation rehearsals. `--bundle`, `--nexus-source` and `--wheels` accept local read-only inputs. Failed preparation retains the staged version and logs, leaving the previous launcher active.
 
-The SDK path may point to either layout:
+For a source build, set `IDA_NEXUS_PYTHON` to a prepared environment's absolute `venv/bin/python`. The installed launcher sets this directly. `probe-runtime` performs the same verified Nexus handshake without opening a database; missing/old runtime or incompatible modules return an error. There is no backend selector. Python/native maintenance budgets run in-process and do not require GNU coreutils.
 
-- the SDK root, for example `/path/to/ida-sdk`
-- the nested `src` directory, for example `/path/to/ida-sdk/src`
+`IDA_CLI_HOME` defaults to `~/.ida` for every frontend. `IDA_NEXUS_IPC_ROOT` optionally chooses a short private parent for bridge endpoints; otherwise the host temporary directory is used. Keep independent home/state/profile/input copies for tests. Offline sbx/idat preparation is retained for sBPF/DSC and never handles ordinary database requests.
 
-The build script accepts both as long as it can locate:
-
-- `include/pro.h`
-- platform libraries under `lib/...`
-
-## Runtime Selection
-
-At runtime, `ida-cli` probes the active IDA installation and selects a
-worker backend automatically:
-
-```bash
-./target/debug/ida-cli probe-runtime
-```
-
-Typical outputs:
-
-```json
-{"runtime":{"major":9,"minor":1,"build":250226},"backend":"idat-compat","supported":true,"reason":null}
-```
-
-```json
-{"runtime":{"major":9,"minor":5,"build":261001},"backend":"native-linked","supported":true,"reason":null}
-```
-
-## Binary Names
-
-The primary executable is `target/debug/ida-cli` or `target/release/ida-cli`.
-A diagnostic-only `multi_idb_probe` binary lives under `src/bin/` and is
-only built with `cargo build --bin multi_idb_probe`.
-
-## Common Commands
-
-Start a long-lived service (stdio MCP, router mode):
-
-```bash
-./target/debug/ida-cli serve
-```
-
-Use the flat CLI (auto-starts a local HTTP server in the background):
-
-```bash
-./target/debug/ida-cli --path /path/to/binary list-functions --limit 20
-./target/debug/ida-cli --path /path/to/binary decompile --addr 0x140001000
-```
-
-Run an explicit HTTP endpoint when you need one:
-
-```bash
-./target/debug/ida-cli serve-http --bind 127.0.0.1:8765
-```
-
-## Output Paths
-
-- Server log: `~/.ida/logs/server.log`
-- Cached databases: `~/.ida/idb/`
-- Server Unix socket: `~/.ida/server.sock`
-- Server PID file: `~/.ida/server.pid`
-- CLI discovery file: `/tmp/ida-cli.socket`
-- Large response cache: `/tmp/ida-cli-out/`
-
-## Notes
-
-- Host support is macOS and Linux only.
-- Runtime support starts at IDA 9.0.
-- IDA 9.0–9.2 uses `idat-compat`; IDA 9.3+ uses `native-linked`.
-- Cross-compilation is not supported.
+Rollback is version-level: retain the fixed N0 executable, matching IDA runtime and closed pre-migration backup. Stop new requests, wait for completion or cancellation evidence, preserve the migrated database, release only owned leases and wait for owner exit before copying. Restore into a separate directory and invoke the old executable directly. Never open a new-runtime database with the old runtime or overwrite real data during rehearsal. Actual installation, daemon restart and rollback require explicit user authorization.

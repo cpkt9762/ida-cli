@@ -1,436 +1,139 @@
 #!/usr/bin/env bash
+# Install a Nexus-only bundle and a dedicated, hash-checked Python environment.
 set -euo pipefail
-
 REPO="${IDA_CLI_REPO:-cpkt9762/ida-cli}"
-DEFAULT_REF="${IDA_CLI_DEFAULT_REF:-master}"
 BIN_DIR="${IDA_CLI_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
 INSTALL_ROOT="${IDA_CLI_INSTALL_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/ida-cli}"
-
-TAG=""
-REF=""
-ADD_PATH=0
-BUILD_FROM_SOURCE=0
-KEEP_TEMP=0
-
+TAG="" REF="" BUNDLE="" SOURCE="" WHEELS="" BUILD=0 KEEP=0 ADD_PATH=0
 usage() {
   cat <<'EOF'
-Install ida-cli from GitHub releases or build it locally from source.
-
-Supported host platforms: macOS and Linux.
-
-Usage:
-  install.sh [options]
-
-Options:
-  --tag <tag>            Install a specific release tag, for example v0.9.3
-  --ref <ref>            Build from a git ref or branch, for example master or patch-1
-  --bin-dir <dir>        Install the launcher into this directory
-  --install-root <dir>   Store downloaded or built files under this directory
-  --add-path             Append the bin directory to the active shell rc file
-  --build-from-source    Skip release assets and build from source locally
-  --keep-temp            Keep the temporary working directory
-  --help                 Show this message
-
-Examples:
-  curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/install.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/install.sh | bash -s -- --add-path
-  curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/install.sh | bash -s -- --tag v0.9.3
+Install the Nexus-only ida-cli release (IDA >=9.4, Python >=3.11).
+  --tag TAG | --ref REF | --build-from-source
+  --bin-dir DIR --install-root DIR --add-path --keep-temp
+  --bundle DIR          Install an already extracted release bundle
+  --nexus-source DIR    Read-only pinned Nexus clone for offline preparation
+  --wheels DIR          Read-only hashed wheel directory
+Set IDADIR to the IDA runtime directory. Rust builds require no IDA SDK.
 EOF
 }
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --tag)
-      TAG="${2:-}"
-      shift 2
-      ;;
-    --ref)
-      REF="${2:-}"
-      shift 2
-      ;;
-    --bin-dir)
-      BIN_DIR="${2:-}"
-      shift 2
-      ;;
-    --install-root)
-      INSTALL_ROOT="${2:-}"
-      shift 2
-      ;;
-    --add-path)
-      ADD_PATH=1
-      shift
-      ;;
-    --build-from-source)
-      BUILD_FROM_SOURCE=1
-      shift
-      ;;
-    --keep-temp)
-      KEEP_TEMP=1
-      shift
-      ;;
-    --help|-h)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "unknown option: $1" >&2
-      usage >&2
-      exit 1
-      ;;
+    --tag) TAG="${2:?}"; shift 2 ;;
+    --ref) REF="${2:?}"; BUILD=1; shift 2 ;;
+    --bin-dir) BIN_DIR="${2:?}"; shift 2 ;;
+    --install-root) INSTALL_ROOT="${2:?}"; shift 2 ;;
+    --bundle) BUNDLE="${2:?}"; shift 2 ;;
+    --nexus-source) SOURCE="${2:?}"; shift 2 ;;
+    --wheels) WHEELS="${2:?}"; shift 2 ;;
+    --build-from-source) BUILD=1; shift ;;
+    --keep-temp) KEEP=1; shift ;;
+    --add-path) ADD_PATH=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 64 ;;
   esac
 done
-
-need_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "missing required command: $1" >&2
-    exit 1
-  fi
-}
-
-need_cmd curl
-need_cmd tar
-need_cmd mktemp
-
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-
-case "$OS" in
-  Darwin)
-    PLATFORM="Darwin"
-    ARCHIVE_EXT="tar.gz"
-    LIB_ENV="DYLD_LIBRARY_PATH"
-    ;;
-  Linux)
-    PLATFORM="Linux"
-    ARCHIVE_EXT="tar.gz"
-    LIB_ENV="LD_LIBRARY_PATH"
-    ;;
-  *)
-    echo "unsupported operating system: $OS" >&2
-    echo "ida-cli currently supports macOS and Linux hosts only" >&2
-    exit 1
-    ;;
-esac
-
-case "$ARCH" in
-  x86_64|amd64)
-    ARCH_LABEL="x86_64"
-    ;;
-  arm64|aarch64)
-    ARCH_LABEL="arm64"
-    ;;
-  *)
-    echo "unsupported architecture: $ARCH" >&2
-    exit 1
-    ;;
-esac
-
-ASSET_NAME="ida-cli-${PLATFORM}_${ARCH_LABEL}.${ARCHIVE_EXT}"
-BINARY_NAME="ida-cli"
-
+for tool in python3 tar mktemp; do command -v "$tool" >/dev/null || { echo "missing command: $tool" >&2; exit 1; }; done
+[[ -n "${IDADIR:-}" ]] || { echo 'set IDADIR to the IDA runtime directory' >&2; exit 1; }
+case "$IDADIR" in *.app) IDADIR="$IDADIR/Contents/MacOS" ;; */Contents) IDADIR="$IDADIR/MacOS" ;; esac
+export IDADIR
 TMP_DIR="$(mktemp -d)"
-cleanup() {
-  if [[ "$KEEP_TEMP" -eq 0 ]]; then
-    rm -rf "$TMP_DIR"
-  else
-    echo "kept temporary directory: $TMP_DIR"
-  fi
-}
+cleanup() { if [[ "$KEEP" == 0 ]]; then rm -rf "$TMP_DIR"; else echo "kept: $TMP_DIR"; fi; }
 trap cleanup EXIT
-
-mkdir -p "$BIN_DIR" "$INSTALL_ROOT"
-REAL_BIN="$INSTALL_ROOT/ida-cli.real"
-LAUNCHER="$BIN_DIR/ida-cli"
-
-download_release_asset() {
-  local base_url
-  if [[ -n "$TAG" ]]; then
-    base_url="https://github.com/${REPO}/releases/download/${TAG}"
+if [[ -z "$BUNDLE" ]]; then
+  command -v curl >/dev/null
+  if [[ "$BUILD" == 1 ]]; then
+    command -v cargo >/dev/null
+    source_url="https://github.com/${REPO}/archive/refs/heads/${REF:-master}.tar.gz"
+    [[ -z "$TAG" ]] || source_url="https://github.com/${REPO}/archive/refs/tags/${TAG}.tar.gz"
+    curl -fsSL "$source_url" -o "$TMP_DIR/source.tar.gz"
+    mkdir "$TMP_DIR/source"
+    tar -xzf "$TMP_DIR/source.tar.gz" --strip-components=1 -C "$TMP_DIR/source"
+    # Python owns the build timeout; no dependency on GNU coreutils on macOS.
+    python3 - "$TMP_DIR/source" "$TMP_DIR/target" <<'PY'
+import os, signal, subprocess, sys
+with subprocess.Popen(['cargo', 'build', '--release', '--locked', '--bin', 'ida-cli'],
+        cwd=sys.argv[1], env=os.environ | {'CARGO_TARGET_DIR': sys.argv[2]}, start_new_session=True) as child:
+    try:
+        code = child.wait(timeout=180)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+        raise SystemExit('source build exceeded 180s')
+    if code:
+        raise SystemExit(code)
+PY
+    BUNDLE="$TMP_DIR/source"
+    cp "$TMP_DIR/target/release/ida-cli" "$BUNDLE/ida-cli"
   else
-    base_url="https://github.com/${REPO}/releases/latest/download"
-  fi
-
-  local archive_path="$TMP_DIR/$ASSET_NAME"
-  echo "downloading release asset: ${ASSET_NAME}"
-  curl -fsSL "${base_url}/${ASSET_NAME}" -o "$archive_path"
-
-  tar -xzf "$archive_path" -C "$TMP_DIR"
-
-  local extracted
-  extracted="$(find "$TMP_DIR" -type f -name "ida-cli" | head -n 1)"
-  if [[ -z "$extracted" ]]; then
-    echo "release asset did not contain ${BINARY_NAME}" >&2
-    return 1
-  fi
-
-  cp "$extracted" "$REAL_BIN"
-  chmod +x "$REAL_BIN"
-}
-
-# Print the major.minor version of the IDA install the build will link against
-# (IDADIR, else the newest common install path), e.g. "9.5".
-detect_ida_version() {
-  local dir="${IDADIR:-}"
-  if [[ -z "$dir" ]]; then
-    case "$OS" in
-      Darwin)
-        dir="$(
-          for app in /Applications/IDA\ Professional*.app "$HOME"/Applications/IDA\ Professional*.app; do
-            [[ -d "$app/Contents/MacOS" ]] && printf '%s\n' "$app"
-          done | sort -V | tail -n 1
-        )"
-        ;;
-      Linux)
-        dir="$(
-          for candidate in "$HOME"/ida-pro /opt/ida* /opt/ida-pro* /usr/local/ida*; do
-            [[ -d "$candidate" ]] && printf '%s\n' "$candidate"
-          done | sort -V | tail -n 1
-        )"
-        ;;
-    esac
-  fi
-
-  [[ -n "$dir" ]] || return 1
-  printf '%s\n' "$dir" | grep -oE '[0-9]+\.[0-9]+' | tail -n 1
-}
-
-# Pick the ida-sdk ref for an IDA version: the releases/X.Y branch, else the
-# newest vX.Y.*-release tag. Prints nothing when no matching ref exists.
-sdk_ref_for_version() {
-  local version="$1" refs
-  refs="$(git ls-remote --heads --tags "$2" 2>/dev/null | awk '{print $2}')" || return 0
-  if grep -qx "refs/heads/releases/${version}" <<<"$refs"; then
-    printf 'releases/%s\n' "$version"
-    return 0
-  fi
-  grep -E "^refs/tags/v${version//./\\.}\.[0-9]+-release$" <<<"$refs" \
-    | sed 's|^refs/tags/||' | sort -V | tail -n 1
-}
-
-ensure_sdk_for_source_build() {
-  if [[ -n "${IDASDKDIR:-}" || -n "${IDALIB_SDK:-}" ]]; then
-    return 0
-  fi
-
-  need_cmd git
-  local sdk_dir="$TMP_DIR/ida-sdk"
-  local sdk_url="https://github.com/HexRaysSA/ida-sdk.git"
-  local ida_version sdk_ref=""
-  # native-linked is only enabled when the build SDK matches the IDA runtime.
-  # Runtimes before 9.3 always use idat-compat, so keep the default SDK there.
-  ida_version="$(detect_ida_version || true)"
-  if [[ -n "$ida_version" && "$(printf '%s\n' 9.3 "$ida_version" | sort -V | head -n 1)" == "9.3" ]]; then
-    sdk_ref="$(sdk_ref_for_version "$ida_version" "$sdk_url")"
-  fi
-
-  if [[ -n "$sdk_ref" ]]; then
-    echo "cloning IDA SDK ${sdk_ref} (matches IDA ${ida_version}) into ${sdk_dir}"
-    git clone --depth 1 --branch "$sdk_ref" "$sdk_url" "$sdk_dir" >/dev/null 2>&1
-  else
-    echo "cloning open-source IDA SDK (default branch) into ${sdk_dir}"
-    git clone --depth 1 "$sdk_url" "$sdk_dir" >/dev/null 2>&1
-  fi
-  export IDASDKDIR="$sdk_dir"
-}
-
-build_from_source() {
-  need_cmd cargo
-
-  local source_url
-  if [[ -n "$TAG" ]]; then
-    source_url="https://github.com/${REPO}/archive/refs/tags/${TAG}.tar.gz"
-  else
-    source_url="https://github.com/${REPO}/archive/refs/heads/${REF:-$DEFAULT_REF}.tar.gz"
-  fi
-
-  local source_archive="$TMP_DIR/source.tar.gz"
-  echo "downloading source archive"
-  curl -fsSL "$source_url" -o "$source_archive"
-  tar -xzf "$source_archive" -C "$TMP_DIR"
-
-  local source_dir
-  source_dir="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-  if [[ -z "$source_dir" ]]; then
-    echo "failed to unpack source archive" >&2
-    exit 1
-  fi
-
-  ensure_sdk_for_source_build
-  (
-    cd "$source_dir"
-    cargo build --release --locked --bin ida-cli
-  )
-
-  cp "$source_dir/target/release/ida-cli" "$REAL_BIN"
-  chmod +x "$REAL_BIN"
-}
-
-normalize_idadir() {
-  local path="${1:-}"
-  if [[ -z "$path" ]]; then
-    return 1
-  fi
-
-  case "$OS" in
-    Darwin)
-      case "$path" in
-        *.app)
-          printf '%s\n' "$path/Contents/MacOS"
-          ;;
-        */Contents)
-          printf '%s\n' "$path/MacOS"
-          ;;
-        *)
-          printf '%s\n' "$path"
-          ;;
-      esac
-      ;;
-    *)
-      printf '%s\n' "$path"
-      ;;
-  esac
-}
-
-write_launcher() {
-  cat >"$LAUNCHER" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-REAL_BIN="${REAL_BIN}"
-IDA_ENV_NAME="${LIB_ENV}"
-OS_NAME="\$(uname -s)"
-
-normalize_idadir() {
-  local path="\${1:-}"
-  if [[ -z "\$path" ]]; then
-    return 1
-  fi
-
-  case "\$OS_NAME" in
-    Darwin)
-      case "\$path" in
-        *.app) printf '%s\n' "\$path/Contents/MacOS" ;;
-        */Contents) printf '%s\n' "\$path/MacOS" ;;
-        *) printf '%s\n' "\$path" ;;
-      esac
-      ;;
-    *)
-      printf '%s\n' "\$path"
-      ;;
-  esac
-}
-
-detect_idadir() {
-  if [[ -n "\${IDADIR:-}" ]]; then
-    normalize_idadir "\$IDADIR"
-    return 0
-  fi
-
-  case "\$OS_NAME" in
-    Darwin)
-      local candidate=""
-      candidate="\$(
-        for app in /Applications/IDA\\ Professional*.app "\$HOME"/Applications/IDA\\ Professional*.app; do
-          [[ -d "\$app/Contents/MacOS" ]] && printf '%s\n' "\$app"
-        done | sort -V | tail -n 1
-      )"
-      if [[ -n "\$candidate" ]]; then
-        printf '%s\n' "\$candidate/Contents/MacOS"
-        return 0
-      fi
-      ;;
-    Linux)
-      local candidate=""
-      candidate="\$(
-        for dir in "\$HOME"/ida-pro /opt/ida* /opt/ida-pro* /usr/local/ida*; do
-          [[ -d "\$dir" ]] && printf '%s\n' "\$dir"
-        done | sort -V | tail -n 1
-      )"
-      if [[ -n "\$candidate" ]]; then
-        printf '%s\n' "\$candidate"
-        return 0
-      fi
-      ;;
-  esac
-
-  return 1
-}
-
-IDA_RUNTIME_DIR="\$(detect_idadir || true)"
-if [[ -n "\$IDA_RUNTIME_DIR" ]]; then
-  export IDADIR="\$IDA_RUNTIME_DIR"
-  case "\$IDA_ENV_NAME" in
-    DYLD_LIBRARY_PATH)
-      export DYLD_LIBRARY_PATH="\$IDA_RUNTIME_DIR\${DYLD_LIBRARY_PATH:+:\$DYLD_LIBRARY_PATH}"
-      ;;
-    LD_LIBRARY_PATH)
-      export LD_LIBRARY_PATH="\$IDA_RUNTIME_DIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-      ;;
-    PATH)
-      export PATH="\$IDA_RUNTIME_DIR\${PATH:+:\$PATH}"
-      ;;
-  esac
-fi
-
-exec -a ida-cli "\$REAL_BIN" "\$@"
-EOF
-  chmod +x "$LAUNCHER"
-}
-
-add_path_entry() {
-  if [[ ":$PATH:" == *":$BIN_DIR:"* ]]; then
-    return 0
-  fi
-
-  local shell_name rc_file line
-  shell_name="$(basename "${SHELL:-}")"
-  case "$shell_name" in
-    zsh)
-      rc_file="$HOME/.zshrc"
-      line="export PATH=\"$BIN_DIR:\$PATH\""
-      ;;
-    bash)
-      rc_file="$HOME/.bashrc"
-      line="export PATH=\"$BIN_DIR:\$PATH\""
-      ;;
-    fish)
-      rc_file="$HOME/.config/fish/config.fish"
-      line="fish_add_path \"$BIN_DIR\""
-      ;;
-    *)
-      echo "installed to ${BIN_DIR}; add it to PATH manually" >&2
-      return 0
-      ;;
-  esac
-
-  mkdir -p "$(dirname "$rc_file")"
-  touch "$rc_file"
-  if ! grep -Fq "$line" "$rc_file"; then
-    printf '\n%s\n' "$line" >>"$rc_file"
-  fi
-}
-
-if [[ "$BUILD_FROM_SOURCE" -eq 1 || -n "$REF" ]]; then
-  build_from_source
-else
-  if ! download_release_asset; then
-    echo "release asset unavailable, falling back to a local source build"
-    build_from_source
+    platform="$(uname -s)"; arch="$(uname -m)"
+    case "$platform/$arch" in Darwin/arm64|Linux/x86_64) ;; *) echo 'unsupported release platform' >&2; exit 1 ;; esac
+    asset="ida-cli-${platform}_${arch}.tar.gz"
+    base="https://github.com/${REPO}/releases/latest/download"
+    [[ -z "$TAG" ]] || base="https://github.com/${REPO}/releases/download/${TAG}"
+    curl -fsSL "$base/$asset" -o "$TMP_DIR/$asset"
+    curl -fsSL "$base/sha256sums.txt" -o "$TMP_DIR/sha256sums.txt"
+    python3 - "$TMP_DIR" "$asset" <<'PY'
+import hashlib, pathlib, sys
+root, name = pathlib.Path(sys.argv[1]), sys.argv[2]
+expected = [line.split()[0] for line in (root/'sha256sums.txt').read_text().splitlines()
+            if pathlib.PurePosixPath(line.split()[-1]).name == name]
+if expected != [hashlib.sha256((root/name).read_bytes()).hexdigest()]:
+    raise SystemExit('release archive hash mismatch')
+PY
+    mkdir "$TMP_DIR/bundle"
+    tar -xzf "$TMP_DIR/$asset" -C "$TMP_DIR/bundle"
+    BUNDLE="$TMP_DIR/bundle"
   fi
 fi
-
-write_launcher
-
-if [[ "$ADD_PATH" -eq 1 ]]; then
-  add_path_entry
+# Refuse incomplete/old releases before changing the installation prefix.
+[[ -f "$BUNDLE/ida-cli" && -f "$BUNDLE/scripts/nexus/runtime-lock.json" ]] || { echo 'Nexus bundle is incomplete' >&2; exit 1; }
+python3 - "$BUNDLE" <<'PY'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])/'scripts/nexus'
+lock = json.loads((root/'runtime-lock.json').read_text())
+for name, expected in lock['assets'].items():
+    if pathlib.PurePath(name).name != name or hashlib.sha256((root/name).read_bytes()).hexdigest() != expected:
+        raise SystemExit('runtime asset hash mismatch: '+name)
+PY
+mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
+INSTALL_ROOT="$(cd "$INSTALL_ROOT" && pwd -P)"
+BIN_DIR="$(cd "$BIN_DIR" && pwd -P)"
+# Stage a complete version first; a failed preparation leaves the active launcher intact.
+VERSION_ROOT="$(mktemp -d "$INSTALL_ROOT/version.XXXXXX")"
+mkdir -p "$VERSION_ROOT/scripts/nexus"
+cp "$BUNDLE/ida-cli" "$VERSION_ROOT/ida-cli.real"
+cp "$BUNDLE/scripts/prepare_nexus_env.py" "$VERSION_ROOT/scripts/"
+cp "$BUNDLE/scripts/nexus/"*.patch "$BUNDLE/scripts/nexus/"*.json "$BUNDLE/scripts/nexus/requirements.lock" "$VERSION_ROOT/scripts/nexus/"
+chmod 700 "$VERSION_ROOT/ida-cli.real"
+args=(--runtime-only --root "$VERSION_ROOT/nexus" --ida-dir "$IDADIR")
+[[ -z "$SOURCE" ]] || args+=(--source "$SOURCE")
+[[ -z "$WHEELS" ]] || args+=(--wheels "$WHEELS")
+python3 "$VERSION_ROOT/scripts/prepare_nexus_env.py" "${args[@]}"
+# Generate quoted shell assignments without interpolating paths as shell code.
+python3 - "$VERSION_ROOT" "$BIN_DIR/ida-cli" "$IDADIR" <<'PY'
+import pathlib, shlex, sys
+root, launcher, ida = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+quote = shlex.quote
+text = ('#!/usr/bin/env bash\nset -euo pipefail\n'
+        'export IDA_NEXUS_PYTHON='+quote(str(root/'nexus/venv/bin/python'))+'\n'
+        'DEFAULT_IDADIR='+quote(ida)+'\n'
+        'export IDADIR="${IDADIR:-$DEFAULT_IDADIR}"\n'
+        'exec -a ida-cli '+quote(str(root/'ida-cli.real'))+' "$@"\n')
+staged = launcher.with_name('.ida-cli.new')
+with staged.open('x') as stream:
+    stream.write(text)
+staged.chmod(0o700)
+staged.replace(launcher)
+PY
+if [[ "$ADD_PATH" == 1 ]]; then
+  python3 - "$BIN_DIR" <<'PYTHON'
+import os, pathlib, shlex, sys
+rc = pathlib.Path.home()/('.zshrc' if pathlib.Path(os.environ.get('SHELL', '')).name == 'zsh' else '.bashrc')
+line = 'export PATH='+shlex.quote(sys.argv[1])+':"$PATH"'
+existing = rc.read_text() if rc.exists() else ''
+if line not in existing.splitlines():
+    with rc.open('a') as stream:
+        stream.write('\n'+line+'\n')
+PYTHON
 fi
-
-echo "installed:"
-echo "  launcher: $LAUNCHER"
-echo "  binary:   $REAL_BIN"
-if [[ "$ADD_PATH" -eq 0 && ":$PATH:" != *":$BIN_DIR:"* ]]; then
-echo "add this to PATH:"
-  echo "  export PATH=\"$BIN_DIR:\$PATH\""
-fi
-echo "skill install:"
-echo "  npx -y skills add https://github.com/${REPO} --skill ida-cli --agent codex --yes --global"
+echo "Installed Nexus-only ida-cli: $BIN_DIR/ida-cli"

@@ -25,28 +25,7 @@ when you actually want a long-lived, externally addressable service.
 
 ### IDA Runtime Policy
 
-| IDA version | Backend | Notes |
-|---|---|---|
-| `< 9.0` | unsupported | — |
-| `9.0 – 9.2` | `idat-compat` | shells out to `idat` + IDAPython |
-| `9.3`, `9.5` built with the matching SDK | `native-linked` | links against vendored `idalib` |
-| other `9.3+` (incl. `9.4`, or a mismatched SDK) | `idat-compat` | native layer is SDK-version specific |
-
-Backend selection is made at runtime by `probe-runtime`. `native-linked` is
-only chosen when the IDA runtime matches the SDK the binary was built
-against (for example a 9.5 SDK build on IDA 9.5) and that pairing has been
-verified; the vendored native layer calls private IDA structures whose
-layout changed in 9.4 and 9.5. IDA 9.4 stays on `idat-compat`: the public
-9.4 SDK uses Hex-Rays API magic 5 while the 9.4.260610 build answers 4, so
-native-linked would run without a decompiler. Building still
-requires an IDA SDK because the vendored native layer is linked against it;
-at runtime the CLI opens IDA itself from `IDADIR` or a normalised common
-install path.
-
-Release binaries are built against the IDA 9.5 SDK (`releases/9.5` of
-`HexRaysSA/ida-sdk`, matching IDA 9.5.261001), so they use `native-linked`
-on IDA 9.5 and `idat-compat` elsewhere. Build from source with the matching
-SDK to get `native-linked` on IDA 9.3.
+Runtime requirements: IDA >=9.4 and Python >=3.11. All database operations use the dedicated pinned Nexus 0.13.4 / Domain 0.5.1 environment. Missing dependencies or mismatched patches fail explicitly. Rust builds need no IDA SDK.
 
 ## Current Capabilities
 
@@ -65,8 +44,7 @@ On supported IDA 9.x runtimes, `ida-cli` can:
 - declare / apply types, rename symbols and locals, set comments
 - run IDAPython snippets via `run_script`
 
-Open items: some write-heavy and advanced type-editing operations are still
-partial on `idat-compat`. See [docs/TOOLS.md](docs/TOOLS.md) for the
+All tools use Nexus with explicit capability errors. See [docs/TOOLS.md](docs/TOOLS.md) for the
 generated tool list.
 
 ## Quick Start
@@ -117,9 +95,7 @@ Notes:
 
 - The installer places the launcher in `~/.local/bin/ida-cli` by default.
 - `--add-path` appends that bin directory to your shell rc file.
-- If neither `IDASDKDIR` nor `IDALIB_SDK` is set and a local build is
-  required, the installer clones the open-source `HexRaysSA/ida-sdk`
-  automatically.
+- The installer creates a dedicated Python environment and verifies all four patches, dependency hashes and installed module hashes.
 - When multiple IDA installations are present, export `IDADIR` explicitly
   before installing or running `ida-cli`.
 
@@ -130,7 +106,6 @@ git clone https://github.com/cpkt9762/ida-cli.git
 cd ida-cli
 
 export IDADIR="/Applications/IDA Professional 9.5.app/Contents/MacOS"   # or a Linux install
-export IDASDKDIR="/path/to/ida-sdk"   # same version as IDADIR, e.g. HexRaysSA/ida-sdk releases/9.5
 
 cargo build --bin ida-cli
 ./target/debug/ida-cli --help
@@ -174,8 +149,7 @@ none; `{`, `}`, `else` and blank lines can carry the address of the block or
 `if` that owns them (the function entry for the outermost braces). The `sub_`
 rename hint is not added in this mode. Hex-Rays can print a very large function
 differently from one call to the next, so use `code` and `lines` from the same
-answer only. Only the native-linked backend can do this; the idat backend
-answers `NotSupported`. Over the CLI socket a large
+answer only. Nexus supports this mode. Over the CLI socket a large
 answer is stored in the response cache like any other (`IDA_MCP_MAX_INLINE_BYTES`).
 
 ```json
@@ -191,15 +165,7 @@ Commands whose first argument is a service subcommand (`serve`,
 ./target/debug/ida-cli probe-runtime
 ```
 
-Example backend-probe output:
-
-```json
-{"runtime":{"major":9,"minor":1,"build":250226},"backend":"idat-compat","supported":true,"reason":null}
-```
-
-```json
-{"runtime":{"major":9,"minor":5,"build":261001},"backend":"native-linked","supported":true,"reason":null}
-```
+`probe-runtime` checks Nexus dependencies, patches and protocol readiness; mismatches exit nonzero.
 
 For the complete CLI surface see
 [skill/references/cli-tool-reference.md](skill/references/cli-tool-reference.md).
@@ -207,29 +173,14 @@ For the complete CLI surface see
 ## Build Requirements
 
 - Rust 1.87+
-- LLVM / Clang
 - macOS or Linux host
-- An IDA installation via `IDADIR` (runtime support starts at IDA 9.0)
-- An IDA SDK via `IDASDKDIR` or `IDALIB_SDK`
-
-The SDK path may point to either layout:
-
-- `/path/to/ida-sdk`
-- `/path/to/ida-sdk/src`
+- An IDA installation via `IDADIR` (runtime support starts at IDA 9.4)
 
 ## Runtime Notes
 
-### `idat-compat`
+### Nexus
 
-IDA 9.0–9.2 compatibility backend. It shells out to `idat`, runs short
-IDAPython scripts, and returns structured JSON back to the CLI runtime.
-
-### `native-linked`
-
-IDA 9.3+ backend. Links against the vendored `idalib` line and opens
-databases in-process. Used for IDA 9.3 and 9.5 when the runtime matches the
-build SDK version; otherwise the probe falls back to `idat-compat`. Set
-`IDA_CLI_WORKER_BACKEND=native-linked|idat-compat` to override.
+The launcher locates its dedicated Python environment; source builds can set `IDA_NEXUS_PYTHON`. Offline sBPF/DSC preparation still uses sbx/idat; ordinary queries, edits and database sessions use Nexus. Rollback uses the fixed N0 executable and a closed pre-migration backup in a separate recovery directory. Installing or switching a real environment requires explicit authorization.
 
 ### Cache and Local Runtime Paths
 
@@ -252,9 +203,7 @@ Current workflow behavior:
 - tagged pushes like `v0.9.3` build release archives for Linux and macOS
 - releases attach `install.sh` plus platform archives
 
-Release binaries are built against SDK stubs. At install time the launcher
-generated by `install.sh` resolves your local IDA runtime through `IDADIR`
-or a normalised set of common install paths before invoking `ida-cli`.
+Release binaries have no IDA linkage. The installer creates and directly locates the pinned, four-patch Nexus Python environment.
 
 ## Documentation
 

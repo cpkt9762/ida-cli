@@ -20,16 +20,7 @@
 
 ### IDA 运行时策略
 
-| IDA 版本 | 后端 | 说明 |
-|---|---|---|
-| `< 9.0` | 不支持 | — |
-| `9.0 – 9.2` | `idat-compat` | 通过 `idat` + IDAPython 兼容 |
-| `9.3`、`9.5`，且用对应版本 SDK 编译 | `native-linked` | 链接 vendored `idalib` 直接进程内打开 |
-| 其余 `9.3+`（含 `9.4`，或 SDK 版本不一致） | `idat-compat` | native 层与 SDK 版本绑定 |
-
-后端选择由 `probe-runtime` 在运行时决定。只有运行时的 IDA 与编译所用 SDK 版本一致时（例如用 9.5 SDK 编译、跑在 IDA 9.5 上）且该组合经过验证，才会选 `native-linked`，因为 vendored native 层调用了 IDA 的私有结构，其布局在 9.4 和 9.5 都变过。IDA 9.4 保持 `idat-compat`：公开的 9.4 SDK 的 Hex-Rays API 魔数是 5，而 9.4.260610 构建仍是 4，native 下会没有反编译器。编译期仍然需要 IDA SDK，因为 vendored native 层要参与编译；运行时实际加载的 IDA 本体来自 `IDADIR` 或常见安装路径。
-
-Release 预编译包用 IDA 9.5 SDK（`HexRaysSA/ida-sdk` 的 `releases/9.5`，对应 IDA 9.5.261001）编译，因此在 IDA 9.5 上走 `native-linked`，其他版本走 `idat-compat`。想在 IDA 9.3 上用 `native-linked`，请用对应 SDK 从源码编译。
+运行时要求 IDA >=9.4、Python >=3.11。所有数据库操作统一通过固定 Nexus 0.13.4 / Domain 0.5.1 专用环境执行；依赖或补丁不匹配直接报错。Rust 构建不需要 IDA SDK。
 
 ## 当前已经可用的能力
 
@@ -46,7 +37,7 @@ Release 预编译包用 IDA 9.5 SDK（`HexRaysSA/ida-sdk` 的 `releases/9.5`，�
 - 声明 / 应用类型、重命名符号与局部变量、打注释
 - 通过 `run_script` 执行 IDAPython 片段
 
-还没对齐的：`idat-compat` 下部分写入 / 高级类型编辑操作仍是部分支持。完整工具清单见 [docs/TOOLS.md](docs/TOOLS.md)。
+完整工具统一使用 Nexus；运行时缺失能力会明确报错。完整工具清单见 [docs/TOOLS.md](docs/TOOLS.md)。
 
 ## 快速开始
 
@@ -94,7 +85,7 @@ curl -fsSL https://raw.githubusercontent.com/cpkt9762/ida-cli/master/scripts/ins
 
 - 安装器默认把 launcher 放到 `~/.local/bin/ida-cli`
 - `--add-path` 会把这个目录追加到当前 shell 的 rc 文件
-- 如果本地源码构建时没有设置 `IDASDKDIR` / `IDALIB_SDK`，安装器会自动拉取开源 `HexRaysSA/ida-sdk`
+- 安装器创建专用 Nexus Python 环境，并校验四个本地补丁、依赖与已安装模块的 SHA256。
 - 机器上同时存在多套 IDA 时，建议在安装 / 运行前显式导出 `IDADIR`
 
 ### 从源码构建
@@ -104,7 +95,6 @@ git clone https://github.com/cpkt9762/ida-cli.git
 cd ida-cli
 
 export IDADIR="/Applications/IDA Professional 9.5.app/Contents/MacOS"   # 或 Linux 安装目录
-export IDASDKDIR="/path/to/ida-sdk"   # 与 IDADIR 同版本，如 HexRaysSA/ida-sdk 的 releases/9.5
 
 cargo build --bin ida-cli
 ./target/debug/ida-cli --help
@@ -136,8 +126,7 @@ cargo build --bin ida-cli
 挂在这一行上的 ctree 项的 IDA 地址（十六进制字符串，升序、去重）。一行可能对应多个不连续的地址，
 列表也不是该语句的全部指令；函数签名和局部变量声明没有地址；`{`、`}`、`else` 和空行可能带着所属块或
 `if` 的地址（最外层大括号是函数入口）。该模式不加 `sub_` 改名提示。Hex-Rays 对很大的函数，
-两次调用打印出的文本可能不同，所以 `code` 与 `lines` 只能取自同一次应答。只有 native-linked 后端支持，
-idat 后端返回 `NotSupported`。经 CLI socket 时，大结果与其他命令一样落到响应缓存
+两次调用打印出的文本可能不同，所以 `code` 与 `lines` 只能取自同一次应答。Nexus 支持该模式。经 CLI socket 时，大结果与其他命令一样落到响应缓存
 （`IDA_MCP_MAX_INLINE_BYTES`）。
 
 ```json
@@ -152,40 +141,21 @@ idat 后端返回 `NotSupported`。经 CLI socket 时，大结果与其他命令
 ./target/debug/ida-cli probe-runtime
 ```
 
-后端 probe 的典型输出：
-
-```json
-{"runtime":{"major":9,"minor":1,"build":250226},"backend":"idat-compat","supported":true,"reason":null}
-```
-
-```json
-{"runtime":{"major":9,"minor":5,"build":261001},"backend":"native-linked","supported":true,"reason":null}
-```
+`probe-runtime` 检查唯一 Nexus 后端的依赖、补丁及协议握手，失败时退出非零。
 
 完整 CLI 使用方式见 [skill/references/cli-tool-reference.md](skill/references/cli-tool-reference.md)。
 
 ## 构建要求
 
 - Rust 1.87+
-- LLVM / Clang
 - macOS 或 Linux 宿主机
-- 通过 `IDADIR` 指定 IDA 安装目录（运行时最低要求 IDA 9.0）
-- 通过 `IDASDKDIR` 或 `IDALIB_SDK` 指定 IDA SDK
-
-SDK 支持两种布局：
-
-- `/path/to/ida-sdk`
-- `/path/to/ida-sdk/src`
+- 通过 `IDADIR` 指定 IDA 安装目录（运行时最低要求 IDA 9.4）
 
 ## 运行时说明
 
-### `idat-compat`
+### Nexus
 
-IDA 9.0–9.2 的兼容后端。通过 `idat` 启动批处理脚本，跑 IDAPython，把结构化 JSON 返回给 CLI 运行时。
-
-### `native-linked`
-
-IDA 9.3+ 的原生后端。直接链接 vendored `idalib` 在进程内打开数据库。用于 IDA 9.3 和 9.5，且运行时与编译 SDK 版本一致时启用，否则 probe 退回 `idat-compat`。可用 `IDA_CLI_WORKER_BACKEND=native-linked|idat-compat` 强制指定。
+安装器直接定位专用 Python 环境；源码运行可设置 `IDA_NEXUS_PYTHON`。离线 sBPF/DSC 准备仍使用 sbx/idat，普通查询、编辑与数据库会话只走 Nexus。回退使用固定 N0 旧发行二进制和迁移前的已关闭备份，在独立恢复目录操作，不能切换运行时后端。真实环境安装/切回仍需明确授权。
 
 ### 缓存和本地运行时路径
 
@@ -206,7 +176,7 @@ GitHub Actions 在 Hosted Runner 上通过开源 `HexRaysSA/ida-sdk` 做编译�
 - 打 tag（例如 `v0.9.3`）构建 Linux / macOS release 资产
 - release 同时附带 `install.sh` 和各平台压缩包
 
-release 二进制是用 SDK stub 构建出来的；真正启动时，`install.sh` 生成的 launcher 会优先通过 `IDADIR` 或常见安装路径解析你本机的 IDA 运行时。
+release 二进制不链接 IDA 库；安装器创建并直接定位固定、带四补丁的 Nexus Python 环境。
 
 ## 其他文档
 

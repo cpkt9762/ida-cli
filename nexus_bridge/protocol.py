@@ -17,6 +17,8 @@ def verify_client():
     if versions != ['0.13.4','0.5.1']:
         raise ValueError('ProtocolMismatch: fixed Nexus 0.13.4/Domain 0.5.1 required; '
                          + f'actual Nexus {versions[0]}/Domain {versions[1]}')
+    if importlib.metadata.version('idapro') != '0.0.10':
+        raise ValueError('ProtocolMismatch: fixed idapro 0.0.10 required')
     package=Path(ida_nexus.__file__).resolve().parent
     modules={}
     for name,expected in SDK_FILES.items():
@@ -26,6 +28,10 @@ def verify_client():
         if source != package/name or actual != expected:
             raise ValueError('ProtocolMismatch: incompatible SDK module '+name)
         modules[name]={'path':str(source),'sha256':actual}
+    http = importlib.import_module('ida_nexus._http')
+    source = Path(http.__file__).resolve()
+    if source != package/'_http.py' or hashlib.sha256(source.read_bytes()).hexdigest() != '30f6b0271ce1a0c622cc6854740a55377cea3c832237f03f12229ad6e3cbf339':
+        raise ValueError('ProtocolMismatch: incompatible loopback patch _http.py')
     return modules
 
 
