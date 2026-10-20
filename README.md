@@ -228,3 +228,12 @@ The installer compares numeric dotted app-name versions component by component, 
 N0 comparisons are valid only with IDA 9.5. At 9.4 the verifier reports BLOCKED for suites requiring N0. Contract `--case E16`, `E17` and `E22` can run independently; E22 generates an annotated 9.4 database in the historical flat-cache layout and checks reuse/prewarm, without claiming an N0 comparison.
 
 Supported IDA runtimes: **9.4 and 9.5** only. Each uses its own locked wheel. For 9.4 only, the Domain metadata exception is conditional on exact installed runtime code hashes; every other dependency conflict fails. An explicit IDADIR override may switch between supported versions; reinstall for the target version is recommended. probe-runtime/status distinguish actual and installation versions. N0 comparisons require 9.5.
+
+Sequential CLI path queries reuse one daemon-owned warm lease instead of
+reopening IDA for each socket connection. `IDA_CLI_MAX_WARM_WORKERS` bounds
+this pool (default 16); least recently used entries are released when full.
+Use `ida-cli --path <file> close` or `shutdown` to release it. MCP openers keep
+independent leases and close tokens. Closed observation details retain at most
+128 settled records; active/unknown obligations are never evicted. Older proof
+files remain in custody journals, while request/operation identity tombstones
+keep the existing `IDA_CLI_NEXUS_RETENTION_CAPACITY` limit and no-replay rules.

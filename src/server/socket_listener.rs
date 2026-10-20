@@ -500,9 +500,9 @@ async fn dispatch_cli_request(
                 };
             let resolve_result = if let Some(ref p) = path {
                 router
-                    .ensure_worker_prepared(p, None, tenant_id.as_deref(), preparation.clone())
+                    .ensure_cli_worker_prepared(p, tenant_id.as_deref(), preparation.clone())
                     .await
-                    .map(|(h, token)| (h, Some(token)))
+                    .map(|handle| (handle, None))
             } else {
                 return (
                     RpcResponse::err(

@@ -314,6 +314,7 @@ pub struct RouterState {
     nexus_bridge: Arc<tokio::sync::OnceCell<Arc<nexus_bridge::NexusBridge>>>,
     nexus_tools: Arc<nexus_tools::Tools>,
     warm_pool: Arc<Mutex<HashMap<PathBuf, WarmLease>>>,
+    cli_open_gate: Arc<Mutex<()>>,
     prewarm_queue: Arc<Mutex<PrewarmQueueState>>,
     route_queue: Arc<Mutex<RouteQueueState>>,
     task_registry: TaskRegistry,
@@ -388,6 +389,7 @@ impl RouterState {
             nexus_bridge: Arc::new(tokio::sync::OnceCell::new()),
             nexus_tools: Arc::new(nexus_tools::Tools::new(config.max_pending_per_tenant)?),
             warm_pool: Arc::new(Mutex::new(HashMap::new())),
+            cli_open_gate: Arc::new(Mutex::new(())),
             prewarm_queue: Arc::new(Mutex::new(PrewarmQueueState::default())),
             route_queue: Arc::new(Mutex::new(RouteQueueState::default())),
             task_registry: TaskRegistry::new(),
@@ -915,6 +917,84 @@ impl RouterState {
             ));
         }
         return self.nexus_tools.open(self, path, preparation).await;
+    }
+
+    /// CLI path requests share a bounded daemon-owned warm reference. MCP
+    /// openers and background tasks keep their independent close authorities.
+    pub(crate) async fn ensure_cli_worker_prepared(
+        &self,
+        path: &str,
+        tenant_id: Option<&str>,
+        preparation: crate::preprocess::Preparation,
+    ) -> Result<DbHandle, crate::error::ToolError> {
+        use crate::error::ToolError;
+        if tenant_id.is_some_and(|tenant| tenant != "default") {
+            return Err(ToolError::NotSupported(
+                "Nexus tenant overrides are not implemented".into(),
+            ));
+        }
+        let expanded = crate::expand_path(path);
+        let canonical = preparation
+            .wait(crate::blocking::run(
+                crate::blocking::WorkClass::Prepare,
+                move || {
+                    expanded
+                        .canonicalize()
+                        .map_err(|error| ToolError::InvalidPath(error.to_string()))
+                },
+            ))
+            .await??;
+        let _opening = preparation
+            .wait(async { Ok(self.cli_open_gate.lock().await) })
+            .await?;
+        let existing = self.warm_pool.lock().await.get(&canonical).cloned();
+        if let Some(existing) = existing {
+            if self.nexus_tools.active_reference(self, &existing.handle) {
+                if let Some(warm) = self.warm_pool.lock().await.get_mut(&canonical) {
+                    warm.last_hit = Instant::now();
+                }
+                return Ok(existing.handle);
+            }
+            // Never replay a business request. Resolve the old reference's
+            // explicit cleanup before admitting a new owner on a later request.
+            self.release_warm_lease(&canonical).await?;
+        }
+        if self.config.max_warm_workers == 0 {
+            return Err(ToolError::Busy);
+        }
+        loop {
+            let pool = self.warm_pool.lock().await;
+            if pool.len() < self.config.max_warm_workers {
+                break;
+            }
+            let oldest = pool
+                .values()
+                .min_by_key(|entry| entry.last_hit)
+                .map(|entry| entry.path.clone());
+            drop(pool);
+            if let Some(oldest) = oldest {
+                self.release_warm_lease(&oldest).await?;
+            }
+        }
+        let (handle, token) = self
+            .ensure_worker_prepared(path, None, tenant_id, preparation.clone())
+            .await?;
+        let mut reference = nexus_tools::ReferenceGuard::new(self.clone(), token.clone());
+        preparation.check()?;
+        self.warm_pool.lock().await.insert(
+            canonical.clone(),
+            WarmLease {
+                handle: handle.clone(),
+                token,
+                path: canonical,
+                cache_path: None,
+                tenant_id: "default".into(),
+                pinned_at: Instant::now(),
+                last_hit: Instant::now(),
+            },
+        );
+        reference.transfer();
+        Ok(handle)
     }
 
     pub(crate) async fn nexus_close_path_detailed(

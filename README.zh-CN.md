@@ -200,3 +200,10 @@ MIT
 安装器按应用名称数字版本逐段比较、尾零等价、同版本按规范路径升序选择最新项，打印其他候选；最新不兼容时报错并提示用 `IDADIR` 指定其他候选，不自动退选。启动器保存安装时路径，显式 `IDADIR` 可覆盖到另一受支持版本；probe-runtime/status 分别报告实际 `ida_version` 和 `installed_ida_version`，建议按目标版本重新安装。实际版本由无数据库的有界子进程加载内核核实，并在每次 open 后核对 owner。
 
 N0 固定二进制链接 IDA 9.5，输出对照仅在 9.5 成立。9.4 下需要 N0 的 suite 明确 BLOCKED；contract 可用 `--case E16`、`E17`、`E22` 单独运行。E22 在 9.4 现场生成带标注的旧平铺布局库，核对缓存与预热契约，不宣称 N0 跨版本对照。
+
+连续 CLI path 查询复用 daemon 持有的独立 warm lease，不随每条 socket 连接
+重开 IDA。`IDA_CLI_MAX_WARM_WORKERS` 限制保活池（默认 16），满时释放最久未
+使用的条目；用 `ida-cli --path <file> close` 或 `shutdown` 释放。MCP opener
+仍持有独立 lease 和 close token。已结清观察明细保留最多 128 条，活动或未知
+义务不会被淘汰；旧证明文件仍在 custody journal 中。请求/操作身份墓碑仍遵守
+`IDA_CLI_NEXUS_RETENTION_CAPACITY` 的既有上限和禁止重放规则。

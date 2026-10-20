@@ -262,7 +262,10 @@ impl Tools {
                 .or_default()
                 .push((handle, db));
         }
-        let active = records.iter().max_by_key(|(_, db)| db.opened_at).map(|(handle, _)| handle);
+        let active = records
+            .iter()
+            .max_by_key(|(_, db)| db.opened_at)
+            .map(|(handle, _)| handle);
         let mut idbs = Vec::new();
         for mut group in groups.into_values() {
             group.sort_by_key(|(handle, db)| (db.opened_at, *handle));
@@ -313,8 +316,21 @@ impl Tools {
         IdbListing::new(idbs)
     }
 
+    pub(super) fn active_reference(&self, router: &RouterState, handle: &str) -> bool {
+        let records = self.records();
+        records.get(handle).is_some_and(|db| {
+            router
+                .nexus_endpoint()
+                .transition(|sessions, _| sessions.status(&db.lease.client_id, &db.lease))
+                .is_ok_and(|status| status.phase == SessionPhase::Active)
+        })
+    }
+
     pub fn active(&self) -> Option<String> {
-        self.records().iter().max_by_key(|(_, db)| db.opened_at).map(|(handle, _)| handle.clone())
+        self.records()
+            .iter()
+            .max_by_key(|(_, db)| db.opened_at)
+            .map(|(handle, _)| handle.clone())
     }
     pub fn handle_for_token(&self, token: &str) -> Option<String> {
         self.records()
