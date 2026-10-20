@@ -62,6 +62,7 @@ pub struct RouterConfig {
     pub max_workers_per_tenant: usize,
     pub max_pending_per_worker: usize,
     pub max_pending_per_tenant: usize,
+    pub nexus_retention_capacity: usize,
     pub max_concurrent_spawns: usize,
     pub max_warm_workers: usize,
     pub max_queued_prewarms: usize,
@@ -101,6 +102,11 @@ impl RouterConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(512);
+        let nexus_retention_capacity = std::env::var("IDA_CLI_NEXUS_RETENTION_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(65536);
         let max_concurrent_spawns = std::env::var("IDA_CLI_MAX_CONCURRENT_SPAWNS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -162,6 +168,7 @@ impl RouterConfig {
             max_workers_per_tenant,
             max_pending_per_worker,
             max_pending_per_tenant,
+            nexus_retention_capacity,
             max_concurrent_spawns,
             max_warm_workers,
             max_queued_prewarms,
@@ -295,6 +302,7 @@ pub struct WorkerStatus {
 pub struct RouterStatus {
     pub owner_observations: Vec<serde_json::Value>,
     pub nexus_lifecycle: Option<serde_json::Value>,
+    pub nexus_retention: crate::nexus::NexusRetentionStatus,
     pub metadata: DaemonMetadata,
     pub worker_count: usize,
     pub active_handle: Option<String>,
@@ -485,7 +493,14 @@ impl RouterState {
             config: config.clone(),
             spawn_gate: Arc::new(Semaphore::new(config.max_concurrent_spawns)),
             nexus: Arc::new(std::sync::Mutex::new((
-                nexus_transport::NexusEndpoint::new(config.max_pending_per_tenant),
+                nexus_transport::NexusEndpoint::with_limits(
+                    config.max_pending_per_tenant,
+                    config.nexus_retention_capacity,
+                    Err(crate::nexus::NexusError::new(
+                        crate::nexus::NexusErrorCode::BridgeUnavailable,
+                        "N3 capability handshake is not installed",
+                    )),
+                ),
                 false,
             ))),
             nexus_bridge: Arc::new(tokio::sync::OnceCell::new()),
@@ -573,8 +588,9 @@ impl RouterState {
             ));
         }
         *endpoint = (
-            nexus_transport::NexusEndpoint::with_capabilities(
+            nexus_transport::NexusEndpoint::with_limits(
                 self.config.max_pending_per_tenant,
+                self.config.nexus_retention_capacity,
                 Ok(capabilities),
             ),
             true,
@@ -1583,6 +1599,9 @@ impl RouterState {
         let mut status = RouterStatus {
             owner_observations: self.nexus_tools.owner_status(self),
             nexus_lifecycle: self.nexus_bridge.get().map(|b| b.lifecycle_status()),
+            nexus_retention: self
+                .nexus_endpoint()
+                .transition(|s, _| s.retention_status()),
             metadata,
             worker_count,
             active_handle,
@@ -3309,6 +3328,7 @@ mod tests {
         let mut config = (*router.config).clone();
         config.max_pending_per_worker = 1;
         config.max_pending_per_tenant = 3;
+        config.nexus_retention_capacity = 65536;
         router.config = Arc::new(config);
         let caps = crate::nexus::NexusCapabilities {
             runtime: crate::nexus::NexusRuntime {
@@ -3324,6 +3344,10 @@ mod tests {
         let lanes = endpoint.take_lanes().unwrap();
         assert_eq!(lanes.business.max_capacity(), 3);
         assert_eq!(lanes.control.max_capacity(), 8);
+        assert_eq!(
+            endpoint.transition(|s, _| s.retention_status().business_capacity),
+            65536
+        );
         for i in 0..4 {
             let request = crate::nexus::AcceptedRequest::new(
                 &crate::nexus::SystemClock,
@@ -3354,6 +3378,117 @@ mod tests {
         }
         drop(lanes);
         endpoint.transition(|_, _| ());
+    }
+
+    #[test]
+    fn rv81_retention_environment_is_independent_of_pending_limit() {
+        if std::env::var_os("RV81_CONFIG_CHILD").is_some() {
+            let config = RouterConfig::from_env();
+            assert_eq!(config.max_pending_per_tenant, 1);
+            assert_eq!(config.nexus_retention_capacity, 3);
+            let router = RouterState::new().expect("configured router");
+            assert_eq!(
+                router
+                    .nexus_endpoint()
+                    .transition(|s, _| s.retention_status().business_capacity),
+                3
+            );
+            assert_eq!(
+                router
+                    .nexus_endpoint()
+                    .take_lanes()
+                    .expect("business lane")
+                    .business
+                    .max_capacity(),
+                1
+            );
+            return;
+        }
+        let output = std::process::Command::new("timeout")
+            .arg("30s")
+            .arg(std::env::current_exe().expect("unit-test executable"))
+            .args([
+                "--exact",
+                "router::tests::rv81_retention_environment_is_independent_of_pending_limit",
+                "--nocapture",
+            ])
+            .env("RV81_CONFIG_CHILD", "1")
+            .env("IDA_CLI_MAX_PENDING_PER_TENANT", "1")
+            .env("IDA_CLI_NEXUS_RETENTION_CAPACITY", "3")
+            .output()
+            .expect("isolated config test child");
+        assert!(
+            output.status.success(),
+            "config child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    }
+
+    #[tokio::test]
+    async fn rv81_status_exposes_configured_retention_and_growing_usage() {
+        let mut router = RouterState::new().expect("router");
+        let mut config = (*router.config).clone();
+        config.max_pending_per_tenant = 1;
+        config.nexus_retention_capacity = 2;
+        router.config = Arc::new(config);
+        let caps = crate::nexus::NexusCapabilities {
+            runtime: crate::nexus::NexusRuntime {
+                ida: crate::nexus::Version(9, 5, 0),
+                python: crate::nexus::Version(3, 14, 7),
+                nexus: Some(crate::nexus::Version(0, 13, 4)),
+                domain: Some(crate::nexus::Version(0, 5, 1)),
+            },
+            methods: Default::default(),
+        };
+        router
+            .install_nexus_capabilities(caps)
+            .expect("capabilities");
+        let before = router.status_snapshot().await;
+        assert_eq!(before.max_pending_per_tenant, 1);
+        assert_eq!(before.nexus_retention.business_used, 0);
+        assert_eq!(before.nexus_retention.business_capacity, 2);
+        let endpoint = router.nexus_endpoint();
+        let mut lanes = endpoint.take_lanes().expect("business lane");
+        for index in 0..2 {
+            let identity = endpoint
+                .transition(|s, t| {
+                    s.open(
+                        &crate::nexus::ClientId::new("rv81-status").unwrap(),
+                        crate::nexus::AcceptedRequest::new(
+                            &crate::nexus::SystemClock,
+                            crate::nexus::RequestId::new(format!("r-{index}")).unwrap(),
+                            None,
+                            "open",
+                            serde_json::json!({}),
+                        )
+                        .unwrap(),
+                        crate::nexus::OpenSpec {
+                            operation_id: crate::nexus::OperationId::new(format!("o-{index}"))
+                                .unwrap(),
+                            path: "/fixture.i64".into(),
+                            options: serde_json::json!({}),
+                        },
+                        t,
+                    )
+                })
+                .expect("retention permits another request after terminal NotSent");
+            drop(lanes.business.try_recv().expect("exact local delivery"));
+            endpoint.transition(|s, _| {
+                assert!(s
+                    .open_progress(&identity.client_id, &identity)
+                    .expect("terminal NotSent tombstone")
+                    .1
+                    .is_some())
+            });
+            let status = serde_json::to_value(router.status_snapshot().await).unwrap();
+            assert_eq!(status["nexus_retention"]["business_used"], index + 1);
+            assert_eq!(status["nexus_retention"]["business_capacity"], 2);
+            assert_eq!(status["nexus_retention"]["total_used"], index + 1);
+            assert_eq!(status["nexus_retention"]["total_capacity"], 128);
+            assert_eq!(status["max_pending_per_tenant"], 1);
+        }
     }
 
     #[test]
