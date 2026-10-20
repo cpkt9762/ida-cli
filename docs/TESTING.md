@@ -1697,3 +1697,15 @@ branches; `tests/support/n8tool_real.py` additionally creates an isolated real
 small IDB with a comment and patched byte, invokes the built entrypoint,
 reopens the migrated/restored IDB and reads both edits back. This targeted
 validation does not replace N8 full E2E or independent review.
+
+
+N8 工具返修的 R5 receiver 回归保持每个 socket 读取 2s 屏障。独立 Rig 在 N1
+入队前通过同样有界的 2s fixture admission 同步，避免互不相关的测试同时
+抢占全进程两个非等待 Encode 名额。单场景的全部 A/B peers、原189轨迹
+和诊断断言仍走相同生产 N1/reader。合法的 Busy/NotSent 不产生 wire frame，
+旧 fixture 却无界等首帧；超时现在打印阶段和 N1 open_progress。没有增加
+生产编码容量或等待策略，也不重试 Busy、不放宽断言。
+
+feature lib 的既有维护夹具还需要私有 `IDA_NEXUS_STATE_DIR`、`R3A_CASE_ROOT`、
+`R3F1_SAMPLE`、静态测试 telemetry，以及 `R4_BASELINE_SOURCE` 指向固定
+`5d8a215f92b4405e6db99af8e7f86c72ae95861f` 的 v1 producer 源码归档。
