@@ -535,6 +535,7 @@ fn main() -> anyhow::Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("cache-legacy")) {
         return ida_mcp::legacy_cache::run(std::env::args_os().skip(2).collect());
     }
+    reject_removed_configuration()?;
     // Initialize logging:
     //   stderr : RUST_LOG  or  ida_mcp=info  (low-noise)
     //   ~/.ida/logs/server.log : RUST_LOG  or  ida_mcp=debug  (verbose, for post-mortem)
@@ -626,6 +627,31 @@ fn main() -> anyhow::Result<()> {
 
         Command::Cli(args) => run_cli(args),
     }
+}
+
+fn reject_removed_configuration() -> anyhow::Result<()> {
+    for name in [
+        "IDA_CLI_NEXUS_DEV",
+        "IDA_CLI_WORKER_BACKEND",
+        "IDA_CLI_MAX_WORKERS",
+        "IDA_CLI_MAX_WORKERS_PER_TENANT",
+        "IDA_CLI_MAX_PENDING_PER_WORKER",
+        "IDA_CLI_MAX_CONCURRENT_SPAWNS",
+        "IDA_CLI_SDK_VERSION",
+    ] {
+        if std::env::var_os(name).is_some() {
+            let migration = if matches!(
+                name,
+                "IDA_CLI_NEXUS_DEV" | "IDA_CLI_WORKER_BACKEND" | "IDA_CLI_SDK_VERSION"
+            ) {
+                "delete this variable; no backend or SDK selection is needed"
+            } else {
+                "delete this variable; configure IDA_CLI_MAX_PENDING_PER_TENANT, IDA_CLI_NEXUS_RETENTION_CAPACITY or IDA_CLI_HELPER_CAPACITY for the corresponding Nexus limits"
+            };
+            anyhow::bail!("{name} was removed in the Nexus-only backend version; {migration}");
+        }
+    }
+    Ok(())
 }
 
 fn run_probe_runtime() -> anyhow::Result<()> {

@@ -1880,3 +1880,5 @@ Linux. Other source/cache filesystems retain complete hashing with a diagnostic;
 failed filesystem qualification is an error. Coarse or remotely cached timestamps
 therefore cannot authorize a hash hit. Linux qualification is implementation
 policy only; this delivery's real E25 evidence remains macOS/APFS.
+
+唯一 Nexus 后端在 CLI 发现 daemon 或服务启动前拒绝已删除配置（包括空值）：`IDA_CLI_NEXUS_DEV`、`IDA_CLI_WORKER_BACKEND`、`IDA_CLI_SDK_VERSION`、`IDA_CLI_MAX_WORKERS`、`IDA_CLI_MAX_WORKERS_PER_TENANT`、`IDA_CLI_MAX_PENDING_PER_WORKER`、`IDA_CLI_MAX_CONCURRENT_SPAWNS`。请删除这些变量；按实际需求配置 `IDA_CLI_MAX_PENDING_PER_TENANT`、`IDA_CLI_NEXUS_RETENTION_CAPACITY` 或 `IDA_CLI_HELPER_CAPACITY`。它们是独立限制，不与旧 worker 数量一一对应。

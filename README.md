@@ -218,3 +218,5 @@ Release binaries have no IDA linkage. The installer creates and directly locates
 ## License
 
 MIT
+
+Removed configuration is an error (even an empty value), before CLI daemon discovery or server startup: `IDA_CLI_NEXUS_DEV`, `IDA_CLI_WORKER_BACKEND`, `IDA_CLI_SDK_VERSION`, `IDA_CLI_MAX_WORKERS`, `IDA_CLI_MAX_WORKERS_PER_TENANT`, `IDA_CLI_MAX_PENDING_PER_WORKER`, `IDA_CLI_MAX_CONCURRENT_SPAWNS`. Remove these variables. For Nexus limits use the applicable `IDA_CLI_MAX_PENDING_PER_TENANT`, `IDA_CLI_NEXUS_RETENTION_CAPACITY`, or `IDA_CLI_HELPER_CAPACITY`; these are independent limits, not direct replacements for worker counts.
