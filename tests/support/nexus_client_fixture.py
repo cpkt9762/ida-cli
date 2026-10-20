@@ -14,7 +14,6 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tests/support"))
 from nexus_env import Environment
-from r0_transport import barrier as startup_barrier
 
 env = Environment(Path(os.environ["N3_ENV_ROOT"]))
 # No signal handler changes in the bridge's business threads. Persist creation
@@ -47,6 +46,7 @@ except ImportError:
         raise
     runpy.run_path(str(REPO / "nexus_bridge/bridge.py"), run_name="__main__")
     raise AssertionError("bridge main must exit")
+from r0_transport import barrier as startup_barrier
 resolver.subprocess = proxy
 # Popen remains owned until waitpid observes exit; the production Nexus client
 # deliberately detaches its owner. This test-only observer sends no signals.

@@ -135,7 +135,7 @@ async fn n6_e20_cancelled_write_retains_first_slice_without_replay() {
                   "first_slice":observed,"readback":second,"hooks":clean}),
     );
     client.release(&lease).await;
-    tokio::time::timeout(Duration::from_secs(10), client.bridge.shutdown())
+    tokio::time::timeout(Duration::from_secs(10), client.shutdown())
         .await
         .expect("bridge stop deadline")
         .expect("owned bridge stopped");

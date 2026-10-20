@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import runpy
 import sys
+import traceback
 
 from r2_process_ledger import install
 install()
@@ -15,6 +16,7 @@ from acquisition import Custodian
 original_execute = Custodian.execute
 original_retry = Custodian.next_retry
 original_obtain = Custodian.obtain
+original_receive = runtime.Bridge.receive
 limit = int(os.environ.get('R7A_ROOT_FAILURES', '0'))
 trace = Path(os.environ['R7A_ROOT_TRACE'])
 
@@ -53,5 +55,16 @@ def obtain(self, Handle, Options, path, options, context):
 
 
 Custodian.obtain = obtain
+
+
+def receive(self, channel, message):
+    try:
+        return original_receive(self, channel, message)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        raise
+
+
+runtime.Bridge.receive = receive
 runtime.main()
 

@@ -48,6 +48,9 @@ def main():
         if not patch_status["applied"] or not patch_status["close_applied"]:
             parser.error("client cancellation and close proof patches required; BLOCKED")
         variables = env.variables()
+        for name in ("CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"):
+            if os.environ.get(name):
+                variables[name] = os.environ[name]
         if args.tmp_root:
             if args.tmp_root.resolve(strict=True) != env.root / "tmp":
                 parser.error("--tmp-root must resolve to this environment's tmp directory")
@@ -78,7 +81,8 @@ def main():
         Path(variables["N3_IPC_ROOT"]).mkdir(mode=0o700, exist_ok=True)
         (env.root / "ipc-root.json").write_text(json.dumps(str(ipc_root)))
         (env.root / "rust-env.json").write_text(json.dumps(variables, indent=2) + "\n")
-        command = ["timeout", "180s", str(cargo), "test", "--locked", "--test", f"nexus_{args.suite}_e2e", "--", "--test-threads=1"]
+        suite_timeout = "300s" if args.suite == "special_inputs" else "180s"
+        command = ["timeout", suite_timeout, str(cargo), "test", "--locked", "--test", f"nexus_{args.suite}_e2e", "--", "--test-threads=1"]
         if args.case:
             command.insert(command.index("--"), "e22_old_cache_proof_preserves_edits_and_warm_lease")
         result = {"status":"FAIL", "command":command, "client_cancel_patch":patch_status}

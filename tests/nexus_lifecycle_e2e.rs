@@ -49,7 +49,7 @@ async fn e02_readiness_dependencies_versions_and_runtime() {
     let client = Client::new().await;
     let cfg = config();
     assert!(client.bridge.pid > 0);
-    client.bridge.shutdown().await.unwrap();
+    client.shutdown().await.unwrap();
     let mut missing = cfg.clone();
     missing.directory = cfg.directory.with_file_name(id());
     let shell = root().join("no-site-python");
@@ -131,7 +131,7 @@ async fn e03_raw_and_existing_idb_save_close_reopen() {
         reopened["lease"]["instance_id"]
     );
     a.release(&lease).await;
-    a.bridge.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
     record(json!({"case":"E03", "status":"PASS", "saved_name":"N3_SAVED_E03", "idb_path":path}));
 }
 #[tokio::test]
@@ -156,8 +156,8 @@ async fn e05_two_client_processes_share_and_release_independently() {
     let (la, _) = a.open(&source, json!({})).await;
     assert_eq!(name(&mut a, &la, address).await, "N3_B_AFTER_A_RELEASE");
     a.release(&la).await;
-    a.bridge.shutdown().await.unwrap();
-    b.bridge.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
     record(
         json!({"case":"E05", "status":"PASS", "same_owner":oa["pid"], "persisted":"N3_B_AFTER_A_RELEASE"}),
     );
@@ -238,7 +238,7 @@ async fn e06_client_killed_shared_owner_survives_and_last_release_saves() {
         "N3_SURVIVES_CLIENT_KILL"
     );
     a.release(&lease).await;
-    a.bridge.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
     record(json!({"case":"E06-client", "status":"PASS"}));
 }
 #[tokio::test]
@@ -271,7 +271,7 @@ async fn e06_bridge_killed_external_lease_survives() {
     let info = b.value(&lease, "database_info", json!({})).await;
     assert_eq!(info["name"], "N3_EXTERNAL_SURVIVES");
     b.release(&lease).await;
-    b.bridge.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
     record(json!({"case":"E06-bridge", "status":"PASS"}));
 }
 async fn crash_recovery(packed: bool) {
@@ -359,7 +359,7 @@ async fn crash_recovery(packed: bool) {
         .collect();
     assert_eq!(backups.len(), usize::from(packed));
     a.release(&replacement).await;
-    a.bridge.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
     record(
         json!({"case":if packed {"E07-packed"} else {"E07-unpacked"},"status":"PASS","recovery":reopened["recovery"],"crash_count":1,"backups":backups}),
     );
@@ -393,8 +393,8 @@ async fn e05_concurrent_ordinary_open_shares_owner_without_explicit_attach() {
     let (reopened, _) = a.open(&source, json!({})).await;
     assert_eq!(name(&mut a, &reopened, address).await, "F1_CONCURRENT_OPEN");
     a.release(&reopened).await;
-    a.bridge.shutdown().await.unwrap();
-    b.bridge.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
     record(
         json!({"case":"E05-concurrent-open", "status":"PASS", "instance_id":la.instance_id, "owner_pid":oa["pid"], "saved_name":"F1_CONCURRENT_OPEN"}),
     );
@@ -460,7 +460,7 @@ async fn e06_same_router_lease_sse_fault_preserves_sibling_operation() {
     );
     a.release(&healthy).await;
     owner_exited(opened["pid"].as_u64().unwrap() as u32).await;
-    a.bridge.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
     record(
         json!({"case":"E06-lease-fault", "status":"PASS", "expired_lease":idle, "healthy_lease":healthy, "reason":disconnected["reason"], "active_operation":operation}),
     );

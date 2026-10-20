@@ -201,6 +201,23 @@ impl Client {
         assert!(result.execution_stopped);
         result.result.unwrap()["result"].clone()
     }
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let state = self.bridge.lifecycle_status();
+                if state["resources"] == 0
+                    && state["startup_and_pre_attach"] == 0
+                    && state["retirement_acks"] == 0
+                {
+                    record(json!({"event":"shutdown_custody_settled", "state":state}));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?;
+        self.bridge.shutdown().await
+    }
     pub async fn release(&mut self, lease: &SessionLease) {
         self.bridge
             .endpoint()

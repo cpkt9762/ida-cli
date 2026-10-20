@@ -100,7 +100,7 @@ async fn start(
 }
 async fn close(a: &mut Client, lease: &SessionLease) {
     a.release(lease).await;
-    a.bridge.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
 }
 fn passed(case: &str, assertions: Value) {
     record(json!({"case":case,"status":"PASS","assertions":assertions}));
