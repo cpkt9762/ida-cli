@@ -30,10 +30,12 @@ class Compatibility(unittest.TestCase):
             target.parent.mkdir(parents=True)
             target.write_bytes(b'isolated')
             diagnostics = types.SimpleNamespace(database_diagnostics=lambda path: {'target': str(path), 'lifetime': 'held'})
-            args = ['compare', '--root', str(root), '--baseline', 'baseline', '--binary', 'binary', '--case', 'E22']
+            baseline = root / 'baseline'
+            baseline.write_bytes(b'isolated baseline fixture')
+            args = ['compare', '--root', str(root), '--baseline', str(baseline), '--binary', 'binary', '--case', 'E22']
             with patch.object(sys, 'argv', args), patch.dict(os.environ, {'IDA_TEST': '1'}), \
                     patch.object(comparison, 'digest', return_value=comparison.BASELINE_SHA), \
-                    patch.object(comparison, 'Environment', return_value=types.SimpleNamespace(root=root)), \
+                    patch.object(comparison, 'Environment', return_value=types.SimpleNamespace(root=root, manifest={"installed_ida_version": "9.5"})), \
                     patch.object(comparison, 'legacy_cache', side_effect=RuntimeError('injected WorkerStartError')), \
                     patch.dict(sys.modules, {'lifecycle': diagnostics}):
                 with self.assertRaisesRegex(RuntimeError, 'WorkerStartError'):
