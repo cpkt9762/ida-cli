@@ -533,8 +533,12 @@ def tool_contracts(env, baseline, binary):
                     'allocated_id_witnesses':witnesses,'status':'PASS' if equal else 'FAIL'})
         refusals = {}
         for name in ("open_dsc", "dsc_add_dylib", "dsc_add_region"):
-            refusal = new.call(name, {})
-            assert "not implemented by Nexus; no legacy fallback" in refusal["error"], refusal
+            refusal = new.client.rpc("tools/call", {"name": name, "arguments": {}})
+            # N7b now owns these tools. Empty requests fail parameter validation
+            # before any preparation/owner execution, rather than capability admission.
+            assert refusal["error"]["code"] == -32602, refusal
+            assert "missing field" in refusal["error"]["message"], refusal
+            assert "no legacy fallback" not in refusal["error"]["message"], refusal
             refusals[name] = refusal
         unknown = new.direct("unknown_n6", {})
         assert unknown["exit"] == 1 and "no legacy fallback" in unknown["error"], unknown

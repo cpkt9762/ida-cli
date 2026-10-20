@@ -1611,3 +1611,37 @@ R7a-fix1 的 close 文本保持单个 legacy `content` 项。MCP stdio/HTTP 的�
 producer/consumer 及 retirement ACK 结清。固定 N0 输出归一化和相等规则不变。
 helper 默认预留 512 个 watch（每 parent 四个），live bytes 按每 slot 32KiB 有界计费，
 mutable registry 另留四倍收尾空间；单份 immutable proof 与 IPC frame 保留原上限。
+
+### N7b real sBPF and DSC directed cases
+
+`nexus_n7b_e2e` has three independent exact cases: E24 first build/query/decompile/
+cached reopen, E24 cancellation inside real sbx-launched IDAPython, and E25 new DSC
+build/existing database/cached reopen. Each needs a fresh prepared environment,
+`IDA_TEST=1`, its `rust-env.json`, private home/state/tmp/IPC, and explicit
+`N7B_SBPF_SAMPLE` or `N7B_DSC_SAMPLE`. Samples remain read-only; sBPF is copied.
+Use `N7B_E2E_BINARY` to name this checkout's absolute release binary for large DSC
+inputs. It must exist; a supplied invalid path never selects another binary.
+
+The DSC case selects `/usr/lib/system/libsystem_blocks.dylib`, adds
+`libsystem_kernel.dylib` through Nexus, and retains the complete input bundle for
+later dscu operations. The current system cache has about 6.56 GiB of companions.
+Its source/member hashes and loader selection determine a distinct content key;
+all copies, build and index publication use the existing root/content/open locks.
+The retained `dsc-inputs` inventory is declared in `generation.json`; GC rejects
+unexpected members, symlinks and incomplete packed groups. Legacy adjacent IDBs
+and direct existing IDBs keep their original identity.
+
+Run one exact case per fresh root, with before/after uptime. Ordinary real cases
+use shell `timeout 180s`; allow `timeout 360s` for E25's complete bundle integrity,
+offline IDA build and repeated loads (inner driver330s). No complete E2E matrix is
+implied. Missing runtime/sample is a failure, never an ignored pass. Each driver
+writes `<case>-result.json` and must finish with PASS plus cleanup CLEAN; the
+Rust wrapper also requires one passed test and zero failures/ignored cases.
+The cancel case blocks actual IDAPython on a FIFO, then requires confirmed stop,
+exact sbx/idat identities gone, no output or staging/temp inputs, and a healthy
+second library. It does not replace sbx/idat with a fake compiler.
+
+`nexus_n7b` separately checks capability admission, generated offline-plugin
+failure and task-owned temporary files. `test_nexus_n7b_cache.py` covers the
+strict bundle inventory. These are deterministic contracts, not real E24/E25.
+N7b delivery and independent acceptance are recorded in the external report.
