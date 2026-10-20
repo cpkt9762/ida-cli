@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 import uuid
 
@@ -83,7 +82,7 @@ def plan(root, mode, group, homes, states, backup, *, probe=offline.observe):
     base = {'schema': 1, 'root': offline.binding(root), 'boot_id': offline.boot(), 'mode': mode,
             'router_homes': [offline.binding(p) for p in homes],
             'state_roots': [offline.binding(p) for p in states], 'backup': str(backup),
-            'indices': files.metadata(root)}
+            'indices': files.metadata(root), 'maintenance_timeout': files.timeout_policy()}
     if mode == 'restore':
         manifest = load_manifest(backup, root)
         base.update(group=manifest['group'], backup_sha256=files.digest(files.read(backup/'manifest.json')),
@@ -118,8 +117,7 @@ def content_key(path):
     executable = os.environ.get('IDA_CLI_LEGACY_TOOL')
     if not executable:
         raise RuntimeError('content-key verification requires the ida-cli cache-legacy entrypoint')
-    result = subprocess.run(['timeout', '10s', executable, 'cache-legacy', '--content-key', str(path)],
-                            capture_output=True, text=True, check=False)
+    result = offline.run_child(['timeout', '--foreground', str(files.remaining_seconds())+'s', executable, 'cache-legacy', '--content-key', str(path)])
     if result.returncode or not re.fullmatch(r'[0-9a-f]{12}\n?', result.stdout):
         raise RuntimeError('content-key verification failed')
     return result.stdout.strip()
@@ -131,8 +129,8 @@ def inspect_copy(backup, idb_name):
     probe.mkdir(mode=0o700)
     source = backup/'files'/idb_name
     files.copy_verified(source, probe/'probe.i64', files.fingerprint(source))
-    result = subprocess.run(['timeout', '30s', *offline.child_argv('--inspect-copy', str(probe/'probe.i64'),
-                             '--result', str(probe/'result.json'))], capture_output=True, text=True, check=False)
+    result = offline.run_child(['timeout', '--foreground', str(files.remaining_seconds())+'s', *offline.child_argv('--inspect-copy', str(probe/'probe.i64'),
+                               '--result', str(probe/'result.json'))])
     if result.returncode:
         raise RuntimeError('private packed IDB inspection failed; copy retained at ' + str(probe))
     value = json.loads(files.read(probe/'result.json'))
@@ -245,7 +243,9 @@ def apply(root, mode, group_name, homes, states, backup, evidence, *,
         fresh, fresh_hash = plan(root, mode, group_name, homes, states, backup, probe=probe)
         if fresh_hash != plan_hash:
             raise RuntimeError('reviewed plan changed under exclusion locks')
-        check = lambda: offline.validate(evidence, plan_hash, root, homes, states)
+        def check():
+            files.checkpoint()
+            offline.validate(evidence, plan_hash, root, homes, states)
         check()
         if mode == 'restore':
             manifest = load_manifest(backup, root)
@@ -296,14 +296,19 @@ def apply(root, mode, group_name, homes, states, backup, evidence, *,
             # Collisions fail visibly, preserve the backup and require explicit
             # restoration; a process crash uses the same idempotent entrypoint.
             try:
-                for path in targets:
-                    value = active_probe(path, states)
-                    if value.get('openers') is not None or not (value.get('packed') is True or value.get('state') == 'missing'):
-                        raise RuntimeError('rollback target now occupied or unknown')
-                files.restore_files(root, backup, manifest)
-            except Exception as rollback:
-                raise RuntimeError(f'operation failed: {failure}; rollback blocked: {rollback}; verified backup retained at {backup}') from failure
+                with files.rollback_window():
+                    rollback(root, backup, manifest, targets, states, active_probe)
+            except Exception as rollback_error:
+                raise RuntimeError(f'operation failed: {failure}; rollback blocked: {rollback_error}; verified backup retained at {backup}') from failure
             raise
+
+
+def rollback(root, backup, manifest, targets, states, active_probe):
+    for path in targets:
+        value = active_probe(path, states)
+        if value.get('openers') is not None or not (value.get('packed') is True or value.get('state') == 'missing'):
+            raise RuntimeError('rollback target now occupied or unknown')
+    files.restore_files(root, backup, manifest)
 
 
 def paths(values):
@@ -328,7 +333,9 @@ def main():
     parser.add_argument('--inspect-copy', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--result', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    runtime = None
     try:
+        runtime = files.begin_runtime()
         if args.observe or args.observe_readonly:
             print(json.dumps(offline.public_observation(args.observe or args.observe_readonly, read_only=bool(args.observe_readonly))))
             return
@@ -342,6 +349,7 @@ def main():
             if args.apply:
                 raise ValueError('--apply requires an explicit mode')
             print(json.dumps({'dry_run': True, 'groups': inventory(root, states),
+                              'maintenance_timeout': files.timeout_policy(),
                               'offline_proof': 'not established; negative probes alone are insufficient'}))
             return
         if not args.backup or (args.mode != 'restore' and not args.group):
@@ -356,11 +364,23 @@ def main():
         else:
             value, plan_hash = plan(root, args.mode, args.group, homes, states, args.backup)
             result = {'dry_run': True, 'plan': value, 'plan_sha256': plan_hash,
+                      'maintenance_timeout': files.timeout_policy(),
                       'required_offline_scope': offline.SCOPE, 'confirmation': offline.CONFIRMATION,
                       'offline_proof': 'operator must establish and maintain exclusion; this preview is not proof'}
         print(json.dumps(result))
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
-        parser.exit(1, 'legacy cache maintenance refused: ' + str(error) + '\n')
+        guidance = ''
+        if args.apply and args.backup:
+            if (args.backup/'manifest.json').is_file():
+                guidance = ('; verified backup retained at ' + str(args.backup)
+                            + '; preview --mode restore --backup <same directory> and apply with fresh offline evidence')
+            else:
+                guidance = ('; no completed manifest: original files/indices were not changed; retain partial backup at '
+                            + str(args.backup) + ' and use a new backup directory for another attempt')
+        parser.exit(1, 'legacy cache maintenance refused: ' + str(error) + guidance + '\n')
+    finally:
+        if runtime is not None:
+            files.end_runtime(runtime)
 
 
 if __name__ == '__main__':

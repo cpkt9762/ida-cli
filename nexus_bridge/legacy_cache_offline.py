@@ -9,13 +9,14 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import sys
 import time
 
 from custody_process_identity import identity
-from legacy_cache_files import directory, object_id, read
+from legacy_cache_files import checkpoint, directory, object_id, read
 from target_coordination import Directory
 
 CONFIRMATION = 'I established and maintain this exclusive offline window'
@@ -133,14 +134,43 @@ def child_argv(*arguments):
     return [sys.executable, '-B', str(Path(__file__).with_name('legacy_cache.py')), *arguments]
 
 
+def run_child(argv, *, env=None):
+    """Own the helper group and observe its terminal before rolling back."""
+    checkpoint()
+    with subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=True) as child:
+        try:
+            while True:
+                checkpoint()
+                try:
+                    stdout, stderr = child.communicate(timeout=0.1)
+                    checkpoint()
+                    return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                child.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.communicate(timeout=2)
+            raise
+
+
 def observe(path, states, *, read_only=True):
     """Fresh SDK import per exact state root; no registry tokens are read here."""
     if not states:
         return {'packed': None, 'openers': 'unknown: no Nexus state-root inventory'}
     for state in states:
-        result = subprocess.run(['timeout', '5s', *child_argv('--observe-readonly' if read_only else '--observe', str(path))],
-                                env=os.environ | {'IDA_NEXUS_STATE_DIR': str(state)},
-                                capture_output=True, text=True, check=False)
+        result = run_child(['timeout', '--foreground', '5s', *child_argv('--observe-readonly' if read_only else '--observe', str(path))],
+                           env=os.environ | {'IDA_NEXUS_STATE_DIR': str(state)})
         if result.returncode:
             return {'packed': None, 'openers': 'unknown: public observation failed', 'exit': result.returncode}
         value = json.loads(result.stdout)

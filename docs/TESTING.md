@@ -1616,7 +1616,13 @@ mutable registry 另留四倍收尾空间；单份 immutable proof 与 IPC frame
 
 `ida-cli cache-legacy` is a local maintenance entrypoint, bypassing router,
 logging and automatic daemon startup. Set `IDA_NEXUS_PYTHON` to the prepared
-Nexus interpreter. Default is dry-run; it lists only root-level legacy `.i64`
+Nexus interpreter. `IDA_CLI_LEGACY_TIMEOUT_SECS` explicitly selects a 1–3600s
+maintenance budget (default 1800s). Dry-run and action plans show the effective
+`maintenance_timeout`; changing it requires a new reviewed plan/evidence. The
+Rust supervisor forwards SIGTERM/SIGINT and allows 35s for rollback before its
+last-resort kill. Use an outer timeout longer than the selected budget plus
+that grace. The configured budget also bounds large input hashing and private
+IDA-copy inspection; owner probes retain their short individual limit. Default is dry-run; it lists only root-level legacy `.i64`
 groups, component names, byte counts, file hashes/identities, filename content
 key, both index entries, packed state and public opener observations. Missing
 SDK/state information is reported as unknown and cannot authorize execution.
@@ -1666,7 +1672,13 @@ nonpacked/component locks, unsettled custody and recovery obligations veto it.
 Public state checks run in fresh bounded processes for each declared state
 root. Ordinary caught failures restore exact original bytes/indices under these
 locks. Unknown replacement bytes cause a visible collision refusal and retain
-all copies. After a hard process interruption, explicitly preview/apply restore
+all copies. SIGTERM/SIGINT are checked between streaming chunks and mutation stages;
+owned helper process groups are reaped before rollback. Restore copies stage
+verified bytes before non-replacing publication, so an interrupted restore
+does not expose a partial original. If forced termination prevents rollback,
+the CLI prints the backup/restore instructions; a missing completed manifest
+means original files/indices were never changed by that attempt. After a hard
+process interruption, explicitly preview/apply restore
 with a fresh offline window. Restore is idempotent and retains backups; migration
 products left by an interrupted/rolled-back operation stay available for the
 existing GC rather than being recursively removed by this tool. Hash manifests
@@ -1675,8 +1687,8 @@ and verification copies remain in the private backup for review.
 ```sh
 timeout 30s ida-cli cache-legacy --root "$CACHE" --state-root "$STATE"
 timeout 30s ida-cli cache-legacy --root "$CACHE" --mode migrate --group "$GROUP" --backup "$BACKUP"
-timeout 120s ida-cli cache-legacy --root "$CACHE" --mode migrate --group "$GROUP" --backup "$BACKUP" --apply --offline-evidence "$EVIDENCE"
-timeout 120s ida-cli cache-legacy --root "$CACHE" --mode restore --backup "$BACKUP" --apply --offline-evidence "$RESTORE_EVIDENCE"
+timeout 1840s ida-cli cache-legacy --root "$CACHE" --mode migrate --group "$GROUP" --backup "$BACKUP" --apply --offline-evidence "$EVIDENCE"
+timeout 1840s ida-cli cache-legacy --root "$CACHE" --mode restore --backup "$BACKUP" --apply --offline-evidence "$RESTORE_EVIDENCE"
 timeout 120s python3 -B tests/test_nexus_n8tool.py -v
 ```
 

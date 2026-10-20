@@ -4,13 +4,76 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import stat
+import time
 import uuid
 
 from target_coordination import Directory
 
 
+TIMEOUT_ENV = 'IDA_CLI_LEGACY_TIMEOUT_SECS'
+DEFAULT_TIMEOUT = 1800
+_interrupted = None
+_deadline = None
+_rollback = False
+
+
+class MaintenanceInterrupted(RuntimeError):
+    """A cooperative interrupt observed before another mutation/chunk."""
+
+
+def timeout_policy():
+    raw = os.environ.get(TIMEOUT_ENV, str(DEFAULT_TIMEOUT))
+    if not raw.isascii() or not raw.isdigit() or not 1 <= int(raw) <= 3600:
+        raise ValueError(TIMEOUT_ENV + ' must be an integer between 1 and 3600')
+    return {'seconds': int(raw), 'rollback_grace_seconds': 35,
+            'configuration': TIMEOUT_ENV, 'default_seconds': DEFAULT_TIMEOUT}
+
+
+def begin_runtime():
+    global _interrupted, _deadline
+    _interrupted = None
+    _deadline = time.monotonic() + timeout_policy()['seconds']
+    def requested(number, _frame):
+        global _interrupted
+        _interrupted = signal.Signals(number).name
+    previous = {number: signal.signal(number, requested) for number in (signal.SIGTERM, signal.SIGINT)}
+    return previous
+
+
+def end_runtime(previous):
+    global _interrupted, _deadline
+    for number, handler in previous.items():
+        signal.signal(number, handler)
+    _interrupted = _deadline = None
+
+
+def checkpoint():
+    if not _rollback:
+        if _interrupted:
+            raise MaintenanceInterrupted('maintenance interrupted by ' + _interrupted)
+        if _deadline is not None and time.monotonic() >= _deadline:
+            raise MaintenanceInterrupted('maintenance time budget expired')
+
+
+def remaining_seconds():
+    checkpoint()
+    return max(1, int(_deadline - time.monotonic()) + 1) if _deadline is not None else timeout_policy()['seconds']
+
+
+@contextmanager
+def rollback_window():
+    global _rollback
+    previous, _rollback = _rollback, True
+    try:
+        yield
+    finally:
+        _rollback = previous
+
+
 def directory(path, *, private=False):
+    checkpoint()
     path = Path(path)
     handle = Directory(path, private=private)
     handle.close()
@@ -63,6 +126,7 @@ def fingerprint(path):
     with opened(path) as (stream, info):
         hasher = hashlib.sha256()
         for block in iter(lambda: stream.read(64 * 1024), b''):
+            checkpoint()
             hasher.update(block)
         result = {'name': path.name, 'bytes': info.st_size, 'sha256': hasher.hexdigest(),
                   'identity': [info.st_dev, info.st_ino, info.st_uid]}
@@ -100,6 +164,7 @@ def replace(path, data, expected):
     try:
         if optional(path) != expected:
             raise ValueError('metadata changed during publication')
+        checkpoint()
         os.replace(temporary, path)
         sync(path.parent)
     finally:
@@ -143,6 +208,7 @@ def copy_verified(source, destination, expected):
         with opened(source) as (input_stream, info), os.fdopen(fd, 'wb', closefd=False) as output:
             hasher = hashlib.sha256()
             for block in iter(lambda: input_stream.read(64 * 1024), b''):
+                checkpoint()
                 hasher.update(block)
                 output.write(block)
             if info.st_size != expected['bytes'] or hasher.hexdigest() != expected['sha256']:
@@ -185,7 +251,14 @@ def restore_files(root, backup, manifest):
     for item in manifest['files']:
         name = item['name']
         if not (root/name).exists():
-            copy_verified(backup/'files'/name, root/name, item)
+            # Publish restored bytes only after a full verified copy. A signal
+            # while copying must never leave an ambiguous partial original.
+            from cache_store import rename_group
+            temporary = root/('.n8tool-restore-' + uuid.uuid4().hex)
+            copy_verified(backup/'files'/name, temporary, item)
+            checkpoint()
+            rename_group(temporary, root/name)
+            sync(root)
     for name, before, current in metadata_updates:
         if current == before:
             continue

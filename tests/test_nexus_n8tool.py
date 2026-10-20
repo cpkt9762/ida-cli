@@ -35,6 +35,16 @@ class EntryTests(unittest.TestCase):
             self.assertIn('sample.abcdef123456.dylib.i64', result.stdout)
             self.assertIn('component', result.stdout)
 
+    def test_explicit_timeout_is_visible_in_dry_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root/'idb').mkdir(mode=0o700)
+            result = subprocess.run(['timeout', '10s', sys.executable, '-B', str(TOOL), '--root', str(root/'idb')],
+                env=os.environ | {'HOME': str(root), 'IDA_CLI_HOME': str(root), 'IDA_CLI_LEGACY_TIMEOUT_SECS': '150'},
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)['maintenance_timeout']['seconds'], 150)
+
 
 
 
@@ -244,6 +254,22 @@ class GovernanceTests(unittest.TestCase):
         self.apply('clean')
         self.assertEqual(lock.stat().st_mode & 0o777, 0o644)
         self.assertFalse((self.cache/self.group).exists())
+
+    def test_interrupted_restore_does_not_publish_partial_original(self):
+        self.apply('clean')
+        copy = self.tool.files.copy_verified
+        def interrupted(source, destination, expected):
+            if destination.parent == self.cache:
+                destination.write_bytes(b'partial restore copy')
+                raise self.tool.files.MaintenanceInterrupted('injected restore interrupt')
+            return copy(source, destination, expected)
+        with patch.object(self.tool.files, 'copy_verified', interrupted):
+            with self.assertRaisesRegex(self.tool.files.MaintenanceInterrupted, 'restore interrupt'):
+                self.apply('restore')
+        self.assertFalse((self.cache/self.group).exists())
+        self.assertFalse((self.cache/self.group[:-4]).exists())
+        self.apply('restore')
+        self.assert_original()
 
     def test_preexisting_backup_is_never_overwritten(self):
         self.backup.mkdir(mode=0o700)
