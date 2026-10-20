@@ -5,6 +5,7 @@ without taking target EX and retains the real instance until durable custody.
 """
 import json
 import os
+import signal
 from pathlib import Path
 import socket
 import stat
@@ -648,18 +649,22 @@ class Observer:
         with self.lock:
             if self.clock() - self.last_router < 300:
                 return False
+            return self.abandon('router disconnected')
+
+    def abandon(self, cause):
+        with self.lock:
             status = 'published'
             try:
                 for item in self.items.values():
                     if not item.get('proof') and not item.get('abandoned'):
                         item['abandoned'] = self.publish(item, 'ObservationAbandoned',
-                            cause='router disconnected', last_observation=item.get('observation_error'))
+                            cause=cause, last_observation=item.get('observation_error'))
             except Exception as exc:
                 status = 'publication_failed'
                 self.exit_blocked = type(exc).__name__ + ': ' + str(exc)
             # Abandonment is diagnostic, never proof or permission to drop a
             # watch. Keep every item/reservation/pending fact for exact recovery.
-            self.orphan_exit = {'status': status, 'retained_watches': list(self.items),
+            self.orphan_exit = {'status': status, 'cause':cause, 'retained_watches': list(self.items),
                 'recovery': 'restore target storage and reconnect the exact helper incarnation',
                 'released': False}
             try:
@@ -707,6 +712,11 @@ class Observer:
 
 
 def main():
+    terminating = threading.Event()
+    # The daemon deliberately ignores TERM. Exec preserves SIG_IGN, so the
+    # independent helper must install its own durable-handoff termination path.
+    signal.signal(signal.SIGTERM, lambda *_: terminating.set())
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
     endpoint, incarnation, capacity = sys.argv[1:]
     directory = Directory(Path(canonical(endpoint)).parent)
     clock = time.monotonic
@@ -746,7 +756,12 @@ def main():
     listener.listen(8)
     listener.settimeout(.2)
     try:
-        while not observer.finishing and not observer.orphan_done():
+        while not observer.finishing:
+            if terminating.is_set():
+                observer.abandon('termination requested')
+                break
+            if observer.orphan_done():
+                break
             observer.discover_startups()
             observer.reconnect_sources()
             try:

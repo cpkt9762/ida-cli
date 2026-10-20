@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import signal
 import sys
 import time
 
@@ -22,6 +23,8 @@ with Target(target) as gate, gate.locked():
     coord = gate.key
 endpoint = root / 'helper/h'
 incarnation = 'orphan-fixture'
+# Reproduce daemon's ignored SIGTERM disposition inherited across exec.
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
 with (root / 'helper.log').open('w') as output:
     child = subprocess.Popen([sys.executable, '-B', os.environ.get('FA_HELPER_SOURCE',str(REPO / 'nexus_bridge/custody/proof_helper.py')),
         str(endpoint), incarnation, '8'], env=dict(os.environ, IDA_CLI_HELPER_TEST_CLOCK=str(clock)),

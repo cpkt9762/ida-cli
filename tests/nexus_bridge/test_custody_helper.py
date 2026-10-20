@@ -607,9 +607,10 @@ with Target(sys.argv[1]) as target:
     def test_orphan_parent_exit_removes_exact_socket_on_publish_success_and_failure(self):
         import shutil
         from process_identity import identity, same_process
-        for failure in (False, True):
-            with self.subTest(publication_failure=failure):
-                case = self.root / str(failure)
+        import itertools
+        for mode, failure in itertools.product(('clock', 'term'), (False, True)):
+            with self.subTest(mode=mode, publication_failure=failure):
+                case = self.root / (mode + str(failure))
                 case.mkdir(mode=0o700)
                 parent = subprocess.Popen([sys.executable, '-B', str(REPO / 'tests/support/helper_orphan_parent.py'), str(case)])
                 self.children.append(parent)
@@ -624,12 +625,18 @@ with Target(sys.argv[1]) as target:
                     self.assertEqual(parent.wait(timeout=3),0)
                     if failure:
                         shutil.rmtree(case/'target')
-                    (case/'clock').write_bytes((301).to_bytes(8,'big'))
+                    if mode == 'clock':
+                        (case/'clock').write_bytes((301).to_bytes(8,'big'))
+                    else:
+                        import signal
+                        self.assertTrue(same_process(identity(born['pid']),born['identity']))
+                        os.kill(born['pid'],signal.SIGTERM)
                     while same_process(identity(born['pid']),born['identity']):
                         self.assertLess(time.monotonic(),deadline,'orphan must exit despite failed publication')
                         time.sleep(.002)
                     self.assertFalse((case/'helper/h').exists())
                     saved = json.loads((case/'helper/helper-state.json').read_text())
+                    self.assertEqual(saved['orphan_exit']['cause'], 'termination requested' if mode == 'term' else 'router disconnected')
                     self.assertFalse(saved['finishing'])
                     self.assertIn('pending',saved['items'])
                     self.assertNotIn('proof',saved['items']['pending'])
@@ -640,7 +647,7 @@ with Target(sys.argv[1]) as target:
                 finally:
                     if same_process(identity(born['pid']),born['identity']):
                         import signal
-                        os.kill(born['pid'],signal.SIGTERM)  # Exact recorded test birth only; assertion remains failed.
+                        os.kill(born['pid'],signal.SIGKILL)  # Exact recorded test birth only; assertion remains failed.
 
     def test_missing_original_source_after_restart_is_blocked_without_fake_proof(self):
         with Boundary(self.root/'owner') as boundary:
