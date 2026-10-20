@@ -354,25 +354,25 @@ async fn crash_recovery(packed: bool) {
     } else {
         "crash-unpacked-count"
     });
+    let mut crash_events = a.bridge.subscribe();
     let result=a.execute(&old,"execute_python",json!({"code":format!("import os\nwith open({:?}, 'a') as stream:\n    stream.write('once\\n')\nos._exit(73)",marker.to_string_lossy())})).await;
     assert_eq!(result.status, OperationStatus::UnknownOutcome);
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "once\n");
     owner_exited(opened["pid"].as_u64().unwrap() as u32).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut poll = tokio::time::interval(Duration::from_millis(10));
-        while a
-            .bridge
-            .endpoint()
-            .transition(|s, _| s.status(&a.client, &old))
-            .unwrap()
-            .phase
-            != SessionPhase::Disconnected
-        {
-            poll.tick().await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (mut disconnected, mut released) = (false, false);
+        while !disconnected || !released {
+            let event = crash_events.recv().await.expect("exact crash event stream");
+            if event["lease"] == json!(old) {
+                disconnected |= event["event"] == "disconnected";
+                released |= event["event"] == "owner_released";
+            }
         }
     })
     .await
-    .expect("N1 disconnect state barrier");
+    .expect("disconnect and public proof barriers");
+    assert_eq!(a.bridge.endpoint().transition(|s,_|s.status(&a.client,&old)).unwrap().phase,
+        SessionPhase::Released, "public owner proof advances the disconnected lease to Released");
     assert!(
         a.bridge
             .endpoint()
