@@ -263,6 +263,41 @@ if __name__ == '__main__':
 
 
 class VerificationSnapshot(unittest.TestCase):
+    def test_replacement_before_first_fstat_retries_without_accepting_an_untrusted_fd(self):
+        import target_journal
+        from contextlib import closing
+        from target_coordination import Directory
+        with tempfile.TemporaryDirectory(dir=os.environ['R3A_CASE_ROOT']) as temporary:
+            root = Path(temporary)
+            with closing(Directory(root)) as directory:
+                directory.durable('custody.json', {'revision':1})
+                original = os.open
+                replaced = []
+                def open_record(name, *args, **kwargs):
+                    descriptor = original(name, *args, **kwargs)
+                    if name == 'custody.json' and kwargs.get('dir_fd') == directory.fd and not replaced:
+                        replaced.append(True)
+                        replacement = root/'next'
+                        replacement.write_text('{"revision":2}')
+                        replacement.chmod(0o600)
+                        replacement.replace(root/'custody.json')
+                    return descriptor
+                with patch('target_coordination.os.open', side_effect=open_record):
+                    self.assertEqual(target_journal.verification_snapshot(directory)[0], {'revision':2})
+                self.assertEqual(replaced, [True], 'actual opened inode was replaced before validation')
+
+    def test_untrusted_record_is_not_reclassified_as_publication_race(self):
+        import target_journal
+        from contextlib import closing
+        from target_coordination import Directory
+        with tempfile.TemporaryDirectory(dir=os.environ['R3A_CASE_ROOT']) as temporary:
+            root = Path(temporary)
+            with closing(Directory(root)) as directory:
+                directory.durable('custody.json', {'revision':1})
+                os.link(root/'custody.json', root/'extra-link')
+                with self.assertRaisesRegex(RuntimeError, 'untrusted type/uid/mode/link identity'):
+                    target_journal.verification_snapshot(directory)
+
     def test_atomic_replacement_is_retried_but_mutating_a_record_never_passes(self):
         from unittest.mock import patch
         import tempfile

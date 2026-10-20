@@ -249,7 +249,25 @@ class Directory:
     def read(self, name):
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
         try:
-            before = checked(fd)
+            try:
+                before = checked(fd)
+            except RuntimeError:
+                # Atomic replacement may unlink this FD before its first
+                # validation. Never consume it: classify only a proved rename
+                # to a different, independently trusted inode as a read race.
+                old = os.fstat(fd)
+                if (old.st_nlink != 0 or not stat.S_ISREG(old.st_mode)
+                        or old.st_uid != os.getuid() or not private_mode(fd, old)):
+                    raise
+                replacement = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
+                try:
+                    current = checked(replacement)
+                    self.verify()
+                    if current.st_dev == old.st_dev and identity(current) != identity(old):
+                        raise RuntimeError('CoordinationBlocked: record changed during read') from None
+                finally:
+                    os.close(replacement)
+                raise
             if before.st_size > self.max_record:
                 raise RuntimeError('CoordinationBlocked: oversized record')
             data = os.read(fd, self.max_record + 1)
