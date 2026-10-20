@@ -18,6 +18,13 @@ class ReleaseAssertions(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'still live'):
             driver.assert_dead([{'pid': os.getpid(), 'identity': driver.identity(os.getpid())}])
 
+    def test_e27_busy_refusal_rejects_a_dead_service_or_killed_operation(self):
+        refused={'exit':1,'stderr':'Nexus CancelPending: lease retained'}
+        driver.assert_busy_shutdown(refused,True,True)
+        for daemon,operation in ((False,True),(True,False)):
+            with self.subTest(daemon=daemon,operation=operation),self.assertRaises(AssertionError):
+                driver.assert_busy_shutdown(refused,daemon,operation)
+
     def test_e28_detects_post_backup_annotation(self):
         with self.assertRaises(AssertionError):
             driver.assert_annotations('POST', 'PRE')
@@ -40,6 +47,28 @@ class ReleaseAssertions(unittest.TestCase):
             for rows in ([intent], [intent,failed|{'errno':None}], [intent,failed,failed]):
                 ledger.write_text('\n'.join(map(json.dumps,rows))+'\n')
                 with self.assertRaises(AssertionError):driver.capture_native_processes(env,ledger)
+
+    def test_live_capture_waits_for_a_recorded_creation_but_never_accepts_unfinished_intents(self):
+        import subprocess
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(dir='/private/tmp') as temporary:
+            root=Path(temporary);ledger=root/'native-processes.jsonl'
+            intent={'kind':'intent','intent':'pending','program':'/bin/sleep','argv':['30']}
+            ledger.write_text(json.dumps(intent)+'\n')
+            env=SimpleNamespace(root=root,native_ledger=ledger,ledger=root/'processes.jsonl',entries=lambda:[])
+            child=subprocess.Popen(['/bin/sleep','30'])
+            try:
+                started={'kind':'started','intent':'pending','pid':child.pid,'identity':driver.identity(child.pid)}
+                def publish(_seconds):
+                    with ledger.open('a') as output:output.write(json.dumps(started)+'\n')
+                with patch.object(driver.time,'sleep',side_effect=publish) as observed:
+                    self.assertEqual(driver.capture(env),[started])
+                    self.assertEqual(observed.call_count,1)
+                ledger.write_text(json.dumps(intent)+'\n')
+                with patch.object(driver.time,'monotonic',side_effect=[0,4]),self.assertRaises(AssertionError):
+                    driver.capture(env)
+            finally:
+                child.terminate();child.wait(timeout=3)
 
     def test_94_comparison_and_missing_release_baseline_are_blocked(self):
         from contextlib import nullcontext

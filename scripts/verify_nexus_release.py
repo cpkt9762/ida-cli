@@ -23,7 +23,18 @@ from test_nexus_removed_config import REMOVED
 
 
 def capture(env):
-    rows = capture_native_processes(env, env.native_ledger)
+    deadline=time.monotonic()+3
+    while True:
+        try:
+            rows = capture_native_processes(env, env.native_ledger)
+            break
+        except AssertionError as error:
+            if str(error) != 'unfinished or duplicate native creation intent':raise
+            records=[json.loads(line) for line in env.native_ledger.read_text().splitlines()]
+            intents={row['intent'] for row in records if row['kind']=='intent'}
+            terminals=[row['intent'] for row in records if row['kind'] in ('started','spawn_failed')]
+            if len(set(terminals))!=len(terminals) or not (intents-set(terminals)) or time.monotonic()>=deadline:raise
+            time.sleep(.01)  # Wait only for recorded creation intents, never guess successful cleanup.
     sockets=env.root/'sockets.jsonl'
     known={line for line in sockets.read_text().splitlines()} if sockets.exists() else set()
     with sockets.open('a') as output:
@@ -238,34 +249,57 @@ finally:handle.close(wait_for_database=True,timeout=15)
         functions = product.raw(a, 'list_functions')['functions']
         target = functions[0]['address']
         product.script(a, f"import ida_name,ida_bytes,ida_loader; assert ida_name.set_name({int(target,16)},'E27_SAVED',ida_name.SN_CHECK); assert ida_bytes.set_cmt({int(target,16)},'E27_SAVED',False); assert ida_loader.save_database(ida_loader.get_path(ida_loader.PATH_TYPE_IDB),0)")
-        code = ("from pathlib import Path\nimport time\n" + f"Path({str(started)!r}).touch()\n"
-                + f"while not Path({str(release)!r}).exists(): time.sleep(.01)\nPath({str(continued)!r}).touch()")
+        code = ("from pathlib import Path\nimport time\n" + f"with Path({str(started)!r}).open('a') as f: f.write('start\\n')\n"
+                + f"while not Path({str(release)!r}).exists(): time.sleep(.01)\n"
+                + f"with Path({str(continued)!r}).open('a') as f: f.write('complete\\n')")
         long = product.start_call(['--path', a, 'raw', json.dumps({'method':'run_script','params':{'code':code}})])
         wait_for(started.exists)
         rows = product.entries()
+        daemon_pid=int((product.directory/'cli/server.pid').read_text())
+        daemon=next(row for row in rows if row['pid']==daemon_pid)
         shutdown = product.call('shutdown', ok=False)
-        result['shutdown_terminal'] = shutdown
-        result['active_barrier'] = str(started)
-        result['negative_witness'] = {'property':'active-operation whole-service shutdown', 'injection_detected':shutdown['exit'] != 0, 'actual_error':shutdown['stderr']}
-        # This is deliberately strict: accepted CancelPending must never be
-        # disguised as a successful whole-service shutdown.
-        external.child.stdin.write((json.dumps({'command':'query','code':'1+1'})+'\n').encode());external.child.stdin.flush()
-        assert external.lines.json()['result'] == 2
-        assert same_process(identity(ready['pid']), external_birth)
-        result['external_owner_survived_shutdown_request'] = {'pid':ready['pid'],'identity':external_birth}
-        assert shutdown['exit'] == 0, 'E27 shutdown while operation is active was refused: '+shutdown['stderr']
-        terminal = product.finish(long, ok=False)
+        result['busy_shutdown_terminal'] = shutdown
+        assert_busy_shutdown(shutdown, same_process(identity(daemon_pid),daemon['identity']), long.poll() is None)
+        assert not release.exists() and not continued.exists(), 'busy shutdown stopped/released the cooperative barrier'
+        assert product.call('status')['worker_count'] == 1, 'service remains responsive and owns A'
+        def external_query():
+            external.child.stdin.write((json.dumps({'command':'query','code':'1+1'})+'\n').encode());external.child.stdin.flush()
+            assert external.lines.json()['result'] == 2
+            assert same_process(identity(ready['pid']), external_birth)
+        external_query()
+        result['busy_refusal_preserved_service_and_operation']=True
+        release.touch()
+        terminal = product.finish(long)
         long = None
-        assert terminal['exit'] != 124 and not continued.exists(), terminal
-        assert same_process(identity(ready['pid']), external_birth)
-        external.child.stdin.write((json.dumps({'command':'query','code':'1+1'})+'\n').encode());external.child.stdin.flush()
-        assert external.lines.json()['result'] == 2
-        product.clean([row for row in rows if row['pid'] not in (ready['pid'], external.child.pid)], allowed_registrations={ready['instance_id']})
+        assert terminal['success'] is True, terminal
+        assert started.read_text()=='start\n' and continued.read_text()=='complete\n', 'long operation must execute once'
+        result['long_terminal']=terminal
+        shutdown = product.call('shutdown')
+        assert shutdown['ok'] is True, shutdown
+        result['shutdown_terminal']=shutdown
+        excluded={ready['pid'],external.child.pid}
+        service_rows=[row for row in product.entries() if row['pid'] not in excluded]
+        product.clean(service_rows,allowed_registrations={ready['instance_id']})
+        external_query()
+        # A real additional held child must make the exact-birth exit proof fail.
+        command=['/bin/sleep','30']
+        extra=env.spawn(lambda:subprocess.Popen(command,env=product.variables),command)
+        try:
+            entry=next(row for row in env.entries() if row['pid']==extra.pid)
+            result['negative_witness']=negative_witness('service exit ledger rejects an extra live birth',
+                lambda:assert_dead(service_rows+[entry]))
+            result['negative_witness']['injected_process']=entry
+        finally:
+            extra.terminate();extra.wait(timeout=3)
         restarted = product.call('status')
         assert restarted['worker_count'] == 0 and not product.call('list-tasks')['tasks'], restarted
+        assert all(restarted['nexus_lifecycle'][name]==0 for name in ('resources','startup_and_pre_attach','retirement_acks'))
         assert product.script(a, f"import ida_name,ida_bytes; print(ida_name.get_name({int(target,16)})); print(ida_bytes.get_cmt({int(target,16)},False))") == 'E27_SAVED\nE27_SAVED\n'
-        product.raw(a, 'close');product.stop();product.clean(product.entries())
-        result['negative_witness'] = negative_witness('all service births exited', lambda: assert_dead([{'pid':os.getpid(),'identity':identity(os.getpid())}]))
+        assert started.read_text()=='start\n' and continued.read_text()=='complete\n', 'completed operation replayed after restart'
+        product.raw(a, 'close');product.stop()
+        product.clean([row for row in product.entries() if row['pid'] not in excluded],allowed_registrations={ready['instance_id']})
+        external_query()
+        result['restarted_saved_edits_and_no_replay']=True
     finally:
         release.touch()
         if long is not None:
@@ -276,6 +310,12 @@ finally:handle.close(wait_for_database=True,timeout=15)
         external.child.stdin.write(b'{"command":"close"}\n');external.child.stdin.flush()
         assert external.lines.json()['event'] == 'external_closed'
         external.wait()
+
+
+def assert_busy_shutdown(terminal, daemon_alive, operation_alive):
+    assert terminal['exit'] not in (0,124) and 'CancelPending' in terminal['stderr'], terminal
+    assert daemon_alive, 'busy shutdown exited the service'
+    assert operation_alive, 'busy shutdown killed the long operation'
 
 
 def assert_dead(rows):

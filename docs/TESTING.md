@@ -1910,14 +1910,14 @@ After interruption run the verifier's `--cleanup` on that exact environment.
 No cleanup scans process names. A failed case retains diagnostics and is not
 converted to PASS by cleanup.
 
-E27 asserts successful whole-service shutdown after an active script's barrier,
-external public client's B survival, natural service-owned process/socket/lease
-cleanup and saved A edits after restarting the same artifact. **Implementation
-is currently blocked by the accepted busy-shutdown contract**: N1 release
-returns CancelPending while work is active, and the existing
-`n4_fix_busy_shutdown_does_not_exit` regression requires refusal without exit.
-The strict E27 regression reports FAIL at that boundary; changing this semantic
-requires orchestrator authorization. It is not skipped or counted as passed.
+E27 first asserts a definite CancelPending refusal while a cooperative script
+holds its started barrier: the daemon and request stay alive, and external B
+remains queryable with its original birth. It releases the barrier and requires
+one successful terminal with no replay, then shutdown succeeds. Exact service
+births, sockets, registrations and leases must be gone while external B remains
+usable. The same artifact restarts, reads saved edits, has no old tasks/leases,
+and shuts down cleanly again. A real additional held child must fail the exit
+ledger assertion. The accepted N1 busy-shutdown refusal remains unchanged.
 
 E28 creates its pre-migration backup during the case, checks N0 annotations,
 migrates a separate copy, retains that scene and restores only the backup in
@@ -1934,3 +1934,18 @@ After restoring the venv, list/decompile/write/save/close/reopen/readback and
 shutdown must succeed naturally. CLI automatic startup now reports an exited
 Nexus daemon immediately using the held Child; no alternate backend is tried.
 Existing N9 patch-tamper regression remains the patch hash negative control.
+
+RV9-6 scripting input is resolved once before database acquisition, including
+CLI, queued jobs and MCP forwarding. Exactly one of code/file is required;
+invalid/unreadable paths use the same InvalidPath text as MCP. File reads retain
+the existing bounded Prepare class, original admission deadline and job tracking;
+input failure starts no bridge or Nexus operation. `nexus_script_input` and the
+library's router/MCP deadline barriers cover admission; the bridge rejects an
+unresolved missing code instead of silently running an empty script.
+
+The nexus_n9 maintenance fixture completes a separately bounded first execution
+of its freshly written shell inode before the measured maintenance invocation.
+This isolates macOS first-execution delay from the unchanged 1s product budget.
+Expiry, rollback guidance and exact PID ESRCH assertions are retained. Directed
+qualification runs that exact test 20 consecutive times against unchanged test
+and product binaries, recording each command's uptime; no retry selects a pass.
