@@ -312,7 +312,28 @@ async fn e10_actual_router_batch_yields_to_short_query() {
     assert!(output["total_searched"].as_u64().unwrap() >= 80);
     router_cancelled_slice_cleanup(&router, &handle).await;
     router.nexus_close_token(&token).await.unwrap();
-    router.shutdown_all().await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let status = router
+                .status_snapshot()
+                .await
+                .nexus_lifecycle
+                .expect("E10 bridge status");
+            if status["resources"] == 0
+                && status["startup_and_pre_attach"] == 0
+                && status["retirement_acks"] == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("E10 public proof and custody settlement");
+    router
+        .shutdown_nexus()
+        .await
+        .expect("E10 exact helper finishes after owner proof");
     close(&mut b, &lb).await;
     passed(
         "E10",
