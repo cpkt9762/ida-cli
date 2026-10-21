@@ -1,6 +1,6 @@
 """A child delayed before exec survives waitpid; revocation forbids late IDB access.
 
-J_RED_HELPER / J_RED_WORKER select read-only baseline sources for the red control.
+J_RED_HELPER / J_RED_PROCESS / J_RED_JOURNAL / J_RED_WORKER select baseline sources.
 The same safety assertion is used for both runs.
 """
 import importlib.util
@@ -43,6 +43,12 @@ def test_delayed_preexec_child_cannot_open_after_settlement():
         observer_type = module.Observer
     from target_coordination import Directory, Target
     from target_journal import Journal
+    if red_helper:
+        baseline_journal = os.environ['J_RED_JOURNAL']
+        journal_spec = importlib.util.spec_from_file_location('j_baseline_journal', baseline_journal)
+        journal_module = importlib.util.module_from_spec(journal_spec)
+        journal_spec.loader.exec_module(journal_module)
+        Journal = journal_module.Journal
     storage = Directory(root)
     observer = observer_type('delayed-helper', 8, storage=storage)
     def call(kind, **fields):
@@ -105,6 +111,15 @@ while True:time.sleep(.1)
         reply = call('launch_settle', watch='delayed', bridge={
             'pid':bridge.pid, 'status':str(status), 'exited_secs':time.monotonic()-reaped})
         assert reply['state'] == 'abandoned'
+        with Target(target) as coordinated:
+            with coordinated.locked():
+                journal = Journal(coordinated)
+                journal.launch_abandoned({'watch':'delayed', 'consumer':reply['consumer']})
+                call('retire', watch='delayed', sha256=reply['consumer']['sha256'])
+                call('retire_parent', parent=ACQUISITION['parent'])
+                journal.settle()
+                assert journal.value['entries'] == {}, 'journal is fully settled before the child resumes'
+        assert call('heartbeat', summary_only=True)['used'] == 0, 'helper holds no obligation before resume'
         (root/'settled.json').write_text(json.dumps(reply))
         (root/'release').touch()
         deadline = time.monotonic()+40
@@ -115,7 +130,7 @@ while True:time.sleep(.1)
         assert identity(child_pid) is None, 'worker exits on its own after denial or lease grace'
         (root/'result.json').write_text(json.dumps({'root':str(root), 'opened':(root/'idb-opened').exists(),
             'idb_exists':target.exists(), 'delay':5.2, 'bridge_waitpid':status,
-            'worker_exit':int((root/'child.exit').read_text())}))
+            'worker_exit':int((root/'child.exit').read_text()), 'journal_entries':0, 'helper_obligations':0}))
         assert not (root/'idb-opened').exists(), 'late worker opened IDB after launch was settled'
         assert not target.exists(), 'denied worker must not create database artifacts'
         assert (root/'child.exit').read_text() == '78', 'authorization denial has an identifiable exit code'

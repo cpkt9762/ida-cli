@@ -2030,7 +2030,7 @@ permissions, short reads and saturation. `test_delayed_launch.py` kills/waitpids
 private parent with an already-spawned child parked before exec for >5s, settles,
 then releases the child: baseline H1 opens the real IDB after settlement, whereas
 J denies it before IDB access. Read-only baseline helper/process/worker sources
-may be selected with `J_RED_HELPER`, `J_RED_PROCESS`, `J_RED_WORKER`; the safety
+may be selected with `J_RED_HELPER`, `J_RED_PROCESS`, `J_RED_JOURNAL`, `J_RED_WORKER`; the safety
 assertion is identical in red and green runs.
 
 Recovery from a lost bridge. This router never replaces its bridge, so the
