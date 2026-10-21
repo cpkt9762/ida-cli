@@ -37,6 +37,11 @@ class ProcessTableFailClosed(unittest.TestCase):
             with self.assertRaises(OSError):
                 _mac_commands()
 
+    def test_live_process_with_unreadable_argv_is_an_error(self):
+        with patch('ctypes.CDLL', return_value=self.library(got=ctypes.sizeof(ProcBsdInfo), error=0)):
+            with self.assertRaises(PermissionError):
+                _mac_commands()
+
     def test_short_process_status_is_an_error(self):
         with patch('ctypes.CDLL', return_value=self.library(got=8, error=0)):
             with self.assertRaises(OSError):
