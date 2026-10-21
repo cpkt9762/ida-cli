@@ -918,6 +918,51 @@ class Journal:
 
         return {}
 
+    def launch_abandoned(self, value):
+        """Close a LaunchIntent that provably never produced an owner.
+
+        The helper's immutable LaunchAbandonedUnspawned fact carries the router's
+        waitpid evidence and the process-table/public-discovery snapshot taken
+        after the exec margin. It authorizes closure of exactly this launch
+        epoch; it is neither a public owner lifetime proof nor a retirement of
+        any lease, owner or other watch.
+        """
+        receipt = value['consumer']
+        record = receipt['record']
+        item = self.item(value['watch'], record['subscription_epoch'])
+        existing = item.get('launch_abandoned')
+        if existing is not None:
+            if existing['sha256'] != receipt['sha256']:
+                raise RuntimeError('StartupUnconfirmed: conflicting launch abandonment')
+            return {}
+        evidence = record.get('evidence')
+        launch = item.get('launch')
+        if (record.get('kind') != 'LaunchAbandonedUnspawned' or not launch or record.get('launch') != launch
+                or record.get('acquisition') != item['acquisition'] or item['lease'] is not None
+                or item.get('owner') or item.get('proof') or record.get('owner') is not None
+                or record.get('os_identity') is not None
+                or any(f['kind'] not in ('SpawnIntent',) for f in item['facts'])
+                or record.get('helper') not in self.authorized_producers(item, ('SpawnIntent',))
+                or not isinstance(evidence, dict)
+                or evidence.get('process_table', {}).get('matches') != []
+                or evidence.get('public_discovery', {}).get('matches') != []
+                or evidence.get('suffix') != launch['suffix'] or evidence.get('target') != launch['target']
+                or type(evidence.get('bridge', {}).get('exited_secs')) not in (int, float)
+                or evidence['bridge']['exited_secs'] < evidence.get('settle_seconds', 1 << 30)):
+            raise RuntimeError('StartupUnconfirmed: launch abandonment lacks exact unspawned evidence')
+        verified = fact(receipt, self.target, kind='LaunchAbandonedUnspawned')
+        item['facts'].append(verified)
+        item['launch_abandoned'] = verified
+        # Same shape as a transferred startup: the immutable launch identity is
+        # kept, the live launch marker is cleared so ordinary compaction applies.
+        item['launch_identity'] = launch
+        item['launch'] = None
+        item['bridge_exit'] = evidence['bridge']
+        item['producer_closed'] = item['consumer_closed'] = item['detached'] = item['bridge_closed'] = True
+        item['unacked_events'] = False
+        self.save()
+        return {}
+
     def startup_owner(self, value):
         record = value['receipt']['record']
         item = self.item(value['watch'], record['subscription_epoch'])
@@ -1419,6 +1464,8 @@ def main():
                 result = journal.startup_transfer(value)
             elif action == 'startup_owner':
                 result = journal.startup_owner(value)
+            elif action == 'launch_abandoned':
+                result = journal.launch_abandoned(value)
             elif action == 'settle':
                 journal.settle()
                 result = {}

@@ -81,6 +81,7 @@ impl Rig {
             cache_root: std::env::temp_dir().join("unused-no-custody-root"),
             bridge_observer: None,
             bridge_exit: Mutex::new(None),
+            launch_settle: Mutex::new(LaunchSettle::default()),
             observer_stop: tokio_util::sync::CancellationToken::new(),
             observation_faults: Mutex::new(HashMap::new()),
             custody_resources: Mutex::new(HashMap::new()),

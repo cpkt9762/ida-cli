@@ -1198,6 +1198,14 @@ pub(super) async fn proofs(state: &Arc<State>, writer: &Writer) -> anyhow::Resul
             && *old_boot != heartbeat["identity"]["boot_id"]
         {
             retire_startup(state, writer, helper, launch).await
+        } else if !has_successor && unspawned_candidate(&launch) {
+            match settle_unspawned_launch(state, helper, &launch).await {
+                Ok(true) => Ok(()),
+                // Not provably unspawned (settling, owner present, identity known):
+                // the ordinary public-lifetime path keeps the launch.
+                Ok(false) => observe_launch(state, writer, helper, &resources, launch).await,
+                Err(error) => Err(error),
+            }
         } else {
             observe_launch(state, writer, helper, &resources, launch).await
         };
@@ -1815,6 +1823,152 @@ async fn finish_resource(
                 "target":resource.target,"coord_key":resource.coord_key}),
         );
     Ok(())
+}
+
+/// A retained launch with no OS identity, no discovered owner and no pending
+/// no-attach closure: the shape in which the bridge may have died before Popen
+/// or before the Spawned fact was signed.
+fn unspawned_candidate(launch: &Value) -> bool {
+    launch["launch"].is_object()
+        && launch["owner"].is_null()
+        && launch["os_identity"].is_null()
+        && launch.get("pending_no_attach").is_none()
+        && launch.get("proof").is_none()
+}
+
+/// Close a signed LaunchIntent whose owner provably does not exist.
+///
+/// Preconditions held here: the exact bridge child was reaped (so no worker can
+/// be forked for this launch any more) and the exec margin elapsed. The helper
+/// then reads the process table and public discovery itself; any worker or
+/// published instance carrying the launch suffix keeps the launch on the normal
+/// public-lifetime path (`Ok(false)`). Absence is recorded as an immutable
+/// `LaunchAbandonedUnspawned` fact, adopted by the target journal, and only then
+/// are the helper watch, parent reservation and acquisition settled. This never
+/// fabricates an owner proof and never replays the open.
+async fn settle_unspawned_launch(
+    state: &Arc<State>,
+    helper: &helper::Helper,
+    launch: &Value,
+) -> anyhow::Result<bool> {
+    let watch = launch["watch"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("startup watch missing"))?
+        .to_owned();
+    let Some(exit) = state
+        .bridge_exit
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    else {
+        return Ok(false);
+    };
+    let age = {
+        let mut clock = state
+            .launch_settle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(reaped) = clock.reaped_at else {
+            return Ok(false);
+        };
+        if reaped.elapsed() < LAUNCH_SETTLE_MARGIN
+            || clock
+                .probed
+                .get(&watch)
+                .is_some_and(|at| at.elapsed() < LAUNCH_SETTLE_PROBE)
+        {
+            return Ok(false);
+        }
+        clock
+            .probed
+            .insert(watch.clone(), std::time::Instant::now());
+        reaped.elapsed()
+    };
+    let reply = helper
+        .call(json!({"kind":"launch_settle","watch":watch,
+            "bridge":{"pid":exit["pid"],"status":exit["status"],"exited_secs":age.as_secs_f64()}}))
+        .await?;
+    let verdict = reply["state"].as_str().unwrap_or_default().to_owned();
+    if verdict != "abandoned" {
+        let mut clock = state
+            .launch_settle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let detail = format!("{verdict} {}", reply["pids"]);
+        if clock.reported.get(&watch) != Some(&detail) {
+            tracing::info!(watch, %verdict, pids = %reply["pids"],
+                "bridge reaped before Spawned; launch stays on the public-lifetime path");
+            clock.reported.insert(watch, detail);
+        }
+        anyhow::ensure!(
+            matches!(
+                verdict.as_str(),
+                "settling" | "owner_present" | "not_applicable"
+            ),
+            "unexpected launch_settle verdict"
+        );
+        return Ok(false);
+    }
+    let consumer = reply["consumer"].clone();
+    anyhow::ensure!(
+        consumer["record"]["kind"] == "LaunchAbandonedUnspawned"
+            && consumer["record"]["watch"] == json!(watch)
+            && consumer["record"]["launch"] == launch["launch"]
+            && consumer["record"]["acquisition"] == launch["acquisition"],
+        "launch abandonment fact does not match the retained launch"
+    );
+    let acquisition: AcquisitionId = decode(launch["acquisition"].clone())?;
+    helper
+        .journal(
+            json!({"action":"launch_abandoned","target":launch["target"],
+            "coord_key":launch["coord_key"],"watch":watch,"consumer":consumer}),
+        )
+        .await?;
+    helper
+        .call(json!({"kind":"retire","watch":watch,"sha256":consumer["sha256"]}))
+        .await?;
+    helper
+        .journal(
+            json!({"action":"settle","target":launch["target"],"coord_key":launch["coord_key"]}),
+        )
+        .await?;
+    helper
+        .call(json!({"kind":"retire_parent","parent":acquisition.parent}))
+        .await?;
+    state
+        .startups
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&watch);
+    state
+        .retired_open_resources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(acquisition.parent.operation_id.clone());
+    let closed = settle_unleased_acquisition(state, &acquisition, true)?;
+    state
+        .custody_retirements
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            watch.clone(),
+            json!({"acquisition":acquisition,"lease":null,"watch":watch,
+                "acquisition_closed":closed,"launch_abandoned":consumer["sha256"],
+                "target":launch["target"],"coord_key":launch["coord_key"]}),
+        );
+    {
+        let mut clock = state
+            .launch_settle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clock.probed.remove(&watch);
+        clock.reported.remove(&watch);
+    }
+    tracing::warn!(watch, evidence = %consumer["record"]["evidence"],
+        "bridge was lost before the owner was spawned; launch settled as abandoned on process-table and discovery evidence");
+    state.emit(json!({"event":"launch_abandoned_unspawned","acquisition":acquisition,"watch":watch,
+        "evidence":consumer["record"]["evidence"],"receipt":{"path":consumer["path"],"sha256":consumer["sha256"]}}));
+    Ok(true)
 }
 
 async fn startup_proof(

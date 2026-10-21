@@ -146,6 +146,7 @@ struct State {
     helper: Option<Arc<helper::Helper>>,
     bridge_observer: Option<String>,
     bridge_exit: Mutex<Option<Value>>,
+    launch_settle: Mutex<LaunchSettle>,
     observer_stop: tokio_util::sync::CancellationToken,
     observation_faults: Mutex<HashMap<String, String>>,
     custody_resources: Mutex<HashMap<LeaseId, custody_wire::Resource>>,
@@ -487,6 +488,22 @@ pub struct NexusBridge {
 /// How long helper-only obligations must stay unchanged after the bridge process
 /// exit before shutdown treats them as untracked (longer than one helper call).
 const UNTRACKED_HELPER_SETTLE: Duration = Duration::from_secs(3);
+/// Exec margin after the exact bridge was reaped. Nothing can fork a worker for
+/// a signed launch any more; a child that was between fork and exec when its
+/// parent died finishes exec within milliseconds, so five seconds is a wide
+/// margin before the process table is read as evidence of absence.
+const LAUNCH_SETTLE_MARGIN: Duration = Duration::from_secs(5);
+/// Pacing of the helper's process-table/discovery probes for one launch.
+const LAUNCH_SETTLE_PROBE: Duration = Duration::from_secs(1);
+
+/// Router-side clock and pacing for settling a launch whose bridge was reaped
+/// before the Spawned fact was signed.
+#[derive(Default)]
+struct LaunchSettle {
+    reaped_at: Option<std::time::Instant>,
+    probed: HashMap<String, std::time::Instant>,
+    reported: HashMap<String, String>,
+}
 // F2/P2-b: acquired before bind/spawn, retained across every startup await.
 // The drop reaper owns the Child (no PID rediscovery) and waits before unlink,
 // so a child cannot recreate l after cleanup. It needs no live Tokio runtime.
@@ -879,6 +896,7 @@ impl NexusBridge {
             helper,
             bridge_observer,
             bridge_exit: Mutex::new(None),
+            launch_settle: Mutex::new(LaunchSettle::default()),
             observer_stop: tokio_util::sync::CancellationToken::new(),
             observation_faults: Mutex::new(HashMap::new()),
             custody_resources: Mutex::new(HashMap::new()),
@@ -931,6 +949,12 @@ impl NexusBridge {
                     Ok(Some(status)) => {
                         *state.bridge_exit.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(json!({"pid":pid,"status":status.to_string()}));
+                        state
+                            .launch_settle
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .reaped_at
+                            .get_or_insert_with(std::time::Instant::now);
                     }
                     Ok(None) => {}
                     Err(error) => tracing::warn!(%error, "bridge producer waitpid unavailable"),
@@ -2467,3 +2491,7 @@ mod r5_receiver_tests;
 #[cfg(test)]
 #[path = "../../tests/support/fa_shutdown.rs"]
 mod final_shutdown_tests;
+
+#[cfg(all(test, feature = "nexus-test-support"))]
+#[path = "../../tests/support/bridge_loss.rs"]
+mod bridge_loss_tests;

@@ -1971,6 +1971,42 @@ shutdown`. Lib regression:
 (red on the old code: CancelPending after 15s). A tracked startup or resource, or
 a live bridge, keeps the previous wait-and-refuse behaviour.
 
+A signed LaunchIntent that Rust tracks (`launch` retained, no `Spawned`, no
+discovered owner) used to refuse shutdown for good when the bridge died inside
+the SDK's launch window: W2a is "intent signed, Popen not called", W2b is "Popen
+returned a worker, `Spawned` not signed". Once the exact bridge child is reaped
+(waitpid) and the router waited the 5s exec margin (`LAUNCH_SETTLE_MARGIN`), the
+router asks the helper (`launch_settle`) to read the process table and public
+discovery itself. A worker whose command line carries `--record-suffix <suffix>`
+(the SDK's only worker identity) or a published instance with that suffix keeps
+the launch on the ordinary path: the helper's discovery binds it, its managed
+lease grace (`--lease-grace`, 20s from the HTTP server start; no lease is ever
+attached once the bridge is gone) ends it, and the public lifetime proof settles
+the startup exactly as before. Only when both views are empty does the helper
+publish the immutable fact `LaunchAbandonedUnspawned` (bridge pid/status/seconds
+since reaped, margin, process-table size and matches, discovery matches), the
+target journal adopts it (`launch_abandoned`: requires the helper's own
+SpawnIntent, no Spawned fact, no owner/lease/proof, empty match lists and an
+elapsed margin) and the usual helper retire, journal settle, parent retire and
+acquisition settle follow. Safety argument: after waitpid nothing can Popen for
+this launch, so the set of workers carrying the suffix only shrinks; a child
+between fork and exec when its parent died execs within milliseconds, far below
+the margin; so "no process, no instance" after the margin means no live owner
+exists to observe or release. The fact is not an owner lifetime proof and is
+never offered as one; a launch with a known birth identity or a discovered owner
+is never settled this way. Owner side: `ida-nexus worker --managed` stops
+`lease-grace` seconds after its HTTP server starts when no lease exists; the time
+before that (`Database.open`) has no worker-side bound and is not changed (the
+SDK's `_await_ready` only raises on timeout, it never signals the worker), so a
+worker hung inside `Database.open` keeps the launch pending and shutdown refused,
+visibly in the log (`launch stays on the public-lifetime path`). Tests:
+`bridge_loss_tests` (lib, `nexus-test-support`, real IDA worker, barriers at the
+SDK `LaunchIntent` stage for W2a and at Popen return for W2b: dead owner settles
+in ~5s; live owner is never settled by absence and the router becomes
+shutdown-ready only after the orphan exited by itself) and
+`tests/nexus_bridge/test_launch_settle.py` (helper request, journal action,
+forged facts, restart).
+
 ### Final-fix harness requirements
 
 E27 needs a release build with `nexus-test-support` to record exact daemon births;

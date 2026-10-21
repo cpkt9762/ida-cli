@@ -14,7 +14,7 @@ import threading
 import time
 
 from owner_identity import owner_key, state_identity, validate_owner
-from custody_process_identity import capture
+from custody_process_identity import capture, process_commands
 from origin import creation_scope
 from target_coordination import Directory, Target, canonical, digest, encoded
 
@@ -32,7 +32,12 @@ REQUEST_FIELDS = {
     'subscribe':('watch','target','coord_key','acquisition','owner','subscription_epoch'),
     'launch_intent':('watch','target','coord_key','acquisition','launch','subscription_epoch'),
     'spawned':('watch','launch','pid','os_identity'),
+    'launch_settle':('watch','bridge'),
 }
+# A forked child that has not exec'd yet still shows its parent's argv, and a
+# dead parent does not stop it from exec'ing. Absence evidence is therefore only
+# taken once the exact bridge has been reaped for this long.
+LAUNCH_SETTLE_SECONDS = 5
 
 
 def peer_uid(stream):
@@ -162,7 +167,7 @@ class Observer:
                   'ProducerClosed':'consumer', 'StartupTransferred':'consumer',
                   'ObservationFailed':'failed', 'ObservationAbandoned':'abandoned',
                   'AttachAttempt':'attach_attempt', 'NoAttachClosed':'consumer',
-                  'NonlastTransferred':'consumer'}
+                  'NonlastTransferred':'consumer', 'LaunchAbandonedUnspawned':'consumer'}
         for watch, item in self.items.items():
             if item.get('watch') != watch:
                 raise RuntimeError('ObservationRecoveryBlocked: registry watch mismatch')
@@ -482,6 +487,8 @@ class Observer:
                         previous_facts=[item[k] for k in ('receipt', 'spawned', 'owner_receipt', 'proof', 'failed') if k in item])
                     item.pop('instance', None)
                 return {'consumer':item['consumer']}
+            if kind == 'launch_settle':
+                return self.settle_unspawned_launch(value)
             if kind == 'retire':
                 item = self.items.get(value['watch'])
                 if item is None:
@@ -587,6 +594,66 @@ class Observer:
                 item['spawned'] = self.publish(item, 'Spawned')
                 return {'receipt':item['spawned']}
             raise ValueError('ProtocolMismatch: unknown helper request')
+
+    @staticmethod
+    def worker_processes(suffix):
+        """Every live process launched with this exact worker record suffix.
+
+        The SDK identifies its worker only by the random `--record-suffix`
+        argument; launcher and worker PIDs may differ. An unreadable process
+        table is an error, never an empty one.
+        """
+        table = process_commands()
+        return len(table), [pid for pid, argv in table
+                            if any(a == '--record-suffix' and b == suffix for a, b in zip(argv, argv[1:]))]
+
+    def settle_unspawned_launch(self, value):
+        """Close a signed LaunchIntent whose owner provably does not exist.
+
+        Only after the router reaped the exact bridge: no process can Popen for
+        this launch any more, so the set of workers carrying its suffix can only
+        shrink. A worker still present (or a published instance) keeps the
+        launch on the normal public-lifetime path; absence after the exec
+        margin means no live owner exists to observe. The evidence is an
+        immutable fact, never a public-lifetime proof.
+        """
+        item = self.items[value['watch']]
+        bridge = value['bridge']
+        if (not isinstance(bridge, dict) or set(bridge) != {'pid', 'status', 'exited_secs'}
+                or type(bridge['pid']) is not int or not isinstance(bridge['status'], str)
+                or type(bridge['exited_secs']) not in (int, float)):
+            raise ValueError('ProtocolMismatch: bridge exit evidence')
+        closed = item.get('consumer')
+        if closed:
+            if closed['record']['kind'] != 'LaunchAbandonedUnspawned':
+                return {'state':'not_applicable'}
+            return {'state':'abandoned', 'consumer':closed}
+        if (not item.get('launch') or item.get('owner') or item.get('os_identity')
+                or item.get('spawned') or item.get('proof')):
+            return {'state':'not_applicable'}
+        if bridge['exited_secs'] < LAUNCH_SETTLE_SECONDS:
+            return {'state':'settling'}
+        evidence = item.get('launch_abandon_evidence')
+        if evidence is None:
+            from ida_nexus import discover_databases
+            suffix = item['launch']['suffix']
+            scanned, pids = self.worker_processes(suffix)
+            discovered = discover_databases(timeout=.2)
+            public = [d.instance for d in discovered if d.instance.record_id.endswith('-' + suffix)]
+            if pids or public:
+                self.discover_startups()
+                return {'state':'owner_present', 'pids':pids,
+                        'public':[i.record_id for i in public], 'bound':bool(item.get('owner'))}
+            evidence = {'reason':'bridge reaped before Spawned; no worker process or public instance carries the launch suffix',
+                        'bridge':bridge, 'settle_seconds':LAUNCH_SETTLE_SECONDS,
+                        'suffix':suffix, 'target':item['launch']['target'], 'taken_at_unix':time.time(),
+                        'process_table':{'scanned':scanned, 'matches':pids},
+                        'public_discovery':{'scanned':len(discovered), 'matches':[]}}
+            item['launch_abandon_evidence'] = evidence
+        item['consumer'] = self.publish(item, 'LaunchAbandonedUnspawned', evidence=evidence)
+        item.pop('instance', None)
+        self.persist()
+        return {'state':'abandoned', 'consumer':item['consumer']}
 
     @staticmethod
     def public_item(item):
