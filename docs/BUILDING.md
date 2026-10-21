@@ -6,7 +6,7 @@ Rust builds need a host Rust toolchain; no IDA SDK, native IDA libraries or LLVM
 timeout 180s cargo build --locked --release --bin ida-cli
 ```
 
-Release archives contain the binary, installer, environment preparer, dependency lock, SDK contract and all four patches: loopback-bind, client-cancel-unknown, client-close-proof and client-acquisition. `scripts/nexus/runtime-lock.json` fixes their hashes, Nexus commit, dependency versions and installed module hashes. `scripts/package_release.py` refuses mismatched assets. No IDA proprietary files are distributed.
+Release archives contain the binary, installer, environment preparer, dependency lock, SDK contract and all five patches: loopback-bind, client-cancel-unknown, client-close-proof client-acquisition and launch-authorization. `scripts/nexus/runtime-lock.json` fixes their hashes, Nexus commit, dependency versions and installed module hashes. `scripts/package_release.py` refuses mismatched assets. No IDA proprietary files are distributed.
 
 ```bash
 python3 scripts/package_release.py --binary target/release/ida-cli --output /tmp/ida-cli-bundle.tar.gz

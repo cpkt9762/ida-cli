@@ -1,0 +1,162 @@
+--- a/ida_nexus/_resolver.py
++++ b/ida_nexus/_resolver.py
+@@ -48,6 +48,7 @@
+     capture platform birth identity inline, before permitting log/ready work.
+     """
+     suffix: str
++    authorization: str
+     source: str
+     target: str
+     backend: str
+@@ -341,7 +342,10 @@
+     launch: LaunchEvent = {"suffix":suffix, "source":source, "target":expected_idb, "backend":"idalib"}
+     observer = options.acquisition_observer
+     if observer is not None:
+-        observer("LaunchIntent", dict(launch))
++        observer("LaunchIntent", launch)
++    if "authorization" in launch:
++        command.extend(["--launch-authorization", launch["authorization"],
++                        "--launch-target", expected_idb])
+     process: subprocess.Popen[bytes]
+     if os.name == "nt":
+         process = subprocess.Popen(
+--- a/ida_nexus/cli/worker.py
++++ b/ida_nexus/cli/worker.py
+@@ -129,6 +129,8 @@
+         "--record-suffix",
+         help=argparse.SUPPRESS,
+     )
++    parser.add_argument("--launch-authorization", type=Path, help=argparse.SUPPRESS)
++    parser.add_argument("--launch-target", help=argparse.SUPPRESS)
+     parser.add_argument(
+         "--lease-grace",
+         type=float,
+@@ -261,6 +263,20 @@
+     except FileNotFoundError:
+         print(f"[ida-nexus] input does not exist: {args.input}", file=sys.stderr)
+         return 2
++
++    if args.launch_authorization is not None:
++        from .._launch_authorization import decide
++        try:
++            if args.launch_target is None or not decide(
++                args.launch_authorization, suffix, args.launch_target, "claimed"
++            ):
++                print("[ida-nexus] LaunchAuthorizationDenied: revoked or already claimed", file=sys.stderr)
++                return 78
++        except Exception as exc:
++            print(f"[ida-nexus] LaunchAuthorizationDenied: {exc}", file=sys.stderr)
++            return 78
++    elif args.launch_target is not None:
++        parser.error("--launch-target requires --launch-authorization")
+ 
+     # Import ida-domain only after the process-specific log is installed. In
+     # library mode it loads idapro first, which makes the IDAPython modules
+--- /dev/null
++++ b/ida_nexus/_launch_authorization.py
+@@ -0,0 +1,105 @@
++"""Persistent, single-use bridge launch permits. Never delete/reissue records.
++
++O_EXCL on one decision name is the linearization point shared by claim/revoke.
++A crash before a complete decision is durable blocks both IDB access and closure.
++"""
++import json
++import os
++from pathlib import Path
++import stat
++
++
++def _encoded(value):
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
++
++
++def _directory(path):
++    path = Path(path)
++    if not path.is_absolute() or path.name in ("", ".", ".."):
++        raise ValueError("launch authorization requires an absolute file path")
++    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
++    info = os.fstat(fd)
++    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
++        os.close(fd)
++        raise RuntimeError("launch authorization directory is not private")
++    return path.name, fd
++
++
++def _read(directory, name):
++    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
++    try:
++        info = os.fstat(fd)
++        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
++                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
++                or not 0 < info.st_size <= 8192):
++            raise RuntimeError("launch authorization record invalid or incomplete")
++        raw = os.read(fd, 8193)
++        value = json.loads(raw)
++        if raw != _encoded(value):
++            raise RuntimeError("launch authorization record is not canonical")
++        # A concurrent publisher may have written the complete record before
++        # fsync. Readers make it durable too before replaying revocation.
++        os.fsync(fd)
++        os.fsync(directory)
++        return value
++    finally:
++        os.close(fd)
++
++
++def _publish(directory, name, value):
++    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
++                 0o600, dir_fd=directory)
++    try:
++        raw = _encoded(value)
++        while raw:
++            size = os.write(fd, raw)
++            if size <= 0:
++                raise OSError("short launch authorization write")
++            raw = raw[size:]
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++    os.fsync(directory)
++
++
++def create(path, suffix, target):
++    name, directory = _directory(path)
++    try:
++        grant = {"schema": 1, "suffix": suffix, "target": str(target)}
++        _publish(directory, name, grant)
++        return str(path)
++    finally:
++        os.close(directory)
++
++
++def decide(path, suffix, target, decision):
++    if decision not in ("claimed", "revoked"):
++        raise ValueError("invalid launch decision")
++    name, directory = _directory(path)
++    try:
++        grant = _read(directory, name)
++        if grant != {"schema": 1, "suffix": suffix, "target": str(target)}:
++            raise RuntimeError("launch authorization identity mismatch")
++        expected = dict(grant, decision=decision)
++        try:
++            _publish(directory, name + ".decision", expected)
++        except FileExistsError:
++            existing = _read(directory, name + ".decision")
++            if existing not in (dict(grant, decision="claimed"), dict(grant, decision="revoked")):
++                raise RuntimeError("launch authorization decision invalid")
++            # Claim is not reentrant: another worker with identical arguments
++            # must not open the IDB twice. Only revocation may replay its ACK.
++            return decision == "revoked" and existing == expected
++        return True
++    finally:
++        os.close(directory)
++
++
++def revoked(path, suffix, target):
++    name, directory = _directory(path)
++    try:
++        grant = {"schema": 1, "suffix": suffix, "target": str(target)}
++        return (_read(directory, name) == grant
++                and _read(directory, name + ".decision") == dict(grant, decision="revoked"))
++    finally:
++        os.close(directory)

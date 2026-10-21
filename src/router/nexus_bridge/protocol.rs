@@ -4,18 +4,26 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const CLIENT_HASH: &str = "dd9daf669b6dc55f657dd11b60f9869dcca70cf278cc65bc1d91b4e02b199acd";
-pub const CLIENT_MODULES: [(&str, &str); 3] = [
+pub const CLIENT_MODULES: [(&str, &str); 5] = [
     (
         "handle.py",
         "dd9daf669b6dc55f657dd11b60f9869dcca70cf278cc65bc1d91b4e02b199acd",
     ),
     (
         "_resolver.py",
-        "d06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8",
+        "86f891f51f753e8a0af4b79d38e59207d542c894eec5f3009ebd764e2b4fd42b",
     ),
     (
         "options.py",
         "1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe",
+    ),
+    (
+        "cli/worker.py",
+        "787cfc2cf0e6ad8bc651d8e8bc3b1d0f8b8b261da4e65b3647e1391740538aff",
+    ),
+    (
+        "_launch_authorization.py",
+        "4a58dc1874e4267bb553b08a5946b9b77e7207db74946b3abe74c4a4dbdcca0a",
     ),
 ];
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +116,13 @@ mod tests {
         let current = serde_json::to_value(Protocol::current()).expect("encode protocol");
         assert_eq!(current["client_modules"], manifest["files"]);
         assert_eq!(current["sdk_boundary"], manifest["sdk_boundary"]);
-        for name in ["handle.py", "_resolver.py", "options.py"] {
+        for name in [
+            "handle.py",
+            "_resolver.py",
+            "options.py",
+            "cli/worker.py",
+            "_launch_authorization.py",
+        ] {
             let mut bad = current.clone();
             bad["client_modules"][name] = serde_json::json!("0".repeat(64));
             assert!(

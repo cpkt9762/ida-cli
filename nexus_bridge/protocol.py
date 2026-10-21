@@ -5,7 +5,7 @@ import os
 IDAPRO_CODE = {'__init__.py': '3d18a1a49ccc5c67e28c2d3fbe9b9e404cac33955665d49d8593ebc717a25555',
                'config.py': '63288585e894c815815784ed8be96f028603790aca16d8e75e715b7870b3c800'}
 
-SDK_FILES = {'handle.py': 'dd9daf669b6dc55f657dd11b60f9869dcca70cf278cc65bc1d91b4e02b199acd', '_resolver.py': 'd06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8', 'options.py': '1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe'}
+SDK_FILES = {'handle.py': 'dd9daf669b6dc55f657dd11b60f9869dcca70cf278cc65bc1d91b4e02b199acd', '_resolver.py': '86f891f51f753e8a0af4b79d38e59207d542c894eec5f3009ebd764e2b4fd42b', 'options.py': '1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe', 'cli/worker.py': '787cfc2cf0e6ad8bc651d8e8bc3b1d0f8b8b261da4e65b3647e1391740538aff', '_launch_authorization.py': '4a58dc1874e4267bb553b08a5946b9b77e7207db74946b3abe74c4a4dbdcca0a'}
 HANDLE_SHA = SDK_FILES['handle.py']
 
 
@@ -30,7 +30,7 @@ def verify_client():
     package=Path(ida_nexus.__file__).resolve().parent
     modules={}
     for name,expected in SDK_FILES.items():
-        module=importlib.import_module('ida_nexus.'+name.removesuffix('.py'))
+        module=importlib.import_module('ida_nexus.'+name.removesuffix('.py').replace('/', '.'))
         source=Path(module.__file__).resolve()
         actual=hashlib.sha256(source.read_bytes()).hexdigest()
         if source != package/name or actual != expected:

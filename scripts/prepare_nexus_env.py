@@ -242,6 +242,9 @@ def prepare(args: argparse.Namespace) -> None:
     if sdk_applied:
         run(root, "sdk-patch-check", ["git", "apply", "--check", str(sdk_patch)], cwd=source)
         run(root, "sdk-patch", ["git", "apply", str(sdk_patch)], cwd=source)
+        authorization_patch = REPO / "scripts/nexus/launch-authorization.patch"
+        run(root, "authorization-patch-check", ["git", "apply", "--check", str(authorization_patch)], cwd=source)
+        run(root, "authorization-patch", ["git", "apply", str(authorization_patch)], cwd=source)
         for name, expected in SDK_CONTRACT["files"].items():
             if digest(source / "ida_nexus" / name) != expected:
                 raise RuntimeError(f"client SDK boundary patch output hash mismatch: {name}; BLOCKED")
@@ -252,9 +255,9 @@ def prepare(args: argparse.Namespace) -> None:
     check_dependencies(root, python, pip, entry)
     installed = json.loads(run(root, "installed-sdk", [str(python), "-I", "-B", "-c",
         "import hashlib,importlib,json,sys; from pathlib import Path; "
-        "names=('handle','_resolver','options'); "
+        "names=('handle','_resolver','options','cli.worker','_launch_authorization'); "
         "modules={n:Path(importlib.import_module('ida_nexus.'+n).__file__).resolve() for n in names}; "
-        "print(json.dumps({n+'.py':{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} "
+        "print(json.dumps({n.replace('.', '/')+'.py':{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} "
         "for n,p in modules.items()}))"]))
     for name, module in installed.items():
         if (not Path(module["path"]).is_relative_to(root / "venv")
@@ -322,7 +325,7 @@ def main() -> None:
                         help="diagnostic old cancel-only red control; unsupported bridge environment")
     args = parser.parse_args()
     if args.runtime_only and (args.sdk_baseline or args.without_client_cancel_patch or args.without_client_close_patch):
-        parser.error("runtime installation requires the complete four-patch chain")
+        parser.error("runtime installation requires the complete five-patch chain")
     try:
         if args.detect_ida:
             selected = discover_ida(report=sys.stderr)

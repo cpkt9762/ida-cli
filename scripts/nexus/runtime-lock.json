@@ -7,7 +7,8 @@
     "loopback-bind.patch",
     "client-cancel-unknown.patch",
     "client-close-proof.patch",
-    "client-acquisition.patch"
+    "client-acquisition.patch",
+    "launch-authorization.patch"
   ],
   "assets": {
     "loopback-bind.patch": "a2d50155d3e36cff9c0bc0f24fc4c17f0900fe2f68ec1fca27c1a9f9b8b89eff",
@@ -15,13 +16,16 @@
     "client-close-proof.patch": "b2b9f2c89504842477c134bfc463bcd0a54d5726e461970527f55fe27df6403a",
     "client-acquisition.patch": "bf4b1973eafa2ba324fdaa46d316b426e3ffbc6e6fa6b4dcf5dde3d7ebd73039",
     "requirements.lock": "8da2a8b48f010b0b8858d361ea15f6f7c210acafc27c6055b7ec8a17154b0a19",
-    "client-sdk-contract.json": "7790c774ff7b4f2c7dd1a2e02104b942c018f40d638faf288e14158aaf8fcf51"
+    "client-sdk-contract.json": "111fa67f73e02a8dc71e60800db82debc76e5a7a69cfba1d992cf4f6e3f6d36f",
+    "launch-authorization.patch": "b86ef048caad21d8cafdcbc2343006bb65b530943bfbdd1dfe1e3e0b90b9cbe6"
   },
   "installed_files": {
     "handle.py": "dd9daf669b6dc55f657dd11b60f9869dcca70cf278cc65bc1d91b4e02b199acd",
-    "_resolver.py": "d06a1014c2193a50372f24144200949092cbead48ffd7113221fa7220e9733e8",
+    "_resolver.py": "86f891f51f753e8a0af4b79d38e59207d542c894eec5f3009ebd764e2b4fd42b",
     "options.py": "1fbd67a12adee065b8db6fa97a333130986085ccedc7728ba92cb41fa3d9dcfe",
-    "_http.py": "30f6b0271ce1a0c622cc6854740a55377cea3c832237f03f12229ad6e3cbf339"
+    "_http.py": "30f6b0271ce1a0c622cc6854740a55377cea3c832237f03f12229ad6e3cbf339",
+    "cli/worker.py": "787cfc2cf0e6ad8bc651d8e8bc3b1d0f8b8b261da4e65b3647e1391740538aff",
+    "_launch_authorization.py": "4a58dc1874e4267bb553b08a5946b9b77e7207db74946b3abe74c4a4dbdcca0a"
   },
   "runtimes": {
     "9.4": {
