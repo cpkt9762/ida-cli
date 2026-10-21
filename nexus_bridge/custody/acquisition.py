@@ -8,7 +8,7 @@ import uuid
 from owner_identity import owner_key, state_identity
 from custody_process_identity import capture
 from proof_helper import request
-from target_coordination import Target, canonical, digest
+from target_coordination import Directory, Target, canonical, digest
 from target_journal import Journal, OwnerDraining, ObservationPending, StartupPending
 
 
@@ -248,6 +248,19 @@ class Custodian:
         elif stage == 'LaunchIntent':
             launch = {k:value[k] for k in ('suffix', 'source', 'target', 'backend')}
             watch = uuid.uuid4().hex
+            from ida_nexus._launch_authorization import create
+            from pathlib import Path
+            authorization_root = Directory(Path(self.helper['endpoint']).parent)
+            try:
+                grants = authorization_root.child('launch-authorizations')
+            finally:
+                authorization_root.close()
+            try:
+                launch['authorization'] = create(grants.path / (watch + '.json'),
+                    launch['suffix'], launch['target'])
+            finally:
+                grants.close()
+            value['authorization'] = launch['authorization']
             epoch = Journal(self.target).begin(self.acquisition, watch, launch=launch)
             receipt = self.helper_request({'kind':'launch_intent', 'watch':watch, 'subscription_epoch':epoch,
                 'target':str(self.target.target), 'coord_key':self.target.key,

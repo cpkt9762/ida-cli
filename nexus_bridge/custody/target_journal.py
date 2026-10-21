@@ -919,14 +919,7 @@ class Journal:
         return {}
 
     def launch_abandoned(self, value):
-        """Close a LaunchIntent that provably never produced an owner.
-
-        The helper's immutable LaunchAbandonedUnspawned fact carries the router's
-        waitpid evidence and the process-table/public-discovery snapshot taken
-        after the exec margin. It authorizes closure of exactly this launch
-        epoch; it is neither a public owner lifetime proof nor a retirement of
-        any lease, owner or other watch.
-        """
+        """Close exactly an unclaimed launch with a durable revoked decision."""
         receipt = value['consumer']
         record = receipt['record']
         item = self.item(value['watch'], record['subscription_epoch'])
@@ -944,12 +937,16 @@ class Journal:
                 or any(f['kind'] not in ('SpawnIntent',) for f in item['facts'])
                 or record.get('helper') not in self.authorized_producers(item, ('SpawnIntent',))
                 or not isinstance(evidence, dict)
-                or evidence.get('process_table', {}).get('matches') != []
-                or evidence.get('public_discovery', {}).get('matches') != []
+                or not launch.get('authorization')
+                or evidence.get('authorization') != launch['authorization']
+                or evidence.get('decision') != 'revoked'
                 or evidence.get('suffix') != launch['suffix'] or evidence.get('target') != launch['target']
                 or type(evidence.get('bridge', {}).get('exited_secs')) not in (int, float)
-                or evidence['bridge']['exited_secs'] < evidence.get('settle_seconds', 1 << 30)):
+                or evidence['bridge']['exited_secs'] < 0):
             raise RuntimeError('StartupUnconfirmed: launch abandonment lacks exact unspawned evidence')
+        from ida_nexus._launch_authorization import revoked
+        if not revoked(launch['authorization'], launch['suffix'], launch['target']):
+            raise RuntimeError('StartupUnconfirmed: launch authorization is not revoked')
         verified = fact(receipt, self.target, kind='LaunchAbandonedUnspawned')
         item['facts'].append(verified)
         item['launch_abandoned'] = verified

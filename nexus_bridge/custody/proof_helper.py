@@ -34,10 +34,8 @@ REQUEST_FIELDS = {
     'spawned':('watch','launch','pid','os_identity'),
     'launch_settle':('watch','bridge'),
 }
-# A forked child that has not exec'd yet still shows its parent's argv, and a
-# dead parent does not stop it from exec'ing. Absence evidence is therefore only
-# taken once the exact bridge has been reaped for this long.
-LAUNCH_SETTLE_SECONDS = 5
+# Scheduling only; authorization revocation supplies the safety evidence.
+LAUNCH_SETTLE_SECONDS = 0
 
 
 def peer_uid(stream):
@@ -608,15 +606,7 @@ class Observer:
                             if any(a == '--record-suffix' and b == suffix for a, b in zip(argv, argv[1:]))]
 
     def settle_unspawned_launch(self, value):
-        """Close a signed LaunchIntent whose owner provably does not exist.
-
-        Only after the router reaped the exact bridge: no process can Popen for
-        this launch any more, so the set of workers carrying its suffix can only
-        shrink. A worker still present (or a published instance) keeps the
-        launch on the normal public-lifetime path; absence after the exec
-        margin means no live owner exists to observe. The evidence is an
-        immutable fact, never a public-lifetime proof.
-        """
+        """Revoke an unclaimed grant after bridge waitpid; never infer from absence."""
         item = self.items[value['watch']]
         bridge = value['bridge']
         if (not isinstance(bridge, dict) or set(bridge) != {'pid', 'status', 'exited_secs'}
@@ -631,24 +621,22 @@ class Observer:
         if (not item.get('launch') or item.get('owner') or item.get('os_identity')
                 or item.get('spawned') or item.get('proof')):
             return {'state':'not_applicable'}
-        if bridge['exited_secs'] < LAUNCH_SETTLE_SECONDS:
-            return {'state':'settling'}
+        authorization = item['launch'].get('authorization')
+        if not authorization:
+            # Older workers never needed permission: no absence observation can
+            # exclude a delayed fork/exec. Keep the signed legacy obligation.
+            return {'state':'not_applicable', 'reason':'legacy launch has no revocable authorization'}
         evidence = item.get('launch_abandon_evidence')
         if evidence is None:
-            from ida_nexus import discover_databases
+            from ida_nexus._launch_authorization import decide
             suffix = item['launch']['suffix']
-            scanned, pids = self.worker_processes(suffix)
-            discovered = discover_databases(timeout=.2)
-            public = [d.instance for d in discovered if d.instance.record_id.endswith('-' + suffix)]
-            if pids or public:
+            if not decide(authorization, suffix, item['launch']['target'], 'revoked'):
                 self.discover_startups()
-                return {'state':'owner_present', 'pids':pids,
-                        'public':[i.record_id for i in public], 'bound':bool(item.get('owner'))}
-            evidence = {'reason':'bridge reaped before Spawned; no worker process or public instance carries the launch suffix',
-                        'bridge':bridge, 'settle_seconds':LAUNCH_SETTLE_SECONDS,
+                return {'state':'owner_present', 'pids':[], 'bound':bool(item.get('owner'))}
+            evidence = {'reason':'durable launch authorization revoked before claim',
+                        'bridge':bridge, 'authorization':authorization,
                         'suffix':suffix, 'target':item['launch']['target'], 'taken_at_unix':time.time(),
-                        'process_table':{'scanned':scanned, 'matches':pids},
-                        'public_discovery':{'scanned':len(discovered), 'matches':[]}}
+                        'decision':'revoked'}
             item['launch_abandon_evidence'] = evidence
         item['consumer'] = self.publish(item, 'LaunchAbandonedUnspawned', evidence=evidence)
         item.pop('instance', None)

@@ -149,7 +149,8 @@ def _mac_commands():
     listed = lib.proc_listallpids(pids, ctypes.sizeof(pids))
     if listed <= 0:
         raise OSError(ctypes.get_errno() or errno.EIO, "cannot list the process table")
-    uid = os.getuid()
+    if listed >= capacity:
+        raise RuntimeError("process table buffer saturated; BLOCKED")
     limit = 1 << 20
     rows = []
     for pid in list(pids)[:listed]:
@@ -161,17 +162,33 @@ def _mac_commands():
         ctypes.set_errno(0)
         if lib.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
             code = ctypes.get_errno()
+            if code == errno.ESRCH:
+                continue
             info = ProcBsdInfo()
+            ctypes.set_errno(0)
             got = lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
-            if got <= 0 or info.status == 5 or info.uid != uid:
-                continue  # Gone, a zombie, or another user's process.
+            info_error = ctypes.get_errno()
+            if got <= 0 and info_error == errno.ESRCH:
+                continue
+            if got != ctypes.sizeof(info):
+                raise OSError(info_error or errno.EIO, f"process status {pid} unreadable or short")
+            if info.pid != pid:
+                raise RuntimeError(f"process status {pid} identity mismatch")
+            if info.status == 5:
+                continue
             raise OSError(code or errno.EIO, f"arguments of live process {pid} unreadable")
         raw = buffer.raw[:size.value]
+        if len(raw) < 6 or len(raw) > limit:
+            raise RuntimeError(f"process arguments {pid} short or oversized")
         argc = int.from_bytes(raw[:4], sys.byteorder)
+        if argc <= 0:
+            raise RuntimeError(f"process arguments {pid} invalid argc")
         parts = raw[4:].split(b"\0")
         index = 1  # parts[0] is the exec path.
         while index < len(parts) and parts[index] == b"":
             index += 1
+        if len(parts) <= index + argc:
+            raise RuntimeError(f"process arguments {pid} truncated")
         rows.append((pid, [part.decode("utf-8", "replace") for part in parts[index:index + argc]]))
     return rows
 
