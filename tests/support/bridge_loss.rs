@@ -457,7 +457,11 @@ async fn an_unarmed_process_reports_the_loss_without_the_retry_code() {
     let refusal = case.cli_request().await;
     let typed = case.router.bridge_loss_not_dispatched(&refusal).is_some();
     let text = refusal.to_string();
+    // Let the dead acquisition settle so its cache lock (process-wide under
+    // IDA_CLI_HOME) is released before the next case in this process opens.
+    let (settled, _) = case.shutdown_ready().await;
     case.cleanup().await;
+    assert!(settled.is_ok(), "{settled:?}");
     assert!(!typed, "unarmed process tagged the retry code: {text}");
     assert!(
         text.contains("bridge disconnected") && text.contains("ida-cli shutdown"),
