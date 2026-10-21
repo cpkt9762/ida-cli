@@ -195,6 +195,17 @@ class LaunchSettle(unittest.TestCase):
         reply = self.call('launch_settle', watch='startup', bridge=BRIDGE)
         self.assertEqual(reply['state'], 'not_applicable')
         self.assertNotIn('consumer', self.observer.items['startup'])
+        legacy_fact = self.observer.publish(self.observer.items['startup'],
+            'LaunchAbandonedUnspawned', evidence={
+                'bridge':BRIDGE, 'suffix':self.suffix, 'target':str(self.target_path),
+                'settle_seconds':5, 'process_table':{'matches':[]},
+                'public_discovery':{'matches':[]}})
+        with Target(self.target_path) as target:
+            with target.locked():
+                journal = Journal(target)
+                with self.assertRaisesRegex(RuntimeError, 'lacks exact unspawned evidence'):
+                    journal.launch_abandoned({'watch':'startup', 'consumer':legacy_fact})
+                self.assertEqual(next(iter(journal.value['entries'].values()))['launch'], self.launch)
 
     def test_incomplete_decision_preserves_the_obligation(self):
         self.sign_launch()
