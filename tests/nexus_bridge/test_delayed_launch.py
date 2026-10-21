@@ -76,7 +76,9 @@ def traced(cls,*a,**kw):
     (r/'idb-opened').touch()
     return result
 Database.open=classmethod(traced)
-sys.exit(worker.main([c['source'],'--record-suffix',c['suffix'],'--managed','--lease-grace','0.1','--no-auto-analysis'] + ([] if c['red_worker'] else ['--launch-authorization',c['grant'],'--launch-target',c['target']])))
+code=worker.main([c['source'],'--record-suffix',c['suffix'],'--managed','--lease-grace','0.1','--no-auto-analysis'] + ([] if c['red_worker'] else ['--launch-authorization',c['grant'],'--launch-target',c['target']]))
+(r/'child.exit').write_text(str(code))
+sys.exit(code)
 ''')
     parent = root/'parent.py'
     parent.write_text('''import subprocess,sys,time
@@ -112,9 +114,11 @@ while True:time.sleep(.1)
             time.sleep(.05)
         assert identity(child_pid) is None, 'worker exits on its own after denial or lease grace'
         (root/'result.json').write_text(json.dumps({'root':str(root), 'opened':(root/'idb-opened').exists(),
-            'idb_exists':target.exists(), 'delay':5.2, 'bridge_waitpid':status}))
+            'idb_exists':target.exists(), 'delay':5.2, 'bridge_waitpid':status,
+            'worker_exit':int((root/'child.exit').read_text())}))
         assert not (root/'idb-opened').exists(), 'late worker opened IDB after launch was settled'
         assert not target.exists(), 'denied worker must not create database artifacts'
+        assert (root/'child.exit').read_text() == '78', 'authorization denial has an identifiable exit code'
     finally:
         if bridge.poll() is None:
             bridge.kill()
