@@ -61,3 +61,15 @@ without a profile are never reused. Reopening the same profile uses its generati
 Empty, unknown, or differently cased values fail with `InvalidParams` naming the
 variable. sbx failures expose stdout/stderr and never fall back to the raw `.so`.
 The existing content lock, input snapshot verification and GC remain in effect.
+
+### Revocable bridge launch authorization
+
+The bridge issues a durable per-launch grant before signing LaunchIntent. A new
+SDK worker argument carries its absolute path. Before loading idalib or touching
+an IDB, the worker must win an exclusive decision-file creation and durably record
+`claimed`. After waitpid of the bridge, the helper may instead win `revoked`.
+Both compete for the same `O_EXCL` inode; an incomplete record blocks settlement.
+Grant and decision records are retained permanently and never reused. A worker
+without this argument keeps the upstream behavior. Legacy launches without a
+grant remain pending until their normal public owner lifecycle supplies evidence.
+The patched environment must be rebuilt; existing venvs cannot be reused.
