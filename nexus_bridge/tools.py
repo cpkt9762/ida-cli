@@ -214,8 +214,24 @@ def invoke(method, params):
                              "size": func.end_ea - func.start_ea}
 
     def named(name):
-        return next(((func, info) for func, info in functions()
-                     if name == info["name"] or name in info["name"]), (None, None))
+        # An exact name beats an earlier substring hit; the first substring
+        # match remains the fallback.
+        partial = None
+        for func, info in functions():
+            if name == info["name"]:
+                return func, info
+            if partial is None and name in info["name"]:
+                partial = (func, info)
+        return partial or (None, None)
+
+    def symbol_address(name):
+        partial = None
+        for entry, symbol in idautils.Names():
+            if name == symbol:
+                return entry
+            if partial is None and name in symbol:
+                partial = entry
+        return partial
 
     def address():
         return parse_address(params.get("address", params.get("addr")))
@@ -229,9 +245,9 @@ def invoke(method, params):
             func, _ = named(name)
             if func:
                 return min(2**64 - 1, func.start_ea + unsigned("offset", 0))
-            for entry, symbol in idautils.Names():
-                if name == symbol or name in symbol:
-                    return min(2**64 - 1, entry + unsigned("offset", 0))
+            entry = symbol_address(name)
+            if entry is not None:
+                return min(2**64 - 1, entry + unsigned("offset", 0))
         return None
 
     def unsigned(key, default):
@@ -247,7 +263,7 @@ def invoke(method, params):
             if func:
                 ea = func.start_ea
             else:
-                ea = next((ea for ea, symbol in idautils.Names() if name == symbol or name in symbol), None)
+                ea = symbol_address(name)
             if ea is None:
                 raise ValueError(f"Function not found: {name}")
         return min(2**64 - 1, ea + offset)

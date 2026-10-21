@@ -18,14 +18,28 @@ def rename_entry(entry, parse_address):
     ea = parse_address(entry.get("address"))
     name = entry.get("current_name")
     if ea is None and name is not None:
+        # Exact name first; the first substring match stays the fallback.
+        partial = None
         for index in range(ida_funcs.get_func_qty()):
             func = ida_funcs.getn_func(index)
             symbol = ida_funcs.get_func_name(func.start_ea) if func else None
-            if symbol and (name == symbol or name in symbol):
+            if symbol and name == symbol:
                 ea = func.start_ea
                 break
+            if symbol and partial is None and name in symbol:
+                partial = func.start_ea
         if ea is None:
-            ea = next((a for a, symbol in idautils.Names() if name == symbol or name in symbol), None)
+            ea = partial
+        if ea is None:
+            partial = None
+            for a, symbol in idautils.Names():
+                if name == symbol:
+                    ea = a
+                    break
+                if partial is None and name in symbol:
+                    partial = a
+            if ea is None:
+                ea = partial
     new_name = entry["new_name"]
     if ea is None:
         return {"address": "", "current_name": name, "new_name": new_name, "success": False,

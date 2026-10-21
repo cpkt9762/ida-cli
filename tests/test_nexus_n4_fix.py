@@ -17,6 +17,7 @@ def load(name, path):
 
 
 tools = load("n4_tools", "nexus_bridge/tools.py")
+edit_tools = load("n4_edit_tools", "nexus_bridge/edit_tools.py")
 metadata = load("n4_metadata", "nexus_bridge/metadata.py")
 tools.install_tools({'warn_missing_input_metadata': metadata.warn_missing_input_metadata})
 compare = load("n4_compare", "scripts/compare_nexus_baseline.py")
@@ -62,6 +63,48 @@ class Business(unittest.TestCase):
         self.assertEqual(result, {"ok": True, "value": {"results": [
             {"address": "0x10", "error": "IDA error: injected native decompiler failure"},
             {"address": "0x20", "code": "int good() { return 1; }\n"}]}})
+
+    def install_named_functions(self, entries):
+        """entries: [(start, name)] in IDA iteration order, 0x10 bytes each."""
+        funcs = self.modules["ida_funcs"]
+        objs = [types.SimpleNamespace(start_ea=ea, end_ea=ea + 0x10) for ea, _ in entries]
+        names = dict(entries)
+        funcs.get_func_qty = lambda: len(objs)
+        funcs.getn_func = lambda index: objs[index]
+        funcs.get_func_name = lambda ea: names.get(ea)
+        funcs.get_func = lambda ea: next((f for f in objs if f.start_ea <= ea < f.end_ea), None)
+        self.modules["idautils"].Names = lambda: iter(entries)
+
+    def test_function_by_name_prefers_exact_match_over_earlier_substring(self):
+        self.install_named_functions([(0x10, "_entrypoint_impl"), (0x20, "_entrypoint")])
+        exact = tools.invoke("get_function_by_name", {"name": "_entrypoint"})
+        self.assertEqual(exact["value"]["address"], "0x20")
+        self.assertEqual(exact["value"]["name"], "_entrypoint")
+        fallback = tools.invoke("get_function_by_name", {"name": "entrypoint"})
+        self.assertEqual(fallback["value"]["address"], "0x10")
+        missing = tools.invoke("get_function_by_name", {"name": "no_such_function"})
+        self.assertEqual(missing, {"ok": False, "error": "Function not found: no_such_function"})
+
+    def test_target_name_prefers_exact_function_and_exact_symbol(self):
+        self.install_named_functions([(0x10, "_entrypoint_impl"), (0x20, "_entrypoint")])
+        result = tools.invoke("get_function_at_address", {"target_name": "_entrypoint"})
+        self.assertEqual(result["value"]["start"], "0x20")
+        # No function carries the name: the symbol table decides, exact first.
+        self.modules["idautils"].Names = lambda: iter([(0x10, "data_sym_old"), (0x20, "data_sym")])
+        result = tools.invoke("get_function_at_address", {"target_name": "data_sym"})
+        self.assertEqual(result["value"]["start"], "0x20")
+        result = tools.invoke("get_function_at_address", {"target_name": "sym_old"})
+        self.assertEqual(result["value"]["start"], "0x10")
+
+    def test_batch_rename_current_name_prefers_exact_match(self):
+        self.install_named_functions([(0x10, "_entrypoint_impl"), (0x20, "_entrypoint")])
+        renamed = []
+        sys.modules["ida_name"] = types.ModuleType("ida_name")
+        sys.modules["ida_name"].set_name = lambda ea, name, flags: renamed.append((ea, name)) or True
+        parse = lambda raw: None
+        edit_tools.rename_entry({"current_name": "_entrypoint", "new_name": "a"}, parse)
+        edit_tools.rename_entry({"current_name": "entrypoint", "new_name": "b"}, parse)
+        self.assertEqual(renamed, [(0x20, "a"), (0x10, "b")])
 
     def test_p26_error_is_truncated_before_summary(self):
         result = tools.invoke("run_script", {"code": "raise ValueError('x' * (1024*1024+1))"})["value"]
