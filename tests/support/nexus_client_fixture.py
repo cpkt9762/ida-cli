@@ -151,6 +151,14 @@ else:
         sys.argv = [str(installation / "bootstrap.py"), "bridge", *sys.argv[1:]]
         bootstrap = runpy.run_path(sys.argv[0], run_name="verified_fixture")
         runtime = vars(bootstrap["load_entry"]())
+    if os.environ.get('R3A_STARTUP_PHASE') == 'BeforeLaunchAck':
+        from acquisition import Custodian
+        original_signed_stage = Custodian.signed_stage
+        def before_launch_ack(self, action, **value):
+            if action == 'launch':
+                startup_barrier(Path(os.environ['R5_ROOT']), 'startup', seconds=30)
+            return original_signed_stage(self, action, **value)
+        Custodian.signed_stage = before_launch_ack
     if os.environ.get('R3A_STARTUP_PHASE') in ('LaunchIntent','Spawned','LogReady','Ready'):
         from acquisition import Custodian
         original_stage = Custodian.stage

@@ -2013,7 +2013,8 @@ Upgrade must rebuild the matching venv; preserve old evidence and confirm prior
 owners have closed before switching versions. Already compacted historical facts
 are not reinterpreted as proofs about ungoverned old workers.
 
-W1 (helper signed, Rust not yet tracking) remains the existing retained-obligation
+W1 (`BeforeLaunchAck` fixture barrier: helper signed, Rust not yet tracking)
+remains the existing retained-obligation
 handoff. The synchronous observer cannot reach Popen until Rust signs/ACKs, so
 bridge death in W1 cannot leave a spawned authorized child. It is not falsely
 reported as revocation or an owner lifetime proof.
