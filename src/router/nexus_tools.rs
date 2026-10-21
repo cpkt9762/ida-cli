@@ -514,6 +514,12 @@ impl Tools {
         dsc: Option<super::nexus_bridge::cache::special::DscInput>,
     ) -> Result<(String, String), ToolError> {
         if let Some(bridge) = router.nexus_bridge.get() {
+            // The bridge is created once per router. After it is lost no open can
+            // reach it, so fail now instead of queueing behind cache and path
+            // locks that the dead bridge's retained acquisition still holds.
+            if bridge.is_lost() {
+                return Err(diagnostic("bridge disconnected: the Nexus bridge was lost and is not replaced by this daemon; run ida-cli shutdown and start it again; retained acquisitions stay in helper-state.json; never replay"));
+            }
             self.consume_released(bridge);
         }
         self.uncertain_cache

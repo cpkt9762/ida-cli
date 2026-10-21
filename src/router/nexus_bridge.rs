@@ -194,6 +194,54 @@ fn take_closed_history(
 
 impl State {
     fn observations_empty(&self) -> bool {
+        self.tracked_observations_empty() && self.helper_observations_empty()
+    }
+    /// What the helper still holds after the exact bridge process is gone while
+    /// this router tracks no resource, startup or retirement. Such watches and
+    /// parent reservations were signed by the dead bridge before Rust learned of
+    /// them, so nothing in this process can advance them; they stay durable in
+    /// `helper-state.json` for the helper's orphan expiry and later recovery.
+    /// `None` while any tracked responsibility, file job or a live bridge exists,
+    /// or while the helper cannot be observed.
+    fn untracked_helper_obligations(&self) -> Option<Value> {
+        let helper = self.helper.as_ref()?;
+        let exited = self
+            .bridge_exit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some();
+        if !exited
+            || !self.failed.load(std::sync::atomic::Ordering::Acquire)
+            || !self.tracked_observations_empty()
+        {
+            return None;
+        }
+        let status = helper.status_snapshot();
+        let snapshot = &status["snapshot"];
+        if !snapshot.is_object() || status["file_jobs_pending"] != 0 {
+            return None;
+        }
+        let held = ["used", "parent_count", "live_ref_bytes"]
+            .iter()
+            .any(|field| snapshot[field] != 0);
+        held.then(|| {
+            json!({"used":snapshot["used"],"parent_count":snapshot["parent_count"],
+                "reserved":snapshot["reserved"],"live_ref_bytes":snapshot["live_ref_bytes"],
+                "watches":snapshot["watches"]})
+        })
+    }
+    fn helper_observations_empty(&self) -> bool {
+        self.helper.as_ref().is_none_or(|helper| {
+            let status = helper.status_snapshot();
+            let snapshot = &status["snapshot"];
+            snapshot.is_object()
+                && ["used", "parent_count", "live_ref_bytes"]
+                    .iter()
+                    .all(|field| snapshot[field] == 0)
+                && status["file_jobs_pending"] == 0
+        })
+    }
+    fn tracked_observations_empty(&self) -> bool {
         let resources_empty = self
             .custody_resources
             .lock()
@@ -229,16 +277,7 @@ impl State {
                             !verification || receipt["verification_removed"] == true
                         })
                 }));
-        let helper_empty = self.helper.as_ref().is_none_or(|helper| {
-            let status = helper.status_snapshot();
-            let snapshot = &status["snapshot"];
-            snapshot.is_object()
-                && ["used", "parent_count", "live_ref_bytes"]
-                    .iter()
-                    .all(|field| snapshot[field] == 0)
-                && status["file_jobs_pending"] == 0
-        });
-        resources_empty && startups_empty && retirements_empty && helper_empty
+        resources_empty && startups_empty && retirements_empty
     }
     fn compact_closed_history(&self) {
         self.endpoint
@@ -440,10 +479,14 @@ pub struct NexusBridge {
     installation: PathBuf,
     owned_files: Mutex<Option<owned_files::OwnedFiles>>,
     probe_cleanup_ready: std::sync::atomic::AtomicBool,
+    untracked_settled: std::sync::atomic::AtomicBool,
     pub ida_version: String,
     pub installed_ida_version: Option<String>,
     pub pid: u32,
 }
+/// How long helper-only obligations must stay unchanged after the bridge process
+/// exit before shutdown treats them as untracked (longer than one helper call).
+const UNTRACKED_HELPER_SETTLE: Duration = Duration::from_secs(3);
 // F2/P2-b: acquired before bind/spawn, retained across every startup await.
 // The drop reaper owns the Child (no PID rediscovery) and waits before unlink,
 // so a child cannot recreate l after cleanup. It needs no live Tokio runtime.
@@ -486,6 +529,10 @@ fn cleanup_startup_sockets(directory: &std::path::Path) {
     }
 }
 impl NexusBridge {
+    /// The bridge channel failed or was stopped; this router never replaces it.
+    pub(crate) fn is_lost(&self) -> bool {
+        self.state.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
     pub(crate) fn resource_retirement_pending(&self, lease: &SessionLease) -> bool {
         self.state
             .custody_retirements
@@ -529,6 +576,7 @@ impl NexusBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let untracked = state.untracked_helper_obligations();
         json!({"ready": !state.failed.load(std::sync::atomic::Ordering::SeqCst) && !state.stop.is_cancelled(), "resources":resources.len(),"startup_and_pre_attach":startups.len(),
             "bridge_dir":self.installation,"prepared_python":self.prepared_python,
             "maintenance_launcher":self.installation.join("maintenance-launch"),
@@ -538,7 +586,10 @@ impl NexusBridge {
             "state_root":state.helper.as_ref().map(|h|&h.state_root),
             "live_limit":state.open_reply_capacity,"same_boot_eligibility":false,
             "boot_retirement":"requires_verified_native_creation_and_consumption_scope",
-            "next_action":if blocked.is_empty() {"wait_public_owner_lifetime"} else {"inspect_observation_failure"}})
+            "untracked_helper_obligations":untracked,
+            "next_action":if !blocked.is_empty() {"inspect_observation_failure"}
+                else if untracked.is_some() {"shutdown_then_restart_helper_retains_obligations"}
+                else {"wait_public_owner_lifetime"}})
     }
     pub(crate) fn owner_release_status(&self, lease: &SessionLease) -> Value {
         let resource = self
@@ -983,6 +1034,7 @@ impl NexusBridge {
             installation: installation_path.canonicalize()?,
             owned_files: Mutex::new(Some(owned_files)),
             probe_cleanup_ready: std::sync::atomic::AtomicBool::new(false),
+            untracked_settled: std::sync::atomic::AtomicBool::new(false),
             ida_version,
             installed_ida_version,
             pid,
@@ -1088,6 +1140,10 @@ impl NexusBridge {
         &self,
         preparation: &crate::preprocess::Preparation,
     ) -> Result<(), crate::error::ToolError> {
+        // Untracked helper obligations must stay unchanged for a full settle
+        // window: a retirement this router is still finishing briefly leaves
+        // both its tables and the helper in that shape.
+        let mut untracked_since: Option<(Value, std::time::Instant)> = None;
         loop {
             if let Some(helper) = &self.state.helper {
                 if !helper.is_finished() {
@@ -1114,6 +1170,29 @@ impl NexusBridge {
             }
             if self.state.observations_empty() {
                 return Ok(());
+            }
+            match self.state.untracked_helper_obligations() {
+                // Settled once; the RPC shutdown and the final process shutdown
+                // both pass through here and must not pay the window twice.
+                Some(_)
+                    if self
+                        .untracked_settled
+                        .load(std::sync::atomic::Ordering::Acquire) =>
+                {
+                    return Ok(());
+                }
+                Some(held) => match &untracked_since {
+                    Some((previous, since))
+                        if *previous == held && since.elapsed() >= UNTRACKED_HELPER_SETTLE =>
+                    {
+                        self.untracked_settled
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        return Ok(());
+                    }
+                    Some((previous, _)) if *previous == held => {}
+                    _ => untracked_since = Some((held, std::time::Instant::now())),
+                },
+                None => untracked_since = None,
             }
             #[cfg(test)]
             self.state
@@ -1153,6 +1232,17 @@ impl NexusBridge {
         }
         let socket_cleanup = self.remove_recorded_socket("l");
         self.state.fail("bridge stopped");
+        if let Some(held) = self.state.untracked_helper_obligations() {
+            // The helper would refuse finish: it owns obligations that only the
+            // dead bridge knew. Keep them durable; its orphan expiry abandons
+            // them with a recorded cause, and a later incarnation recovers them.
+            // No proof, retirement or replay is fabricated here.
+            tracing::warn!(held = %held, directory = %self.directory.display(),
+                "bridge process is gone; shutdown leaves untracked helper obligations durable in helper-state.json");
+            self.state.observer_stop.cancel();
+            socket_cleanup?;
+            return Ok(());
+        }
         if let Some(helper) = &self.state.helper {
             // Never force-stop an observer with outstanding responsibility.
             helper.finish().await?;
