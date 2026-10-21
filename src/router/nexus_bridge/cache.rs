@@ -208,6 +208,11 @@ pub async fn prepare_n7_open(
             crate::router::is_sbpf_elf(&classify)
         }))
         .await?;
+    let sbx_profile = if path_for_sbpf {
+        Some(crate::sbpf::SbxProfile::from_env()?)
+    } else {
+        None
+    };
     let hash_source = source.clone();
     let preparing = preparation.clone();
     let hash = preparation
@@ -216,12 +221,13 @@ pub async fn prepare_n7_open(
         }))
         .await?
         .map_err(|e| ToolError::IdaError(format!("cache content identity: {e}")))?;
-    let key = hash.to_hex()[..12].to_string();
+    let key = cache_key(&hash, sbx_profile);
     let content_guard = super::cache_lock::acquire_content(&cache, &key, preparation).await?;
     let preparing = preparation.clone();
     let result = preparation
         .wait(blocking::run(blocking::WorkClass::Prepare, move || {
-            let mut prepared = prepare_impl_inner(source, cache, &preparing, true, refresh)?;
+            let mut prepared =
+                prepare_impl_profile(source, cache, &preparing, true, refresh, sbx_profile)?;
             // An independently mutable source must not publish under another
             // content key than the one whose coordination right we hold.
             let snapshot = if prepared.path.extension().is_some_and(|e| e == "i64") {
@@ -249,8 +255,8 @@ pub async fn prepare_n7_open(
         receipt.wait().await?;
     }
     let prepared = result?;
-    if path_for_sbpf {
-        special::sbpf(prepared, preparation).await
+    if let Some(profile) = sbx_profile {
+        special::sbpf(prepared, profile, preparation).await
     } else {
         Ok(prepared)
     }
@@ -312,6 +318,21 @@ fn prepare_impl_inner(
     allow_legacy: bool,
     refresh: bool,
 ) -> anyhow::Result<PreparedOpen> {
+    prepare_impl_profile(path, cache, preparation, allow_legacy, refresh, None)
+}
+
+fn cache_key(hash: &blake3::Hash, profile: Option<crate::sbpf::SbxProfile>) -> String {
+    profile.map_or_else(|| hash.to_hex()[..12].to_string(), |p| p.cache_key(hash))
+}
+
+fn prepare_impl_profile(
+    path: PathBuf,
+    cache: PathBuf,
+    preparation: &Preparation,
+    allow_legacy: bool,
+    refresh: bool,
+    profile: Option<crate::sbpf::SbxProfile>,
+) -> anyhow::Result<PreparedOpen> {
     preparation.check()?;
     let path = path.canonicalize()?;
     if path.extension().is_some_and(|x| x == "i64" || x == "idb") {
@@ -362,9 +383,28 @@ fn prepare_impl_inner(
     let hash = digest(&staging, preparation)?;
     #[cfg(test)]
     hook("snapshot_hashed");
-    let short = &hash.to_hex()[..12];
+    let identity_key = cache_key(&hash, profile);
+    let short = identity_key.as_str();
     if allow_legacy && !refresh {
         if let Some(idb) = super::generations::current(&cache, short)? {
+            if profile.is_some() {
+                // A profile-less or differently bound generation is never proof
+                // of the code generation profile, even with identical raw bytes.
+                let manifest = idb.with_file_name("generation.json");
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                    .open(manifest)?;
+                anyhow::ensure!(file.metadata()?.is_file(), "sBPF manifest is not a file");
+                let mut bytes = Vec::new();
+                file.take(4097).read_to_end(&mut bytes)?;
+                anyhow::ensure!(bytes.len() <= 4096, "sBPF manifest exceeds size limit");
+                let metadata: serde_json::Value = serde_json::from_slice(&bytes)?;
+                anyhow::ensure!(
+                    metadata["version"] == 1 && metadata["key"] == short,
+                    "sBPF generation profile identity mismatch"
+                );
+            }
             let input = idb.with_extension("");
             anyhow::ensure!(
                 digest(&input, preparation)? == hash,
@@ -379,7 +419,9 @@ fn prepare_impl_inner(
         }
     }
     let mut existing = None;
-    for entry in std::fs::read_dir(&cache)? {
+    // Flat legacy databases have no profile proof. Only ordinary inputs may
+    // use the legacy discovery/verification path.
+    for entry in std::fs::read_dir(&cache)?.filter(|_| profile.is_none()) {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();

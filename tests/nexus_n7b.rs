@@ -67,7 +67,7 @@ async fn sbx_temporary_inputs_belong_to_the_cleaned_task_stage() {
     std::fs::create_dir(&root).expect("private sbx test root");
     let executable = root.join("sbx");
     let report = root.join("child-temp-path");
-    std::fs::write(&executable, format!("#!/usr/bin/env python3\nimport os,sys\nfrom pathlib import Path\nroot=Path(os.environ['TMPDIR'])/'sbpf_emit_fixture'\nroot.mkdir()\n(root/'input').write_bytes(b'private temporary input')\nPath({:?}).write_text(str(root))\nPath(sys.argv[-1]).write_bytes(b'offline output fixture')\n", report.to_str().expect("UTF-8 report"))).expect("fake offline builder");
+    std::fs::write(&executable, format!("#!/usr/bin/env python3\nimport os,sys\nfrom pathlib import Path\nroot=Path(os.environ['TMPDIR'])/'sbpf_emit_fixture'\nroot.mkdir()\n(root/'input').write_bytes(b'private temporary input')\nPath({:?}).write_text(str(root))\nPath(sys.argv[sys.argv.index('--output')+1]).write_bytes(b'offline output fixture')\n", report.to_str().expect("UTF-8 report"))).expect("fake offline builder");
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
         .expect("fixture executable");
     let input = root.join("program.so");

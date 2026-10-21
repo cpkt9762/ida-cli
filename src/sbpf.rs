@@ -47,6 +47,64 @@ pub fn find_sbx() -> Result<PathBuf, ToolError> {
     ))
 }
 
+pub const SBX_PROFILE_ENV: &str = "IDA_CLI_SBX_PROFILE";
+
+/// Explicit code generation identity, independent of the installed sbx default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SbxProfile {
+    #[default]
+    Analysis,
+    AnalysisInline,
+    Trace,
+    Optimized,
+}
+
+impl SbxProfile {
+    pub fn parse(value: &str) -> Result<Self, ToolError> {
+        match value {
+            "analysis" => Ok(Self::Analysis),
+            "analysis-inline" => Ok(Self::AnalysisInline),
+            "trace" => Ok(Self::Trace),
+            "optimized" => Ok(Self::Optimized),
+            other => Err(ToolError::InvalidParams(format!(
+                "{SBX_PROFILE_ENV}={other:?} is not one of analysis, analysis-inline, trace, optimized"
+            ))),
+        }
+    }
+
+    /// Read the server process environment; only absence selects the default.
+    pub fn from_env() -> Result<Self, ToolError> {
+        match std::env::var_os(SBX_PROFILE_ENV) {
+            None => Ok(Self::default()),
+            Some(value) => Self::parse(value.to_str().ok_or_else(|| {
+                ToolError::InvalidParams(format!("{SBX_PROFILE_ENV} is not valid UTF-8"))
+            })?),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Analysis => "analysis",
+            Self::AnalysisInline => "analysis-inline",
+            Self::Trace => "trace",
+            Self::Optimized => "optimized",
+        }
+    }
+
+    pub fn sbx_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Analysis => &["--profile", "analysis"],
+            Self::AnalysisInline => &["--profile", "analysis", "--inline"],
+            Self::Trace => &["--profile", "trace"],
+            Self::Optimized => &["--profile", "optimized"],
+        }
+    }
+
+    pub(crate) fn cache_key(self, hash: &blake3::Hash) -> String {
+        format!("sbpf-v1-{}.sbx-{}", hash.to_hex(), self.name())
+    }
+}
+
 // ── AOT compilation ───────────────────────────────────────────────────────
 
 pub struct SbxAotResult {
@@ -56,6 +114,15 @@ pub struct SbxAotResult {
 pub async fn run_sbx_aot_i64(
     input: &Path,
     output_i64: &Path,
+    preparation: crate::preprocess::Preparation,
+) -> Result<SbxAotResult, ToolError> {
+    run_sbx_aot_i64_with_profile(input, output_i64, SbxProfile::from_env()?, preparation).await
+}
+
+pub(crate) async fn run_sbx_aot_i64_with_profile(
+    input: &Path,
+    output_i64: &Path,
+    profile: SbxProfile,
     preparation: crate::preprocess::Preparation,
 ) -> Result<SbxAotResult, ToolError> {
     let mut cancellation_guard = preparation.cancel_on_drop();
@@ -94,11 +161,13 @@ pub async fn run_sbx_aot_i64(
             .arg("--program")
             .arg(&abs_input)
             .arg("--output")
-            .arg(&stage.output);
+            .arg(&stage.output)
+            .args(profile.sbx_args());
         let output = crate::preprocess::run(command, preparation.clone()).await?;
         if !output.status.success() {
             return Err(ToolError::InvalidParams(format!(
-                "sbx aot i64 failed (exit {})\nstderr: {}\nstdout: {}",
+                "sbx aot i64 (profile {}) failed (exit {})\nstderr: {}\nstdout: {}",
+                profile.name(),
                 output.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&output.stderr),
                 String::from_utf8_lossy(&output.stdout)
@@ -125,6 +194,45 @@ pub async fn run_sbx_aot_i64(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profiles_are_strict_and_arguments_are_explicit() {
+        for (name, profile, args) in [
+            (
+                "analysis",
+                SbxProfile::Analysis,
+                &["--profile", "analysis"][..],
+            ),
+            (
+                "analysis-inline",
+                SbxProfile::AnalysisInline,
+                &["--profile", "analysis", "--inline"][..],
+            ),
+            ("trace", SbxProfile::Trace, &["--profile", "trace"][..]),
+            (
+                "optimized",
+                SbxProfile::Optimized,
+                &["--profile", "optimized"][..],
+            ),
+        ] {
+            assert_eq!(SbxProfile::parse(name).expect("valid profile"), profile);
+            assert_eq!(profile.name(), name);
+            assert_eq!(profile.sbx_args(), args);
+        }
+        assert_eq!(SbxProfile::default(), SbxProfile::Analysis);
+        for invalid in [
+            "",
+            "Analysis",
+            "TRACE",
+            "inline",
+            "optimised",
+            "analysis --inline",
+        ] {
+            let error = SbxProfile::parse(invalid).expect_err("invalid must not default");
+            assert!(matches!(error, ToolError::InvalidParams(_)));
+            assert!(error.to_string().contains(SBX_PROFILE_ENV));
+        }
+    }
 
     #[test]
     fn find_sbx_bad_env_var() {

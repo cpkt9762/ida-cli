@@ -36,13 +36,20 @@ impl DscInput {
 
 pub(super) async fn sbpf(
     mut prepared: PreparedOpen,
+    profile: crate::sbpf::SbxProfile,
     preparation: &Preparation,
 ) -> Result<PreparedOpen, ToolError> {
     if prepared.path.extension().is_some_and(|e| e == "i64") {
         return Ok(prepared);
     }
     let output = prepared.path.with_extension("i64");
-    crate::sbpf::run_sbx_aot_i64(&prepared.path, &output, preparation.clone()).await?;
+    crate::sbpf::run_sbx_aot_i64_with_profile(
+        &prepared.path,
+        &output,
+        profile,
+        preparation.clone(),
+    )
+    .await?;
     prepared.path = output;
     prepared.options = serde_json::json!({"auto_analysis":false});
     Ok(prepared)
