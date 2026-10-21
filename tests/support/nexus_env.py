@@ -75,11 +75,14 @@ def _current_identity(pid):
 
 
 class Environment:
-    def __init__(self, root: Path):
-        self.root = root.resolve(strict=True)
-        self.manifest = json.loads((self.root / "environment.json").read_text())
-        if self.manifest["root"] != str(self.root):
+    def __init__(self, root: Path, *, case_root=None):
+        self.prepared_root = root.resolve(strict=True)
+        self.manifest = json.loads((self.prepared_root / "environment.json").read_text())
+        if self.manifest["root"] != str(self.prepared_root):
             raise ValueError("environment moved; rebuild it instead of reusing venv paths")
+        # Reuse a verified venv read-only while all mutable test evidence and
+        # runtime state belong to this run's independently prepared private root.
+        self.root = Path(case_root).resolve(strict=True) if case_root else self.prepared_root
         self.ledger = self.root / "processes.jsonl"
         self.intents = self.root / "process-intents"
         self.children = []
@@ -93,7 +96,7 @@ class Environment:
         if spec is None or spec.origin is None:
             raise RuntimeError("ida-nexus is missing; BLOCKED")
         source = Path(spec.origin).parent / "handle.py"
-        if not source.resolve().is_relative_to(self.root / "venv"):
+        if not source.resolve().is_relative_to(self.prepared_root / "venv"):
             raise RuntimeError("Nexus must load from this isolated environment")
         actual = hashlib.sha256(source.read_bytes()).hexdigest()
         if actual != self.manifest.get("client_handle_sha256"):
@@ -126,10 +129,10 @@ class Environment:
         # Every test client uses its own home; no user daemon or cache discovery.
         # No profile, credentials, PYTHONPATH or daemon settings are inherited.
         env = {name: os.environ[name] for name in ("HOME", "USER", "LOGNAME") if name in os.environ}
-        env.update({"HOME": str(self.root / "home"), "PATH": os.pathsep.join((str(self.root / "venv/bin"), str(Path(TIMEOUT).parent), os.defpath)),
+        env.update({"HOME": str(self.root / "home"), "PATH": os.pathsep.join((str(self.prepared_root / "venv/bin"), str(Path(TIMEOUT).parent), os.defpath)),
                     "IDADIR": self.manifest["ida_dir"], "IDAUSR": str(self.root / "profile"),
                     "IDA_CLI_HOME": str(self.root / "cli-home"),
-                    "IDAPYTHON_VENV_EXECUTABLE": str(self.root / "venv/bin/python"),
+                    "IDAPYTHON_VENV_EXECUTABLE": str(self.prepared_root / "venv/bin/python"),
                     "IDA_NEXUS_STATE_DIR": str(self.root / "state"),
                     "TMPDIR": str(self.root / "tmp"), "PYTHONNOUSERSITE": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",

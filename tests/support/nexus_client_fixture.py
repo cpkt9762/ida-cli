@@ -15,7 +15,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tests/support"))
 from nexus_env import Environment
 
-env = Environment(Path(os.environ["N3_ENV_ROOT"]))
+env = Environment(Path(os.environ["N3_ENV_ROOT"]), case_root=os.environ.get('N3_CASE_ROOT'))
 # No signal handler changes in the bridge's business threads. Persist creation
 # intent before Popen and the exact birth before returning it to Nexus.
 real_popen = subprocess.Popen

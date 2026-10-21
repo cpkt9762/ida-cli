@@ -103,3 +103,36 @@ print('complete closure verified; only imported original bytes compiled')
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReadOnlyPreparedEnvironment(unittest.TestCase):
+    def test_fixture_writes_only_to_the_private_case_root(self):
+        import importlib.util
+        support = Path(__file__).resolve().parents[1]/'support'
+        spec = importlib.util.spec_from_file_location('private_nexus_env', support/'nexus_env.py')
+        module = importlib.util.module_from_spec(spec)
+        # nexus_env imports the existing native process identity support module.
+        sys.path.insert(0, str(support))
+        self.addCleanup(sys.path.remove, str(support))
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(dir=os.environ['R3A_CASE_ROOT']) as temporary:
+            root = Path(temporary).resolve()
+            prepared, case = root/'prepared', root/'case'
+            prepared.mkdir(mode=0o700)
+            case.mkdir(mode=0o700)
+            manifest = {'root':str(prepared), 'ida_dir':'/private/unused-ida'}
+            (prepared/'environment.json').write_text(json.dumps(manifest))
+            env = module.Environment(prepared, case_root=case)
+            intent = env._begin_creation(['private-test'])
+            self.assertTrue(intent.is_relative_to(case))
+            env._finish_creation(intent)
+            with env.exclusive():
+                self.assertTrue((case/'.verification.lock').exists())
+            variables = env.variables()
+            for name in ('HOME', 'IDAUSR', 'IDA_CLI_HOME', 'IDA_NEXUS_STATE_DIR', 'TMPDIR'):
+                self.assertTrue(Path(variables[name]).is_relative_to(case), name)
+            self.assertEqual(variables['IDAPYTHON_VENV_EXECUTABLE'], str(prepared/'venv/bin/python'))
+            self.assertEqual(list(prepared.iterdir()), [prepared/'environment.json'])
+            (prepared/'environment.json').write_text(json.dumps(dict(manifest, root=str(case))))
+            with self.assertRaisesRegex(ValueError, 'environment moved'):
+                module.Environment(prepared, case_root=case)

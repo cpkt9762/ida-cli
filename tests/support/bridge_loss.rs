@@ -136,13 +136,16 @@ async fn case_at_authorization(phase: &str, authorization_phase: &str) -> Case {
 /// A helper that accepted `finish` proves it held no watch and no parent.
 async fn helper_holdings(bridge: &NexusBridge) -> Value {
     let helper = bridge.state.helper.as_ref().expect("helper");
+    // Finish may win after a separate is_finished check. Use the same
+    // serialized observation as shutdown, then read its accepted snapshot.
+    helper
+        .observe_for_shutdown()
+        .await
+        .expect("serialized helper observation");
     if helper.is_finished() {
         return json!({"used":0,"parent_count":0,"finished":true});
     }
-    helper
-        .call(json!({"kind":"heartbeat","summary_only":true}))
-        .await
-        .expect("helper heartbeat")
+    helper.status_snapshot()["snapshot"].clone()
 }
 
 /// The abandonment event carries the immutable fact's evidence.

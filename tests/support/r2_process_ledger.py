@@ -104,7 +104,7 @@ def install():
             row = {'kind':'socket_bound','path':address,'dev':info.st_dev,'ino':info.st_ino,
                    'pid':os.getpid(),'identity':captured}
             record(row)
-            root = os.environ.get('N3_ENV_ROOT')
+            root = os.environ.get('N3_CASE_ROOT') or os.environ.get('N3_ENV_ROOT')
             if root:
                 with (Path(root)/'sockets.jsonl').open('a') as output:
                     output.write(json.dumps(row)+'\n');output.flush();os.fsync(output.fileno())
