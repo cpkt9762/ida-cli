@@ -518,7 +518,18 @@ impl Tools {
             // reach it, so fail now instead of queueing behind cache and path
             // locks that the dead bridge's retained acquisition still holds.
             if bridge.is_lost() {
-                return Err(diagnostic("bridge disconnected: the Nexus bridge was lost and is not replaced by this daemon; run ida-cli shutdown and start it again; retained acquisitions stay in helper-state.json; never replay"));
+                // Nothing was sent. The daemon exits by itself once custody
+                // allows it; `ida-cli shutdown` is the manual path.
+                let advice = if router.bridge_loss_exit_armed() {
+                    "this daemon exits on its own once custody is settled (or run ida-cli shutdown) and a fresh daemon serves the retry"
+                } else {
+                    "run ida-cli shutdown (or restart this process) and start it again; this process does not exit by itself"
+                };
+                return Err(NexusError::new(
+                    NexusErrorCode::Disconnected,
+                    format!("bridge disconnected: the Nexus bridge was lost and is not replaced by this process; {advice}; retained acquisitions stay in helper-state.json; never replay"),
+                )
+                .into());
             }
             self.consume_released(bridge);
         }

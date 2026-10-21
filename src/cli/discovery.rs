@@ -12,6 +12,31 @@ pub fn discover_socket(explicit: Option<&str>) -> Result<PathBuf, String> {
     )
 }
 
+/// The caller pinned the daemon (`--socket` or `$IDA_MCP_SOCKET`). Such a client
+/// never starts, replaces or waits for a daemon, so it never retries either.
+pub fn is_pinned(explicit: Option<&str>) -> bool {
+    explicit.is_some() || std::env::var("IDA_MCP_SOCKET").is_ok()
+}
+
+/// Block until nothing listens on `socket` any more (the daemon cleaned up and
+/// exited), bounded by `budget`. A daemon that lost its Nexus bridge exits by
+/// itself once its custody allows a safe shutdown.
+pub fn wait_for_daemon_exit(socket: &Path, budget: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if !socket.exists() || socket_refuses(socket) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the previous daemon ({}) did not exit within {budget:?}; its custody is not settled yet. Inspect ~/.ida/logs/server.log and `ida-cli status`, or run `ida-cli shutdown`",
+                socket.display()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn resolve(
     explicit: Option<&str>,
     env_socket: Option<String>,

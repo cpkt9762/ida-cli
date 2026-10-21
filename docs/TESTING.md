@@ -2007,6 +2007,34 @@ shutdown-ready only after the orphan exited by itself) and
 `tests/nexus_bridge/test_launch_settle.py` (helper request, journal action,
 forged facts, restart).
 
+Recovery from a lost bridge. This router never replaces its bridge, so the
+`serve-http` daemon now leaves by itself (`RouterState::exit_after_bridge_loss`):
+once the bridge is lost it polls the same gate `ida-cli shutdown` uses
+(`wait_shutdown_ready`: empty custody, the helper-only rule above, or a settled
+unspawned launch), takes the usual `shutdown_nexus` path and cancels the service
+token, which removes socket and discovery files; the reason is logged whenever it
+changes ("daemon retained until custody allows a safe shutdown"). Nothing is
+forced: with unsettled custody (a live orphan owner, a tracked resource) the
+daemon stays and requests keep their refusal. The stdio `serve` process does not
+run this watcher: it is the MCP server of its client, cannot be replaced behind
+that client's back, and keeps the explicit error (its message says it does not
+exit by itself). A request refused before anything reached the lost bridge
+carries JSON-RPC code `-32010` (`RPC_BRIDGE_LOST_NOT_DISPATCHED`, data
+`bridge_lost.dispatched=false`, `nexus.code=disconnected`); it is only emitted by
+a daemon that has armed its self-exit. A dispatched request keeps `-32000` with
+`UnknownOutcome`/"open outcome retained by N1; never replay" and is never retried.
+The CLI (`send_recoverable`) treats only `-32010` specially, once: it waits (up to
+180s) until nothing listens on the old socket, lets the existing discovery start
+a fresh daemon, and resends the same request once. A second refusal, an unknown
+outcome, an explicit `--socket` or `$IDA_MCP_SOCKET` (never started, replaced or
+waited for), and a daemon that does not exit in time return the original error.
+Applies to every single-request subcommand and `pipe` (per line);
+`prewarm-many` is unchanged. Lib cases: `bridge_loss_tests::daemon_*` (self exit
+in W2a; no early exit while a live orphan owner holds custody; unarmed process
+never tags the retry code) and `cli::bridge_loss_recovery_tests`. Real
+end-to-end evidence is recorded in the H report (W1, W2a, W2b; the first
+ordinary `list-functions` after the loss succeeds).
+
 ### Final-fix harness requirements
 
 E27 needs a release build with `nexus-test-support` to record exact daemon births;

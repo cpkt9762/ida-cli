@@ -182,6 +182,19 @@ fn always_inline(method: &str) -> bool {
 
 type CliRefGuard = crate::router::CliLeaseGuard;
 
+/// Ordinary request failure, except that a refusal which provably happened before
+/// anything reached the lost Nexus bridge carries the dedicated retry-once code.
+fn failure_response(
+    router: &RouterState,
+    id: &str,
+    error: &crate::error::ToolError,
+) -> RpcResponse {
+    match router.bridge_loss_not_dispatched(error) {
+        Some(nexus) => RpcResponse::bridge_lost_not_dispatched(id, nexus),
+        None => RpcResponse::err(id, -32000, error.to_string()),
+    }
+}
+
 async fn dispatch_cli_request(
     req: &RpcRequest,
     router: &RouterState,
@@ -512,10 +525,10 @@ async fn dispatch_cli_request(
                         .await
                     {
                         Ok(v) => (RpcResponse::ok(&req.id, v), ref_guard),
-                        Err(e) => (RpcResponse::err(&req.id, -32000, e.to_string()), ref_guard),
+                        Err(e) => (failure_response(router, &req.id, &e), ref_guard),
                     }
                 }
-                Err(e) => (RpcResponse::err(&req.id, -32000, e.to_string()), None),
+                Err(e) => (failure_response(router, &req.id, &e), None),
             }
         }
     }

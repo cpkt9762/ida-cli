@@ -21,6 +21,7 @@ struct Case {
     opening: tokio::task::JoinHandle<()>,
     suffix: String,
     watch: String,
+    sample: PathBuf,
 }
 
 fn live_workers(suffix: &str) -> Vec<u32> {
@@ -114,6 +115,7 @@ async fn case(phase: &str) -> Case {
         opening,
         suffix,
         watch,
+        sample,
     }
 }
 
@@ -169,6 +171,19 @@ impl Case {
             .wait_shutdown_ready(&Preparation::new(SETTLE_DEADLINE))
             .await;
         (result, started.elapsed())
+    }
+
+    /// What a CLI request gets from the daemon after the bridge was lost.
+    async fn cli_request(&self) -> crate::error::ToolError {
+        self.router
+            .ensure_cli_worker_prepared(
+                &self.sample.display().to_string(),
+                None,
+                Preparation::new(Duration::from_secs(20)),
+            )
+            .await
+            .err()
+            .expect("a lost bridge cannot open")
     }
 
     fn evidence(&self, name: &str, value: Value) {
@@ -338,4 +353,115 @@ async fn bridge_loss_after_popen_with_live_owner_waits_for_its_public_lifetime()
         elapsed > Duration::from_secs(5),
         "a live owner must not be settled by absence evidence: {elapsed:?}"
     );
+}
+
+/// H2: the daemon leaves by itself once the lost bridge's custody allows it, and
+/// until then every request gets the dedicated retry-once refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_exits_by_itself_after_bridge_loss_in_w2a() {
+    let case = case("LaunchIntent").await;
+    case.kill_bridge().await;
+    case.router.arm_bridge_loss_exit();
+    let refusal = case.cli_request().await;
+    let typed = case.router.bridge_loss_not_dispatched(&refusal).is_some();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let watcher = {
+        let router = case.router.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move { router.exit_after_bridge_loss(cancel).await })
+    };
+    let started = std::time::Instant::now();
+    let left = tokio::time::timeout(SETTLE_DEADLINE, cancel.cancelled()).await;
+    let elapsed = started.elapsed();
+    case.evidence(
+        "h2-w2a-result.json",
+        json!({"refusal":refusal.to_string(),"typed":typed,"left":left.is_ok(),
+            "elapsed_ms":elapsed.as_millis() as u64}),
+    );
+    cancel.cancel();
+    let _ = watcher.await;
+    case.cleanup().await;
+    assert!(
+        typed,
+        "a request refused before dispatch must carry the typed code: {refusal}"
+    );
+    assert!(
+        left.is_ok(),
+        "daemon must leave by itself after the launch is settled"
+    );
+}
+
+/// H2 negative: while a live orphan owner keeps custody unsettled the daemon is
+/// not forced out; it leaves only after that owner exited by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_waits_for_a_live_orphan_owner_before_leaving() {
+    let case = case("PopenReturn").await;
+    let workers = live_workers(&case.suffix);
+    assert_eq!(
+        workers.len(),
+        1,
+        "W2b has a real owner process: {workers:?}"
+    );
+    case.kill_bridge().await;
+    case.router.arm_bridge_loss_exit();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let watcher = {
+        let router = case.router.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move { router.exit_after_bridge_loss(cancel).await })
+    };
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let early = cancel.is_cancelled();
+    let still_alive = live_workers(&case.suffix);
+    let refusal = case.cli_request().await;
+    let typed = case.router.bridge_loss_not_dispatched(&refusal).is_some();
+    let started = std::time::Instant::now();
+    let left = tokio::time::timeout(Duration::from_secs(60), cancel.cancelled()).await;
+    let after = live_workers(&case.suffix);
+    case.evidence(
+        "h2-w2b-live-result.json",
+        json!({"early":early,"still_alive":still_alive,"typed":typed,"left":left.is_ok(),
+            "waited_more_ms":started.elapsed().as_millis() as u64,"workers_after":after}),
+    );
+    cancel.cancel();
+    let _ = watcher.await;
+    case.cleanup().await;
+    assert!(
+        !early,
+        "daemon left while the orphan owner still held custody"
+    );
+    assert!(
+        !still_alive.is_empty(),
+        "the orphan owner is still alive at the check"
+    );
+    assert!(
+        typed,
+        "requests keep the typed refusal while waiting: {refusal}"
+    );
+    assert!(
+        left.is_ok(),
+        "daemon leaves once the owner exited by itself"
+    );
+    assert!(
+        after.is_empty(),
+        "no worker may outlive the daemon exit: {after:?}"
+    );
+}
+
+/// A process that does not leave by itself (stdio `serve`) must not invite a
+/// retry: its refusal stays an ordinary error that says how to restart it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unarmed_process_reports_the_loss_without_the_retry_code() {
+    let case = case("LaunchIntent").await;
+    case.kill_bridge().await;
+    let refusal = case.cli_request().await;
+    let typed = case.router.bridge_loss_not_dispatched(&refusal).is_some();
+    let text = refusal.to_string();
+    case.cleanup().await;
+    assert!(!typed, "unarmed process tagged the retry code: {text}");
+    assert!(
+        text.contains("bridge disconnected") && text.contains("ida-cli shutdown"),
+        "{text}"
+    );
+    assert!(text.contains("does not exit by itself"), "{text}");
 }

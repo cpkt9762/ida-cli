@@ -1028,6 +1028,12 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             });
 
             tokio::spawn(handle_shutdown_signals(signals, router.clone(), cancel.clone()));
+            router.arm_bridge_loss_exit();
+            tokio::spawn({
+                let router = router.clone();
+                let cancel = cancel.clone();
+                async move { router.exit_after_bridge_loss(cancel).await }
+            });
 
             loop {
                 tokio::select! {

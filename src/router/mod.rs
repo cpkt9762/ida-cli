@@ -365,6 +365,8 @@ pub struct RouterState {
     federation_nodes: Arc<Mutex<HashMap<String, crate::federation::FederationNodeRecord>>>,
     http_address: Arc<Mutex<Option<String>>>,
     maintenance_started: Arc<AtomicBool>,
+    /// Set while `exit_after_bridge_loss` runs (serve-http daemon only).
+    bridge_loss_exit_armed: Arc<AtomicBool>,
     metadata_refreshing: Arc<AtomicBool>,
     cache_stats: Arc<Mutex<CacheSnapshot>>,
 }
@@ -444,6 +446,7 @@ impl RouterState {
             federation_nodes: Arc::new(Mutex::new(crate::federation::load_node_map_from_env())),
             http_address: Arc::new(Mutex::new(None)),
             maintenance_started: Arc::new(AtomicBool::new(false)),
+            bridge_loss_exit_armed: Arc::new(AtomicBool::new(false)),
             metadata_refreshing: Arc::new(AtomicBool::new(false)),
             cache_stats: Arc::new(Mutex::new((None, None, None))),
         })
@@ -1850,6 +1853,104 @@ impl RouterState {
         }
     }
 
+    /// Declare that this process leaves by itself after a bridge loss. Only then
+    /// does a pre-dispatch refusal carry the retry-once code, because a client
+    /// can only retry on a fresh daemon if this one is going away.
+    pub fn arm_bridge_loss_exit(&self) {
+        self.bridge_loss_exit_armed.store(true, Ordering::SeqCst);
+    }
+    pub(crate) fn bridge_loss_exit_armed(&self) -> bool {
+        self.bridge_loss_exit_armed.load(Ordering::SeqCst)
+    }
+    /// The Nexus bridge was lost; this router never replaces it.
+    pub fn nexus_bridge_lost(&self) -> bool {
+        self.nexus_bridge
+            .get()
+            .is_some_and(|bridge| bridge.is_lost())
+    }
+    /// A request failure that provably happened before anything reached the lost
+    /// bridge: the typed `Disconnected` code is only ever assigned to NotSent
+    /// deliveries (sent work is `UnknownOutcome`). Used to mark the one safe retry.
+    pub fn bridge_loss_not_dispatched<'a>(
+        &self,
+        error: &'a crate::error::ToolError,
+    ) -> Option<&'a crate::ida::nexus::NexusError> {
+        match error {
+            crate::error::ToolError::Nexus(nexus)
+                if nexus.code == crate::ida::nexus::NexusErrorCode::Disconnected
+                    && self.nexus_bridge_lost()
+                    && self.bridge_loss_exit_armed() =>
+            {
+                Some(nexus)
+            }
+            _ => None,
+        }
+    }
+    /// Daemon self-exit gate after bridge loss: Ok once the lost bridge's custody
+    /// allows the same shutdown `ida-cli shutdown` would accept. Does not take the
+    /// CLI admission lock, so requests keep getting their typed error meanwhile.
+    pub async fn bridge_loss_shutdown_ready(&self) -> Result<(), crate::error::ToolError> {
+        let Some(bridge) = self.nexus_bridge.get() else {
+            return Ok(());
+        };
+        bridge
+            .wait_shutdown_ready(&crate::preprocess::Preparation::new(Duration::from_secs(5)))
+            .await
+    }
+    /// Daemon-only (`serve-http`): a lost Nexus bridge is never replaced inside this
+    /// process, so once the same custody conditions that `ida-cli shutdown`
+    /// requires are met the daemon leaves by itself (`cancel` is the service token
+    /// that stops the listeners and removes socket and discovery files) and a fresh
+    /// daemon serves the next request. While they are not met nothing is forced:
+    /// requests keep getting their typed error and the reason is logged whenever
+    /// it changes. The stdio `serve` process does not run this: it is the MCP
+    /// server of its client and exits only with it.
+    pub async fn exit_after_bridge_loss(&self, cancel: tokio_util::sync::CancellationToken) {
+        self.bridge_loss_exit_armed.store(true, Ordering::SeqCst);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
+            if self.nexus_bridge_lost() {
+                break;
+            }
+        }
+        warn!(target: "ida_mcp::shutdown",
+            "Nexus bridge lost; this daemon exits by itself once custody allows a safe shutdown");
+        let mut reported = String::new();
+        loop {
+            let attempt = match self.bridge_loss_shutdown_ready().await {
+                Ok(()) => {
+                    match tokio::time::timeout(Duration::from_secs(30), self.shutdown_nexus()).await
+                    {
+                        Ok(result) => result.map_err(|error| error.to_string()),
+                        Err(_) => Err("CancelPending: shutdown exceeded its total deadline".into()),
+                    }
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            match attempt {
+                Ok(()) => {
+                    info!(target: "ida_mcp::shutdown",
+                        "Nexus bridge lost and custody settled; daemon exiting so a fresh daemon can serve");
+                    cancel.cancel();
+                    return;
+                }
+                Err(reason) => {
+                    if reason != reported {
+                        warn!(target: "ida_mcp::shutdown", %reason,
+                            "Nexus bridge lost; daemon retained until custody allows a safe shutdown");
+                        reported = reason;
+                    }
+                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+        }
+    }
     pub async fn shutdown_nexus(&self) -> Result<(), crate::error::ToolError> {
         let _exclusive = self
             .cli_admission

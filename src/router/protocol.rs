@@ -3,6 +3,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// JSON-RPC error code for a request that the daemon refused *before* anything was
+/// sent to the Nexus bridge because that bridge was lost. Nothing ran, so a client
+/// may submit the same request to a fresh daemon once. Never used for a request
+/// that was dispatched (those report an unknown outcome and must not be replayed).
+pub const RPC_BRIDGE_LOST_NOT_DISPATCHED: i64 = -32010;
+
 /// Serialisable request envelope sent from router to worker stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcRequest {
@@ -54,6 +60,27 @@ impl RpcResponse {
                 code: error.rpc_code(),
                 message: error.to_string(),
                 data: Some(serde_json::json!({"nexus": error.details()})),
+            }),
+        }
+    }
+
+    /// Bridge lost before dispatch: machine-readable, strictly distinct from an
+    /// unknown outcome. The daemon exits by itself once custody allows it.
+    pub fn bridge_lost_not_dispatched(
+        id: impl Into<String>,
+        error: &crate::ida::nexus::NexusError,
+    ) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id: id.into(),
+            result: None,
+            error: Some(RpcError {
+                code: RPC_BRIDGE_LOST_NOT_DISPATCHED,
+                message: error.to_string(),
+                data: Some(serde_json::json!({
+                    "nexus": error.details(),
+                    "bridge_lost": {"dispatched": false, "retry": "once_after_daemon_exit"},
+                })),
             }),
         }
     }
@@ -119,6 +146,28 @@ pub(crate) fn take_deadline(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn bridge_loss_before_dispatch_has_its_own_machine_readable_code() {
+        use crate::ida::nexus::{NexusError, NexusErrorCode};
+        let error = NexusError::new(NexusErrorCode::Disconnected, "bridge disconnected: lost");
+        let response = RpcResponse::bridge_lost_not_dispatched("7", &error);
+        let rpc = response.error.expect("error envelope");
+        assert_eq!(rpc.code, RPC_BRIDGE_LOST_NOT_DISPATCHED);
+        let data = rpc.data.expect("structured data");
+        assert_eq!(data["bridge_lost"]["dispatched"], false);
+        assert_eq!(data["nexus"]["code"], "disconnected");
+        // Never the code of an ordinary failure or of an unknown outcome.
+        assert_ne!(RPC_BRIDGE_LOST_NOT_DISPATCHED, -32000);
+        let unknown = NexusError::new(NexusErrorCode::UnknownOutcome, "sent");
+        assert_eq!(
+            RpcResponse::nexus_error("8", &unknown)
+                .error
+                .expect("error")
+                .code,
+            -32000
+        );
+    }
 
     #[test]
     fn test_rpc_request_roundtrip() {

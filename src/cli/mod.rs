@@ -1,7 +1,7 @@
 pub mod discovery;
 pub mod format;
 
-use crate::router::protocol::{RpcRequest, RpcResponse};
+use crate::router::protocol::{RpcRequest, RpcResponse, RPC_BRIDGE_LOST_NOT_DISPATCHED};
 use clap::{Parser, Subcommand};
 use format::OutputMode;
 use std::io::{Read, Write};
@@ -187,6 +187,10 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
+    let mut endpoint = Endpoint {
+        path: socket_path.clone(),
+        pinned: discovery::is_pinned(args.socket.as_deref()),
+    };
 
     let output_mode = if args.compact {
         OutputMode::Compact
@@ -199,7 +203,7 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
     let timeout = std::time::Duration::from_secs(args.timeout);
 
     match args.command {
-        CliCommand::Pipe => run_pipe(&socket_path, args.path.as_deref(), &output_mode).await,
+        CliCommand::Pipe => run_pipe(&mut endpoint, args.path.as_deref(), &output_mode).await,
         CliCommand::PrewarmMany {
             list_file,
             jobs,
@@ -247,7 +251,7 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
                 payload.insert("task_params".to_string(), value);
             }
             let req = RpcRequest::new("1", "enqueue", serde_json::Value::Object(payload));
-            let resp = send_request(&socket_path, &req, timeout).await?;
+            let resp = send_recoverable(&mut endpoint, &req, timeout).await?;
             handle_response(&resp, "enqueue", &output_mode)
         }
         CliCommand::TaskStatus { task_id } => {
@@ -256,12 +260,12 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
                 "task_status",
                 serde_json::json!({ "task_id": task_id }),
             );
-            let resp = send_request(&socket_path, &req, timeout).await?;
+            let resp = send_recoverable(&mut endpoint, &req, timeout).await?;
             handle_response(&resp, "task_status", &output_mode)
         }
         CliCommand::ListTasks => {
             let req = RpcRequest::new("1", "list_tasks", serde_json::json!({}));
-            let resp = send_request(&socket_path, &req, timeout).await?;
+            let resp = send_recoverable(&mut endpoint, &req, timeout).await?;
             handle_response(&resp, "list_tasks", &output_mode)
         }
         CliCommand::CancelTask { task_id } => {
@@ -270,7 +274,7 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
                 "cancel_task",
                 serde_json::json!({ "task_id": task_id }),
             );
-            let resp = send_request(&socket_path, &req, timeout).await?;
+            let resp = send_recoverable(&mut endpoint, &req, timeout).await?;
             handle_response(&resp, "cancel_task", &output_mode)
         }
         CliCommand::FederationList => {
@@ -341,14 +345,14 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
                         .or_insert_with(|| serde_json::json!(tenant));
                 }
             }
-            let resp = send_request(&socket_path, &req, timeout).await?;
+            let resp = send_recoverable(&mut endpoint, &req, timeout).await?;
             handle_response(&resp, &req.method, &output_mode)
         }
         cmd => {
             let (method, params) =
                 build_rpc_params(&cmd, args.path.as_deref(), args.tenant.as_deref());
             let req = RpcRequest::new("1", &method, params);
-            let resp = send_request(&socket_path, &req, timeout).await?;
+            let resp = send_recoverable(&mut endpoint, &req, timeout).await?;
             handle_response(&resp, &method, &output_mode)
         }
     }
@@ -690,6 +694,68 @@ fn complete_envelope(raw: &str, seq: u64) -> anyhow::Result<RpcRequest> {
     serde_json::from_value(val).map_err(|e| anyhow::anyhow!("Invalid request: {e}"))
 }
 
+/// How long a client waits for a daemon that lost its Nexus bridge to settle its
+/// custody and exit before it gives up and reports the original error.
+const BRIDGE_LOSS_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The daemon this process talks to. A pinned endpoint (`--socket`,
+/// `$IDA_MCP_SOCKET`) is never replaced; an auto-discovered one may be.
+pub(crate) struct Endpoint {
+    path: std::path::PathBuf,
+    pinned: bool,
+}
+
+/// The daemon refused before anything reached its lost Nexus bridge: no effect
+/// happened, and only this code (never an unknown outcome) allows a retry.
+fn refused_before_dispatch(resp: &RpcResponse) -> bool {
+    resp.error
+        .as_ref()
+        .is_some_and(|error| error.code == RPC_BRIDGE_LOST_NOT_DISPATCHED)
+}
+
+/// Send once; if the daemon reports a bridge loss that happened before dispatch,
+/// wait for it to exit, let discovery start a fresh daemon and resend exactly
+/// once. A second refusal, an unknown outcome or a pinned endpoint is returned
+/// untouched.
+async fn send_recoverable(
+    endpoint: &mut Endpoint,
+    req: &RpcRequest,
+    timeout: std::time::Duration,
+) -> anyhow::Result<RpcResponse> {
+    send_recoverable_with(endpoint, req, timeout, |old| {
+        discovery::wait_for_daemon_exit(old, BRIDGE_LOSS_EXIT_WAIT)?;
+        discovery::discover_socket(None)
+    })
+    .await
+}
+
+async fn send_recoverable_with(
+    endpoint: &mut Endpoint,
+    req: &RpcRequest,
+    timeout: std::time::Duration,
+    restart: impl FnOnce(&Path) -> Result<std::path::PathBuf, String> + Send + 'static,
+) -> anyhow::Result<RpcResponse> {
+    let resp = send_request(&endpoint.path, req, timeout).await?;
+    if endpoint.pinned || !refused_before_dispatch(&resp) {
+        return Ok(resp);
+    }
+    eprintln!(
+        "The ida-cli daemon lost its Nexus bridge before running this request; waiting for it to exit, then retrying once on a fresh daemon..."
+    );
+    let old = endpoint.path.clone();
+    let blocking_old = old.clone();
+    match tokio::task::spawn_blocking(move || restart(&blocking_old)).await? {
+        Ok(path) => {
+            endpoint.path = path;
+            send_request(&endpoint.path, req, timeout).await
+        }
+        Err(reason) => {
+            eprintln!("Cannot recover automatically: {reason}");
+            Ok(resp)
+        }
+    }
+}
+
 async fn send_request(
     socket_path: &Path,
     req: &RpcRequest,
@@ -829,7 +895,7 @@ fn handle_response(resp: &RpcResponse, method: &str, mode: &OutputMode) -> anyho
 }
 
 async fn run_pipe(
-    socket_path: &Path,
+    endpoint: &mut Endpoint,
     global_path: Option<&str>,
     mode: &OutputMode,
 ) -> anyhow::Result<()> {
@@ -867,7 +933,7 @@ async fn run_pipe(
                     }
                 }
 
-                match send_request(socket_path, &req, timeout).await {
+                match send_recoverable(endpoint, &req, timeout).await {
                     Ok(resp) => {
                         let out = match mode {
                             OutputMode::Compact | OutputMode::Json => {
@@ -948,5 +1014,228 @@ mod tests {
         );
         assert_eq!(method, "get_address_info");
         assert_eq!(params["address"], "0x2000");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bridge_loss_recovery_tests {
+    use super::*;
+    use crate::router::protocol::RpcError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::UnixListener;
+
+    static CASES: AtomicUsize = AtomicUsize::new(0);
+
+    fn case_dir() -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/icr-{}-{}",
+            std::process::id(),
+            CASES.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("private case dir");
+        dir
+    }
+
+    fn reply(code: Option<i64>, message: &str) -> RpcResponse {
+        RpcResponse {
+            jsonrpc: "2.0".into(),
+            id: "1".into(),
+            result: code.is_none().then(|| serde_json::json!({"ok": true})),
+            error: code.map(|code| RpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+        }
+    }
+
+    /// One-connection-per-request fake daemon that answers every request with
+    /// `response` and counts them.
+    fn fake_daemon(
+        socket: &Path,
+        response: RpcResponse,
+    ) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = UnixListener::bind(socket).expect("bind fake daemon");
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                // Liveness probes connect and close without sending a request.
+                match BufReader::new(reader).read_line(&mut line).await {
+                    Ok(0) | Err(_) => continue,
+                    Ok(_) => {}
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut out = serde_json::to_vec(&response).expect("encode");
+                out.push(b'\n');
+                let _ = writer.write_all(&out).await;
+            }
+        });
+        (seen, task)
+    }
+
+    fn request() -> RpcRequest {
+        RpcRequest::new("1", "list_functions", serde_json::json!({"path": "/tmp/x"}))
+    }
+
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn refused_before_dispatch_waits_for_the_exit_then_retries_exactly_once() {
+        let dir = case_dir();
+        let (old_socket, new_socket) = (dir.join("old"), dir.join("new"));
+        let (old_seen, _old) = fake_daemon(
+            &old_socket,
+            reply(Some(RPC_BRIDGE_LOST_NOT_DISPATCHED), "bridge lost"),
+        );
+        let (new_seen, _new) = fake_daemon(&new_socket, reply(None, ""));
+        let mut endpoint = Endpoint {
+            path: old_socket.clone(),
+            pinned: false,
+        };
+        let restarted = new_socket.clone();
+        let resp = send_recoverable_with(&mut endpoint, &request(), TIMEOUT, move |old| {
+            assert!(
+                old.ends_with("old"),
+                "restart is told which daemon was lost"
+            );
+            Ok(restarted)
+        })
+        .await
+        .expect("recovered request");
+        assert!(
+            resp.error.is_none(),
+            "the retry on the fresh daemon succeeded"
+        );
+        assert_eq!(
+            (
+                old_seen.load(Ordering::SeqCst),
+                new_seen.load(Ordering::SeqCst)
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            endpoint.path, new_socket,
+            "later requests use the fresh daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_refusal_is_returned_without_a_third_attempt() {
+        let dir = case_dir();
+        let (old_socket, new_socket) = (dir.join("old"), dir.join("new"));
+        let refusal = reply(Some(RPC_BRIDGE_LOST_NOT_DISPATCHED), "bridge lost");
+        let (old_seen, _old) = fake_daemon(&old_socket, refusal.clone());
+        let (new_seen, _new) = fake_daemon(&new_socket, refusal);
+        let mut endpoint = Endpoint {
+            path: old_socket,
+            pinned: false,
+        };
+        let restarted = new_socket;
+        let resp =
+            send_recoverable_with(&mut endpoint, &request(), TIMEOUT, move |_| Ok(restarted))
+                .await
+                .expect("response");
+        assert!(refused_before_dispatch(&resp));
+        assert_eq!(
+            (
+                old_seen.load(Ordering::SeqCst),
+                new_seen.load(Ordering::SeqCst)
+            ),
+            (1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_outcome_or_ordinary_error_is_never_replayed() {
+        for response in [
+            reply(
+                Some(-32000),
+                "Nexus UnknownOutcome: connection lost after dispatch; do not replay",
+            ),
+            reply(
+                Some(-32000),
+                "Nexus: bridge disconnected; open outcome retained by N1; never replay",
+            ),
+        ] {
+            let dir = case_dir();
+            let socket = dir.join("only");
+            let (seen, _daemon) = fake_daemon(&socket, response);
+            let mut endpoint = Endpoint {
+                path: socket,
+                pinned: false,
+            };
+            let resp = send_recoverable_with(&mut endpoint, &request(), TIMEOUT, |_| {
+                panic!("a dispatched request must never trigger a restart")
+            })
+            .await
+            .expect("response");
+            assert_eq!(resp.error.expect("error").code, -32000);
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "no replay");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pinned_socket_is_never_replaced_or_retried() {
+        let dir = case_dir();
+        let socket = dir.join("pinned");
+        let (seen, _daemon) = fake_daemon(
+            &socket,
+            reply(Some(RPC_BRIDGE_LOST_NOT_DISPATCHED), "bridge lost"),
+        );
+        let mut endpoint = Endpoint {
+            path: socket,
+            pinned: true,
+        };
+        let resp = send_recoverable_with(&mut endpoint, &request(), TIMEOUT, |_| {
+            panic!("an explicit --socket / $IDA_MCP_SOCKET never starts or waits for a daemon")
+        })
+        .await
+        .expect("response");
+        assert!(refused_before_dispatch(&resp));
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_does_not_exit_leaves_the_original_refusal() {
+        let dir = case_dir();
+        let socket = dir.join("stuck");
+        let (seen, _daemon) = fake_daemon(
+            &socket,
+            reply(Some(RPC_BRIDGE_LOST_NOT_DISPATCHED), "bridge lost"),
+        );
+        let mut endpoint = Endpoint {
+            path: socket,
+            pinned: false,
+        };
+        let resp = send_recoverable_with(&mut endpoint, &request(), TIMEOUT, |old| {
+            discovery::wait_for_daemon_exit(old, std::time::Duration::from_millis(400))?;
+            unreachable!("the stuck daemon never exits")
+        })
+        .await
+        .expect("response");
+        assert!(refused_before_dispatch(&resp), "original refusal reported");
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "nothing was resent");
+    }
+
+    #[test]
+    fn wait_for_daemon_exit_returns_when_nothing_listens_any_more() {
+        let dir = case_dir();
+        let socket = dir.join("leaving");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let socket_for_thread = socket.clone();
+        let leaving = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_for_thread);
+        });
+        discovery::wait_for_daemon_exit(&socket, std::time::Duration::from_secs(5))
+            .expect("exit observed");
+        leaving.join().expect("leaving thread");
     }
 }
