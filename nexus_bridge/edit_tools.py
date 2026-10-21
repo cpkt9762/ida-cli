@@ -10,6 +10,30 @@ WRITE_METHODS = ("set_comment", "set_function_comment", "rename_symbol", "batch_
                  "set_stack_variable_type", "create_enum", "run_auto_analysis", "load_debug_info", "run_script")
 
 
+def locate_by_name(name, function_names):
+    """Shared name lookup: function exact, symbol exact, function substring, symbol substring.
+
+    function_names yields (start_ea, name); names may be empty/None and never match.
+    The substring tiers keep the original first-match behaviour.
+    """
+    import idautils
+    partial_function = None
+    for ea, symbol in function_names:
+        if not symbol:
+            continue
+        if name == symbol:
+            return ea
+        if partial_function is None and name in symbol:
+            partial_function = ea
+    partial_symbol = None
+    for ea, symbol in idautils.Names():
+        if name == symbol:
+            return ea
+        if partial_symbol is None and name in symbol:
+            partial_symbol = ea
+    return partial_function if partial_function is not None else partial_symbol
+
+
 def rename_entry(entry, parse_address):
     """One N0 batch item; successful previous entries are never rolled back."""
     import ida_funcs
@@ -18,28 +42,9 @@ def rename_entry(entry, parse_address):
     ea = parse_address(entry.get("address"))
     name = entry.get("current_name")
     if ea is None and name is not None:
-        # Exact name first; the first substring match stays the fallback.
-        partial = None
-        for index in range(ida_funcs.get_func_qty()):
-            func = ida_funcs.getn_func(index)
-            symbol = ida_funcs.get_func_name(func.start_ea) if func else None
-            if symbol and name == symbol:
-                ea = func.start_ea
-                break
-            if symbol and partial is None and name in symbol:
-                partial = func.start_ea
-        if ea is None:
-            ea = partial
-        if ea is None:
-            partial = None
-            for a, symbol in idautils.Names():
-                if name == symbol:
-                    ea = a
-                    break
-                if partial is None and name in symbol:
-                    partial = a
-            if ea is None:
-                ea = partial
+        ea = locate_by_name(name, ((func.start_ea, ida_funcs.get_func_name(func.start_ea))
+                                   for func in map(ida_funcs.getn_func, range(ida_funcs.get_func_qty()))
+                                   if func))
     new_name = entry["new_name"]
     if ea is None:
         return {"address": "", "current_name": name, "new_name": new_name, "success": False,

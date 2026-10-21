@@ -19,6 +19,8 @@ def load(name, path):
 tools = load("n4_tools", "nexus_bridge/tools.py")
 edit_tools = load("n4_edit_tools", "nexus_bridge/edit_tools.py")
 metadata = load("n4_metadata", "nexus_bridge/metadata.py")
+# tools.py shares locate_by_name with edit_tools.py via the bridge's concatenated source.
+tools.locate_by_name = edit_tools.locate_by_name
 tools.install_tools({'warn_missing_input_metadata': metadata.warn_missing_input_metadata})
 compare = load("n4_compare", "scripts/compare_nexus_baseline.py")
 
@@ -105,6 +107,26 @@ class Business(unittest.TestCase):
         edit_tools.rename_entry({"current_name": "_entrypoint", "new_name": "a"}, parse)
         edit_tools.rename_entry({"current_name": "entrypoint", "new_name": "b"}, parse)
         self.assertEqual(renamed, [(0x20, "a"), (0x10, "b")])
+
+    def test_exact_symbol_beats_function_substring_for_lookup_and_rename(self):
+        # `foo` is a non-function symbol inside function `other`; function
+        # `foo_bar` merely contains the query. The exact symbol must win.
+        self.install_named_functions([(0x10, "foo_bar"), (0x30, "other")])
+        self.modules["idautils"].Names = lambda: iter([(0x10, "foo_bar"), (0x38, "foo")])
+        located = tools.invoke("get_function_at_address", {"target_name": "foo"})
+        self.assertEqual(located["value"]["start"], "0x30")
+        renamed = []
+        sys.modules["ida_name"] = types.ModuleType("ida_name")
+        sys.modules["ida_name"].set_name = lambda ea, name, flags: renamed.append((ea, name)) or True
+        edit_tools.rename_entry({"current_name": "foo", "new_name": "a"}, lambda raw: None)
+        self.assertEqual(renamed, [(0x38, "a")])
+        # Without an exact symbol the first function substring still wins,
+        # and a symbol substring is the last resort.
+        edit_tools.rename_entry({"current_name": "oo_b", "new_name": "b"}, lambda raw: None)
+        self.assertEqual(renamed[-1], (0x10, "b"))
+        self.modules["idautils"].Names = lambda: iter([(0x40, "zzz_sym")])
+        edit_tools.rename_entry({"current_name": "zz_s", "new_name": "c"}, lambda raw: None)
+        self.assertEqual(renamed[-1], (0x40, "c"))
 
     def test_p26_error_is_truncated_before_summary(self):
         result = tools.invoke("run_script", {"code": "raise ValueError('x' * (1024*1024+1))"})["value"]

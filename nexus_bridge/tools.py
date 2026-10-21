@@ -224,14 +224,8 @@ def invoke(method, params):
                 partial = (func, info)
         return partial or (None, None)
 
-    def symbol_address(name):
-        partial = None
-        for entry, symbol in idautils.Names():
-            if name == symbol:
-                return entry
-            if partial is None and name in symbol:
-                partial = entry
-        return partial
+    def function_names():
+        return ((func.start_ea, info["name"]) for func, info in functions())
 
     def address():
         return parse_address(params.get("address", params.get("addr")))
@@ -242,10 +236,7 @@ def invoke(method, params):
             return min(2**64 - 1, ea + unsigned("offset", 0))
         name = params.get("target_name", params.get("name"))
         if isinstance(name, str):
-            func, _ = named(name)
-            if func:
-                return min(2**64 - 1, func.start_ea + unsigned("offset", 0))
-            entry = symbol_address(name)
+            entry = locate_by_name(name, function_names())
             if entry is not None:
                 return min(2**64 - 1, entry + unsigned("offset", 0))
         return None
@@ -259,11 +250,7 @@ def invoke(method, params):
         if ea is None:
             if name is None:
                 raise ValueError("Invalid parameters: expected address or name")
-            func, _ = named(name)
-            if func:
-                ea = func.start_ea
-            else:
-                ea = symbol_address(name)
+            ea = locate_by_name(name, function_names())
             if ea is None:
                 raise ValueError(f"Function not found: {name}")
         return min(2**64 - 1, ea + offset)
