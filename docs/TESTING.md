@@ -1956,6 +1956,21 @@ Busy lease release still fails before this wait. Pending or blocked observations
 return CancelPending with the bridge retained; no unproved cleanup is called
 success. E27 exercises this path without a preparatory close command.
 
+Bridge death during a cold open can leave the helper holding a signed launch
+intent and parent reservation that Rust never tracked. Once the exact bridge
+process is reaped, Rust tracks no resource, startup or retirement and no file job
+is pending, shutdown (RPC and TERM/INT) waits for that helper-only state to stay
+unchanged for 3s, skips the helper finish it would refuse, and exits. Nothing is
+retired, proved or replayed: `helper-state.json` keeps the obligation, the helper
+abandons it through its 300s orphan expiry, and status reports
+`untracked_helper_obligations` with next_action
+`shutdown_then_restart_helper_retains_obligations`. This router never replaces a
+lost bridge, so opens fail at once with `bridge disconnected: ... ida-cli
+shutdown`. Lib regression:
+`final_shutdown_tests::shutdown_after_bridge_death_retains_untracked_helper_obligation`
+(red on the old code: CancelPending after 15s). A tracked startup or resource, or
+a live bridge, keeps the previous wait-and-refuse behaviour.
+
 ### Final-fix harness requirements
 
 E27 needs a release build with `nexus-test-support` to record exact daemon births;
