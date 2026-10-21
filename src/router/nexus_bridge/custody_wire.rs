@@ -1836,16 +1836,16 @@ fn unspawned_candidate(launch: &Value) -> bool {
         && launch.get("proof").is_none()
 }
 
-/// Close a signed LaunchIntent whose owner provably does not exist.
+/// Close an unclaimed LaunchIntent after its authorization is durably revoked.
 ///
-/// Preconditions held here: the exact bridge child was reaped (so no worker can
-/// be forked for this launch any more) and the exec margin elapsed. The helper
-/// then reads the process table and public discovery itself; any worker or
-/// published instance carrying the launch suffix keeps the launch on the normal
-/// public-lifetime path (`Ok(false)`). Absence is recorded as an immutable
-/// `LaunchAbandonedUnspawned` fact, adopted by the target journal, and only then
-/// are the helper watch, parent reservation and acquisition settled. This never
-/// fabricates an owner proof and never replays the open.
+/// The exact bridge child must have been reaped before the helper attempts
+/// atomic revocation. A claimed authorization or a legacy launch without one
+/// stays on the public-lifetime path (`Ok(false)`); unreadable or incomplete
+/// authorization records retain the obligation. Successful revocation produces
+/// an immutable `LaunchAbandonedUnspawned` fact, which the target journal
+/// independently validates before the helper watch, parent reservation and
+/// acquisition are settled. This never fabricates an owner proof or replays
+/// the open, and does not depend on an exec deadline or absence observations.
 async fn settle_unspawned_launch(
     state: &Arc<State>,
     helper: &helper::Helper,
@@ -1964,7 +1964,7 @@ async fn settle_unspawned_launch(
         clock.reported.remove(&watch);
     }
     tracing::warn!(watch, evidence = %consumer["record"]["evidence"],
-        "bridge was lost before the owner was spawned; launch settled as abandoned on process-table and discovery evidence");
+        "bridge was lost before Spawned was signed; unclaimed launch settled after durable authorization revocation");
     state.emit(json!({"event":"launch_abandoned_unspawned","acquisition":acquisition,"watch":watch,
         "evidence":consumer["record"]["evidence"],"receipt":{"path":consumer["path"],"sha256":consumer["sha256"]}}));
     Ok(true)

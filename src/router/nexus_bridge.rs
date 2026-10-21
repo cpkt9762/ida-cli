@@ -488,11 +488,7 @@ pub struct NexusBridge {
 /// How long helper-only obligations must stay unchanged after the bridge process
 /// exit before shutdown treats them as untracked (longer than one helper call).
 const UNTRACKED_HELPER_SETTLE: Duration = Duration::from_secs(3);
-/// Exec margin after the exact bridge was reaped. Nothing can fork a worker for
-/// a signed launch any more; a child that was between fork and exec when its
-/// parent died finishes exec within milliseconds, so five seconds is a wide
-/// margin before the process table is read as evidence of absence.
-/// Pacing of the helper's process-table/discovery probes for one launch.
+/// Pacing of helper authorization-revocation attempts for one retained launch.
 const LAUNCH_SETTLE_PROBE: Duration = Duration::from_secs(1);
 
 /// Router-side clock and pacing for settling a launch whose bridge was reaped

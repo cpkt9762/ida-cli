@@ -9,13 +9,13 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(REPO/'nexus_bridge/custody'), str(REPO/'tests/support')]
-from proof_helper import LAUNCH_SETTLE_SECONDS, Observer
+from proof_helper import Observer
 from ida_nexus._launch_authorization import create, decide
 from target_coordination import Directory, Target
 from target_journal import Journal
 
 ACQUISITION = {'parent':'launch-settle', 'purpose':'final', 'ordinal':1}
-BRIDGE = {'pid':424242, 'status':'signal: 9 (SIGKILL)', 'exited_secs':float(LAUNCH_SETTLE_SECONDS) + .5}
+BRIDGE = {'pid':424242, 'status':'signal: 9 (SIGKILL)', 'exited_secs':.5}
 
 
 class LaunchSettle(unittest.TestCase):

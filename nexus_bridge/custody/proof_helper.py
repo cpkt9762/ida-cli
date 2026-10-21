@@ -14,7 +14,7 @@ import threading
 import time
 
 from owner_identity import owner_key, state_identity, validate_owner
-from custody_process_identity import capture, process_commands
+from custody_process_identity import capture
 from origin import creation_scope
 from target_coordination import Directory, Target, canonical, digest, encoded
 
@@ -34,9 +34,6 @@ REQUEST_FIELDS = {
     'spawned':('watch','launch','pid','os_identity'),
     'launch_settle':('watch','bridge'),
 }
-# Scheduling only; authorization revocation supplies the safety evidence.
-LAUNCH_SETTLE_SECONDS = 0
-
 
 def peer_uid(stream):
     if sys.platform == 'darwin':
@@ -592,18 +589,6 @@ class Observer:
                 item['spawned'] = self.publish(item, 'Spawned')
                 return {'receipt':item['spawned']}
             raise ValueError('ProtocolMismatch: unknown helper request')
-
-    @staticmethod
-    def worker_processes(suffix):
-        """Every live process launched with this exact worker record suffix.
-
-        The SDK identifies its worker only by the random `--record-suffix`
-        argument; launcher and worker PIDs may differ. An unreadable process
-        table is an error, never an empty one.
-        """
-        table = process_commands()
-        return len(table), [pid for pid, argv in table
-                            if any(a == '--record-suffix' and b == suffix for a, b in zip(argv, argv[1:]))]
 
     def settle_unspawned_launch(self, value):
         """Revoke an unclaimed grant after bridge waitpid; never infer from absence."""
