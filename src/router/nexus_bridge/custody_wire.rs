@@ -1871,11 +1871,10 @@ async fn settle_unspawned_launch(
         let Some(reaped) = clock.reaped_at else {
             return Ok(false);
         };
-        if reaped.elapsed() < LAUNCH_SETTLE_MARGIN
-            || clock
-                .probed
-                .get(&watch)
-                .is_some_and(|at| at.elapsed() < LAUNCH_SETTLE_PROBE)
+        if clock
+            .probed
+            .get(&watch)
+            .is_some_and(|at| at.elapsed() < LAUNCH_SETTLE_PROBE)
         {
             return Ok(false);
         }

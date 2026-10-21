@@ -492,7 +492,6 @@ const UNTRACKED_HELPER_SETTLE: Duration = Duration::from_secs(3);
 /// a signed launch any more; a child that was between fork and exec when its
 /// parent died finishes exec within milliseconds, so five seconds is a wide
 /// margin before the process table is read as evidence of absence.
-const LAUNCH_SETTLE_MARGIN: Duration = Duration::from_secs(0);
 /// Pacing of the helper's process-table/discovery probes for one launch.
 const LAUNCH_SETTLE_PROBE: Duration = Duration::from_secs(1);
 
