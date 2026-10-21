@@ -64,23 +64,8 @@ impl ToolMux<IdaMcpServer> {
         &self,
         context: ToolCallContext<'_, IdaMcpServer>,
     ) -> Result<CallToolResult, McpError> {
-        {
-            if !matches!(
-                context.name.as_ref(),
-                "open_idb"
-                    | "list_idbs"
-                    | "close_idb"
-                    | "tool_catalog"
-                    | "tool_help"
-                    | "get_task_status"
-                    | "convert_number"
-            ) {
-                if let Err(error) = crate::router::nexus_tools::Tools::require_tool(
-                    tool_registry::primary_name_for(&context.name),
-                ) {
-                    return Ok(error.to_tool_result());
-                }
-            }
+        if let Err(error) = crate::router::nexus_tools::Tools::admit_tool(&context.name) {
+            return Ok(error.to_tool_result());
         }
         self.call_router.call(context).await
     }

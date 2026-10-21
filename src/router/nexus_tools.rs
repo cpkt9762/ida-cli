@@ -429,6 +429,32 @@ impl Tools {
             .into())
         }
     }
+    /// MCP tools served without a worker method (session management, catalog,
+    /// task status and pure local helpers).
+    pub const LOCAL_TOOLS: &'static [&'static str] = &[
+        "open_idb",
+        "list_idbs",
+        "close_idb",
+        "tool_catalog",
+        "tool_help",
+        "get_task_status",
+        "convert_number",
+    ];
+    /// The single MCP admission rule: `ToolMux::call` and the status
+    /// `supported_tools` list both go through this function.
+    pub fn admit_tool(name: &str) -> Result<(), ToolError> {
+        if Self::LOCAL_TOOLS.contains(&name) {
+            return Ok(());
+        }
+        Self::require_tool(crate::tool_registry::primary_name_for(name))
+    }
+    /// Registry tools that `admit_tool` accepts, in registry order.
+    pub fn supported_tools() -> Vec<String> {
+        crate::tool_registry::all_tools()
+            .filter(|tool| Self::admit_tool(tool.name).is_ok())
+            .map(|tool| tool.name.to_string())
+            .collect()
+    }
     pub fn require_tool(method: &str) -> Result<(), ToolError> {
         if matches!(method, "list_idbs" | "open_dsc") {
             return Ok(());
@@ -1847,14 +1873,7 @@ mod n4_fix_regressions {
     use super::*;
     #[test]
     fn n6_every_registered_tool_and_old_capability_has_an_explicit_path() {
-        let local = [
-            "open_idb",
-            "close_idb",
-            "tool_catalog",
-            "tool_help",
-            "get_task_status",
-            "convert_number",
-        ];
+        let local = Tools::LOCAL_TOOLS;
         let mut count = 0;
         for tool in crate::tool_registry::all_tools() {
             count += 1;
@@ -1880,6 +1899,34 @@ mod n4_fix_regressions {
         }
         for method in ["unknown_n6", "dbg_unknown_n6"] {
             assert!(Tools::require_tool(method).is_err(), "must reject {method}");
+        }
+    }
+    #[test]
+    fn supported_tools_is_exactly_what_the_mcp_gate_admits() {
+        let supported = Tools::supported_tools();
+        let mut expected = 0;
+        for tool in crate::tool_registry::all_tools() {
+            let admitted = Tools::admit_tool(tool.name).is_ok();
+            assert_eq!(
+                admitted,
+                supported.iter().any(|name| name == tool.name),
+                "{} admission and supported_tools disagree",
+                tool.name
+            );
+            expected += usize::from(admitted);
+        }
+        assert_eq!(supported.len(), expected);
+        for name in [
+            "read_byte",
+            "read_qword",
+            "convert_number",
+            "search_structs",
+        ] {
+            assert!(supported.iter().any(|t| t == name), "{name}");
+        }
+        for name in ["unknown_gate", "dbg_unknown_gate"] {
+            assert!(Tools::admit_tool(name).is_err(), "{name}");
+            assert!(!supported.iter().any(|t| t == name), "{name}");
         }
     }
     #[tokio::test]

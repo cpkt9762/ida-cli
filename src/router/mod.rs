@@ -728,7 +728,7 @@ impl RouterState {
                 .nexus_bridge
                 .get()
                 .and_then(|bridge| bridge.installed_ida_version.clone()),
-            supported_tools: supported_methods.clone(),
+            supported_tools: nexus_tools::Tools::supported_tools(),
             supported_methods,
         };
         let workers = self.nexus_tools.workers(self);
@@ -2267,6 +2267,44 @@ mod tests {
             assert_eq!(status["nexus_retention"]["total_capacity"], 128);
             assert_eq!(status["max_pending_per_tenant"], 1);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_supported_tools_lists_every_tool_mcp_admits() {
+        let router = RouterState::new().unwrap();
+        let status = router.status_snapshot().await;
+        for tool in [
+            "read_byte",
+            "read_word",
+            "read_dword",
+            "read_qword",
+            "convert_number",
+            "decompile_structured",
+            "search_structs",
+            "open_idb",
+            "close_idb",
+            "list_idbs",
+            "tool_catalog",
+            "tool_help",
+            "get_task_status",
+        ] {
+            assert!(
+                status.metadata.supported_tools.iter().any(|t| t == tool),
+                "supported_tools misses {tool}"
+            );
+        }
+        assert_eq!(
+            status.metadata.supported_tools.len(),
+            crate::tool_registry::all_tools().count()
+        );
+        assert!(
+            status
+                .metadata
+                .supported_methods
+                .iter()
+                .all(|m| nexus_tools::METHODS.contains(&m.as_str())),
+            "supported_methods stays the worker method list"
+        );
     }
 
     #[test]
