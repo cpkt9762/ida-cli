@@ -150,13 +150,16 @@ mod tests {
     #[test]
     fn bridge_loss_before_dispatch_has_its_own_machine_readable_code() {
         use crate::ida::nexus::{NexusError, NexusErrorCode};
-        let error = NexusError::new(NexusErrorCode::Disconnected, "bridge disconnected: lost");
+        let error = NexusError::new(
+            NexusErrorCode::BridgeLostNotDispatched,
+            "bridge disconnected: lost",
+        );
         let response = RpcResponse::bridge_lost_not_dispatched("7", &error);
         let rpc = response.error.expect("error envelope");
         assert_eq!(rpc.code, RPC_BRIDGE_LOST_NOT_DISPATCHED);
         let data = rpc.data.expect("structured data");
         assert_eq!(data["bridge_lost"]["dispatched"], false);
-        assert_eq!(data["nexus"]["code"], "disconnected");
+        assert_eq!(data["nexus"]["code"], "bridge_lost_not_dispatched");
         // Never the code of an ordinary failure or of an unknown outcome.
         assert_ne!(RPC_BRIDGE_LOST_NOT_DISPATCHED, -32000);
         let unknown = NexusError::new(NexusErrorCode::UnknownOutcome, "sent");

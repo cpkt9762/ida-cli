@@ -699,10 +699,17 @@ impl<C: Clock> NexusSessions<C> {
                 } else {
                     OperationStatus::Failed
                 };
-                op.snapshot.error = Some(NexusError::new(
+                let error = NexusError::new(
                     if sent { NexusErrorCode::UnknownOutcome } else { NexusErrorCode::Disconnected },
                     "client lease disconnected; effects and stop of dispatched work are unknown; do not replay",
-                ));
+                );
+                op.snapshot.error = Some(
+                    if !sent && op.request.params.get("_n5_checkpoint").is_some() {
+                        Self::completed_slices_error(error)
+                    } else {
+                        error
+                    },
+                );
             }
         }
         Ok(true)
@@ -738,7 +745,7 @@ impl<C: Clock> NexusSessions<C> {
                 } else {
                     OperationStatus::Failed
                 };
-                op.snapshot.error = Some(NexusError::new(
+                let error = NexusError::new(
                     if sent {
                         NexusErrorCode::UnknownOutcome
                     } else {
@@ -747,9 +754,16 @@ impl<C: Clock> NexusSessions<C> {
                     if sent {
                         "connection lost after dispatch; effects and stop are unknown; do not replay"
                     } else {
-                        "connection lost before dispatch"
+                        "connection lost before dispatch of current slice"
                     },
-                ));
+                );
+                op.snapshot.error = Some(
+                    if !sent && op.request.params.get("_n5_checkpoint").is_some() {
+                        Self::completed_slices_error(error)
+                    } else {
+                        error
+                    },
+                );
             }
         }
     }

@@ -2020,8 +2020,17 @@ run this watcher: it is the MCP server of its client, cannot be replaced behind
 that client's back, and keeps the explicit error (its message says it does not
 exit by itself). A request refused before anything reached the lost bridge
 carries JSON-RPC code `-32010` (`RPC_BRIDGE_LOST_NOT_DISPATCHED`, data
-`bridge_lost.dispatched=false`, `nexus.code=disconnected`); it is only emitted by
-a daemon that has armed its self-exit. A dispatched request keeps `-32000` with
+`bridge_lost.dispatched=false`, `nexus.code=bridge_lost_not_dispatched`); it is only emitted by
+a daemon that has armed its self-exit. Only the outer open entrance, before
+acquisition or dispatch, creates `BridgeLostNotDispatched`. Generic `Disconnected`
+and per-attempt `NotSent` never establish this whole-request guarantee: a yielded
+operation is queued with execution stopped even though earlier slices completed.
+Generation loss, client lease loss and next-slice NotSent after `_n5_checkpoint`
+therefore report `OperationFailed`/"effects may remain; do not replay", retaining
+the original cause. Both the delivery return and operation snapshot carry that
+classification. In-flight uncertainty remains `UnknownOutcome`. Contract cases
+`completed_write_continuation_*` cover write counts and both failure surfaces.
+A dispatched request keeps `-32000` with
 `UnknownOutcome`/"open outcome retained by N1; never replay" and is never retried.
 The CLI (`send_recoverable`) treats only `-32010` specially, once: it waits (up to
 180s) until nothing listens on the old socket, lets the existing discovery start

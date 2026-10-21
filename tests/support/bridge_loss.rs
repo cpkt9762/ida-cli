@@ -12,6 +12,12 @@ use super::*;
 use crate::preprocess::Preparation;
 use tokio::sync::broadcast;
 
+use crate::nexus;
+
+#[allow(dead_code)] // Shared contract rig also exposes open/deadline helpers.
+#[path = "nexus_contract.rs"]
+mod continuation_contract;
+
 const SETTLE_DEADLINE: Duration = Duration::from_secs(40);
 
 struct Case {
@@ -364,6 +370,46 @@ async fn daemon_exits_by_itself_after_bridge_loss_in_w2a() {
     case.router.arm_bridge_loss_exit();
     let refusal = case.cli_request().await;
     let typed = case.router.bridge_loss_not_dispatched(&refusal).is_some();
+    // The actual router/socket response feeds the CLI retry path. Transport
+    // Disconnected alone must not invite replay, even on this lost bridge.
+    let generic = NexusError::new(NexusErrorCode::Disconnected, "transport NotSent").into();
+    let generic_typed = case.router.bridge_loss_not_dispatched(&generic).is_some();
+    let mut continuation_results = Vec::new();
+    for failure in ["generation", "lease", "notsent"] {
+        let mut rig = continuation_contract::Rig::new();
+        let lease = rig.connect("continued", "owner", 1);
+        let write = rig.queue(&lease, "write", "batch_rename", 120);
+        rig.dispatch(&write);
+        rig.sessions
+            .yield_operation(&write, json!({"index":1}))
+            .expect("completed first write slice");
+        let error = match failure {
+            "notsent" => {
+                rig.backend.fail_business = Some(DispatchFailure::NotSent(NexusError::new(
+                    NexusErrorCode::Disconnected,
+                    "next slice not sent",
+                )));
+                rig.sessions
+                    .dispatch(&lease.client_id, &write, &mut rig.backend)
+                    .expect_err("next slice not sent")
+            }
+            _ => {
+                if failure == "lease" {
+                    rig.sessions.lease_disconnected(&lease).expect("lease loss");
+                } else {
+                    assert!(rig
+                        .sessions
+                        .disconnected(&lease.instance_id, lease.generation));
+                }
+                rig.snapshot(&write).error.expect("continuation error")
+            }
+        };
+        let response =
+            crate::server::socket_listener::failure_response(&case.router, "1", &error.into());
+        let (code, requests) = crate::cli::test_bridge_loss_response_no_replay(response).await;
+        continuation_results.push((failure, code, requests, rig.backend.writes));
+    }
+
     let cancel = tokio_util::sync::CancellationToken::new();
     let watcher = {
         let router = case.router.clone();
@@ -381,6 +427,15 @@ async fn daemon_exits_by_itself_after_bridge_loss_in_w2a() {
     cancel.cancel();
     let _ = watcher.await;
     case.cleanup().await;
+    assert!(
+        !generic_typed,
+        "generic Disconnected is never entrance refusal"
+    );
+    for (failure, code, requests, writes) in continuation_results {
+        assert_eq!(code, -32000, "{failure}: no retry permission");
+        assert_eq!(requests, 1, "{failure}: no CLI replay");
+        assert_eq!(writes, 1, "{failure}: completed write not repeated");
+    }
     assert!(
         typed,
         "a request refused before dispatch must carry the typed code: {refusal}"

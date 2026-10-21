@@ -1017,6 +1017,11 @@ mod tests {
     }
 }
 
+#[cfg(all(test, unix, feature = "nexus-test-support"))]
+pub(crate) async fn test_bridge_loss_response_no_replay(response: RpcResponse) -> (i64, usize) {
+    bridge_loss_recovery_tests::check_no_replay(response).await
+}
+
 #[cfg(all(test, unix))]
 mod bridge_loss_recovery_tests {
     use super::*;
@@ -1077,6 +1082,31 @@ mod bridge_loss_recovery_tests {
             }
         });
         (seen, task)
+    }
+
+    #[cfg(feature = "nexus-test-support")]
+    pub(super) async fn check_no_replay(response: RpcResponse) -> (i64, usize) {
+        let dir = case_dir();
+        let socket = dir.join("continuation");
+        let (seen, daemon) = fake_daemon(&socket, response);
+        let mut endpoint = Endpoint {
+            path: socket,
+            pinned: false,
+        };
+        let restarts = Arc::new(AtomicUsize::new(0));
+        let restarted = restarts.clone();
+        let response = send_recoverable_with(&mut endpoint, &request(), TIMEOUT, move |_| {
+            restarted.fetch_add(1, Ordering::SeqCst);
+            Err("unexpected restart".into())
+        })
+        .await
+        .expect("ordinary failure response");
+        let code = response.error.expect("continuation error").code;
+        let requests = seen.load(Ordering::SeqCst);
+        daemon.abort();
+        std::fs::remove_dir_all(dir).expect("remove fake endpoint");
+        assert_eq!(restarts.load(Ordering::SeqCst), 0, "no CLI restart");
+        (code, requests)
     }
 
     fn request() -> RpcRequest {

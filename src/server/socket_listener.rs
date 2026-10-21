@@ -184,7 +184,7 @@ type CliRefGuard = crate::router::CliLeaseGuard;
 
 /// Ordinary request failure, except that a refusal which provably happened before
 /// anything reached the lost Nexus bridge carries the dedicated retry-once code.
-fn failure_response(
+pub(crate) fn failure_response(
     router: &RouterState,
     id: &str,
     error: &crate::error::ToolError,

@@ -1869,15 +1869,15 @@ impl RouterState {
             .is_some_and(|bridge| bridge.is_lost())
     }
     /// A request failure that provably happened before anything reached the lost
-    /// bridge: the typed `Disconnected` code is only ever assigned to NotSent
-    /// deliveries (sent work is `UnknownOutcome`). Used to mark the one safe retry.
+    /// bridge: only the outer entrance refusal proves that the entire request
+    /// was untouched. A NotSent continuation may follow completed writes.
     pub fn bridge_loss_not_dispatched<'a>(
         &self,
         error: &'a crate::error::ToolError,
     ) -> Option<&'a crate::ida::nexus::NexusError> {
         match error {
             crate::error::ToolError::Nexus(nexus)
-                if nexus.code == crate::ida::nexus::NexusErrorCode::Disconnected
+                if nexus.code == crate::ida::nexus::NexusErrorCode::BridgeLostNotDispatched
                     && self.nexus_bridge_lost()
                     && self.bridge_loss_exit_armed() =>
             {

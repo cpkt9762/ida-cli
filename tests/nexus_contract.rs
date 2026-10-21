@@ -1,6 +1,7 @@
 //! Deterministic N1 contracts, not a Python bridge or real IDA E2E suite.
 use std::sync::{Arc, Barrier, Mutex};
 
+use ida_mcp::nexus;
 use ida_mcp::nexus::*;
 use serde_json::json;
 
@@ -55,6 +56,94 @@ fn r2_late_notsent_preserves_public_lifetime_release_and_original_failure() {
 mod compatibility;
 #[path = "support/nexus_lifecycle.rs"]
 mod lifecycle;
+
+#[test]
+fn completed_write_continuation_disconnect_never_reports_not_dispatched() {
+    for lease_only in [false, true] {
+        let mut rig = Rig::new();
+        let lease = rig.connect("continued", "owner", 1);
+        let write = rig.queue(&lease, "write", "batch_rename", 120);
+        rig.dispatch(&write);
+        rig.sessions
+            .yield_operation(&write, json!({"index":1}))
+            .expect("first slice completed");
+        if lease_only {
+            rig.sessions.lease_disconnected(&lease).expect("lease loss");
+        } else {
+            assert!(rig
+                .sessions
+                .disconnected(&lease.instance_id, lease.generation));
+        }
+        let snapshot = rig.snapshot(&write);
+        let error = snapshot.error.expect("continuation failure");
+        assert_eq!(error.code, NexusErrorCode::OperationFailed, "{error}");
+        assert!(error.message.contains("effects may remain"), "{error}");
+        assert!(error.message.contains("do not replay"), "{error}");
+        assert_eq!(error.retry_advice(), RetryAdvice::NeverReplay);
+        assert_eq!(snapshot.status, OperationStatus::Failed);
+        assert!(snapshot.execution_stopped);
+        let error = rig
+            .sessions
+            .dispatch(&lease.client_id, &write, &mut rig.backend)
+            .expect_err("disconnected continuation cannot dispatch");
+        assert_eq!(error.code, NexusErrorCode::OperationFailed);
+        assert!(error.message.contains("effects may remain"));
+        assert_eq!(rig.backend.writes, 1);
+    }
+}
+
+#[test]
+fn completed_write_continuation_notsent_preserves_effects_in_return_and_snapshot() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("continued", "owner", 1);
+    let write = rig.queue(&lease, "write", "batch_rename", 120);
+    rig.dispatch(&write);
+    rig.sessions
+        .yield_operation(&write, json!({"index":1}))
+        .expect("first slice completed");
+    let cause = NexusError::new(NexusErrorCode::Disconnected, "next slice not sent");
+    rig.backend.fail_business = Some(DispatchFailure::NotSent(cause.clone()));
+    let error = rig
+        .sessions
+        .dispatch(&lease.client_id, &write, &mut rig.backend)
+        .expect_err("continuation could not be sent");
+    assert_eq!(error.code, NexusErrorCode::OperationFailed, "{error}");
+    assert!(error.message.contains("effects may remain"), "{error}");
+    assert!(error.message.contains("do not replay"), "{error}");
+    assert_eq!(error.retry_advice(), RetryAdvice::NeverReplay);
+    assert_eq!(error.cause.as_deref(), Some(&cause));
+    assert_eq!(rig.snapshot(&write).error, Some(error));
+    assert_eq!(rig.backend.writes, 1, "only the first slice wrote");
+}
+
+#[test]
+fn completed_write_continuation_uncertain_keeps_unknown_outcome() {
+    let mut rig = Rig::new();
+    let lease = rig.connect("continued", "owner", 1);
+    let write = rig.queue(&lease, "write", "batch_rename", 120);
+    rig.dispatch(&write);
+    rig.sessions
+        .yield_operation(&write, json!({"index":1}))
+        .expect("first slice completed");
+    rig.backend.fail_business = Some(DispatchFailure::Uncertain(NexusError::new(
+        NexusErrorCode::Disconnected,
+        "send outcome unknown",
+    )));
+    let error = rig
+        .sessions
+        .dispatch(&lease.client_id, &write, &mut rig.backend)
+        .expect_err("next slice outcome unknown");
+    assert_eq!(error.code, NexusErrorCode::UnknownOutcome);
+    assert_eq!(error.retry_advice(), RetryAdvice::NeverReplay);
+    let snapshot = rig.snapshot(&write);
+    assert_eq!(snapshot.status, OperationStatus::UnknownOutcome);
+    assert!(!snapshot.execution_stopped);
+    assert_eq!(snapshot.error, Some(error));
+    assert_eq!(
+        rig.backend.writes, 2,
+        "uncertain slice may already have written"
+    );
+}
 
 #[test]
 fn n6_expired_write_continuation_reports_completed_effects() {

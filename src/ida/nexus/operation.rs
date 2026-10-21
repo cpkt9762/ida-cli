@@ -185,7 +185,13 @@ impl<C: Clock> NexusSessions<C> {
         identity: &OperationIdentity,
         backend: &mut impl NexusBackend,
     ) -> Result<(), NexusError> {
-        self.active(client, &identity.lease)?;
+        self.active(client, &identity.lease).map_err(|error| {
+            if error.code == NexusErrorCode::Disconnected {
+                self.continuation_delivery_error(identity, error)
+            } else {
+                error
+            }
+        })?;
         let op = self.operation(client, identity)?;
         if op.snapshot.status != OperationStatus::Queued {
             return Err(NexusError::new(
@@ -242,6 +248,30 @@ impl<C: Clock> NexusSessions<C> {
             op.snapshot.execution_stopped = false;
         }
         self.send_delivery(command, attempt, backend)
+    }
+
+    pub(super) fn completed_slices_error(error: NexusError) -> NexusError {
+        NexusError::caused_by(
+            NexusErrorCode::OperationFailed,
+            "continuation failed after completed slices; effects may remain; do not replay",
+            error,
+        )
+    }
+
+    pub(super) fn continuation_delivery_error(
+        &self,
+        identity: &OperationIdentity,
+        error: NexusError,
+    ) -> NexusError {
+        if self
+            .operations
+            .get(&identity.operation_id)
+            .is_some_and(|op| op.request.params.get("_n5_checkpoint").is_some())
+        {
+            Self::completed_slices_error(error)
+        } else {
+            error
+        }
     }
 
     pub(super) fn execute_delivery_failed(

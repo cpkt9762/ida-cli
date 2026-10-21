@@ -1,4 +1,5 @@
 //! R3b review regressions. Models, real N1/transport and SDK/helper cases are separate.
+use ida_mcp::nexus;
 use ida_mcp::nexus::*;
 use serde_json::json;
 #[allow(dead_code)]

@@ -21,6 +21,8 @@ pub enum NexusErrorCode {
     CancelPending,
     Cancelled,
     Disconnected,
+    /// Entire outer request refused before acquisition or dispatch.
+    BridgeLostNotDispatched,
     UnknownOutcome,
     OperationFailed,
     ExclusiveCloseRequired,

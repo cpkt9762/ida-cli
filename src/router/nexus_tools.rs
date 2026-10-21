@@ -526,7 +526,7 @@ impl Tools {
                     "run ida-cli shutdown (or restart this process) and start it again; this process does not exit by itself"
                 };
                 return Err(NexusError::new(
-                    NexusErrorCode::Disconnected,
+                    NexusErrorCode::BridgeLostNotDispatched,
                     format!("bridge disconnected: the Nexus bridge was lost and is not replaced by this process; {advice}; retained acquisitions stay in helper-state.json; never replay"),
                 )
                 .into());

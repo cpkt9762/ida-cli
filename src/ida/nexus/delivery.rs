@@ -307,6 +307,14 @@ impl<C: Clock> NexusSessions<C> {
             DispatchFailure::NotSent(error) => (false, error),
             DispatchFailure::Uncertain(error) => (true, error),
         };
+        // NotSent describes this attempt, not earlier completed slices. Keep
+        // the operation result AND the synchronous dispatch return consistent.
+        let error = match &attempt.target {
+            DeliveryTarget::Execute { identity } if !uncertain => {
+                self.continuation_delivery_error(identity, error)
+            }
+            _ => error,
+        };
         let previous = self.current_delivery(attempt)?.previous_phase;
         match &attempt.target {
             DeliveryTarget::Execute { identity } => {
