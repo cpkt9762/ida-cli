@@ -10,6 +10,7 @@ import unittest
 REPO = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(REPO/'nexus_bridge/custody'), str(REPO/'tests/support')]
 from proof_helper import LAUNCH_SETTLE_SECONDS, Observer
+from ida_nexus._launch_authorization import create, decide
 from target_coordination import Directory, Target
 from target_journal import Journal
 
@@ -28,6 +29,7 @@ class LaunchSettle(unittest.TestCase):
         self.suffix = os.urandom(3).hex()
         self.launch = {'suffix':self.suffix, 'source':str(self.target_path),
                        'target':str(self.target_path), 'backend':'idalib'}
+        self.launch['authorization'] = create(self.root/'grant.json', self.suffix, str(self.target_path))
         self.children = []
         self.addCleanup(self.reap)
 
@@ -60,11 +62,11 @@ class LaunchSettle(unittest.TestCase):
         self.children.append(child)
         return child
 
-    def test_exec_margin_has_not_elapsed_so_nothing_is_published(self):
+    def test_revocation_needs_no_exec_margin(self):
         self.sign_launch()
-        reply = self.call('launch_settle', watch='startup', bridge=dict(BRIDGE, exited_secs=LAUNCH_SETTLE_SECONDS - .1))
-        self.assertEqual(reply, {'state':'settling'})
-        self.assertNotIn('consumer', self.observer.items['startup'])
+        reply = self.call('launch_settle', watch='startup', bridge=dict(BRIDGE, exited_secs=0.0))
+        self.assertEqual(reply['state'], 'abandoned')
+        self.assertFalse(decide(self.launch['authorization'], self.suffix, str(self.target_path), 'claimed'))
 
     def test_absence_after_the_margin_publishes_exact_unspawned_evidence_once(self):
         epoch = self.sign_launch()
@@ -76,10 +78,10 @@ class LaunchSettle(unittest.TestCase):
         self.assertIsNone(record['owner'])
         self.assertIsNone(record['os_identity'])
         evidence = record['evidence']
-        self.assertEqual(evidence['process_table']['matches'], [])
-        self.assertEqual(evidence['public_discovery']['matches'], [])
+        self.assertEqual(evidence['authorization'], self.launch['authorization'])
+        self.assertEqual(evidence['decision'], 'revoked')
         self.assertEqual(evidence['bridge'], BRIDGE)
-        self.assertGreater(evidence['process_table']['scanned'], 0, 'an empty table is a failure, not evidence')
+        self.assertTrue(Path(self.launch['authorization'] + '.decision').is_file())
         # ACK loss: repeating the request returns the same immutable fact.
         self.assertEqual(self.call('launch_settle', watch='startup', bridge=BRIDGE), reply)
         self.assertNotIn('proof', self.observer.items['startup'], 'abandonment is never an owner lifetime proof')
@@ -103,13 +105,15 @@ class LaunchSettle(unittest.TestCase):
     def test_a_worker_with_the_suffix_keeps_the_launch_on_the_public_lifetime_path(self):
         self.sign_launch()
         worker = self.fake_worker()
+        self.assertTrue(decide(self.launch['authorization'], self.suffix, str(self.target_path), 'claimed'))
         reply = self.call('launch_settle', watch='startup', bridge=BRIDGE)
         self.assertEqual(reply['state'], 'owner_present')
-        self.assertEqual(reply['pids'], [worker.pid])
+        self.assertEqual(reply['pids'], [])
         self.assertNotIn('consumer', self.observer.items['startup'])
         worker.kill()
         worker.wait(timeout=5)
-        self.assertEqual(self.call('launch_settle', watch='startup', bridge=BRIDGE)['state'], 'abandoned')
+        self.assertEqual(self.call('launch_settle', watch='startup', bridge=BRIDGE)['state'], 'owner_present',
+                         'a claimed launch is retained even after its owner dies; no absence settlement')
 
     def test_a_known_os_identity_or_discovered_owner_is_not_an_unspawned_launch(self):
         self.sign_launch()
@@ -146,9 +150,9 @@ class LaunchSettle(unittest.TestCase):
             return changed
 
         cases = {
-            'worker present': forged(nested('process_table', 'matches', value=[4242])),
-            'public instance present': forged(nested('public_discovery', 'matches', value=['1-' + self.suffix])),
-            'margin not elapsed': forged(nested('bridge', 'exited_secs', value=1.0)),
+            'not revoked': forged(nested('decision', value='claimed')),
+            'other grant': forged(nested('authorization', value='/invalid/grant')),
+            'invalid waitpid age': forged(nested('bridge', 'exited_secs', value=-1.0)),
             'other suffix': forged(nested('suffix', value='other')),
             'birth known': forged(os_identity={'pid':4242}),
             'other launch': forged(launch=dict(self.launch, suffix='other')),
@@ -184,6 +188,20 @@ class LaunchSettle(unittest.TestCase):
         reply = self.call('launch_settle', watch='startup', bridge=BRIDGE)
         restarted = Observer('launch-settle-helper', 8, storage=self.storage)
         self.assertEqual(restarted.items['startup']['consumer'], reply['consumer'])
+
+    def test_legacy_launch_without_authorization_never_settles_from_absence(self):
+        self.launch.pop('authorization')
+        self.sign_launch()
+        reply = self.call('launch_settle', watch='startup', bridge=BRIDGE)
+        self.assertEqual(reply['state'], 'not_applicable')
+        self.assertNotIn('consumer', self.observer.items['startup'])
+
+    def test_incomplete_decision_preserves_the_obligation(self):
+        self.sign_launch()
+        Path(self.launch['authorization'] + '.decision').touch(mode=0o600)
+        with self.assertRaisesRegex(RuntimeError, 'invalid or incomplete'):
+            self.call('launch_settle', watch='startup', bridge=BRIDGE)
+        self.assertNotIn('consumer', self.observer.items['startup'])
 
 
 if __name__ == '__main__':

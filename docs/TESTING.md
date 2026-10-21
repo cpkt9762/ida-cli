@@ -245,7 +245,7 @@ IDA auto-analyses it and writes an `.i64` alongside.
 N3 introduced the fixed public Nexus client with the user-approved local
 `client-cancel-unknown.patch`, then `client-close-proof.patch`. Preparation verifies the patched `handle.py`
 SHA-256 and records patch status. Only a validated upstream fix passing the
-probe and N0/N3 gates permits removal. R1 adds a fourth patch; N9 packages must
+probe and N0/N3 gates permits removal. R1 adds a fourth patch and J adds launch-authorization as the fifth; N9 packages must
 carry the complete declared chain, including `loopback-bind.patch`.
 
 Close proof uses `close_outcome`: nonfinal lease ACK, final owner lifetime proof,
@@ -1972,40 +1972,65 @@ shutdown`. Lib regression:
 a live bridge, keeps the previous wait-and-refuse behaviour.
 
 A signed LaunchIntent that Rust tracks (`launch` retained, no `Spawned`, no
-discovered owner) used to refuse shutdown for good when the bridge died inside
-the SDK's launch window: W2a is "intent signed, Popen not called", W2b is "Popen
-returned a worker, `Spawned` not signed". Once the exact bridge child is reaped
-(waitpid) and the router waited the 5s exec margin (`LAUNCH_SETTLE_MARGIN`), the
-router asks the helper (`launch_settle`) to read the process table and public
-discovery itself. A worker whose command line carries `--record-suffix <suffix>`
-(the SDK's only worker identity) or a published instance with that suffix keeps
-the launch on the ordinary path: the helper's discovery binds it, its managed
-lease grace (`--lease-grace`, 20s from the HTTP server start; no lease is ever
-attached once the bridge is gone) ends it, and the public lifetime proof settles
-the startup exactly as before. Only when both views are empty does the helper
-publish the immutable fact `LaunchAbandonedUnspawned` (bridge pid/status/seconds
-since reaped, margin, process-table size and matches, discovery matches), the
-target journal adopts it (`launch_abandoned`: requires the helper's own
-SpawnIntent, no Spawned fact, no owner/lease/proof, empty match lists and an
-elapsed margin) and the usual helper retire, journal settle, parent retire and
-acquisition settle follow. Safety argument: after waitpid nothing can Popen for
-this launch, so the set of workers carrying the suffix only shrinks; a child
-between fork and exec when its parent died execs within milliseconds, far below
-the margin; so "no process, no instance" after the margin means no live owner
-exists to observe or release. The fact is not an owner lifetime proof and is
-never offered as one; a launch with a known birth identity or a discovered owner
-is never settled this way. Owner side: `ida-nexus worker --managed` stops
-`lease-grace` seconds after its HTTP server starts when no lease exists; the time
-before that (`Database.open`) has no worker-side bound and is not changed (the
-SDK's `_await_ready` only raises on timeout, it never signals the worker), so a
-worker hung inside `Database.open` keeps the launch pending and shutdown refused,
-visibly in the log (`launch stays on the public-lifetime path`). Tests:
-`bridge_loss_tests` (lib, `nexus-test-support`, real IDA worker, barriers at the
-SDK `LaunchIntent` stage for W2a and at Popen return for W2b: dead owner settles
-in ~5s; live owner is never settled by absence and the router becomes
-shutdown-ready only after the orphan exited by itself) and
-`tests/nexus_bridge/test_launch_settle.py` (helper request, journal action,
-forged facts, restart).
+public owner) is settled only by revoking its durable startup authorization.
+The old H1 inference from waitpid + a 5s margin + empty process/public scans is
+invalid: a forked child may remain pre-exec indefinitely and later open the IDB.
+No scheduling delay supplies an upper bound.
+
+J adds `launch-authorization.patch` to the fixed SDK chain. In the synchronous
+pre-Popen `LaunchIntent` observer, the bridge creates/fsyncs a per-watch grant in
+the helper's private IPC directory, includes its absolute path in the signed
+launch identity, and returns it to the SDK. The SDK adds `--launch-authorization`
+and `--launch-target`. Before `probe()` loads idalib, unpacking, `Database.open`
+or database locking, the worker must exclusively create `<grant>.decision` and
+fsync a complete `claimed` record plus directory. The helper, only after the
+router waitpid of its exact bridge, competes for that same name with `O_EXCL` and
+writes/fsyncs `revoked`. Exactly one creation wins. A missing grant, partial file,
+permission failure or unknown record permits neither worker access nor journal
+settlement. A late or duplicate claimant exits 78 and logs
+`LaunchAuthorizationDenied`. A complete revoked decision may replay its ACK;
+claiming is never reentrant. Grant/decision files are never deleted or reissued.
+
+Only durable revocation produces `LaunchAbandonedUnspawned`: its signed launch,
+watch/acquisition/epoch, exact grant path and revoked decision must match. The
+target journal independently checks the decision on disk, refuses any known
+owner/Spawned/lease/proof, and then uses the existing helper retire/journal
+settle/parent retire path. Process-table and discovery absence carry no closure
+authority. The remaining native scan fails closed on argv permission errors,
+status/argv short reads and full PID buffers; only ESRCH or a validated zombie
+is skipped. No worker is signalled or interrupted by this protocol.
+
+If the worker already claimed, the helper retains the obligation, discovers the
+public owner and follows the original public lifecycle. The managed 20s lease
+grace only starts draining after server startup; `analysis_thread.join()` and
+`database.close()` have no bound. A claimed worker stuck in open/close, or one
+that dies before publication, remains pending. This patch neither bounds those
+operations nor settles a claimed owner crash. Legacy live launch records without
+authorization also remain pending unless the public lifecycle proves release;
+a new SDK worker launched without these two arguments keeps its upstream behavior.
+Old absence-only abandonment facts cannot newly authorize journal settlement.
+Upgrade must rebuild the matching venv; preserve old evidence and confirm prior
+owners have closed before switching versions. Already compacted historical facts
+are not reinterpreted as proofs about ungoverned old workers.
+
+W1 (helper signed, Rust not yet tracking) remains the existing retained-obligation
+handoff. The synchronous observer cannot reach Popen until Rust signs/ACKs, so
+bridge death in W1 cannot leave a spawned authorized child. It is not falsely
+reported as revocation or an owner lifetime proof.
+
+Tests: `bridge_loss_tests` uses explicit pre-claim and claimed worker barriers for
+W2b, and the pre-Popen barrier for W2a. The live claimed owner must finish by its
+public lifecycle; a dead unclaimed child settles by revocation. Helpers are never
+manually killed for test cleanup. `test_launch_settle.py` covers journal rejection,
+restart/idempotence, legacy records and torn decisions;
+`test_launch_authorization.py` races claim/revoke and checks worker pre-IDB denial
+and unchanged standalone SDK behavior. `test_process_table_fail_closed.py` injects
+permissions, short reads and saturation. `test_delayed_launch.py` kills/waitpids a
+private parent with an already-spawned child parked before exec for >5s, settles,
+then releases the child: baseline H1 opens the real IDB after settlement, whereas
+J denies it before IDB access. Read-only baseline helper/process/worker sources
+may be selected with `J_RED_HELPER`, `J_RED_PROCESS`, `J_RED_WORKER`; the safety
+assertion is identical in red and green runs.
 
 Recovery from a lost bridge. This router never replaces its bridge, so the
 `serve-http` daemon now leaves by itself (`RouterState::exit_after_bridge_loss`):

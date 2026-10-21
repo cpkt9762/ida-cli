@@ -21,6 +21,9 @@ env = Environment(Path(os.environ["N3_ENV_ROOT"]))
 real_popen = subprocess.Popen
 proxy = types.SimpleNamespace(**vars(subprocess))
 def owned_popen(command, **options):
+    original_command = command
+    if os.environ.get('R3A_WORKER_AUTHORIZATION_PHASE') == 'unclaimed':
+        command = [sys.executable, str(REPO/'tests/support/launch_before_claim.py'), *command]
     intent = env._begin_creation(command)
     child = real_popen(command, **options)
     try:
@@ -32,6 +35,22 @@ def owned_popen(command, **options):
         raise
     env.children.append(child)
     if os.environ.get('R3A_STARTUP_PHASE') == 'PopenReturn':
+        if os.environ.get('R3A_WORKER_AUTHORIZATION_PHASE') == 'claimed':
+            import time
+            grant = Path(original_command[original_command.index('--launch-authorization') + 1] + '.decision')
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    decision = json.loads(grant.read_bytes())
+                except (FileNotFoundError, ValueError):
+                    decision = None
+                if decision is not None:
+                    if decision.get('decision') != 'claimed':
+                        raise RuntimeError('worker did not claim its private launch')
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('private worker claim barrier')
+                time.sleep(.01)
         startup_barrier(Path(os.environ['R5_ROOT']),'startup',seconds=8)
         if os.environ.get('R3F1_STARTUP_FAULT')=='failure':
             raise RuntimeError('controlled verification startup failure after Popen')

@@ -51,6 +51,10 @@ fn registry(root: &std::path::Path) -> Value {
 }
 
 async fn case(phase: &str) -> Case {
+    case_at_authorization(phase, "claimed").await
+}
+
+async fn case_at_authorization(phase: &str, authorization_phase: &str) -> Case {
     static IDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let root =
         PathBuf::from(std::env::var_os("R3A_CASE_ROOT").expect("private test root")).join(format!(
@@ -68,6 +72,10 @@ async fn case(phase: &str) -> Case {
     .expect("sample copy");
     let mut environment: BTreeMap<String, String> = std::env::vars().collect();
     environment.insert("R3A_STARTUP_PHASE".into(), phase.into());
+    environment.insert(
+        "R3A_WORKER_AUTHORIZATION_PHASE".into(),
+        authorization_phase.into(),
+    );
     environment.insert("R5_ROOT".into(), root.join("barrier").display().to_string());
     let router = RouterState::new().expect("router");
     let bridge = router
@@ -210,7 +218,7 @@ impl Case {
                 .args(["-TERM", &pid.to_string()])
                 .status();
         }
-        let _ = self.bridge.test_helper_fault(true).await;
+        // Orphan helpers retain their obligations and expire on their own.
         drop(self.router);
     }
 }
@@ -249,17 +257,8 @@ async fn bridge_loss_before_popen_settles_the_unspawned_launch() {
     );
     assert!(elapsed < Duration::from_secs(30), "bounded: {elapsed:?}");
     let settled = settled.expect("durable abandonment evidence is announced");
-    assert_eq!(settled["evidence"]["process_table"]["matches"], json!([]));
-    assert_eq!(
-        settled["evidence"]["public_discovery"]["matches"],
-        json!([])
-    );
-    assert!(
-        settled["evidence"]["bridge"]["exited_secs"]
-            .as_f64()
-            .unwrap_or(0.0)
-            >= 5.0
-    );
+    assert_eq!(settled["evidence"]["decision"], json!("revoked"));
+    assert!(settled["evidence"]["authorization"].as_str().is_some());
     assert_eq!(
         used,
         json!(0),
@@ -277,7 +276,7 @@ async fn bridge_loss_before_popen_settles_the_unspawned_launch() {
 /// rule, and the process table shows no worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bridge_loss_after_popen_with_dead_owner_settles_the_launch() {
-    let case = case("PopenReturn").await;
+    let case = case_at_authorization("PopenReturn", "unclaimed").await;
     let workers = live_workers(&case.suffix);
     assert_eq!(
         workers.len(),
@@ -314,7 +313,7 @@ async fn bridge_loss_after_popen_with_dead_owner_settles_the_launch() {
     assert!(ok, "shutdown must complete once the unspawned owner is provably gone: {result:?} after {elapsed:?}");
     assert_eq!(used, json!(0));
     let settled = settled.expect("durable abandonment evidence is announced");
-    assert_eq!(settled["evidence"]["process_table"]["matches"], json!([]));
+    assert_eq!(settled["evidence"]["decision"], json!("revoked"));
 }
 
 /// W2b with a live owner: the launch must never be settled as abandoned while
