@@ -2021,7 +2021,10 @@ that client's back, and keeps the explicit error (its message says it does not
 exit by itself). A request refused before anything reached the lost bridge
 carries JSON-RPC code `-32010` (`RPC_BRIDGE_LOST_NOT_DISPATCHED`, data
 `bridge_lost.dispatched=false`, `nexus.code=bridge_lost_not_dispatched`); it is only emitted by
-a daemon that has armed its self-exit. Only the outer open entrance, before
+a daemon that has armed its self-exit. Its `nexus.retry` is
+`reconnect_then_new_request`, consistent with the bridge-specific
+`bridge_lost.retry=once_after_daemon_exit` recovery instruction.
+Only the outer open entrance, before
 acquisition or dispatch, creates `BridgeLostNotDispatched`. Generic `Disconnected`
 and per-attempt `NotSent` never establish this whole-request guarantee: a yielded
 operation is queued with execution stopped even though earlier slices completed.

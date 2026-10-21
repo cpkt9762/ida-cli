@@ -68,7 +68,9 @@ impl NexusError {
     pub fn retry_advice(&self) -> RetryAdvice {
         match self.code {
             NexusErrorCode::Busy | NexusErrorCode::QueueExpired => RetryAdvice::NewRequest,
-            NexusErrorCode::Disconnected => RetryAdvice::ReconnectThenNewRequest,
+            NexusErrorCode::Disconnected | NexusErrorCode::BridgeLostNotDispatched => {
+                RetryAdvice::ReconnectThenNewRequest
+            }
             NexusErrorCode::CancelPending => RetryAdvice::ObserveOperation,
             _ => RetryAdvice::NeverReplay,
         }

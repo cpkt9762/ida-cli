@@ -160,6 +160,8 @@ mod tests {
         let data = rpc.data.expect("structured data");
         assert_eq!(data["bridge_lost"]["dispatched"], false);
         assert_eq!(data["nexus"]["code"], "bridge_lost_not_dispatched");
+        assert_eq!(data["nexus"]["retry"], "reconnect_then_new_request");
+        assert_eq!(data["bridge_lost"]["retry"], "once_after_daemon_exit");
         // Never the code of an ordinary failure or of an unknown outcome.
         assert_ne!(RPC_BRIDGE_LOST_NOT_DISPATCHED, -32000);
         let unknown = NexusError::new(NexusErrorCode::UnknownOutcome, "sent");
