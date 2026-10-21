@@ -250,7 +250,9 @@ class Custodian:
             watch = uuid.uuid4().hex
             from ida_nexus._launch_authorization import create
             from pathlib import Path
-            authorization_root = Directory(Path(self.helper['endpoint']).parent)
+            # Match proof_helper's endpoint spelling before Directory walks it
+            # with O_NOFOLLOW (macOS /var is a system symlink prefix).
+            authorization_root = Directory(Path(canonical(self.helper['endpoint'])).parent)
             try:
                 grants = authorization_root.child('launch-authorizations')
             finally:

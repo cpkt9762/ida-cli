@@ -50,6 +50,24 @@ class LaunchAuthorization(unittest.TestCase):
             create(self.path, self.suffix, self.target)
         self.assertFalse(decide(self.path, self.suffix, self.target, 'claimed'))
 
+    def test_final_directory_and_grant_symlinks_remain_forbidden(self):
+        alias = self.root/'alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(OSError):
+            decide(alias/'grant', self.suffix, self.target, 'claimed')
+        link = self.root/'grant-link'
+        link.symlink_to(self.path)
+        with self.assertRaises(OSError):
+            decide(link, self.suffix, self.target, 'claimed')
+        self.assertFalse((self.root/'grant.decision').exists())
+
+    def test_nonprivate_grant_directory_remains_forbidden(self):
+        self.root.chmod(0o755)
+        self.addCleanup(self.root.chmod, 0o700)
+        with self.assertRaisesRegex(RuntimeError, 'not private'):
+            decide(self.path, self.suffix, self.target, 'claimed')
+        self.assertFalse((self.root/'grant.decision').exists())
+
     def test_missing_incomplete_and_mismatched_grants_never_authorize(self):
         with self.assertRaises(FileNotFoundError):
             decide(self.root/'absent', self.suffix, self.target, 'claimed')

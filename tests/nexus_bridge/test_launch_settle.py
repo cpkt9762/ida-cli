@@ -217,3 +217,80 @@ class LaunchSettle(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SymlinkedLaunchRoot(unittest.TestCase):
+    def check_root(self, root, alias):
+        """Use the real LaunchIntent producer, helper facts and target journal."""
+        import time
+        from unittest.mock import Mock
+        from acquisition import Custodian
+        from ida_nexus._registry import canonical_path
+        from ida_nexus.database_state import expected_idb_path
+        from ida_nexus._launch_authorization import revoked
+
+        root.mkdir(mode=0o700)
+        storage = Directory(root)
+        self.addCleanup(storage.close)
+        observer = Observer('symlink-launch', 8, storage=storage)
+        target_path = root/'sample.i64'
+        target_path.write_bytes(b'private database')
+        # The SDK canonicalizes input and output_database before emitting launch.
+        source = canonical_path(alias/'sample.i64')
+        launch = dict(suffix='abcdef', source=source,
+                      target=expected_idb_path(source), backend='idalib')
+        self.assertEqual(launch['target'], str(target_path))
+        custody = Custodian.__new__(Custodian)
+        custody.deadline = time.monotonic()+10
+        custody.helper = {'endpoint':str(alias/'h')}
+        custody.acquisition = ACQUISITION
+        custody.launches = {}
+        custody.signed_stage = Mock()
+        custody.helper_request = lambda value: observer.receive(dict(
+            value, protocol=2, helper=observer.incarnation))
+        custody.helper_request({'kind':'reserve_parent', 'parent':ACQUISITION['parent']})
+        with Target(alias/'sample.i64') as target:
+            with target.locked():
+                custody.target = target
+                custody.target_path = str(target.target)
+                custody.coord_key = target.key
+                custody.stage('LaunchIntent', launch)
+                signed = custody.signed_stage.call_args.kwargs['launch']
+                grant = signed['authorization']
+                self.assertEqual(grant, str(Path(grant).resolve()))
+                self.assertTrue(Path(grant).is_relative_to(root))
+                self.assertEqual(launch['authorization'], grant)
+                watch = custody.launches['abcdef']['watch']
+                # Rust receives exactly the journal/helper identity, including grant.
+                self.assertEqual(observer.items[watch]['launch'], signed)
+                self.assertEqual(next(iter(Journal(target).value['entries'].values()))['launch'], signed)
+                reply = custody.helper_request({'kind':'launch_settle', 'watch':watch, 'bridge':BRIDGE})
+                self.assertEqual(reply['state'], 'abandoned')
+                self.assertTrue(revoked(grant, 'abcdef', str(target_path)))
+                self.assertFalse(decide(grant, 'abcdef', str(target_path), 'claimed'))
+                journal = Journal(target)
+                journal.launch_abandoned({'watch':watch, 'consumer':reply['consumer']})
+                custody.helper_request({'kind':'retire', 'watch':watch, 'sha256':reply['consumer']['sha256']})
+                custody.helper_request({'kind':'retire_parent', 'parent':ACQUISITION['parent']})
+                journal.settle()
+                self.assertEqual(journal.value['entries'], {})
+        # A separate launch can be claimed using an alias prefix without changing identity.
+        claimed = create(root/'launch-authorizations/claim.json', '123456', str(target_path))
+        self.assertTrue(decide(alias/'launch-authorizations/claim.json', '123456', str(target_path), 'claimed'))
+        self.assertFalse(revoked(claimed, '123456', str(target_path)))
+
+    def test_ipc_root_through_private_symlink_prefix(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['R3A_CASE_ROOT']) as temporary:
+            base = Path(temporary).resolve()
+            real = base/'real'
+            real.mkdir(mode=0o700)
+            (base/'link').symlink_to(real, target_is_directory=True)
+            self.check_root(real/'ipc', base/'link/ipc')
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS system TMPDIR alias')
+    def test_macos_default_tmpdir_prefix(self):
+        default = subprocess.check_output(['getconf', 'DARWIN_USER_TEMP_DIR'], text=True).strip()
+        with tempfile.TemporaryDirectory(dir=default) as temporary:
+            alias = Path(temporary)/'ipc'
+            self.assertTrue(str(alias).startswith('/var/folders/'))
+            self.check_root(alias.resolve(), alias)

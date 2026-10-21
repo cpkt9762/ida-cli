@@ -2073,6 +2073,34 @@ never tags the retry code) and `cli::bridge_loss_recovery_tests`. Real
 end-to-end evidence is recorded in the H report (W1, W2a, W2b; the first
 ordinary `list-functions` after the loss succeeds).
 
+### Symlinked temporary roots (K)
+
+Verification must cover TMPDIR paths with symlink prefixes, including macOS's
+actual `TMPDIR=$(getconf DARWIN_USER_TEMP_DIR)` under `/var/folders`, with
+`IDA_NEXUS_IPC_ROOT` unset. Also run the private `/private/tmp` control. Keep
+CLI home, state, IDA profile and sample copies private in both cases; use the
+release binary for status, list-functions and shutdown, and check actual process
+exit plus socket/discovery cleanup. W1/W2a/W2b must each run in both environments.
+
+`test_launch_settle.py::SymlinkedLaunchRoot` exercises the real LaunchIntent
+producer through a private link-to-real prefix and the system TMPDIR prefix. It
+checks canonical grant spelling across the SDK callback, signed Rust payload,
+helper and target journal, then revocation, denied late claim and full journal
+retirement. A separate grant exercises claim through a prefix alias. SDK source
+and output database paths already use the same realpath/abspath/expanduser rule
+as target coordination; the bridge now normalizes the helper endpoint just as
+proof_helper does before its strict Directory walk. The SDK patch is unchanged.
+`test_launch_authorization.py` additionally rejects symlinked final directories,
+symlinked grant files and nonprivate directories; O_NOFOLLOW checks remain intact.
+
+For a reused prepared environment, set `N3_CASE_ROOT` to a fresh private root
+with home/profile/state/tmp subdirectories and a copied test license. The fixture
+validates modules against the original `N3_ENV_ROOT`, while process ledgers and
+runtime state go to the case root. `ReadOnlyPreparedEnvironment` verifies that
+separation without changing the prepared manifest's identity checks. The W2a
+helper observation uses shutdown's existing serialized observation gate, so a
+concurrent accepted finish is observed as finished rather than a second RPC.
+
 ### Final-fix harness requirements
 
 E27 needs a release build with `nexus-test-support` to record exact daemon births;
