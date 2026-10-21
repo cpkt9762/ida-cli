@@ -248,3 +248,24 @@ for 262144 entries; larger request parameters consume more memory, so this is
 not a memory ceiling. A full lifetime budget rejects new reservations until
 the daemon/bridge is restarted. Configure any override before restarting;
 never replay requests with unknown outcomes.
+
+
+### sBPF code generation profile
+
+Set `IDA_CLI_SBX_PROFILE` before starting the server/daemon. The server reads it;
+changing only a client environment does not reconfigure an already running server.
+Opening an sBPF `.so` always passes the profile explicitly to `sbx aot i64`:
+
+| Value | sbx arguments |
+|---|---|
+| unset or `analysis` (default) | `--profile analysis` |
+| `analysis-inline` | `--profile analysis --inline` |
+| `trace` | `--profile trace` |
+| `optimized` | `--profile optimized` (currently refused by sbx for `aot i64`) |
+
+Each profile has its own cache generation. The versioned key records the full raw
+BLAKE3 digest and profile in `nexus-index.json` and `generation.json`; old entries
+without a profile are never reused. Reopening the same profile uses its generation.
+Empty, unknown, or differently cased values fail with `InvalidParams` naming the
+variable. sbx failures expose stdout/stderr and never fall back to the raw `.so`.
+The existing content lock, input snapshot verification and GC remain in effect.

@@ -216,3 +216,22 @@ business 并同比派生其他两项；未设置、非法值或 0 使用默认�
 这不是内存硬上限，另有 internal 身份、分配器和其他生命周期数据。上限用满后继续拒绝
 新预留，必须重启 daemon/bridge 才能恢复；需要覆盖容量时应在重启前配置。
 重启不代表可以重放结果未知的请求。
+
+
+### sBPF 代码生成 profile
+
+在启动 server/daemon **之前**设置 `IDA_CLI_SBX_PROFILE`。变量由服务进程读取，
+仅改变客户端环境不会重新配置已经运行的服务。打开 sBPF `.so` 时始终显式传参：
+
+| 值 | sbx 参数 |
+|---|---|
+| 未设置或 `analysis`（默认） | `--profile analysis` |
+| `analysis-inline` | `--profile analysis --inline` |
+| `trace` | `--profile trace` |
+| `optimized` | `--profile optimized`（当前 sbx 对 `aot i64` 拒绝此值） |
+
+缓存按 profile 分代；版本化 key 在 `nexus-index.json` 和 `generation.json` 中
+记录原始输入的完整 BLAKE3 与 profile，不复用没有 profile 的旧条目。
+同一 profile 再次打开会命中自己的缓存。空值、未知值或大小写不同的值均报
+点名该变量的 `InvalidParams`；sbx 失败原样暴露 stdout/stderr，不回退打开原始 `.so`。
+内容锁、输入快照校验与 GC 沿用 Nexus 既有契约。

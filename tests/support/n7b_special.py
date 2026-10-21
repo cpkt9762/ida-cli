@@ -22,6 +22,8 @@ def e24(env, binary, sample):
         response = client.mcp('open_idb', {'path': str(copied)})
         assert 'result' in response, response
         first = response['result']
+        runtime = client.control('status')['metadata']['ida_version']
+        assert runtime == env.manifest['installed_ida_version'], runtime
         functions = client.mcp('list_functions', {'db_handle': first['db_handle']})
         assert functions['result']['functions'], functions
         entry = client.mcp('get_function_by_name', {'db_handle': first['db_handle'], 'name': 'entrypoint'})
@@ -36,7 +38,7 @@ def e24(env, binary, sample):
         second = client.mcp('open_idb', {'path': str(copied)})
         assert 'result' in second and second['result']['path'] == first['path'], second
         assert client.mcp('close_idb', {'close_token': second['result']['close_token']}).get('result')
-        return {'first': first, 'reopen': second, 'entry': entry, 'decompile': code}
+        return {'first': first, 'reopen': second, 'entry': entry, 'decompile': code, 'ida_version': runtime}
     finally:
         client.stop()
 

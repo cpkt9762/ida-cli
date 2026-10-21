@@ -2037,3 +2037,18 @@ match the packed base. This makes the formerly intermittent R9/E07 composition
 explicit without widening backup-count or no-replay assertions.
 E23 releases the independent CLI warm lease while the recorded GUI owner is
 still alive, then confirms the scene is unchanged before exact GUI cleanup.
+
+
+### sBPF profile isolation
+
+`nexus_sbx_profile` uses isolated child environments and a recording offline
+builder to reject profile-less flat/index entries, verify explicit arguments,
+cache hits and different generation paths, and reject a mismatched manifest.
+`tests/support/sbx_profile_real.py` runs one real profile case against a supplied
+release binary in a prepared environment with a shared profile cache. Select
+`default`, `analysis-inline`, `trace`, `optimized`, or `invalid`; run each with
+shell `timeout 180s` and record uptime. It records actual sbx/idat argv and birth
+identities, queries/decompiles, checks the second open uses no new build, and
+starts the server in a private fake Cargo workspace to exclude target-aot output.
+The default case also proves a client variable cannot reconfigure its server.
+This is directed validation; it does not run or advance the full E2E matrix.
