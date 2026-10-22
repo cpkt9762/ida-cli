@@ -523,6 +523,20 @@ impl RouterState {
             .await
             .cloned()
     }
+    /// Production connection: config.directory is the IPC parent, not an owned directory.
+    async fn connect_nexus_session(
+        &self,
+        config: nexus_bridge::BridgeConfig,
+    ) -> anyhow::Result<Arc<nexus_bridge::NexusBridge>> {
+        self.nexus_bridge
+            .get_or_try_init(|| async {
+                nexus_bridge::NexusBridge::start_session(self, config)
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+            .cloned()
+    }
     pub fn install_nexus_capabilities(
         &self,
         capabilities: crate::nexus::NexusCapabilities,

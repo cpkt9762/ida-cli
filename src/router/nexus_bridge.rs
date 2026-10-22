@@ -10,6 +10,7 @@ mod owned_files;
 pub mod protocol;
 mod receiver;
 pub mod recovery_guard;
+mod session_directory;
 #[cfg(feature = "nexus-test-support")]
 mod test_barriers;
 #[cfg(feature = "nexus-test-support")]
@@ -723,9 +724,21 @@ impl NexusBridge {
             }
         }
     }
-    pub async fn start(
+    pub async fn start(router: &super::RouterState, config: BridgeConfig) -> anyhow::Result<Self> {
+        Self::start_inner(router, config, false).await
+    }
+
+    pub(crate) async fn start_session(
+        router: &super::RouterState,
+        config: BridgeConfig,
+    ) -> anyhow::Result<Self> {
+        Self::start_inner(router, config, true).await
+    }
+
+    async fn start_inner(
         router: &super::RouterState,
         mut config: BridgeConfig,
+        allocate_session: bool,
     ) -> anyhow::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         let startup_cwd = std::env::current_dir()?;
@@ -749,7 +762,11 @@ impl NexusBridge {
             "IDA_CLI_NEXUS_PROTOCOL".into(),
             serde_json::to_string(&protocol::Protocol::current())?,
         );
-        std::fs::create_dir(&config.directory)?;
+        if allocate_session {
+            config.directory = session_directory::allocate(&config.directory)?;
+        } else {
+            std::fs::create_dir(&config.directory)?;
+        }
         std::fs::set_permissions(&config.directory, std::fs::Permissions::from_mode(0o700))?;
         let mut owned_files = owned_files::OwnedFiles::created(&config.directory)?;
         let installation_path = config.directory.join("installation");

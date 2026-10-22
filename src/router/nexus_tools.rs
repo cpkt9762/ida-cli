@@ -409,10 +409,10 @@ impl Tools {
             environment.insert("IDADIR".into(), ida.to_string_lossy().into_owned());
         }
         router
-            .connect_nexus(BridgeConfig {
+            .connect_nexus_session(BridgeConfig {
                 python,
                 script,
-                directory: ipc.join(id()),
+                directory: ipc,
                 environment,
             })
             .await
