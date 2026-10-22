@@ -14,6 +14,7 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tests/support"))
 from nexus_env import Environment
+from nexus_worker_open_gate import build_worker
 
 env = Environment(Path(os.environ["N3_ENV_ROOT"]), case_root=os.environ.get('N3_CASE_ROOT'))
 # No signal handler changes in the bridge's business threads. Persist creation
@@ -25,7 +26,6 @@ def owned_popen(command, **options):
     open_gate = os.environ.get('R3A_WORKER_OPEN_GATE_ROOT')
     if open_gate and '--record-suffix' in command:
         # Generate the SDK copy only in this run's private directory.
-        from nexus_worker_open_gate import build_worker
         worker = build_worker(Path(open_gate))
         command = [sys.executable, str(worker), open_gate, *command[2:]]
     if os.environ.get('R3A_WORKER_AUTHORIZATION_PHASE') == 'unclaimed':
