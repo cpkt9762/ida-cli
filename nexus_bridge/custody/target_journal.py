@@ -1096,13 +1096,23 @@ class Journal:
         receipt = self.death_receipt(item)
         helper = item['spawned_death_producer']
         endpoint = registration['endpoint']
-        status = request(endpoint, helper, {'kind':'lookup', 'watch':item['watch']})
-        if status.get('state_root') != registration['state_root']:
-            raise RuntimeError('StartupUnconfirmed: helper state root changed')
-        if status.get('item') is not None:
-            request(endpoint, helper, {'kind':'spawned_dead_adopt', 'watch':item['watch'], 'consumer':receipt})
-            request(endpoint, helper, {'kind':'retire', 'watch':item['watch'], 'sha256':receipt['sha256']})
-        request(endpoint, helper, {'kind':'retire_parent', 'parent':item['acquisition']['parent']})
+        try:
+            status = request(endpoint, helper, {'kind':'lookup', 'watch':item['watch']})
+            if status.get('state_root') != registration['state_root']:
+                raise RuntimeError('StartupUnconfirmed: helper state root changed')
+            if status.get('item') is not None:
+                request(endpoint, helper, {'kind':'spawned_dead_adopt', 'watch':item['watch'], 'consumer':receipt})
+                request(endpoint, helper, {'kind':'retire', 'watch':item['watch'], 'sha256':receipt['sha256']})
+            request(endpoint, helper, {'kind':'retire_parent', 'parent':item['acquisition']['parent']})
+        except (OSError, RuntimeError):
+            if same_boot_exit(original) is None:
+                raise
+            import logging
+            logging.getLogger(__name__).info(
+                'SpawnedDeathHelperExited: exact helper exited during retirement RPC')
+            item['spawned_death_pending'] = False
+            self.save()
+            return
         # Keep the evidence pinned until the original daemon acknowledges its
         # in-memory retirement too, or the exact helper exits. A new daemon must
         # not compact facts the old daemon may still be acknowledging.

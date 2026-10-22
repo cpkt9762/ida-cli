@@ -484,7 +484,12 @@ class Observer:
                     item.pop('instance', None)
                 return {'consumer':item['consumer']}
             if kind == 'spawned_dead_adopt':
-                item = self.items[value['watch']]
+                item = self.items.get(value['watch'])
+                if item is None:
+                    # This grants no closure authority. The journal already
+                    # selected its immutable fact; a concurrent retire may have
+                    # removed this watch after the caller's lookup.
+                    return {'already_absent':True}
                 receipt = value['consumer']
                 record = receipt['record']
                 if (item.get('owner') or item.get('proof') or not item.get('spawned')

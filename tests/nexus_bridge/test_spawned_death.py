@@ -184,6 +184,8 @@ class SpawnedSettlement(unittest.TestCase):
             consumer = reply['consumer']
             self.call('spawned_dead_adopt', watch='startup', consumer=consumer)
             self.call('retire', watch='startup', sha256=consumer['sha256'])
+            self.assertEqual(self.call('spawned_dead_adopt', watch='startup', consumer=consumer),
+                             {'already_absent':True})
             self.call('retire_parent', parent=launch_tests.ACQUISITION['parent'])
             journal.spawned_dead_ack('startup', epoch)
             journal.settle()
