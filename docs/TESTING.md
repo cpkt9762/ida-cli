@@ -2199,7 +2199,7 @@ The default case also proves a client variable cannot reconfigure its server.
 This is directed validation; it does not run or advance the full E2E matrix.
 
 
-### Spawned worker death settlement (N; implementation, validation pending)
+### Spawned worker death settlement (N; validated implementation)
 
 The same-boot exit capability is separate from public owner lifetime and from
 unspawned authorization revocation. A valid native birth and boot UUID must bind
@@ -2267,3 +2267,15 @@ the pinned SDK hashes and the closed bootstrap's interpreter-prefix checks.
 The optional existing test collector must remain opt-in for explicit collection;
 ordinary gate tests leave its variables unset. Preserve any earlier accidental
 shared log append as diagnostic evidence instead of truncating shared history.
+
+
+Qualification: default lib 542, feature lib 564 (three private-root runs and one
+native macOS TMPDIR run), contract 78, and Python 271 in each temporary-root
+configuration. The six startup scenarios each pass three times, with separate
+CONT public-lifetime controls and three restart cases that verify a still-live
+old helper retires its own watch and parent. W1/W2a/W2b and the ordinary
+production SDK path also pass under native TMPDIR. PID/birth and private process
+audits require zero residuals; shared prepared-runtime ledgers stay unchanged
+during the final isolated qualification. SDK module hashes and patches are
+unchanged. The old complete-worker fixture is absent from the branch history;
+only the private runtime generator remains.
