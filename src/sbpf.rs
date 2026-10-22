@@ -41,9 +41,7 @@ pub fn find_sbx() -> Result<PathBuf, ToolError> {
     }
 
     Err(ToolError::InvalidParams(
-        "Cannot find sbx. Install it with `cargo install --path crates/sbx --locked` \
-         from the sbpf-interpreter workspace, or set the SBX env var to its path."
-            .into(),
+        "Cannot find sbx. Set the SBX env var to its path.".into(),
     ))
 }
 
