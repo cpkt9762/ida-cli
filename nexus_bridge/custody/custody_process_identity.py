@@ -39,7 +39,7 @@ def _mac_boot_id(lib):
     return str(uuid.UUID(value.value.decode("ascii")))
 
 
-def _mac_identity(pid, *, retain_zombie=False):
+def _mac_identity(pid, *, exit_probe=False):
     if (ctypes.sizeof(ProcBsdInfo), ProcBsdInfo.start_sec.offset,
             ProcBsdInfo.start_usec.offset) != (136, 120, 128):
         raise RuntimeError("unsupported proc_bsdinfo ABI")
@@ -51,18 +51,19 @@ def _mac_identity(pid, *, retain_zombie=False):
     ctypes.set_errno(0)
     count = lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
     code = ctypes.get_errno()
-    if count <= 0 and code == errno.ESRCH:
+    if count == 0 and code == errno.ESRCH:
         return None
     if count != ctypes.sizeof(info):
         raise OSError(code or errno.EIO, f"proc_pidinfo({pid}) returned {count}, expected 136")
     if info.pid != pid or not info.start_sec or info.start_usec >= 1_000_000:
         raise RuntimeError(f"invalid process birth for {pid}")
-    if info.status == 5:  # SZOMB, sys/proc.h: exited, cannot execute or receive a signal.
-        if retain_zombie:
-            raise RuntimeError('StartupUnconfirmed: zombie retained until definite ESRCH')
+    if info.status == 5 and not exit_probe:  # SZOMB: exited, no execution remains.
         return None
-    return {"kind": "macos-libproc-v1", "boot_id": _mac_boot_id(lib),
-            "birth": [info.start_sec, info.start_usec]}
+    result = {"kind": "macos-libproc-v1", "boot_id": _mac_boot_id(lib),
+              "birth": [info.start_sec, info.start_usec]}
+    if info.status == 5:
+        result['state'] = 'zombie'
+    return result
 
 
 def _linux_identity(pid):
@@ -135,12 +136,12 @@ def boot_identity():
 
 
 def exit_identity(pid):
-    """Only definite ESRCH returns None; zombies and failed queries retain custody."""
+    """Only definite ESRCH returns None; a readable zombie carries its exact birth."""
     if type(pid) is not int or not 0 < pid <= 2_147_483_647:
         raise ValueError('process identity requires a native positive PID')
     if sys.platform != 'darwin':
         raise RuntimeError('same-boot exit capability unsupported on this platform')
-    return _mac_identity(pid, retain_zombie=True)
+    return _mac_identity(pid, exit_probe=True)
 
 
 def same_boot_exit(recorded, *, read=None, current_boot=None):
@@ -170,10 +171,16 @@ def same_boot_exit(recorded, *, read=None, current_boot=None):
     current = (read or exit_identity)(recorded['pid'])
     if current is None:
         return {'reason':'esrch', 'boot_id':boot, 'recorded':recorded, 'current':None}
+    zombie = isinstance(current, dict) and current.get('state') == 'zombie'
+    if zombie:
+        if set(current) != {'kind', 'boot_id', 'birth', 'state'}:
+            return None
+        current = {k:current[k] for k in ('kind', 'boot_id', 'birth')}
     if (not valid_identity(current) or current['kind'] != birth['kind']
-            or current['boot_id'] != boot or current == birth):
+            or current['boot_id'] != boot or (current == birth and not zombie)):
         return None
-    return {'reason':'pid_reused', 'boot_id':boot, 'recorded':recorded, 'current':current}
+    return {'reason':'zombie' if zombie and current == birth else 'pid_reused',
+            'boot_id':boot, 'recorded':recorded, 'current':current}
 
 
 def _mac_commands():

@@ -266,6 +266,9 @@ class Journal:
             if name not in allowed:
                 raise RuntimeError('RecoveryBlocked: unsupported target coordination entry: ' + name)
         self.recover_public_proofs()
+        for startup in list(self.value['entries'].values()):
+            if startup.get('launch') and not startup.get('owner'):
+                self.spawned_dead(startup['watch'], startup['epoch'])
         resume_at_gate(self.target)
         try:self.value,self.info,self.raw=self.target.directory.read('custody.json')
         except FileNotFoundError:
@@ -960,6 +963,126 @@ class Journal:
         self.save()
         return {}
 
+    def spawned_dead(self, watch, epoch):
+        """Target EX serializes an independent launch-exit fact, including restart.
+
+        This producer never writes another helper's registry or sequence. Its
+        deterministic immutable slot is distinct from every helper's facts.
+        """
+        item = self.value['entries'].get(str(epoch))
+        if item is None:
+            if epoch <= self.value['closed_through'] or any(
+                    a <= epoch <= b for a, b in self.value['closed_after_holes']):
+                return {'state':'closed'}
+            raise RuntimeError('StartupUnconfirmed: unknown startup epoch')
+        if item['watch'] != watch:
+            raise RuntimeError('StartupUnconfirmed: mismatched startup watch')
+        if item.get('spawned_death'):
+            return {'state':'dead', 'consumer':self.death_receipt(item)}
+        if (not item.get('launch') or item.get('owner') or item.get('proof')
+                or item.get('lease') or any(f['kind'] not in ('SpawnIntent', 'Spawned') for f in item['facts'])):
+            return {'state':'not_applicable'}
+        sources = [self.referenced_record(f) for f in item['facts'] if f['kind'] == 'Spawned']
+        if len(sources) != 1:
+            return {'state':'not_applicable'}
+        source = sources[0]
+        launch = item['launch']
+        if (source.get('watch') != watch or source.get('subscription_epoch') != epoch
+                or source.get('acquisition') != item['acquisition'] or source.get('launch') != launch
+                or source.get('owner') is not None or not launch.get('authorization')):
+            raise RuntimeError('StartupUnconfirmed: incomplete Spawned binding')
+        from custody_process_identity import same_boot_exit
+        evidence = same_boot_exit(source.get('os_identity'))
+        if evidence is None:
+            return {'state':'pending'}
+        # Read the durable single-use permit independently. It permanently fences
+        # a second claimant; no suffix scan or discovery absence grants closure.
+        from ida_nexus._launch_authorization import _directory, _read
+        name, directory = _directory(launch['authorization'])
+        try:
+            grant = {'schema':1, 'suffix':launch['suffix'], 'target':launch['target']}
+            if (_read(directory, name) != grant
+                    or _read(directory, name + '.decision') != dict(grant, decision='claimed')):
+                raise RuntimeError('StartupUnconfirmed: launch is not durably claimed')
+        finally:
+            os.close(directory)
+        container = self.target.directory.child('observations')
+        try:
+            producer = container.child(digest(watch.encode()))
+            try:
+                with producer.fact_view():
+                    from recovery_files import visible_names
+                    for name in visible_names(producer):
+                        if name.endswith('.new'):
+                            raise ObservationPending('StartupUnconfirmed: pending startup publication')
+                        record, _, _ = producer.read(name)
+                        if (record.get('watch') != watch or record.get('acquisition') != item['acquisition']
+                                or record.get('subscription_epoch') != epoch):
+                            raise RuntimeError('StartupUnconfirmed: conflicting startup namespace')
+                        if record.get('owner') is not None or record.get('kind') in (
+                                'StartupOwnerSubscribed', 'StartupTransferred', 'AttachAttempt', 'PublicOwnerLifetime'):
+                            return {'state':'not_applicable'}
+                    helper = 'target-spawned-death-' + digest(watch.encode())
+                    name = helper + '-' + str(epoch) + '.json'
+                    try:
+                        record, _, _ = producer.read(name)
+                    except FileNotFoundError:
+                        record = dict(source, helper=helper, seq=epoch,
+                            observation_id=helper + '-' + str(epoch),
+                            kind='SpawnedOwnerDiedUnpublished', evidence=evidence,
+                            source_spawned=digest(source))
+                        producer.retry_immutable(name, record)
+                    # A prior completed fact may follow a crash before custody.json.
+                    saved_evidence = record.get('evidence')
+                    expected = dict(source, helper=helper, seq=epoch,
+                        observation_id=helper + '-' + str(epoch),
+                        kind='SpawnedOwnerDiedUnpublished', evidence=saved_evidence,
+                        source_spawned=digest(source))
+                    if (encoded(record) != encoded(expected) or not isinstance(saved_evidence, dict)
+                            or saved_evidence.get('recorded') != source['os_identity']
+                            or same_boot_exit(source['os_identity'],
+                                read=lambda pid: saved_evidence.get('current'),
+                                current_boot=lambda: saved_evidence.get('boot_id')) != saved_evidence):
+                        raise RuntimeError('StartupUnconfirmed: conflicting spawned death fact')
+                    receipt = {'path':str(producer.path/name), 'sha256':digest(record), 'record':record}
+                    verified = fact(receipt, self.target, kind='SpawnedOwnerDiedUnpublished')
+            finally:
+                producer.close()
+        finally:
+            container.close()
+        # Publication and adoption are separate durable steps. Native death was
+        # rechecked above even when retrying a previously published fact.
+        item['facts'].append(verified)
+        item['spawned_death'] = verified
+        item['spawned_death_pending'] = True
+        item['spawned_death_helper'] = source['helper_registration']['identity']
+        item['launch_identity'], item['launch'] = launch, None
+        item['producer_closed'] = item['consumer_closed'] = item['detached'] = item['bridge_closed'] = True
+        item['unacked_events'] = False
+        self.save()
+        return {'state':'dead', 'consumer':receipt}
+
+    def spawned_dead_ack(self, watch, epoch):
+        item = self.value['entries'].get(str(epoch))
+        if item is None:
+            return self.spawned_dead(watch, epoch)
+        if item['watch'] != watch or not item.get('spawned_death'):
+            raise RuntimeError('StartupUnconfirmed: death ACK lacks exact journal closure')
+        item['spawned_death_pending'] = False
+        self.save()
+        return {}
+
+    def death_helper_retired(self, item):
+        if not item.get('spawned_death_pending'):
+            return True
+        from custody_process_identity import same_boot_exit
+        return same_boot_exit(item.get('spawned_death_helper')) is not None
+
+    def death_receipt(self, item):
+        reference = item['spawned_death']
+        record = self.referenced_record(reference)
+        return {'path':reference['path'], 'sha256':reference['sha256'], 'record':record}
+
     def startup_owner(self, value):
         record = value['receipt']['record']
         item = self.item(value['watch'], record['subscription_epoch'])
@@ -1003,6 +1126,7 @@ class Journal:
                     and item.get('bridge_closed')
                     and not item['unacked_events'] and not item.get('failure') and not item.get('launch')
                     and not item.get('manual_offline_recovery')
+                    and self.death_helper_retired(item)
                     and item['epoch'] not in pinned]
         eligible_epochs={i['epoch'] for i in eligible}
         eligible=[item for item in eligible if not any(i.get('nonlast_successor') == item['epoch']
@@ -1142,6 +1266,7 @@ class Journal:
             if not item or not (item['producer_closed'] and item['consumer_closed'] and item['detached']
                                 and not item['unacked_events'] and not item.get('failure')
                                 and not item.get('manual_offline_recovery')
+                    and self.death_helper_retired(item)
                                 and (item.get('bridge_closed') or item.get('transferred_to') in intent['epochs'])
                                 and (not item.get('launch') or item.get('transferred_to') in intent['epochs'])):
                 raise RuntimeError('RoutineCompactionFailed: live reference appeared')
@@ -1461,6 +1586,10 @@ def main():
                 result = journal.startup_transfer(value)
             elif action == 'startup_owner':
                 result = journal.startup_owner(value)
+            elif action == 'spawned_dead_ack':
+                result = journal.spawned_dead_ack(value['watch'], value['epoch'])
+            elif action == 'spawned_dead':
+                result = journal.spawned_dead(value['watch'], value['epoch'])
             elif action == 'launch_abandoned':
                 result = journal.launch_abandoned(value)
             elif action == 'settle':

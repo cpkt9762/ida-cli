@@ -2199,7 +2199,7 @@ The default case also proves a client variable cannot reconfigure its server.
 This is directed validation; it does not run or advance the full E2E matrix.
 
 
-### Spawned worker death settlement (N; design, implementation pending)
+### Spawned worker death settlement (N; implementation, validation pending)
 
 The same-boot exit capability is separate from public owner lifetime and from
 unspawned authorization revocation. A valid native birth and boot UUID must bind
@@ -2215,9 +2215,10 @@ A positive exit observation requires a validated recorded identity, an independe
 current boot query matching that record, and either definite native ESRCH or a
 complete current identity with the same boot and a different birth. Permission
 errors, short reads, malformed identities, a live or stopped matching worker and
-cross-boot observations retain custody. Zombie handling must not reuse the
-existing diagnostic identity API's None (which also denotes absence): settlement
-will conservatively retain zombies until a definite ESRCH after reaping. Existing
+cross-boot observations retain custody. A zombie has exited and cannot execute
+or touch the IDB; it may settle after native ESRCH (macOS can exclude zombies
+from proc_pidinfo) or a full native SZOMB record with validated birth. This
+uses a distinct native probe, never the diagnostic identity API's ambiguous None. Existing
 qualified boot retirement remains a distinct path with its existing scope checks.
 
 An independent immutable SpawnedOwnerDiedUnpublished fact must close only launch
@@ -2226,3 +2227,22 @@ The journal must verify the signed source, authorization and native death itself
 under target EX. Restart settlement must serialize against a still-live old
 helper's fact publication and must not write its mutable helper registry.
 Database recovery and unknown request outcomes retain their existing handling.
+
+The target writer publishes the new fact in a deterministic slot distinct from
+helper sequence names. Target EX serializes competing gate/recovery writers;
+the observation fact-view lock serializes this publication with old helper
+publication. No recovery writer edits the old helper registry or claims its
+identity. The journal independently reopens the original Spawned inode/hash,
+revalidates launch/acquisition/watch/epoch, reads the claimed grant with the
+SDK's strict descriptor reader, and checks native same-boot death. Known owner,
+lease, attach or public-owner facts refuse this narrow closure. A complete
+fact left by a crash before journal adoption is rechecked and reused.
+
+The original daemon waits for SDK completion or bridge waitpid, adopts the
+journal-selected consumer in its helper, retires the watch and parent, then
+closes the acquisition. A new daemon's gate can settle the target while the old
+helper remains alive. Evidence GC stays pinned until that helper acknowledges
+retirement or its recorded birth is confirmed exited. Only that helper writes
+its mutable registry; an orphan follows the existing 300-second expiry. Death
+never certifies a safe database close: ordinary database_state probing and IDA
+crash recovery still run at the next open. No unknown request is replayed.

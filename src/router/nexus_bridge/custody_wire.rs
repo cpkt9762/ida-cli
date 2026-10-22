@@ -1198,6 +1198,16 @@ pub(super) async fn proofs(state: &Arc<State>, writer: &Writer) -> anyhow::Resul
             && *old_boot != heartbeat["identity"]["boot_id"]
         {
             retire_startup(state, writer, helper, launch).await
+        } else if !has_successor
+            && launch["launch"].is_object()
+            && launch["owner"].is_null()
+            && launch["os_identity"].is_object()
+        {
+            match settle_spawned_dead(state, helper, &launch).await {
+                Ok(true) => Ok(()),
+                Ok(false) => observe_launch(state, writer, helper, &resources, launch).await,
+                Err(error) => Err(error),
+            }
         } else if !has_successor && unspawned_candidate(&launch) {
             match settle_unspawned_launch(state, helper, &launch).await {
                 Ok(true) => Ok(()),
@@ -1834,6 +1844,96 @@ fn unspawned_candidate(launch: &Value) -> bool {
         && launch["os_identity"].is_null()
         && launch.get("pending_no_attach").is_none()
         && launch.get("proof").is_none()
+}
+
+/// Settle only startup observation after native death and durable journal adoption.
+/// SDK completion is independent: a live bridge must report it before this path
+/// can close the acquisition; bridge waitpid also excludes further SDK launches.
+async fn settle_spawned_dead(
+    state: &Arc<State>,
+    helper: &helper::Helper,
+    launch: &Value,
+) -> anyhow::Result<bool> {
+    let acquisition: AcquisitionId = decode(launch["acquisition"].clone())?;
+    let sdk_finished = state
+        .endpoint
+        .transition(|s, _| s.acquisition_sdk_finished(&acquisition))?;
+    let bridge_reaped = state
+        .bridge_exit
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    if !sdk_finished && !bridge_reaped {
+        return Ok(false);
+    }
+    let watch = launch["watch"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("spawned startup watch missing"))?;
+    let epoch = &launch["receipt"]["record"]["subscription_epoch"];
+    let reply = helper
+        .journal(json!({"action":"spawned_dead", "target":launch["target"],
+            "coord_key":launch["coord_key"], "watch":watch, "epoch":epoch}))
+        .await?;
+    if reply["state"] != "dead" {
+        anyhow::ensure!(
+            matches!(reply["state"].as_str(), Some("pending" | "not_applicable")),
+            "unexpected spawned death settlement state"
+        );
+        return Ok(false);
+    }
+    let consumer = &reply["consumer"];
+    anyhow::ensure!(
+        consumer["record"]["kind"] == "SpawnedOwnerDiedUnpublished"
+            && consumer["record"]["watch"] == watch
+            && consumer["record"]["acquisition"] == launch["acquisition"]
+            && consumer["record"]["launch"] == launch["launch"],
+        "spawned death fact does not bind the retained launch"
+    );
+    helper
+        .call(json!({"kind":"spawned_dead_adopt", "watch":watch, "consumer":consumer}))
+        .await?;
+    helper
+        .call(json!({"kind":"retire", "watch":watch, "sha256":consumer["sha256"]}))
+        .await?;
+    helper
+        .journal(
+            json!({"action":"spawned_dead_ack", "target":launch["target"],
+            "coord_key":launch["coord_key"], "watch":watch, "epoch":epoch}),
+        )
+        .await?;
+    helper
+        .journal(json!({"action":"settle", "target":launch["target"],
+            "coord_key":launch["coord_key"]}))
+        .await?;
+    helper
+        .call(json!({"kind":"retire_parent", "parent":acquisition.parent}))
+        .await?;
+    state
+        .startups
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(watch);
+    state
+        .retired_open_resources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(acquisition.parent.operation_id.clone());
+    let closed = settle_unleased_acquisition(state, &acquisition, true)?;
+    state
+        .custody_retirements
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            watch.to_owned(),
+            json!({"acquisition":acquisition, "lease":null, "watch":watch,
+            "acquisition_closed":closed, "spawned_death":consumer["sha256"],
+            "target":launch["target"], "coord_key":launch["coord_key"]}),
+        );
+    state.emit(
+        json!({"event":"spawned_owner_died_unpublished", "watch":watch,
+        "acquisition":acquisition, "evidence":consumer["record"]["evidence"]}),
+    );
+    Ok(true)
 }
 
 /// Close an unclaimed LaunchIntent after its authorization is durably revoked.

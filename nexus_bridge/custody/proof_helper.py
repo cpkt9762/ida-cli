@@ -33,6 +33,7 @@ REQUEST_FIELDS = {
     'launch_intent':('watch','target','coord_key','acquisition','launch','subscription_epoch'),
     'spawned':('watch','launch','pid','os_identity'),
     'launch_settle':('watch','bridge'),
+    'spawned_dead_adopt':('watch','consumer'),
 }
 
 def peer_uid(stream):
@@ -482,6 +483,33 @@ class Observer:
                         previous_facts=[item[k] for k in ('receipt', 'spawned', 'owner_receipt', 'proof', 'failed') if k in item])
                     item.pop('instance', None)
                 return {'consumer':item['consumer']}
+            if kind == 'spawned_dead_adopt':
+                item = self.items[value['watch']]
+                receipt = value['consumer']
+                record = receipt['record']
+                if (item.get('owner') or item.get('proof') or not item.get('spawned')
+                        or record.get('kind') != 'SpawnedOwnerDiedUnpublished'
+                        or record.get('watch') != item['watch']
+                        or record.get('launch') != item['launch']
+                        or record.get('acquisition') != item['acquisition']
+                        or record.get('os_identity') != item['os_identity']
+                        or record.get('source_spawned') != item['spawned']['sha256']):
+                    raise RuntimeError('StartupUnconfirmed: mismatched launch death consumer')
+                with Target(item['target']) as target:
+                    # This is a read-only exact custody check; journal writes
+                    # remain under target EX in the independent writer.
+                    durable, _, _ = target.directory.read('custody.json')
+                    entry = durable['entries'].get(str(item['subscription_epoch']))
+                    from target_journal import fact
+                    verified = fact(receipt, target, kind='SpawnedOwnerDiedUnpublished')
+                    if (not entry or entry.get('spawned_death') != verified
+                            or entry.get('watch') != item['watch'] or entry.get('launch') is not None):
+                        raise RuntimeError('StartupUnconfirmed: launch death not adopted by journal')
+                if item.get('consumer') and item['consumer'] != receipt:
+                    raise RuntimeError('StartupUnconfirmed: conflicting launch consumer')
+                item['consumer'] = receipt
+                self.persist()
+                return {'consumer':receipt}
             if kind == 'launch_settle':
                 return self.settle_unspawned_launch(value)
             if kind == 'retire':

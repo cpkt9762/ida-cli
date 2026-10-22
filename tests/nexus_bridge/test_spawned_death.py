@@ -73,7 +73,7 @@ class SameBootExit(unittest.TestCase):
             os.kill(child.pid, signal.SIGCONT)
             child.communicate(timeout=5)
 
-    def test_zombie_is_retained_until_reaped(self):
+    def test_zombie_has_exited_even_before_reaping(self):
         read_fd, write_fd = os.pipe()
         pid = os.fork()
         if pid == 0:
@@ -88,8 +88,7 @@ class SameBootExit(unittest.TestCase):
             while processes.identity(pid) is not None:
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.01)
-            with self.assertRaisesRegex(RuntimeError, 'zombie retained'):
-                processes.same_boot_exit(recorded)
+            self.assertIn(processes.same_boot_exit(recorded)['reason'], ('esrch', 'zombie'))
         finally:
             os.waitpid(pid, 0)
         self.assertEqual(processes.same_boot_exit(recorded)['reason'], 'esrch')
@@ -106,3 +105,119 @@ class SameBootExit(unittest.TestCase):
                     processes.ctypes, 'CDLL', return_value=Lib(count, error)):
                 with self.assertRaises(OSError):
                     processes.exit_identity(os.getpid())
+
+
+import test_launch_settle as launch_tests
+from target_coordination import Target
+from target_journal import Journal
+from ida_nexus._launch_authorization import decide
+
+
+class SpawnedSettlement(unittest.TestCase):
+    setUp = launch_tests.LaunchSettle.setUp
+    reap = launch_tests.LaunchSettle.reap
+    call = launch_tests.LaunchSettle.call
+    sign_launch = launch_tests.LaunchSettle.sign_launch
+    fake_worker = launch_tests.LaunchSettle.fake_worker
+
+    def spawned(self):
+        epoch = self.sign_launch()
+        worker = self.fake_worker()
+        self.assertTrue(decide(self.launch['authorization'], self.suffix, str(self.target_path), 'claimed'))
+        with Target(self.target_path) as target, target.locked():
+            receipt = self.call('spawned', watch='startup', launch=self.launch, pid=worker.pid,
+                                os_identity=processes.capture(worker.pid))['receipt']
+            Journal(target).launch_signed(receipt)
+        return epoch, worker
+
+    def test_dead_spawned_settles_in_restart_gate_and_retains_database(self):
+        epoch, worker = self.spawned()
+        worker.kill()
+        worker.wait(timeout=5)
+        with Target(self.target_path) as target, target.locked():
+            journal = Journal(target)
+            reply = journal.spawned_dead('startup', epoch)
+            self.assertEqual(reply['state'], 'dead')
+            self.assertEqual(reply['consumer']['record']['kind'], 'SpawnedOwnerDiedUnpublished')
+            item = journal.value['entries'][str(epoch)]
+            self.assertIsNone(item['launch'])
+            self.assertIsNone(item['owner'])
+            self.assertNotIn('proof', item)
+            self.assertEqual(self.target_path.read_bytes(), b'private input')
+            self.assertEqual(journal.spawned_dead('startup', epoch), reply)
+            Journal(target).gate()
+
+    def test_live_worker_and_query_failure_retain_launch(self):
+        epoch, worker = self.spawned()
+        with Target(self.target_path) as target, target.locked():
+            journal = Journal(target)
+            self.assertEqual(journal.spawned_dead('startup', epoch)['state'], 'pending')
+            with patch.object(processes, 'exit_identity', side_effect=PermissionError('denied')):
+                with self.assertRaises(PermissionError):
+                    journal.spawned_dead('startup', epoch)
+            self.assertEqual(journal.value['entries'][str(epoch)]['launch'], self.launch)
+
+    def test_known_owner_never_uses_spawned_death(self):
+        epoch, worker = self.spawned()
+        worker.kill()
+        worker.wait(timeout=5)
+        with Target(self.target_path) as target, target.locked():
+            journal = Journal(target)
+            journal.value['entries'][str(epoch)]['owner'] = {'pid':worker.pid}
+            self.assertEqual(journal.spawned_dead('startup', epoch)['state'], 'not_applicable')
+
+    def test_helper_adopts_only_journal_verified_fact_then_full_retirement(self):
+        epoch, worker = self.spawned()
+        worker.kill()
+        worker.wait(timeout=5)
+        with Target(self.target_path) as target, target.locked():
+            journal = Journal(target)
+            reply = journal.spawned_dead('startup', epoch)
+            consumer = reply['consumer']
+            self.call('spawned_dead_adopt', watch='startup', consumer=consumer)
+            self.call('retire', watch='startup', sha256=consumer['sha256'])
+            self.call('retire_parent', parent=launch_tests.ACQUISITION['parent'])
+            journal.spawned_dead_ack('startup', epoch)
+            journal.settle()
+            self.assertEqual(journal.value['entries'], {})
+        self.assertEqual(self.observer.items, {})
+        self.assertEqual(self.observer.parents, {})
+
+    def test_journal_save_failure_reuses_the_same_independent_immutable_fact(self):
+        epoch, worker = self.spawned()
+        worker.kill()
+        worker.wait(timeout=5)
+        with Target(self.target_path) as target, target.locked():
+            journal = Journal(target)
+            with patch.object(journal, 'save', side_effect=OSError('controlled write failure')):
+                with self.assertRaisesRegex(OSError, 'controlled write failure'):
+                    journal.spawned_dead('startup', epoch)
+            restored = Journal(target)
+            reply = restored.spawned_dead('startup', epoch)
+            self.assertEqual(reply['state'], 'dead')
+            self.assertEqual(restored.spawned_dead('startup', epoch), reply)
+
+    def test_unknown_or_malformed_authorization_never_settles(self):
+        epoch, worker = self.spawned()
+        worker.kill()
+        worker.wait(timeout=5)
+        Path(self.launch['authorization'] + '.decision').write_bytes(b'{}')
+        with Target(self.target_path) as target, target.locked():
+            journal = Journal(target)
+            with self.assertRaisesRegex(RuntimeError, 'not durably claimed'):
+                journal.spawned_dead('startup', epoch)
+            self.assertIsNotNone(journal.value['entries'][str(epoch)]['launch'])
+
+    def test_restart_gate_keeps_old_helper_registry_unchanged(self):
+        epoch, worker = self.spawned()
+        worker.kill()
+        worker.wait(timeout=5)
+        self.observer.persist()
+        before = (self.root/'helper-state.json').read_bytes()
+        with Target(self.target_path) as target, target.locked():
+            journal = Journal(target)
+            journal.gate()
+            self.assertIsNone(journal.value['entries'][str(epoch)]['launch'])
+            journal.settle()
+            self.assertIn(str(epoch), journal.value['entries'], 'live helper prevents premature evidence GC')
+        self.assertEqual((self.root/'helper-state.json').read_bytes(), before)
