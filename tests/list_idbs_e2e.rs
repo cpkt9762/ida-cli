@@ -466,7 +466,10 @@ fn list_idbs_follows_two_clients_through_a_real_daemon() {
     }
 
     // One client closes its database: only that entry disappears.
-    assert_eq!(client_a.close_idb(&token_a), "Database closed");
+    assert_eq!(
+        client_a.close_idb(&token_a),
+        ida_mcp::server::LAST_REFERENCE_CLOSED
+    );
     let (after_close, _) = client_b.list_idbs();
     record("a closed alpha", "mcp (as b)", &after_close);
     assert_eq!(after_close["count"], 1);
@@ -510,7 +513,10 @@ fn list_idbs_follows_two_clients_through_a_real_daemon() {
     assert_eq!(after_release["count"], 1);
     assert_eq!(entry(&after_release, &handle_b)["ref_count"], 1);
 
-    assert_eq!(client_b.close_idb(&token_b), "Database closed");
+    assert_eq!(
+        client_b.close_idb(&token_b),
+        ida_mcp::server::LAST_REFERENCE_CLOSED
+    );
     let (closed_all, _) = client_a.list_idbs();
     record("everything closed", "mcp (as a)", &closed_all);
     assert_eq!(closed_all, json!({"count": 0, "idbs": []}));

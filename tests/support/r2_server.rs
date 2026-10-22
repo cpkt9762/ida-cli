@@ -206,8 +206,8 @@ async fn close_preserves_text_error_and_lifecycle() {
                 .text;
             if scenario == "slow-owner" {
                 anyhow::ensure!(
-                    text == "Database closed",
-                    "existing close text changed: {text}"
+                    text == crate::server::LAST_REFERENCE_CLOSED,
+                    "last-reference close text changed: {text}"
                 );
             } else {
                 anyhow::ensure!(

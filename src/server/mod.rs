@@ -20,6 +20,12 @@ use rmcp::{
 use serde_json::{json, Value};
 use tracing::{debug, info, instrument, warn};
 
+/// close_idb text after the last reference: the lease is released, but the owner
+/// still saves and exits afterwards. Kept starting with "Database closed".
+pub const LAST_REFERENCE_CLOSED: &str = "Database closed: last reference released; \
+    the IDA owner saves and exits in the background. Before rewriting the database \
+    files, wait for _meta.nexus.lifecycle.owner_observation_ref with the wait_owner_exit RPC.";
+
 /// MCP server for IDA Pro analysis
 #[derive(Clone)]
 pub struct IdaMcpServer {
@@ -374,7 +380,7 @@ impl IdaMcpServer {
         let mut result = match result {
                 Ok(None) => CallToolResult::success(vec![Content::text("close_idb ignored: invalid close_token")]),
                 Ok(Some((_,remaining))) if remaining > 0 => CallToolResult::success(vec![Content::text(format!("Reference released ({remaining} client(s) still active, database remains open)"))]),
-                Ok(Some(_)) => CallToolResult::success(vec![Content::text("Database closed")]),
+                Ok(Some(_)) => CallToolResult::success(vec![Content::text(LAST_REFERENCE_CLOSED)]),
                 Err(error) => error.to_tool_result(),
             };
         if let Some(lifecycle) = lifecycle {
@@ -457,6 +463,10 @@ impl IdaMcpServer {
     #[tool(description = "Close the currently open IDA database. \
         Call this when you're done analyzing to free resources. \
         In HTTP/SSE mode, provide the close_token returned by open_idb. \
+        Closing releases this client's reference; after the last reference the IDA \
+        owner saves and exits in the background, so wait for \
+        _meta.nexus.lifecycle.owner_observation_ref with the wait_owner_exit RPC \
+        before rewriting the database files. \
         The database can also be left open for the duration of the session.")]
     #[instrument(skip(self))]
     async fn close_idb(
