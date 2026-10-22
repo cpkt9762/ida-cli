@@ -2,6 +2,9 @@
 import errno
 import os
 import signal
+import json
+import socket
+import threading
 import time
 from unittest.mock import patch
 from pathlib import Path
@@ -228,3 +231,55 @@ class SpawnedSettlement(unittest.TestCase):
             journal.settle()
             self.assertIn(str(epoch), journal.value['entries'], 'live helper prevents premature evidence GC')
         self.assertEqual((self.root/'helper-state.json').read_bytes(), before)
+
+    def test_restart_gate_retires_through_the_original_helpers_rpc(self):
+        from proof_helper import bind_private_listener
+        endpoint = str(self.root/'old-helper.sock')
+        self.observer.endpoint = endpoint
+        listener = socket.socket(socket.AF_UNIX)
+        bind_private_listener(listener, endpoint)
+        listener.listen(4)
+        listener.settimeout(.1)
+        stop = threading.Event()
+        failures = []
+
+        def serve():
+            while not stop.is_set():
+                try:
+                    stream, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                with stream:
+                    try:
+                        with stream.makefile('rb') as source:
+                            message = json.loads(source.readline())
+                        reply = self.observer.receive(message)
+                        self.observer.persist()
+                        stream.sendall(json.dumps(dict(ok=True, protocol=2,
+                            helper=self.observer.incarnation, **reply)).encode() + b'\n')
+                    except Exception as exc:
+                        failures.append(repr(exc))
+                        stream.sendall(json.dumps(dict(ok=False, protocol=2,
+                            helper=self.observer.incarnation, error=str(exc))).encode() + b'\n')
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        try:
+            epoch, worker = self.spawned()
+            worker.kill()
+            worker.wait(timeout=5)
+            self.assertTrue(self.observer.parents)
+            with Target(self.target_path) as target, target.locked():
+                journal = Journal(target)
+                journal.gate()
+                self.assertIsNone(journal.value['entries'][str(epoch)]['launch'])
+            self.assertEqual(failures, [])
+            self.assertEqual(self.observer.items, {})
+            self.assertEqual(self.observer.parents, {})
+            persisted = json.loads((self.root/'helper-state.json').read_text())
+            self.assertEqual((persisted['items'], persisted['parents']), ({}, {}))
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+            listener.close()
+        self.assertFalse(thread.is_alive())

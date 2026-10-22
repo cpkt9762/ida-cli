@@ -269,6 +269,9 @@ class Journal:
         for startup in list(self.value['entries'].values()):
             if startup.get('launch') and not startup.get('owner'):
                 self.spawned_dead(startup['watch'], startup['epoch'])
+        for startup in list(self.value['entries'].values()):
+            if startup.get('spawned_death_pending'):
+                self.reconcile_dead_helper(startup)
         resume_at_gate(self.target)
         try:self.value,self.info,self.raw=self.target.directory.read('custody.json')
         except FileNotFoundError:
@@ -1056,11 +1059,53 @@ class Journal:
         item['spawned_death'] = verified
         item['spawned_death_pending'] = True
         item['spawned_death_helper'] = source['helper_registration']['identity']
+        item['spawned_death_registration'] = source['helper_registration']
+        item['spawned_death_producer'] = source['helper']
         item['launch_identity'], item['launch'] = launch, None
         item['producer_closed'] = item['consumer_closed'] = item['detached'] = item['bridge_closed'] = True
         item['unacked_events'] = False
         self.save()
         return {'state':'dead', 'consumer':receipt}
+
+    def reconcile_dead_helper(self, item):
+        """Only the exact old helper retires its mutable watch and reservation.
+
+        Gate owns target EX; helper adoption reads the committed journal without
+        taking EX. This ordering cannot deadlock with helper fact publication.
+        """
+        from custody_process_identity import same_boot_exit, exit_identity
+        original = item.get('spawned_death_helper')
+        if same_boot_exit(original) is not None:
+            item['spawned_death_pending'] = False
+            self.save()
+            return
+        registration = item.get('spawned_death_registration', {})
+        if (not registration.get('endpoint') or not isinstance(original, dict)
+                or original.get('capability') != 'MacSameBootExitV1'):
+            # Legacy helpers have no adoption RPC. Their retained registry is
+            # historical evidence; target closure is independently authoritative.
+            # Do not edit it or impersonate their producer. Pin facts until exit.
+            import logging
+            logging.getLogger(__name__).warning(
+                'SpawnedDeathHelperDeferred: legacy/offline helper retirement awaits exact process exit')
+            return
+        current = exit_identity(original['pid'])
+        if current != {k:original[k] for k in ('kind', 'boot_id', 'birth')}:
+            raise RuntimeError('StartupUnconfirmed: helper birth changed during reconciliation')
+        from proof_helper import request
+        receipt = self.death_receipt(item)
+        helper = item['spawned_death_producer']
+        endpoint = registration['endpoint']
+        status = request(endpoint, helper, {'kind':'lookup', 'watch':item['watch']})
+        if status.get('state_root') != registration['state_root']:
+            raise RuntimeError('StartupUnconfirmed: helper state root changed')
+        if status.get('item') is not None:
+            request(endpoint, helper, {'kind':'spawned_dead_adopt', 'watch':item['watch'], 'consumer':receipt})
+            request(endpoint, helper, {'kind':'retire', 'watch':item['watch'], 'sha256':receipt['sha256']})
+        request(endpoint, helper, {'kind':'retire_parent', 'parent':item['acquisition']['parent']})
+        # Keep the evidence pinned until the original daemon acknowledges its
+        # in-memory retirement too, or the exact helper exits. A new daemon must
+        # not compact facts the old daemon may still be acknowledging.
 
     def spawned_dead_ack(self, watch, epoch):
         item = self.value['entries'].get(str(epoch))

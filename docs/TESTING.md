@@ -2241,8 +2241,13 @@ fact left by a crash before journal adoption is rechecked and reused.
 The original daemon waits for SDK completion or bridge waitpid, adopts the
 journal-selected consumer in its helper, retires the watch and parent, then
 closes the acquisition. A new daemon's gate can settle the target while the old
-helper remains alive. Evidence GC stays pinned until that helper acknowledges
-retirement or its recorded birth is confirmed exited. Only that helper writes
-its mutable registry; an orphan follows the existing 300-second expiry. Death
+helper remains alive. After independently committing the fact, gate verifies
+the old helper's exact birth and uses its authenticated private RPC to adopt the
+consumer, retire the watch and retire its parent reservation. Only that helper
+writes its registry. Evidence GC remains pinned until the original daemon ACKs
+its in-memory retirement or the exact helper exits, so concurrent consumers
+cannot lose their source records. Legacy/offline helpers lacking this RPC are
+explicitly diagnosed; their registry is retained without impersonation, and
+GC waits for the existing 300-second orphan expiry. Death
 never certifies a safe database close: ordinary database_state probing and IDA
 crash recovery still run at the next open. No unknown request is replayed.
