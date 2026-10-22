@@ -2197,3 +2197,32 @@ identities, queries/decompiles, checks the second open uses no new build, and
 starts the server in a private fake Cargo workspace to exclude target-aot output.
 The default case also proves a client variable cannot reconfigure its server.
 This is directed validation; it does not run or advance the full E2E matrix.
+
+
+### Spawned worker death settlement (N; design, implementation pending)
+
+The same-boot exit capability is separate from public owner lifetime and from
+unspawned authorization revocation. A valid native birth and boot UUID must bind
+the signed Spawned PID to the worker that claimed the single-use launch grant.
+The fixed macOS console script calls CLI main, which calls worker main in the
+same process; shebang interpretation/exec preserves that PID and birth. The
+post-Database.open test gate must record that same PID, with an independent
+native birth capture. This argument applies only to the verified fixed launch
+chain; an arbitrary spawner or a launcher that forks requires worker self-attestation
+in the claimed decision before this capability can be used.
+
+A positive exit observation requires a validated recorded identity, an independent
+current boot query matching that record, and either definite native ESRCH or a
+complete current identity with the same boot and a different birth. Permission
+errors, short reads, malformed identities, a live or stopped matching worker and
+cross-boot observations retain custody. Zombie handling must not reuse the
+existing diagnostic identity API's None (which also denotes absence): settlement
+will conservatively retain zombies until a definite ESRCH after reaping. Existing
+qualified boot retirement remains a distinct path with its existing scope checks.
+
+An independent immutable SpawnedOwnerDiedUnpublished fact must close only launch
+observation, never synthesize PublicOwnerLifetime or LaunchAbandonedUnspawned.
+The journal must verify the signed source, authorization and native death itself
+under target EX. Restart settlement must serialize against a still-live old
+helper's fact publication and must not write its mutable helper registry.
+Database recovery and unknown request outcomes retain their existing handling.
