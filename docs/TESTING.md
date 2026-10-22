@@ -2251,3 +2251,19 @@ explicitly diagnosed; their registry is retained without impersonation, and
 GC waits for the existing 300-second orphan expiry. Death
 never certifies a safe database close: ordinary database_state probing and IDA
 crash recovery still run at the next open. No unknown request is replayed.
+
+
+The worker gate is generated at test runtime from the hash-verified installed
+SDK worker. The repository contains only a small generator and explicit fence;
+complete SDK source, IDBs and generated native artifacts stay in caller-owned
+private directories outside the repository. A unit check removes the three
+insertions and requires byte-for-byte equality with the installed worker.
+The generator rejects a nonprivate directory and any directory inside the repo.
+
+Keep prepared runtime packages and all mutable test evidence separate. Executable
+startup telemetry in a shared venv can override shell environment variables.
+Use a fresh matching private runtime if that prevents read-only reuse; preserve
+the pinned SDK hashes and the closed bootstrap's interpreter-prefix checks.
+The optional existing test collector must remain opt-in for explicit collection;
+ordinary gate tests leave its variables unset. Preserve any earlier accidental
+shared log append as diagnostic evidence instead of truncating shared history.
