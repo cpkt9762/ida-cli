@@ -11,7 +11,7 @@ import tempfile
 
 _SDK_SHA256 = "787cfc2cf0e6ad8bc651d8e8bc3b1d0f8b8b261da4e65b3647e1391740538aff"
 _PREFIX = "__package__ = 'ida_nexus.cli'\n"
-_MAIN = "def main() -> int:\n"
+_MAIN = "def main(argv: list[str] | None = None) -> int:\n"
 _MAIN_HOOK = "    _test_gate_root = Path(sys.argv.pop(1))\n"
 _AFTER_OPEN = "        if args.save_after_open:\n"
 _FENCE = """        # Test-only fence: Database.open returned; publication has not started.
