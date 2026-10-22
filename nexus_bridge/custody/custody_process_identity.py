@@ -171,6 +171,7 @@ def same_boot_exit(recorded, *, read=None, current_boot=None):
     current = (read or exit_identity)(recorded['pid'])
     if current is None:
         return {'reason':'esrch', 'boot_id':boot, 'recorded':recorded, 'current':None}
+    observed = current
     zombie = isinstance(current, dict) and current.get('state') == 'zombie'
     if zombie:
         if set(current) != {'kind', 'boot_id', 'birth', 'state'}:
@@ -180,7 +181,7 @@ def same_boot_exit(recorded, *, read=None, current_boot=None):
             or current['boot_id'] != boot or (current == birth and not zombie)):
         return None
     return {'reason':'zombie' if zombie and current == birth else 'pid_reused',
-            'boot_id':boot, 'recorded':recorded, 'current':current}
+            'boot_id':boot, 'recorded':recorded, 'current':observed}
 
 
 def _mac_commands():

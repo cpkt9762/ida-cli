@@ -1874,7 +1874,7 @@ async fn settle_spawned_dead(
         .journal(json!({"action":"spawned_dead", "target":launch["target"],
             "coord_key":launch["coord_key"], "watch":watch, "epoch":epoch}))
         .await?;
-    if reply["state"] != "dead" {
+    if !matches!(reply["state"].as_str(), Some("dead" | "closed")) {
         anyhow::ensure!(
             matches!(reply["state"].as_str(), Some("pending" | "not_applicable")),
             "unexpected spawned death settlement state"
@@ -1882,19 +1882,31 @@ async fn settle_spawned_dead(
         return Ok(false);
     }
     let consumer = &reply["consumer"];
-    anyhow::ensure!(
-        consumer["record"]["kind"] == "SpawnedOwnerDiedUnpublished"
-            && consumer["record"]["watch"] == watch
-            && consumer["record"]["acquisition"] == launch["acquisition"]
-            && consumer["record"]["launch"] == launch["launch"],
-        "spawned death fact does not bind the retained launch"
-    );
-    helper
-        .call(json!({"kind":"spawned_dead_adopt", "watch":watch, "consumer":consumer}))
-        .await?;
-    helper
-        .call(json!({"kind":"retire", "watch":watch, "sha256":consumer["sha256"]}))
-        .await?;
+    let status = helper.call(json!({"kind":"lookup", "watch":watch})).await?;
+    if reply["state"] == "dead" {
+        anyhow::ensure!(
+            consumer["record"]["kind"] == "SpawnedOwnerDiedUnpublished"
+                && consumer["record"]["watch"] == watch
+                && consumer["record"]["acquisition"] == launch["acquisition"]
+                && consumer["record"]["launch"] == launch["launch"],
+            "spawned death fact does not bind the retained launch"
+        );
+        if !status["item"].is_null() {
+            helper
+                .call(json!({"kind":"spawned_dead_adopt", "watch":watch, "consumer":consumer}))
+                .await?;
+            helper
+                .call(json!({"kind":"retire", "watch":watch, "sha256":consumer["sha256"]}))
+                .await?;
+        }
+    } else {
+        // Compaction follows the helper retire ACK. A failed later journal,
+        // parent or endpoint ACK may replay this exact closed epoch.
+        anyhow::ensure!(
+            status["item"].is_null(),
+            "compacted death still has a live helper watch"
+        );
+    }
     helper
         .journal(
             json!({"action":"spawned_dead_ack", "target":launch["target"],

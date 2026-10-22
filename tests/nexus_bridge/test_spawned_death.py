@@ -33,6 +33,11 @@ class SameBootExit(unittest.TestCase):
         current['birth'][0] += 1
         self.assertEqual(self.verdict(current)['reason'], 'pid_reused')
 
+    def test_full_native_zombie_identity_proves_exit(self):
+        current = {k:self.recorded[k] for k in ('kind', 'boot_id', 'birth')}
+        current['state'] = 'zombie'
+        self.assertEqual(self.verdict(current)['reason'], 'zombie')
+
     def test_definite_esrch_is_dead(self):
         self.assertEqual(self.verdict(None)['reason'], 'esrch')
 
@@ -180,6 +185,8 @@ class SpawnedSettlement(unittest.TestCase):
             journal.spawned_dead_ack('startup', epoch)
             journal.settle()
             self.assertEqual(journal.value['entries'], {})
+            self.assertEqual(journal.spawned_dead('startup', epoch), {'state':'closed'})
+            self.assertEqual(journal.spawned_dead_ack('startup', epoch), {'state':'closed'})
         self.assertEqual(self.observer.items, {})
         self.assertEqual(self.observer.parents, {})
 
