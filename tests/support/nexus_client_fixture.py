@@ -22,6 +22,12 @@ real_popen = subprocess.Popen
 proxy = types.SimpleNamespace(**vars(subprocess))
 def owned_popen(command, **options):
     original_command = command
+    open_gate = os.environ.get('R3A_WORKER_OPEN_GATE_ROOT')
+    if open_gate and '--record-suffix' in command:
+        # Generate the SDK copy only in this run's private directory.
+        from nexus_worker_open_gate import build_worker
+        worker = build_worker(Path(open_gate))
+        command = [sys.executable, str(worker), open_gate, *command[2:]]
     if os.environ.get('R3A_WORKER_AUTHORIZATION_PHASE') == 'unclaimed':
         command = [sys.executable, str(REPO/'tests/support/launch_before_claim.py'), *command]
     intent = env._begin_creation(command)

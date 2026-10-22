@@ -285,3 +285,36 @@ class SpawnedSettlement(unittest.TestCase):
             thread.join(timeout=2)
             listener.close()
         self.assertFalse(thread.is_alive())
+
+
+class PrivateWorkerSource(unittest.TestCase):
+    def test_runtime_copy_preserves_sdk_except_the_explicit_fence(self):
+        import nexus_worker_open_gate as generator
+        import ida_nexus
+        import hashlib
+        import stat
+        import tempfile
+        with tempfile.TemporaryDirectory(dir=os.environ['R3A_CASE_ROOT']) as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            generated = generator.build_worker(root)
+            self.assertTrue(generated.is_relative_to(root))
+            self.assertFalse(generated.is_relative_to(Path(__file__).resolve().parents[2]))
+            self.assertEqual(stat.S_IMODE(generated.stat().st_mode), 0o600)
+            source = generated.read_text()
+            compile(source, str(generated), 'exec')
+            source = source.removeprefix(generator._PREFIX)
+            source = source.replace(generator._MAIN_HOOK, '', 1).replace(generator._FENCE, '', 1)
+            original = (Path(ida_nexus.__file__).parent/'cli/worker.py').read_text()
+            self.assertEqual(source, original)
+            self.assertEqual(hashlib.sha256(source.encode()).hexdigest(), generator._SDK_SHA256)
+
+    def test_nonprivate_directory_is_rejected_before_copy(self):
+        import nexus_worker_open_gate as generator
+        import tempfile
+        with tempfile.TemporaryDirectory(dir=os.environ['R3A_CASE_ROOT']) as temporary:
+            root = Path(temporary)
+            root.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, 'private directory outside'):
+                generator.build_worker(root)
+            self.assertEqual(list(root.iterdir()), [])
