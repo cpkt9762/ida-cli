@@ -55,7 +55,7 @@ impl Protocol {
             custody: 5,
             helper: 2,
             target_gate: 3,
-            same_boot_exit: 0,
+            same_boot_exit: 1,
             boot_retirement: 1,
             client_hash: CLIENT_HASH.into(),
             sdk_boundary: 2,

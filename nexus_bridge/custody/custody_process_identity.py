@@ -39,7 +39,7 @@ def _mac_boot_id(lib):
     return str(uuid.UUID(value.value.decode("ascii")))
 
 
-def _mac_identity(pid):
+def _mac_identity(pid, *, retain_zombie=False):
     if (ctypes.sizeof(ProcBsdInfo), ProcBsdInfo.start_sec.offset,
             ProcBsdInfo.start_usec.offset) != (136, 120, 128):
         raise RuntimeError("unsupported proc_bsdinfo ABI")
@@ -58,6 +58,8 @@ def _mac_identity(pid):
     if info.pid != pid or not info.start_sec or info.start_usec >= 1_000_000:
         raise RuntimeError(f"invalid process birth for {pid}")
     if info.status == 5:  # SZOMB, sys/proc.h: exited, cannot execute or receive a signal.
+        if retain_zombie:
+            raise RuntimeError('StartupUnconfirmed: zombie retained until definite ESRCH')
         return None
     return {"kind": "macos-libproc-v1", "boot_id": _mac_boot_id(lib),
             "birth": [info.start_sec, info.start_usec]}
@@ -114,14 +116,64 @@ def same_process(current, recorded) -> bool:
 
 
 def capture(pid):
-    """Diagnostic birth capture; it never enables same-boot release authority."""
+    """Capture native birth; eligibility is confined to launch observation exit."""
     import os
     current = identity(pid)
     if current is None:
         raise RuntimeError('StartupUnconfirmed: process ended before identity capture')
     current.update(pid=pid, sid=os.getsid(pid), pgid=os.getpgid(pid),
-                   eligibility=False, capability='Unsupported')
+                   eligibility=sys.platform == 'darwin',
+                   capability='MacSameBootExitV1' if sys.platform == 'darwin' else 'Unsupported')
     return current
+
+
+def boot_identity():
+    """Independent host boot query, including when the recorded PID is absent."""
+    if sys.platform != 'darwin':
+        raise RuntimeError('same-boot exit capability unsupported on this platform')
+    return _mac_boot_id(ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True))
+
+
+def exit_identity(pid):
+    """Only definite ESRCH returns None; zombies and failed queries retain custody."""
+    if type(pid) is not int or not 0 < pid <= 2_147_483_647:
+        raise ValueError('process identity requires a native positive PID')
+    if sys.platform != 'darwin':
+        raise RuntimeError('same-boot exit capability unsupported on this platform')
+    return _mac_identity(pid, retain_zombie=True)
+
+
+def same_boot_exit(recorded, *, read=None, current_boot=None):
+    """Prove an exact recorded process is gone, without granting owner release.
+
+    Legacy captures already contain the same native birth. Their diagnostic
+    capability flag is not upgraded; this predicate validates its own narrow
+    inputs and never changes generic origin/owner retirement eligibility.
+    Exceptions remain visible to callers, which must retain the obligation.
+    """
+    if not isinstance(recorded, dict):
+        return None
+    required = {'kind', 'boot_id', 'birth', 'pid', 'sid', 'pgid', 'eligibility', 'capability'}
+    if (set(recorded) != required or type(recorded['pid']) is not int
+            or not 0 < recorded['pid'] <= 2_147_483_647
+            or any(type(recorded[k]) is not int or recorded[k] <= 0 for k in ('sid', 'pgid'))
+            or type(recorded['eligibility']) is not bool
+            or (recorded['eligibility'], recorded['capability']) not in (
+                (False, 'Unsupported'), (True, 'MacSameBootExitV1'))):
+        return None
+    birth = {k:recorded[k] for k in ('kind', 'boot_id', 'birth')}
+    if not valid_identity(birth) or birth['kind'] != 'macos-libproc-v1':
+        return None
+    boot = (current_boot or boot_identity)()
+    if boot != birth['boot_id'] or str(uuid.UUID(boot)) != boot:
+        return None
+    current = (read or exit_identity)(recorded['pid'])
+    if current is None:
+        return {'reason':'esrch', 'boot_id':boot, 'recorded':recorded, 'current':None}
+    if (not valid_identity(current) or current['kind'] != birth['kind']
+            or current['boot_id'] != boot or current == birth):
+        return None
+    return {'reason':'pid_reused', 'boot_id':boot, 'recorded':recorded, 'current':current}
 
 
 def _mac_commands():

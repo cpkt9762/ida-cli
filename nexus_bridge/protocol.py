@@ -46,7 +46,7 @@ def verify_client():
 def contract():
     return {'wire': 2, 'schema': 1, 'release': 4, 'open': 6,
             'owner_observation': 1, 'custody':5, 'helper':2, 'target_gate':3,
-            'same_boot_exit':0, 'boot_retirement':1, 'client_hash': HANDLE_SHA,
+            'same_boot_exit':1, 'boot_retirement':1, 'client_hash': HANDLE_SHA,
             'sdk_boundary': 2, 'client_modules': dict(SDK_FILES),
             'capabilities': ['absolute_home_v1', 'ack_cleanup_v1', 'acquisition_outcome_v1',
                              'durable_public_proof_v1', 'file_job_relay_v2', 'file_recovery_ack_v1', 'final_preparing_v1', 'internal_grant_v1', 'k2_acquisitions_v1',
