@@ -16,6 +16,8 @@ env:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    # Step budgets total 17 minutes; allow 13 more for checkout/toolchain/network.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -23,13 +25,18 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
+        with:
+          components: clippy
 
       # The library uses the public client without loading IDA. This is not a
       # production runtime: idapro and real-IDB acceptance require a licensed host.
       - name: Prepare fixed public client for isolated library fixtures
         run: |
+          # Cold Linux venv: 1.21s; >3x margin within this local-only step.
           timeout 30s python3 -m venv /tmp/nexus-client
-          timeout 30s /tmp/nexus-client/bin/python -m pip install --no-deps --require-hashes -r scripts/nexus/requirements.lock
+          # Cold dependency download: 5.04s; allow >3x plus shared-runner network variance.
+          timeout 120s /tmp/nexus-client/bin/python -m pip install --no-deps --require-hashes -r scripts/nexus/requirements.lock
+          # Offline tree verification and patches: 0.10s; >3x margin.
           timeout 30s python3 - <<'PY'
           import pathlib, sys
           sys.path.insert(0, 'scripts')
@@ -43,6 +50,7 @@ jobs:
               run(root, name + '-check', ['git', 'apply', '--check', str(patch)], cwd=source)
               run(root, name, ['git', 'apply', str(patch)], cwd=source)
           PY
+          # Local client install: 0.24s; >3x margin without a dependency resolver.
           timeout 30s /tmp/nexus-client/bin/python -m pip install --no-deps --no-build-isolation /tmp/nexus-ci/nexus-source
           echo /tmp/nexus-client/bin >> "$GITHUB_PATH"
           echo IDA_NEXUS_PYTHON=/tmp/nexus-client/bin/python >> "$GITHUB_ENV"
@@ -50,15 +58,19 @@ jobs:
 
       - name: Validate Rust library tests
         run: |
-          timeout 30s cargo check --locked --all-targets
-          timeout 30s cargo clippy --locked --all-targets -- -D warnings
+          # Cold stable check on 4 CPUs: 12.08s; >3x for x86_64/shared runners (30s failed there).
+          timeout 300s cargo check --locked --all-targets
+          # Following cold check: 5.70s; >3x for x86_64/shared runners.
+          timeout 180s cargo clippy --locked --all-targets -- -D warnings
           echo 'NOT RUN (requires nexus-test-support and licensed IDA): router::nexus_bridge::final_shutdown_tests::raw_shutdown_waits_for_exact_helper_retirement'
           echo 'NOT RUN (requires nexus-test-support and licensed IDA): router::nexus_bridge::final_shutdown_tests::shutdown_after_bridge_death_retains_untracked_helper_obligation'
-          timeout 120s cargo test --locked --lib -- --nocapture
+          # Cold test build plus library run: 25.62s on 4 CPUs; >3x runner margin.
+          timeout 300s cargo test --locked --lib -- --nocapture
 
       - name: Validate Python scripts
         run: |
-          python3 -m py_compile \
+          # Six scripts compile in 0.02s; >3x margin and a finite shell bound.
+          timeout 30s python3 -m py_compile \
             scripts/decompile_structured.py \
             scripts/run_dbg_test.py \
             scripts/stress_test.py \
@@ -69,6 +81,8 @@ jobs:
   build-linux:
     needs: validate
     runs-on: ubuntu-latest
+    # Ten-minute build budget plus ten minutes for checkout/toolchain/artifact I/O.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -78,7 +92,8 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
       - name: Build release binary
-        run: timeout 180s cargo build --release --locked --bin ida-cli -vv
+        # Cold stable release on 4 Linux CPUs: 35.65s; >3x x86_64/shared-runner margin.
+        run: timeout 600s cargo build --release --locked --bin ida-cli -vv
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -89,6 +104,8 @@ jobs:
   build-macos:
     needs: validate
     runs-on: macos-14
+    # Ten-minute build budget plus ten minutes for checkout/toolchain/artifact I/O.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -98,7 +115,8 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
       - name: Build release binary
-        run: timeout 180s cargo build --release --locked --bin ida-cli
+        # Cold macOS stable release without compiler cache: 28.9s; >3x runner margin.
+        run: timeout 600s cargo build --release --locked --bin ida-cli
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

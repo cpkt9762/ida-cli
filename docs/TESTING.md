@@ -1350,7 +1350,7 @@ bootstrap tests also require `R3A_INSTALLATION` from the current Rust-produced
 installation. The existing test-support process ledger records pre-spawn intent
 and native birth when `R2_LEDGER` names a private append-only evidence file.
 
-Public-client library validation runs `timeout 120s cargo test --locked --lib`.
+Public-client library validation runs `timeout 300s cargo test --locked --lib`.
 The two `router::nexus_bridge::final_shutdown_tests` cases
 `raw_shutdown_waits_for_exact_helper_retirement` and
 `shutdown_after_bridge_death_retains_untracked_helper_obligation` require
