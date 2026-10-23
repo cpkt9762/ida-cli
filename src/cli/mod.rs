@@ -870,6 +870,7 @@ async fn run_prewarm_many(
         }
     }
 
+    let failed = results.iter().filter(|item| item["ok"] == false).count();
     let output = serde_json::json!({
         "count": results.len(),
         "results": results,
@@ -878,6 +879,9 @@ async fn run_prewarm_many(
         "{}",
         format::format_response(output_mode, "prewarm_many", &output)
     );
+    if failed != 0 {
+        anyhow::bail!("{failed} prewarm item(s) failed");
+    }
     Ok(())
 }
 

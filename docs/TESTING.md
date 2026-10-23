@@ -2067,7 +2067,10 @@ a fresh daemon, and resends the same request once. A second refusal, an unknown
 outcome, an explicit `--socket` or `$IDA_MCP_SOCKET` (never started, replaced or
 waited for), and a daemon that does not exit in time return the original error.
 Applies to every single-request subcommand and `pipe` (per line);
-`prewarm-many` is unchanged. Lib cases: `bridge_loss_tests::daemon_*` (self exit
+`prewarm-many` always prints its per-item results and exits 1 if any item fails
+(partial and complete failures use the same status), or 0 if all items succeed.
+With `--queue`, success means acceptance with a task id; inspect `status` for
+the eventual task results. Lib cases: `bridge_loss_tests::daemon_*` (self exit
 in W2a; no early exit while a live orphan owner holds custody; unarmed process
 never tags the retry code) and `cli::bridge_loss_recovery_tests`. Real
 end-to-end evidence is recorded in the H report (W1, W2a, W2b; the first
