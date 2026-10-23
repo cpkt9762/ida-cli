@@ -57,7 +57,7 @@ impl IdaMcpServer {
                     .await
                 {
                     Ok(value) => CallToolResult::success(vec![Content::text(value.to_string())]),
-                    Err(error) => error.to_tool_result(),
+                    Err(error) => bridge_loss_tool_result(router, &error, error.to_tool_result()),
                 },
             );
         }

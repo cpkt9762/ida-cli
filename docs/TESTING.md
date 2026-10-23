@@ -2050,6 +2050,19 @@ carries JSON-RPC code `-32010` (`RPC_BRIDGE_LOST_NOT_DISPATCHED`, data
 a daemon that has armed its self-exit. Its `nexus.retry` is
 `reconnect_then_new_request`, consistent with the bridge-specific
 `bridge_lost.retry=once_after_daemon_exit` recovery instruction.
+The same entrance refusal on MCP carries `isError: true`, readable text and
+`_meta["ida-cli/bridge_loss"] = {"v":1,"scope":"whole_request","dispatched":false,
+"retry":"once_after_daemon_exit"}`. This is additive to other metadata such as
+`_meta.nexus.lifecycle`. It uses the identical lost-and-self-exit-armed predicate
+as the CLI code, across HTTP MCP and the MCP socket. Stdio `serve` omits this
+marker because it does not exit by itself. Clients must require the complete
+known version and fields, wait for daemon exit, then retry at most once; no
+marker or an unknown version grants no replay permission. `open_idb` (including
+force) and synchronous `open_dsc` propagate this typed refusal. A DSC background
+task has already started its outer request, so its later failure remains a task
+failure without a whole-request replay marker. `bridge_loss_tests` covers the
+positive marker, preserved lifecycle metadata, ordinary/disconnected/unknown
+errors, completed-write continuation failures and unarmed stdio.
 Only the outer open entrance, before
 acquisition or dispatch, creates `BridgeLostNotDispatched`. Generic `Disconnected`
 and per-attempt `NotSent` never establish this whole-request guarantee: a yielded

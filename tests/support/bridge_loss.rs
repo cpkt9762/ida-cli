@@ -397,6 +397,37 @@ async fn daemon_exits_by_itself_after_bridge_loss_in_w2a() {
     case.router.arm_bridge_loss_exit();
     let refusal = case.cli_request().await;
     let typed = case.router.bridge_loss_not_dispatched(&refusal).is_some();
+    let mut original = refusal.to_tool_result();
+    original.meta = Some(rmcp::model::Meta(
+        json!({"nexus":{"lifecycle":{"kept":true}}})
+            .as_object()
+            .expect("metadata object")
+            .clone(),
+    ));
+    let marked = crate::server::bridge_loss_tool_result(&case.router, &refusal, original);
+    assert_eq!(marked.is_error, Some(true));
+    let metadata = serde_json::to_value(&marked).expect("MCP result");
+    assert_eq!(
+        metadata["_meta"]["ida-cli/bridge_loss"],
+        json!({
+        "v":1,"scope":"whole_request","dispatched":false,
+        "retry":"once_after_daemon_exit"})
+    );
+    assert_eq!(metadata["_meta"]["nexus"]["lifecycle"]["kept"], true);
+    assert!(!marked.content.is_empty(), "readable error remains");
+    for error in [
+        NexusError::new(NexusErrorCode::Disconnected, "NotSent").into(),
+        NexusError::new(NexusErrorCode::UnknownOutcome, "unknown outcome").into(),
+        crate::error::ToolError::InvalidParams("ordinary error".into()),
+    ] {
+        let result =
+            crate::server::bridge_loss_tool_result(&case.router, &error, error.to_tool_result());
+        assert!(
+            result.meta.is_none(),
+            "non-entrance errors never grant replay"
+        );
+    }
+
     // The actual router/socket response feeds the CLI retry path. Transport
     // Disconnected alone must not invite replay, even on this lost bridge.
     let generic = NexusError::new(NexusErrorCode::Disconnected, "transport NotSent").into();
@@ -431,8 +462,14 @@ async fn daemon_exits_by_itself_after_bridge_loss_in_w2a() {
                 rig.snapshot(&write).error.expect("continuation error")
             }
         };
-        let response =
-            crate::server::socket_listener::failure_response(&case.router, "1", &error.into());
+        let error: crate::error::ToolError = error.into();
+        let mcp =
+            crate::server::bridge_loss_tool_result(&case.router, &error, error.to_tool_result());
+        assert!(
+            mcp.meta.is_none(),
+            "{failure}: continuation cannot grant MCP replay"
+        );
+        let response = crate::server::socket_listener::failure_response(&case.router, "1", &error);
         let (code, requests) = crate::cli::test_bridge_loss_response_no_replay(response).await;
         continuation_results.push((failure, code, requests, rig.backend.writes));
     }
@@ -538,6 +575,12 @@ async fn an_unarmed_process_reports_the_loss_without_the_retry_code() {
     case.kill_bridge().await;
     let refusal = case.cli_request().await;
     let typed = case.router.bridge_loss_not_dispatched(&refusal).is_some();
+    let result =
+        crate::server::bridge_loss_tool_result(&case.router, &refusal, refusal.to_tool_result());
+    assert!(
+        result.meta.is_none(),
+        "stdio must not grant retry after daemon exit"
+    );
     let text = refusal.to_string();
     // Let the dead acquisition settle so its cache lock (process-wide under
     // IDA_CLI_HOME) is released before the next case in this process opens.

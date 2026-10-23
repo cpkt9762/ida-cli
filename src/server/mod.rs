@@ -26,6 +26,23 @@ pub const LAST_REFERENCE_CLOSED: &str = "Database closed: last reference release
     the IDA owner saves and exits in the background. Before rewriting the database \
     files, wait for _meta.nexus.lifecycle.owner_observation_ref with the wait_owner_exit RPC.";
 
+/// Only the router's whole-request entrance refusal grants replay permission.
+/// Keep unrelated metadata (including lifecycle observations) intact.
+pub(crate) fn bridge_loss_tool_result(
+    router: &crate::router::RouterState,
+    error: &ToolError,
+    mut result: CallToolResult,
+) -> CallToolResult {
+    if router.bridge_loss_not_dispatched(error).is_some() {
+        result.meta.get_or_insert_with(Default::default).0.insert(
+            "ida-cli/bridge_loss".into(),
+            json!({"v":1,"scope":"whole_request","dispatched":false,
+                "retry":"once_after_daemon_exit"}),
+        );
+    }
+    result
+}
+
 /// MCP server for IDA Pro analysis
 #[derive(Clone)]
 pub struct IdaMcpServer {
@@ -270,7 +287,7 @@ impl IdaMcpServer {
                 // Raw RPC keeps its original error text in nexus_tools.
                 Ok(ToolError::IdaError(e.to_string()).to_tool_result())
             }
-            Err(e) => Ok(e.to_tool_result()),
+            Err(e) => Ok(bridge_loss_tool_result(router, &e, e.to_tool_result())),
         }
     }
 
@@ -296,7 +313,7 @@ impl IdaMcpServer {
                     Ok(e.to_tool_result())
                 }
             },
-            Err(e) => Ok(e.to_tool_result()),
+            Err(e) => Ok(bridge_loss_tool_result(router, &e, e.to_tool_result())),
         };
     }
 
@@ -336,14 +353,26 @@ impl IdaMcpServer {
         };
         let (handle, token) = match opened {
             Ok(value) => value,
-            Err(error) => return Ok(error.to_tool_result()),
+            Err(error) => {
+                return Ok(bridge_loss_tool_result(
+                    router,
+                    &error,
+                    error.to_tool_result(),
+                ))
+            }
         };
         router.set_nexus_client(&handle, &self.client);
         let mut reference =
             crate::router::nexus_tools::ReferenceGuard::new(router.clone(), token.clone());
         let mut value = match router.nexus_open_details(&handle, preparation).await {
             Ok(value) => value,
-            Err(error) => return Ok(error.to_tool_result()),
+            Err(error) => {
+                return Ok(bridge_loss_tool_result(
+                    router,
+                    &error,
+                    error.to_tool_result(),
+                ))
+            }
         };
         value["db_handle"] = json!(handle);
         value["close_token"] = json!(token);
