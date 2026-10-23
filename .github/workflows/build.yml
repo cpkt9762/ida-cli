@@ -103,7 +103,8 @@ jobs:
 
   build-macos:
     needs: validate
-    runs-on: macos-14
+    # macos-14 is in brownout and retires on 2026-11-02; retain the arm64 runner.
+    runs-on: macos-15
     # Ten-minute build budget plus ten minutes for checkout/toolchain/artifact I/O.
     timeout-minutes: 20
     steps:
@@ -115,8 +116,10 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
       - name: Build release binary
-        # Cold macOS stable release without compiler cache: 28.9s; >3x runner margin.
-        run: timeout 600s cargo build --release --locked --bin ida-cli
+        # macOS has no built-in GNU timeout; use the Actions step deadline.
+        # Cold stable release: 31.86s without compiler cache; >3x runner margin.
+        timeout-minutes: 10
+        run: cargo build --release --locked --bin ida-cli
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
