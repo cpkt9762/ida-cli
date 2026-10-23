@@ -52,6 +52,8 @@ jobs:
         run: |
           timeout 30s cargo check --locked --all-targets
           timeout 30s cargo clippy --locked --all-targets -- -D warnings
+          echo 'NOT RUN (requires nexus-test-support and licensed IDA): router::nexus_bridge::final_shutdown_tests::raw_shutdown_waits_for_exact_helper_retirement'
+          echo 'NOT RUN (requires nexus-test-support and licensed IDA): router::nexus_bridge::final_shutdown_tests::shutdown_after_bridge_death_retains_untracked_helper_obligation'
           timeout 120s cargo test --locked --lib -- --nocapture
 
       - name: Validate Python scripts

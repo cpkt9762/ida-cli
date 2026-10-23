@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(feature = "nexus-test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn raw_shutdown_waits_for_exact_helper_retirement() {
     let root = std::env::temp_dir().join(format!("fa-shutdown-{}", std::process::id()));
@@ -66,6 +67,7 @@ async fn raw_shutdown_waits_for_exact_helper_retirement() {
 /// it (F: bridge death during a cold open). Rust tracks nothing, the exact bridge
 /// process is gone, and no router code can advance what only the helper holds.
 /// Shutdown must complete in bounded time and leave that obligation durable.
+#[cfg(feature = "nexus-test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_after_bridge_death_retains_untracked_helper_obligation() {
     let root = std::env::temp_dir().join(format!("fa-bridge-death-{}", std::process::id()));

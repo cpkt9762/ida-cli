@@ -1350,14 +1350,27 @@ bootstrap tests also require `R3A_INSTALLATION` from the current Rust-produced
 installation. The existing test-support process ledger records pre-spawn intent
 and native birth when `R2_LEDGER` names a private append-only evidence file.
 
+Public-client library validation runs `timeout 120s cargo test --locked --lib`.
+The two `router::nexus_bridge::final_shutdown_tests` cases
+`raw_shutdown_waits_for_exact_helper_retirement` and
+`shutdown_after_bridge_death_retains_untracked_helper_obligation` require
+`nexus-test-support` and a licensed IDA runtime; CI explicitly lists them as
+NOT RUN. The same module's `pending_history_head_cannot_block_retirement_of_later_closed_records`
+remains in the default suite. No test body or assertion is disabled at runtime.
+On macOS the default suite contains 551 tests and the feature suite contains 576;
+platform-specific cases make Linux counts different. Both commands are required
+on a licensed host with isolated home/state/profile and the prepared interpreter.
+The full feature suite uses a 900-second shell bound for serial real-process
+fault teardown and cold compilation; a timeout or any failure rejects acceptance.
+
 ```sh
-timeout 120s cargo test --locked --features nexus-test-support --lib -- --test-threads=1
+timeout 900s cargo test --locked --features nexus-test-support --lib -- --test-threads=1
 timeout 30s cargo test --locked --features nexus-test-support --test nexus_r2 last_ack_finishes_lease_before_owner_exit -- --exact
 timeout 30s cargo test --locked --features nexus-test-support --test nexus_r2 boot_source_injection_retires_only_current_resources_and_preserves_unknown_history -- --exact
 timeout 30s "$R3A_PYTHON" -B tests/support/r2_sdk.py
 ```
 
-The 120-second library allowance covers real pipe/process fault teardown; each
+The full feature library allowance covers real pipe/process fault teardown; each
 ordinary R2 case retains 30 seconds. Multiple-process R3a matrices/128 rounds use
 120 seconds and fresh prepare/cold build/real tiny IDA use 180 seconds, with the
 reason stated before running. These shell limits do not change product budgets.
