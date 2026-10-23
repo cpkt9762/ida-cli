@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments and Node dependencies
+.venv
+node_modules/
+
+# Local coverage measurements and reports
+.coverage
+.coverage.*
+htmlcov/
+
+# Runtime logs
+.ida-codemode/
+
+# IDA Databases
+*.idb
+*.i64
+*.nam
+*.id0
+*.id1
+*.id2
+*.til

@@ -1,0 +1,910 @@
+from __future__ import annotations
+
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+import ida_nexus._runtime as runtime_module
+from ida_nexus._runtime import (
+    AnalysisState,
+    APIError,
+    IDARuntime,
+    IdbChangeState,
+    PythonExecutionResult,
+    _execute_user_code,
+    create_idb_change_hook,
+    reconcile_autoanalysis_state,
+)
+
+
+@pytest.fixture
+def gui_runtime(monkeypatch):
+    """Model IDA's UI dispatch without marshalling calls on worker threads."""
+    gui_thread = threading.get_ident()
+    queued = Queue()
+    native_cancellations = []
+    auto = SimpleNamespace(st_Ready=0, st_Think=1, st_Work=3, state=0)
+
+    def set_ida_state(state):
+        previous, auto.state = auto.state, state
+        return previous
+
+    auto.set_ida_state = set_ida_state
+    # Deliberately expose no enable_auto(): status repair must not run analysis.
+    monkeypatch.setitem(sys.modules, "ida_auto", auto)
+
+    def execute_sync(callback, flags):
+        if flags == 2:  # MFF_WRITE, invoked by the test's GUI thread
+            assert threading.get_ident() == gui_thread
+            assert auto.state != auto.st_Work, "MFF_WRITE blocked by IDA busy status"
+            return callback()
+        assert flags == 8  # MFF_FAST | MFF_NOWAIT
+        queued.put(callback)
+        return 1
+
+    def set_cancelled():
+        # Real IDA would marshal this call and potentially deadlock. Fail
+        # directly so regressions cannot leave the test runner hanging.
+        assert threading.get_ident() == gui_thread
+        native_cancellations.append(True)
+
+    monkeypatch.setitem(sys.modules, "ida_domain", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules, "idaapi", SimpleNamespace(get_kernel_version=lambda: "9.4")
+    )
+    monkeypatch.setitem(sys.modules, "idc", SimpleNamespace(batch=lambda _value: 0))
+    monkeypatch.setitem(
+        sys.modules,
+        "ida_kernwin",
+        SimpleNamespace(
+            MFF_FAST=0,
+            MFF_WRITE=2,
+            MFF_NOWAIT=8,
+            execute_sync=execute_sync,
+            set_cancelled=set_cancelled,
+            clr_cancelled=lambda: None,
+        ),
+    )
+    runtime = IDARuntime(
+        backend="gui",
+        database=object(),
+        analysis_state=AnalysisState(),
+        idb_change_state=IdbChangeState(),
+    )
+    return runtime, queued, native_cancellations
+
+
+@pytest.mark.parametrize("initial_state", [0, 1])
+@pytest.mark.parametrize(
+    "failure", [None, ValueError("save raised"), APIError("save_failed", "save failed")]
+)
+def test_gui_save_restores_status_before_next_write(
+    gui_runtime, initial_state, failure
+):
+    runtime, _, _ = gui_runtime
+    auto = sys.modules["ida_auto"]
+    auto.set_ida_state(initial_state)
+
+    def save():
+        # IDA's save path leaves this status behind when analysis is disabled.
+        auto.set_ida_state(auto.st_Work)
+        if failure is not None:
+            raise failure
+        return {"saved": True}
+
+    if failure is None:
+        assert runtime._run_sync(save, kind="save", timeout=1) == {"saved": True}
+    else:
+        with pytest.raises(APIError) as error:
+            runtime._run_sync(save, kind="save", timeout=1)
+        assert error.value.code == (
+            failure.code if isinstance(failure, APIError) else "execution_failed"
+        )
+    assert auto.state == initial_state
+    assert runtime._run_sync(lambda: 42, kind="execute", timeout=1) == 42
+    assert auto.state == initial_state
+
+
+@pytest.mark.parametrize("dispatch_during_successor", [False, True])
+def test_gui_timeout_recovers_after_sleep_and_ignores_late_native_cancel(
+    gui_runtime, dispatch_during_successor
+):
+    runtime, queued, native_cancellations = gui_runtime
+    with pytest.raises(APIError) as error:
+        runtime._run_sync(lambda: time.sleep(0.15), kind="execute", timeout=0.02)
+    assert error.value.code == "operation_timeout"
+    assert error.value.status == 408
+    cancel_native = queued.get(timeout=2)
+    if not dispatch_during_successor:
+        cancel_native()
+
+    def successor():
+        if dispatch_during_successor:
+            cancel_native()
+        return 42
+
+    assert runtime._run_sync(successor, kind="execute", timeout=1) == 42
+    assert native_cancellations == []
+
+
+def test_gui_cancellation_sets_native_flag_on_gui_thread_once(gui_runtime, monkeypatch):
+    runtime, queued, native_cancellations = gui_runtime
+    python_interruptions = []
+    # Model a native operation that pumps UI requests before returning to
+    # Python, where its asynchronous Python exception would be delivered.
+    monkeypatch.setattr(
+        runtime_module, "_interrupt_thread", python_interruptions.append
+    )
+
+    def operation():
+        worker = threading.Thread(target=runtime.cancel_active, daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        queued.get(timeout=2)()
+        assert native_cancellations == [True]
+        runtime.cancel_active()
+        assert queued.empty()
+        raise runtime_module._OperationInterrupt
+
+    with pytest.raises(APIError) as error:
+        runtime._run_sync(operation, kind="execute", timeout=None)
+    assert error.value.code == "operation_cancelled"
+    assert python_interruptions == [threading.get_ident()]
+    assert runtime._run_sync(lambda: 42, kind="execute", timeout=1) == 42
+
+
+@pytest.mark.parametrize(
+    "backend,path,temporary,saved,error_code",
+    [
+        ("idalib", "", False, True, "no_database"),
+        ("idalib", "db.i64", False, False, "save_failed"),
+        ("gui", "db.i64", True, True, "save_as_required"),
+        ("gui", "db.i64", False, False, "save_failed"),
+        ("gui", "db.i64", False, True, None),
+    ],
+)
+def test_save_requires_database_and_respects_ida_failure_and_gui_save_as(
+    monkeypatch, backend, path, temporary, saved, error_code
+):
+    calls = []
+
+    def save(*args):
+        calls.append(args)
+        return saved
+
+    monkeypatch.setitem(
+        sys.modules,
+        "ida_loader",
+        SimpleNamespace(
+            PATH_TYPE_IDB=0,
+            DBFL_TEMP=1,
+            get_path=lambda _kind: path,
+            is_database_flag=lambda _flag: temporary,
+            save_database=save,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules, "ida_kernwin", SimpleNamespace(process_ui_action=save)
+    )
+    runtime = object.__new__(IDARuntime)
+    runtime.backend = backend
+    # Isolate the IDA save contract; scheduler/transport are covered separately.
+    monkeypatch.setattr(runtime, "_run_sync", lambda callback, **_kwargs: callback())
+    if error_code:
+        with pytest.raises(APIError) as error:
+            runtime.save_database()
+        assert error.value.code == error_code
+    else:
+        assert runtime.save_database()["saved"] is True
+    assert len(calls) == (0 if error_code in {"no_database", "save_as_required"} else 1)
+    if calls and backend == "gui":
+        assert calls == [("SaveBase",)]
+
+
+def test_analysis_state_can_settle_disabled_then_finish_analysis() -> None:
+    state = AnalysisState()
+    callbacks: list[str] = []
+    state.add_completion_callback(lambda: callbacks.append("ready"))
+
+    state.mark_complete("disabled")
+    assert state.snapshot() == {"status": "disabled", "complete": True}
+    assert callbacks == ["ready"]
+
+    state.mark_complete()
+    assert state.snapshot() == {"status": "complete", "complete": True}
+    assert callbacks == ["ready"]
+
+
+def test_reconcile_uses_persistent_disable_not_runtime_disable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = AnalysisState()
+    monkeypatch.setitem(
+        sys.modules,
+        "ida_auto",
+        SimpleNamespace(auto_is_ok=lambda: False, is_auto_enabled=lambda: False),
+    )
+    fake_ida = SimpleNamespace(inf_is_auto_enabled=lambda: True)
+    monkeypatch.setitem(sys.modules, "ida_ida", fake_ida)
+
+    assert reconcile_autoanalysis_state(
+        state,
+        disabled_is_complete=True,
+    ) == {"status": "running", "complete": False}
+
+    fake_ida.inf_is_auto_enabled = lambda: False
+    assert reconcile_autoanalysis_state(
+        state,
+        disabled_is_complete=True,
+    ) == {"status": "disabled", "complete": True}
+
+
+def test_idb_change_state_delivers_one_event_at_a_time() -> None:
+    state = IdbChangeState()
+    subscriber = state.subscribe()
+    state.record({"event_name": "first", "timestamp": 1}, "operation-1")
+    state.record({"event_name": "second", "timestamp": 2}, "operation-2")
+
+    assert state.wait(subscriber, timeout=1.0) == {
+        "event_name": "first",
+        "timestamp": 1,
+        "revision": 1,
+        "operation_id": "operation-1",
+        "operation_label": None,
+        "origin_id": None,
+    }
+    assert state.wait(subscriber, timeout=1.0) == {
+        "event_name": "second",
+        "timestamp": 2,
+        "revision": 2,
+        "operation_id": "operation-2",
+        "operation_label": None,
+        "origin_id": None,
+    }
+    assert state.wait(subscriber, timeout=0.01) is None
+
+
+def test_idb_change_state_fans_out_from_subscription_time() -> None:
+    state = IdbChangeState()
+    early = state.subscribe()
+    state.record({"event_name": "first", "timestamp": 1})
+    late = state.subscribe()
+    state.record({"event_name": "second", "timestamp": 2})
+
+    first = state.wait(early, 1.0)
+    assert first is not None and first["event_name"] == "first"
+    second = state.wait(early, 1.0)
+    assert second is not None and second["event_name"] == "second"
+    late_event = state.wait(late, 1.0)
+    assert late_event is not None and late_event["event_name"] == "second"
+
+
+def test_idb_change_state_bounds_slow_subscriber_queue() -> None:
+    state = IdbChangeState()
+    subscriber = state.subscribe()
+    for revision in range(10_000):
+        state.record({"event_name": "changed", "timestamp": revision})
+
+    with pytest.raises(OverflowError, match="fell behind"):
+        state.wait(subscriber, timeout=1.0)
+
+
+def _namespace() -> dict[str, Any]:
+    return {"__builtins__": __builtins__, "db": object()}
+
+
+def test_execute_user_code_preserves_repl_namespace() -> None:
+    namespace = _namespace()
+    runtime = {"db": namespace["db"]}
+
+    assert _execute_user_code("offset = 40", namespace, runtime) is None
+    assert _execute_user_code("offset + 2", namespace, runtime) == 42
+    assert (
+        _execute_user_code("def add(value): return offset + value", namespace, runtime)
+        is None
+    )
+    assert _execute_user_code("offset = 41", namespace, runtime) is None
+    assert _execute_user_code("add(1)", namespace, runtime) == 42
+
+
+def test_old_entrypoint_is_not_reused_and_result_is_per_call() -> None:
+    namespace = _namespace()
+    runtime = {"db": namespace["db"]}
+
+    assert _execute_user_code("def run(db): return 7", namespace, runtime) == 7
+    assert _execute_user_code("value = 1", namespace, runtime) is None
+    assert _execute_user_code("result = 9", namespace, runtime) == 9
+    assert _execute_user_code("result = 9", namespace, runtime) == 9
+    assert _execute_user_code("other = 2", namespace, runtime) is None
+    with pytest.raises(NameError):
+        _execute_user_code("result", namespace, runtime)
+
+
+def test_execute_user_code_preserves_ordinary_broad_exception_handlers() -> None:
+    namespace = _namespace()
+    runtime = {"db": namespace["db"]}
+
+    assert (
+        _execute_user_code(
+            "try:\n    raise ValueError('expected')\nexcept:\n    result = 41",
+            namespace,
+            runtime,
+        )
+        == 41
+    )
+
+
+def _inline_runtime(monkeypatch: pytest.MonkeyPatch) -> IDARuntime:
+    monkeypatch.setitem(__import__("sys").modules, "ida_domain", SimpleNamespace())
+    runtime = object.__new__(IDARuntime)
+    runtime.database = object()
+    runtime.default_timeout = 60.0
+    runtime._session_namespaces = {}
+    runtime._idb_change_hook = None
+
+    def run_inline(
+        function,
+        *,
+        kind: str,
+        timeout: float | None,
+        batch: bool = True,
+        capture_output: bool = False,
+        trace_filename: str | None = None,
+    ) -> Any:
+        result = function()
+        if capture_output:
+            return PythonExecutionResult(result=result, stdout="", stderr="")
+        return result
+
+    monkeypatch.setattr(runtime, "_run_sync", run_inline)
+    return runtime
+
+
+def test_execute_python_flushes_database_before_and_after_user_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _inline_runtime(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "ida_loader",
+        SimpleNamespace(flush_buffers=lambda: calls.append("flush") or 1),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_execute_user_code",
+        lambda *_args: calls.append("execute") or 42,
+    )
+
+    result = runtime.execute_python("42", timeout=1.0, flush_database=True)
+
+    assert result["result"] == 42
+    assert calls == ["flush", "execute", "flush"]
+
+
+@pytest.mark.parametrize("failure", ("return_false", "raise"))
+def test_execute_python_continues_when_database_flush_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    runtime = _inline_runtime(monkeypatch)
+    calls: list[str] = []
+
+    def flush_buffers() -> int:
+        calls.append("flush")
+        if failure == "raise":
+            raise RuntimeError("license does not permit flushing")
+        return 0
+
+    monkeypatch.setitem(
+        sys.modules,
+        "ida_loader",
+        SimpleNamespace(flush_buffers=flush_buffers),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_execute_user_code",
+        lambda *_args: calls.append("execute") or 42,
+    )
+
+    result = runtime.execute_python("42", timeout=1.0, flush_database=True)
+
+    assert result["result"] == 42
+    assert calls == ["flush", "execute", "flush"]
+
+
+def test_execute_python_flushes_after_user_code_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _inline_runtime(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "ida_loader",
+        SimpleNamespace(flush_buffers=lambda: calls.append("flush") or 1),
+    )
+
+    def fail(*_args: Any) -> None:
+        calls.append("execute")
+        raise RuntimeError("user code failed")
+
+    monkeypatch.setattr(runtime_module, "_execute_user_code", fail)
+
+    with pytest.raises(RuntimeError, match="user code failed"):
+        runtime.execute_python("raise", timeout=1.0, flush_database=True)
+    assert calls == ["flush", "execute", "flush"]
+
+
+@pytest.mark.parametrize("handler", ("except:", "except BaseException:"))
+def test_execute_python_protects_cancellation_from_generated_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: str,
+) -> None:
+    runtime = _inline_runtime(monkeypatch)
+    interrupt_name = runtime_module._OPERATION_INTERRUPT_GLOBAL
+    code = (
+        "def run():\n"
+        "    for _ in range(1):\n"
+        "        try:\n"
+        f"            raise {interrupt_name}\n"
+        f"        {handler}\n"
+        "            continue\n"
+        "    return 'swallowed'\n"
+    )
+
+    with pytest.raises(runtime_module._OperationInterrupt):
+        runtime.execute_python(code, timeout=1.0)
+
+
+def test_execute_python_protects_cancellation_from_generated_except_star(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _inline_runtime(monkeypatch)
+    interrupt_name = runtime_module._OPERATION_INTERRUPT_GLOBAL
+    code = (
+        "def run():\n"
+        "    try:\n"
+        f"        raise {interrupt_name}\n"
+        "    except* BaseException:\n"
+        "        swallowed = True\n"
+        "    return swallowed\n"
+    )
+
+    with pytest.raises(runtime_module._OperationInterrupt):
+        runtime.execute_python(code, timeout=1.0)
+
+
+def test_autoanalysis_slices_release_before_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _inline_runtime(monkeypatch)
+    runtime.analysis_state = AnalysisState()
+    steps = iter((True, False))
+    calls: list[object] = []
+
+    def enable_auto(enabled: bool) -> bool:
+        calls.append(("enable", enabled))
+        return False
+
+    def auto_make_step(start: int, end: int) -> bool:
+        calls.append(("step", start, end))
+        return next(steps)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "ida_auto",
+        SimpleNamespace(
+            enable_auto=enable_auto,
+            auto_make_step=auto_make_step,
+            auto_is_ok=lambda: True,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "ida_idaapi", SimpleNamespace(BADADDR=-1))
+
+    assert runtime.advance_autoanalysis(max_steps=1, max_seconds=1) == {
+        "status": "running",
+        "complete": False,
+    }
+    assert runtime.advance_autoanalysis(max_steps=1, max_seconds=1) == {
+        "status": "complete",
+        "complete": True,
+    }
+    assert calls == [
+        ("enable", True),
+        ("step", 0, -1),
+        ("enable", False),
+        ("enable", True),
+        ("step", 0, -1),
+        ("enable", False),
+    ]
+
+
+@pytest.mark.parametrize("analysis_complete", [False, True])
+def test_autoanalysis_completion_check_runs_on_ida_thread(
+    gui_runtime, monkeypatch, analysis_complete
+):
+    runtime, queued, _ = gui_runtime
+    ida_thread = threading.get_ident()
+    auto = sys.modules["ida_auto"]
+    checks = []
+    enabled = False
+
+    def enable_auto(value):
+        nonlocal enabled
+        assert threading.get_ident() == ida_thread
+        previous, enabled = enabled, value
+        return previous
+
+    def auto_is_ok():
+        assert threading.get_ident() == ida_thread
+        checks.append(True)
+        return analysis_complete
+
+    def execute_sync(callback, flags):
+        assert flags == 2
+        done = threading.Event()
+        queued.put((callback, done))
+        assert done.wait(timeout=5), "IDA thread did not dispatch the callback"
+        return 1
+
+    monkeypatch.setattr(auto, "enable_auto", enable_auto, raising=False)
+    monkeypatch.setattr(auto, "auto_make_step", lambda *_: False, raising=False)
+    monkeypatch.setattr(auto, "auto_is_ok", auto_is_ok, raising=False)
+    monkeypatch.setitem(sys.modules, "ida_idaapi", SimpleNamespace(BADADDR=-1))
+    monkeypatch.setattr(sys.modules["ida_kernwin"], "execute_sync", execute_sync)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(runtime.advance_autoanalysis)
+        callback, done = queued.get(timeout=5)
+        try:
+            callback()
+        finally:
+            done.set()
+        assert result.result(timeout=5) == {
+            "status": "complete" if analysis_complete else "running",
+            "complete": analysis_complete,
+        }
+    assert checks == [True]
+    assert enabled is False
+
+
+@pytest.fixture
+def waiting_runtime(gui_runtime, monkeypatch):
+    runtime, _, _ = gui_runtime
+    flags = SimpleNamespace(enabled=False, persistent=False, steps=0)
+
+    def enable_auto(enabled):
+        previous, flags.enabled = flags.enabled, enabled
+        return previous
+
+    def auto_make_step(start, end):
+        assert (start, end) == (0, -1)
+        assert flags.enabled
+        flags.steps += 1
+        return flags.steps % 3 != 0
+
+    def auto_wait():
+        pytest.fail("explicit waits must not enter the uninterruptible native drain")
+
+    auto = sys.modules["ida_auto"]
+    monkeypatch.setattr(auto, "enable_auto", enable_auto, raising=False)
+    monkeypatch.setattr(auto, "auto_wait", auto_wait, raising=False)
+    monkeypatch.setattr(auto, "auto_make_step", auto_make_step, raising=False)
+    monkeypatch.setattr(auto, "auto_is_ok", lambda: True, raising=False)
+    monkeypatch.setitem(sys.modules, "ida_idaapi", SimpleNamespace(BADADDR=-1))
+    monkeypatch.setitem(
+        sys.modules,
+        "ida_ida",
+        SimpleNamespace(
+            inf_is_auto_enabled=lambda: flags.persistent,
+            inf_set_auto_enabled=lambda value: setattr(flags, "persistent", value),
+        ),
+    )
+    return runtime, flags, auto
+
+
+@pytest.mark.parametrize("initial_status", ["running", "disabled", "complete"])
+@pytest.mark.parametrize("initial_flags", [(False, False), (False, True), (True, True)])
+def test_explicit_wait_enables_ongoing_analysis_even_after_completion(
+    waiting_runtime, initial_status, initial_flags
+):
+    runtime, flags, _ = waiting_runtime
+    flags.enabled, flags.persistent = initial_flags
+    if initial_status != "running":
+        runtime.analysis_state.mark_complete(initial_status)
+    assert runtime.wait_autoanalysis(1) == {"status": "complete", "complete": True}
+    assert flags.enabled and flags.persistent
+    assert flags.steps == 3  # Even an already-complete barrier must drain new work.
+
+
+@pytest.mark.parametrize("initial_status", ["running", "disabled", "complete"])
+@pytest.mark.parametrize("initial_flags", [(False, False), (False, True), (True, True)])
+@pytest.mark.parametrize("failure", ["cancelled", "exception", "timeout", "interrupt"])
+def test_failed_explicit_wait_restores_analysis_settings(
+    waiting_runtime, initial_status, initial_flags, failure
+):
+    runtime, flags, auto = waiting_runtime
+    flags.enabled, flags.persistent = initial_flags
+    if initial_status != "running":
+        runtime.analysis_state.mark_complete(initial_status)
+
+    def failed_step(_start, _end):
+        if failure == "exception":
+            raise ValueError("analysis failed")
+        if failure == "interrupt":
+            raise runtime_module._OperationInterrupt
+        if failure == "timeout":
+            time.sleep(0.15)
+        return False
+
+    auto.auto_make_step = failed_step
+    auto.auto_is_ok = lambda: False
+    with pytest.raises(APIError) as error:
+        runtime.wait_autoanalysis(0.02 if failure == "timeout" else 1)
+    assert (
+        error.value.code
+        == {
+            "cancelled": "analysis_cancelled",
+            "exception": "execution_failed",
+            "timeout": "operation_timeout",
+            "interrupt": "operation_cancelled",
+        }[failure]
+    )
+    assert (flags.enabled, flags.persistent) == initial_flags
+    assert runtime.analysis_state.snapshot()["status"] == initial_status
+
+
+def test_execution_operation_metadata_is_scoped_to_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = IdbChangeState()
+    subscriber = state.subscribe()
+    runtime = _inline_runtime(monkeypatch)
+    hook = SimpleNamespace(
+        operation_id=None,
+        operation_label="IDA GUI",
+        origin_id=None,
+    )
+    runtime._idb_change_hook = hook
+
+    def record_change() -> None:
+        state.record(
+            {"event_name": "renamed", "timestamp": 1},
+            hook.operation_id,
+            hook.operation_label,
+            hook.origin_id,
+        )
+
+    def execute_and_fail(*_args: Any) -> None:
+        record_change()
+        raise RuntimeError("failed after mutation")
+
+    monkeypatch.setattr(runtime_module, "_execute_user_code", execute_and_fail)
+    with pytest.raises(RuntimeError, match="failed after mutation"):
+        runtime.execute_python(
+            "mutate()",
+            None,
+            operation_id="request-1",
+            operation_label="IDA Nexus TUI: Duncan",
+            lease_id="lease-1",
+        )
+
+    attributed = state.wait(subscriber, timeout=1.0)
+    assert attributed is not None
+    assert attributed["operation_id"] == "request-1"
+    assert attributed["operation_label"] == "IDA Nexus TUI: Duncan"
+    assert attributed["origin_id"] == runtime_module._event_origin_id("lease-1")
+
+    record_change()
+    gui_event = state.wait(subscriber, timeout=1.0)
+    assert gui_event is not None
+    assert gui_event["operation_id"] is None
+    assert gui_event["operation_label"] == "IDA GUI"
+    assert gui_event["origin_id"] is None
+
+
+def test_idb_hook_starts_with_runtime_unattributed_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _inline_runtime(monkeypatch)
+    runtime.idb_change_state = IdbChangeState()
+    runtime.unattributed_operation_label = "IDA GUI"
+    hook = SimpleNamespace(operation_label=None, hook=lambda: True)
+    monkeypatch.setattr(
+        runtime_module,
+        "create_idb_change_hook",
+        lambda _state: hook,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ida_kernwin",
+        SimpleNamespace(MFF_FAST=0, execute_sync=lambda callback, _flags: callback()),
+    )
+
+    runtime.enable_idb_change_hook()
+
+    assert runtime._idb_change_hook is hook
+    assert hook.operation_label == "IDA GUI"
+
+
+def test_idb_hook_installation_requires_execute_sync_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _inline_runtime(monkeypatch)
+    monkeypatch.setattr(
+        runtime_module,
+        "create_idb_change_hook",
+        lambda _state: SimpleNamespace(operation_label=None, hook=lambda: True),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ida_kernwin",
+        SimpleNamespace(MFF_FAST=0, execute_sync=lambda _callback, _flags: -1),
+    )
+
+    with pytest.raises(RuntimeError, match="did not install"):
+        runtime.enable_idb_change_hook()
+
+
+def test_structured_hook_captures_renamed_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeIDBHooks:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+    monkeypatch.delitem(sys.modules, "ida_nexus._idb_events", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "ida_idp",
+        SimpleNamespace(IDB_Hooks=FakeIDBHooks),
+    )
+    for module_name in (
+        "ida_dirtree",
+        "ida_frame",
+        "ida_funcs",
+        "ida_gdl",
+        "ida_moves",
+        "ida_range",
+        "ida_segment",
+        "ida_typeinf",
+        "ida_ua",
+    ):
+        monkeypatch.setitem(sys.modules, module_name, SimpleNamespace())
+
+    state = IdbChangeState()
+    subscriber = state.subscribe()
+    hook = create_idb_change_hook(state)
+    hook.renamed(0x401000, "new_name", False, "old_name")
+
+    event = state.wait(subscriber, timeout=1.0)
+    assert event is not None
+    assert event == {
+        "event_name": "renamed",
+        "timestamp": event["timestamp"],
+        "ea": 0x401000,
+        "new_name": "new_name",
+        "local_name": False,
+        "old_name": "old_name",
+        "revision": 1,
+        "operation_id": None,
+        "operation_label": None,
+        "origin_id": None,
+    }
+    assert isinstance(event["timestamp"], int)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "idc",
+        SimpleNamespace(BADADDR=-1, get_name=lambda _ea: "target"),
+    )
+    refinfo = SimpleNamespace(
+        target=0x401000,
+        base=0,
+        tdelta=4,
+        flags=8,
+        type=lambda: 1,
+    )
+    hook.changing_op_type(
+        0x402000,
+        0,
+        SimpleNamespace(
+            ri=refinfo,
+            ec=SimpleNamespace(tid=0),
+            path=SimpleNamespace(len=0),
+            tid=0,
+            strtype=0,
+        ),
+    )
+
+    operand_event = state.wait(subscriber, timeout=1.0)
+    assert operand_event is not None
+    assert operand_event["event_name"] == "changing_op_type"
+    assert operand_event["opinfo"] == {
+        "kind": "offset",
+        "refinfo": {
+            "target": 0x401000,
+            "base": 0,
+            "tdelta": 4,
+            "flags": 8,
+            "ref_type": 1,
+            "target_name": "target",
+        },
+    }
+
+
+def test_stateless_execution_discards_persistent_lease_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _inline_runtime(monkeypatch)
+
+    runtime.execute_python(
+        "answer = 42",
+        None,
+        lease_id="agent",
+        persist_globals=True,
+    )
+    namespace = runtime._session_namespaces["agent"]
+
+    stateless = runtime.execute_python(
+        "globals().get('answer')",
+        None,
+        lease_id="agent",
+    )
+    resumed = runtime.execute_python(
+        "globals().get('answer')",
+        None,
+        lease_id="agent",
+        persist_globals=True,
+    )
+
+    assert stateless["result"] is None
+    assert resumed["result"] is None
+    assert namespace == {}
+    assert runtime._session_namespaces["agent"] is not namespace
+
+
+def test_runtime_namespaces_are_isolated_and_released_per_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _inline_runtime(monkeypatch)
+
+    def execute(code: str, lease_id: str) -> PythonExecutionResult:
+        return runtime.execute_python(
+            code,
+            None,
+            lease_id=lease_id,
+            persist_globals=True,
+        )
+
+    runtime.execute_python("temporary = 1", None, lease_id="agent-a")
+    fresh = runtime.execute_python(
+        "globals().get('temporary')", None, lease_id="agent-a"
+    )
+    execute("answer = 42", "agent-a")
+    first = execute("answer", "agent-a")
+    second = execute("globals().get('answer')", "agent-b")
+    execute("_adapter_state = {'retained': object()}", "agent-a")
+    execute("db = None", "agent-a")
+    refreshed = execute("db is None", "agent-a")
+
+    assert fresh["result"] is None
+    assert first["result"] == 42
+    assert second["result"] is None
+    assert refreshed["result"] is False
+    namespace = runtime._session_namespaces["agent-a"]
+    assert namespace["_adapter_state"]["retained"] is not None
+
+    runtime.release_session("agent-a")
+
+    assert namespace == {}
+    assert "agent-a" not in runtime._session_namespaces
+    reopened = execute("globals().get('answer')", "agent-a")
+    assert reopened["result"] is None

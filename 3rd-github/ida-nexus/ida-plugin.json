@@ -1,0 +1,25 @@
+{
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "ida-nexus",
+    "entryPoint": "ida_nexus_plugin.py",
+    "categories": ["api-scripting-and-automation"],
+    "keywords": ["python", "automation", "idalib", "ai"],
+    "description": "Authenticated local Python execution for IDA GUI and command-line idalib sessions.",
+    "idaVersions": ">=9.4",
+    "version": "0.13.4",
+    "license": "MIT",
+    "authors": [
+      {
+        "name": "Hex-Rays SA",
+        "email": "support@hex-rays.com"
+      }
+    ],
+    "urls": {
+      "repository": "https://github.com/HexRaysSA/ida-nexus"
+    },
+    "pythonDependencies": [
+      "ida-nexus==0.13.4"
+    ]
+  }
+}
