@@ -2306,3 +2306,43 @@ audits require zero residuals; shared prepared-runtime ledgers stay unchanged
 during the final isolated qualification. SDK module hashes and patches are
 unchanged. The old complete-worker fixture is absent from the branch history;
 only the private runtime generator remains.
+
+
+### Spawned worker death before the launch claim
+
+A signed `Spawned` is not proof that its worker claimed the launch permit.
+`Journal.spawned_dead` first requires the existing complete, native same-boot
+exit evidence for that exact PID and birth. Only then may it call the existing
+single-use `decide(..., "revoked")` operation. Its `O_EXCL` decision file is the
+same linearization point used by the worker before any database access. If
+revocation wins, the worker never obtained permission to touch the database.
+If claim wins, the existing claimed-worker death path applies. A partial decision,
+read failure, permission error or incomplete identity retains the obligation;
+a live or stopped worker, a different boot, and a reused PID with unknown birth
+cannot trigger revocation. No elapsed-time or process-list absence substitutes
+for this evidence.
+
+Both branches use `SpawnedOwnerDiedUnpublished`: the exact recorded worker died
+without publishing an owner, regardless of whether it reached the claim. The
+revoked branch adds `authorization_decision: "revoked"` to its exit evidence.
+The target writer independently rereads and fsyncs the exact grant and decision,
+binds the immutable fact to the source `Spawned` and its launch, and validates
+the saved exit evidence separately from this decision tag. Claimed facts keep
+their existing format. This is neither an unspawned launch nor an owner lifetime
+proof, and makes no assertion that IDA closed safely. Other custody, database
+state and crash-recovery checks still apply; unknown requests are not replayed.
+
+The original daemon and restart `Journal.gate` share this target-EX writer and
+its immutable fact slot. Namespace publication remains serialized by `fact_view`.
+Retirement uses the exact original helper's adoption RPC and journal ACK rules;
+the new daemon never edits a live old helper's registry. Interrupted revocation,
+fact publication and journal adoption can resume from the same durable decision
+without granting a second claim or creating a second closure authority.
+
+`test_spawned_death.py` covers unclaimed death, live/SIGSTOP and unknown identity,
+partial decisions and read errors, late-claim/revocation contention, interrupted
+publication, and restart retirement through the original helper. The private
+worker generator also supports an explicit pre-claim stop point; both generated
+variants must restore byte-for-byte to the pinned SDK after removing the test
+insertions. SDK source is generated only in private runtime directories outside
+the repository.

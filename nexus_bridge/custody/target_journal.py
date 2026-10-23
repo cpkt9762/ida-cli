@@ -1000,15 +1000,25 @@ class Journal:
             return {'state':'pending'}
         # Read the durable single-use permit independently. It permanently fences
         # a second claimant; no suffix scan or discovery absence grants closure.
-        from ida_nexus._launch_authorization import _directory, _read
+        from ida_nexus._launch_authorization import _directory, _read, decide
+        # O_EXCL is shared with the worker's pre-database claim. Revocation may
+        # replay after a crash; a claim winner instead takes the existing death
+        # path. Incomplete decisions and all read/write errors retain the debt.
+        try:
+            revoked = decide(launch['authorization'], launch['suffix'], launch['target'], 'revoked')
+        except RuntimeError as exc:
+            raise RuntimeError('StartupUnconfirmed: launch is not durably claimed or revoked: ' + str(exc)) from exc
+        decision = 'revoked' if revoked else 'claimed'
         name, directory = _directory(launch['authorization'])
         try:
             grant = {'schema':1, 'suffix':launch['suffix'], 'target':launch['target']}
             if (_read(directory, name) != grant
-                    or _read(directory, name + '.decision') != dict(grant, decision='claimed')):
+                    or _read(directory, name + '.decision') != dict(grant, decision=decision)):
                 raise RuntimeError('StartupUnconfirmed: launch is not durably claimed')
         finally:
             os.close(directory)
+        if revoked:
+            evidence = dict(evidence, authorization_decision='revoked')
         container = self.target.directory.child('observations')
         try:
             producer = container.child(digest(watch.encode()))
@@ -1041,11 +1051,15 @@ class Journal:
                         observation_id=helper + '-' + str(epoch),
                         kind='SpawnedOwnerDiedUnpublished', evidence=saved_evidence,
                         source_spawned=digest(source))
+                    saved_exit = (None if not isinstance(saved_evidence, dict) else
+                                  {k:v for k,v in saved_evidence.items() if k != 'authorization_decision'})
                     if (encoded(record) != encoded(expected) or not isinstance(saved_evidence, dict)
+                            or ('authorization_decision' in saved_evidence) != revoked
+                            or saved_evidence.get('authorization_decision') != ('revoked' if revoked else None)
                             or saved_evidence.get('recorded') != source['os_identity']
                             or same_boot_exit(source['os_identity'],
                                 read=lambda pid: saved_evidence.get('current'),
-                                current_boot=lambda: saved_evidence.get('boot_id')) != saved_evidence):
+                                current_boot=lambda: saved_evidence.get('boot_id')) != saved_exit):
                         raise RuntimeError('StartupUnconfirmed: conflicting spawned death fact')
                     receipt = {'path':str(producer.path/name), 'sha256':digest(record), 'record':record}
                     verified = fact(receipt, self.target, kind='SpawnedOwnerDiedUnpublished')
