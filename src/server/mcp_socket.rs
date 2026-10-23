@@ -140,14 +140,23 @@ pub fn bind_mcp_socket(path: PathBuf) -> anyhow::Result<BoundMcpSocket> {
         .map_err(|e| anyhow::anyhow!("cannot bind MCP socket {path:?}: {e}"))?;
     let metadata = std::fs::symlink_metadata(&path)
         .map_err(|error| anyhow::anyhow!("cannot stat MCP socket {path:?}: {error}"))?;
-    let cleanup = SocketCleanup {
+    let mut cleanup = SocketCleanup {
         path: path.clone(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
+        identity: SocketIdentity::from_metadata(&metadata),
     };
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| anyhow::anyhow!("cannot chmod MCP socket {path:?}: {e}"))?;
-    owner_lock.record_identity(SocketIdentity::from_metadata(&metadata))?;
+    // chmod changes ctime: record the final identity, not the pre-chmod value.
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| anyhow::anyhow!("cannot stat MCP socket {path:?}: {error}"))?;
+    if !metadata.file_type().is_socket()
+        || metadata.dev() != cleanup.identity.device
+        || metadata.ino() != cleanup.identity.inode
+    {
+        anyhow::bail!("MCP socket {path:?} changed identity while setting permissions");
+    }
+    cleanup.identity = SocketIdentity::from_metadata(&metadata);
+    owner_lock.record_identity(cleanup.identity)?;
     Ok(BoundMcpSocket {
         listener: Some(listener),
         cleanup,
@@ -187,7 +196,7 @@ where
         );
     }
     let original_identity = SocketIdentity::from_metadata(&metadata);
-    if recorded_identity != Some(original_identity) {
+    if !recorded_identity.is_some_and(|recorded| recorded.matches_observed(original_identity)) {
         anyhow::bail!(
             "cannot confirm MCP socket {} is stale: owner record does not match its identity",
             path.display()
@@ -223,6 +232,7 @@ where
 struct SocketIdentity {
     device: u64,
     inode: u64,
+    changed: Option<(i64, i64)>,
 }
 
 impl SocketIdentity {
@@ -230,7 +240,43 @@ impl SocketIdentity {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
+            changed: Some((metadata.ctime(), metadata.ctime_nsec())),
         }
+    }
+
+    fn from_record(record: &str) -> Option<Self> {
+        let fields: Vec<_> = record.trim().split(':').collect();
+        match fields.as_slice() {
+            // Explicit compatibility with owner locks written before v2. Only
+            // the persisted record uses dev/ino semantics; the live recheck
+            // below still compares complete identities, including ctime.
+            [device, inode] => Some(Self {
+                device: device.parse().ok()?,
+                inode: inode.parse().ok()?,
+                changed: None,
+            }),
+            ["v2", device, inode, seconds, nanos] => {
+                let nanos = nanos.parse().ok()?;
+                if !(0..1_000_000_000).contains(&nanos) {
+                    return None;
+                }
+                Some(Self {
+                    device: device.parse().ok()?,
+                    inode: inode.parse().ok()?,
+                    changed: Some((seconds.parse().ok()?, nanos)),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn matches_observed(self, observed: Self) -> bool {
+        self.device == observed.device
+            && self.inode == observed.inode
+            && match self.changed {
+                Some(changed) => observed.changed == Some(changed),
+                None => true, // Legacy persisted record, explicitly parsed above.
+            }
     }
 }
 
@@ -291,14 +337,13 @@ impl McpSocketOwnerLock {
         if self.file.read_to_string(&mut record).is_err() {
             return None;
         }
-        let (device, inode) = record.trim().split_once(':')?;
-        Some(SocketIdentity {
-            device: device.parse().ok()?,
-            inode: inode.parse().ok()?,
-        })
+        SocketIdentity::from_record(&record)
     }
 
     fn record_identity(&mut self, identity: SocketIdentity) -> anyhow::Result<()> {
+        let (seconds, nanos) = identity.changed.ok_or_else(|| {
+            anyhow::anyhow!("cannot write an MCP socket owner record without ctime")
+        })?;
         self.file.set_len(0).map_err(|error| {
             anyhow::anyhow!(
                 "cannot truncate MCP socket owner lock {}: {error}",
@@ -311,7 +356,12 @@ impl McpSocketOwnerLock {
                 self.path.display()
             )
         })?;
-        write!(self.file, "{}:{}", identity.device, identity.inode).map_err(|error| {
+        write!(
+            self.file,
+            "v2:{}:{}:{seconds}:{nanos}",
+            identity.device, identity.inode
+        )
+        .map_err(|error| {
             anyhow::anyhow!(
                 "cannot write MCP socket owner lock {}: {error}",
                 self.path.display()
@@ -351,21 +401,20 @@ fn owner_lock_path(socket_path: &Path) -> anyhow::Result<PathBuf> {
 #[derive(Debug)]
 struct SocketCleanup {
     path: PathBuf,
-    device: u64,
-    inode: u64,
+    identity: SocketIdentity,
 }
 
 impl Drop for SocketCleanup {
     fn drop(&mut self) {
-        remove_socket_if_same(&self.path, self.device, self.inode);
+        remove_socket_if_same(&self.path, self.identity);
     }
 }
 
-fn remove_socket_if_same(path: &Path, device: u64, inode: u64) {
+fn remove_socket_if_same(path: &Path, identity: SocketIdentity) {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return;
     };
-    if metadata.file_type().is_socket() && metadata.dev() == device && metadata.ino() == inode {
+    if metadata.file_type().is_socket() && SocketIdentity::from_metadata(&metadata) == identity {
         if let Err(error) = std::fs::remove_file(path) {
             warn!("cannot remove MCP socket {}: {error}", path.display());
         }
@@ -450,7 +499,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after unix epoch")
             .as_nanos();
-        PathBuf::from("/private/tmp").join(format!(
+        PathBuf::from("/tmp").join(format!(
             "ida-mcp-{label}-{}-{nanos}.sock",
             std::process::id()
         ))
@@ -576,6 +625,111 @@ mod tests {
         std::fs::remove_file(test_owner_lock_path(&path)).expect("cleanup owner lock");
     }
 
+    #[test]
+    fn test_socket_identity_rejects_reused_inode_with_changed_ctime() {
+        let original = SocketIdentity {
+            device: 7,
+            inode: 42,
+            changed: Some((10, 20)),
+        };
+        assert!(original.matches_observed(original));
+        for replacement in [
+            SocketIdentity {
+                changed: Some((10, 21)),
+                ..original
+            },
+            SocketIdentity {
+                changed: Some((11, 20)),
+                ..original
+            },
+            SocketIdentity {
+                device: 8,
+                ..original
+            },
+            SocketIdentity {
+                inode: 43,
+                ..original
+            },
+        ] {
+            assert!(!original.matches_observed(replacement));
+            assert_ne!(
+                original, replacement,
+                "live recheck must reject replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn test_socket_identity_parses_legacy_and_rejects_invalid_new_records() {
+        let legacy = SocketIdentity::from_record("7:42\n").expect("legacy owner record");
+        let current = SocketIdentity::from_record("v2:7:42:10:20").expect("v2 owner record");
+        assert!(legacy.matches_observed(current));
+        assert!(!legacy.matches_observed(SocketIdentity {
+            inode: 43,
+            ..current
+        }));
+        assert!(!legacy.matches_observed(SocketIdentity {
+            device: 8,
+            ..current
+        }));
+        assert_ne!(
+            legacy, current,
+            "legacy compatibility is only for owner records"
+        );
+        for invalid in [
+            "v2:7:42",
+            "v2:7:42:10",
+            "v2:7:42:10:-1",
+            "v2:7:42:10:1000000000",
+            "v3:7:42:10:20",
+            "7:42:extra",
+            "bad:42",
+        ] {
+            assert!(
+                SocketIdentity::from_record(invalid).is_none(),
+                "invalid record: {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_legacy_owner_record_can_remove_stale_socket() {
+        let path = temp_socket("legacy-record");
+        let first = bind_mcp_socket(path.clone()).expect("bind original socket");
+        let BoundMcpSocket {
+            listener,
+            cleanup,
+            _owner_lock,
+        } = first;
+        std::mem::forget(cleanup);
+        drop(listener);
+        drop(_owner_lock);
+        let metadata = std::fs::symlink_metadata(&path).expect("stale socket metadata");
+        std::fs::write(
+            test_owner_lock_path(&path),
+            format!("{}:{}", metadata.dev(), metadata.ino()),
+        )
+        .expect("write pre-v2 owner record");
+        let replacement =
+            bind_mcp_socket(path.clone()).expect("legacy stale socket remains removable");
+        let record =
+            std::fs::read_to_string(test_owner_lock_path(&path)).expect("new owner record");
+        assert_eq!(
+            SocketIdentity::from_record(&record),
+            Some(replacement.cleanup.identity)
+        );
+        assert!(
+            record.starts_with("v2:"),
+            "successful bind upgrades the record"
+        );
+        drop(replacement);
+        assert!(
+            !path.exists(),
+            "complete identity cleanup removes its own socket"
+        );
+        std::fs::remove_file(test_owner_lock_path(&path)).expect("cleanup owner lock");
+    }
+
     #[tokio::test]
     async fn test_stale_probe_refuses_replaced_socket_identity() {
         let path = temp_socket("identity-race");
@@ -610,8 +764,8 @@ mod tests {
         let current = std::fs::symlink_metadata(&path).expect("replacement socket metadata");
         assert!(current.file_type().is_socket());
         assert_ne!(
-            (current.dev(), current.ino()),
-            (original.dev(), original.ino())
+            SocketIdentity::from_metadata(&current),
+            SocketIdentity::from_metadata(&original)
         );
         let replacement_listener = replacement
             .lock()

@@ -1357,7 +1357,7 @@ The two `router::nexus_bridge::final_shutdown_tests` cases
 `nexus-test-support` and a licensed IDA runtime; CI explicitly lists them as
 NOT RUN. The same module's `pending_history_head_cannot_block_retirement_of_later_closed_records`
 remains in the default suite. No test body or assertion is disabled at runtime.
-On macOS the default suite contains 551 tests and the feature suite contains 576;
+On macOS the default suite contains 554 tests and the feature suite contains 579;
 platform-specific cases make Linux counts different. Both commands are required
 on a licensed host with isolated home/state/profile and the prepared interpreter.
 The full feature suite uses a 900-second shell bound for serial real-process
