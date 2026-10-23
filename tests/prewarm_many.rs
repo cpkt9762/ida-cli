@@ -31,7 +31,6 @@ fn batch(responses: Vec<Value>) -> Output {
     let socket_case = Case::new();
     let socket = socket_case.path().join("sock");
     let listener = UnixListener::bind(&socket).expect("bind batch daemon");
-    let count = responses.len();
     let daemon = std::thread::spawn(move || {
         for response in responses {
             let (mut stream, _) = listener.accept().expect("batch connection");
@@ -60,7 +59,6 @@ fn batch(responses: Vec<Value>) -> Output {
         .output()
         .expect("run batch CLI");
     daemon.join().expect("fake daemon stopped");
-    assert_eq!(count, 2, "these cases answer both items");
     output
 }
 
@@ -98,4 +96,21 @@ fn accepted_queue_items_exit_zero_without_replay() {
     let table: Value = serde_json::from_slice(&output.stdout).expect("queue result table");
     assert_eq!(table["count"], 2);
     assert_eq!(table["results"][1]["result"]["task_id"], "two");
+}
+
+#[test]
+fn connection_loss_preserves_completed_items_and_records_remaining_failures() {
+    let output = batch(vec![
+        json!({"jsonrpc":"2.0","id":"", "result":{"cached_after":true}}),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let table: Value =
+        serde_json::from_slice(&output.stdout).expect("table survives connection loss");
+    assert_eq!(table["count"], 2);
+    assert_eq!(table["results"][0]["ok"], true);
+    assert_eq!(table["results"][1]["ok"], false);
+    assert!(table["results"][1]["error"]
+        .as_str()
+        .expect("connection error")
+        .contains("Cannot connect"));
 }

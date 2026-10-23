@@ -363,6 +363,31 @@ async fn bridge_loss_after_popen_with_live_owner_waits_for_its_public_lifetime()
     );
 }
 
+/// A prewarm uses a dedicated socket branch, which must retain the same
+/// whole-request refusal classification as an ordinary open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prewarm_socket_preserves_entrance_refusal_retry_code() {
+    let case = case("LaunchIntent").await;
+    case.kill_bridge().await;
+    case.router.arm_bridge_loss_exit();
+    let response = crate::server::socket_listener::test_cli_rpc(
+        case.router.clone(),
+        "prewarm",
+        json!({"path":case.sample, "queue":false}),
+        10,
+    )
+    .await;
+    case.cleanup().await;
+    assert_eq!(
+        response["error"]["code"],
+        crate::router::protocol::RPC_BRIDGE_LOST_NOT_DISPATCHED
+    );
+    assert_eq!(
+        response["error"]["data"]["bridge_lost"]["dispatched"],
+        false
+    );
+}
+
 /// H2: the daemon leaves by itself once the lost bridge's custody allows it, and
 /// until then every request gets the dedicated retry-once refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

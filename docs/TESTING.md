@@ -2070,7 +2070,14 @@ Applies to every single-request subcommand and `pipe` (per line);
 `prewarm-many` always prints its per-item results and exits 1 if any item fails
 (partial and complete failures use the same status), or 0 if all items succeed.
 With `--queue`, success means acceptance with a task id; inspect `status` for
-the eventual task results. Lib cases: `bridge_loss_tests::daemon_*` (self exit
+the eventual task results. Batch connection failures and timeouts are recorded
+per item, preserving earlier results. Only whole-request entrance refusals
+(`-32010` / `BridgeLostNotDispatched`) may be retried once after the old daemon
+exits. Concurrent batch items share one recovery (including a failed recovery);
+subsequent items use the replacement endpoint. Dispatched/unknown outcomes,
+transport errors and accepted queue task ids are never replayed. Pinned sockets
+(`--socket` / `$IDA_MCP_SOCKET`) never recover or retry. Deterministic contracts:
+`tests/prewarm_many.rs` and `cli::bridge_loss_recovery_tests::batch_*`. Lib cases: `bridge_loss_tests::daemon_*` (self exit
 in W2a; no early exit while a live orphan owner holds custody; unarmed process
 never tags the retry code) and `cli::bridge_loss_recovery_tests`. Real
 end-to-end evidence is recorded in the H report (W1, W2a, W2b; the first

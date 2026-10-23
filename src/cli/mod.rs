@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 
 #[derive(Parser)]
 #[command(name = "ida-cli", version, about = "Headless IDA CLI and MCP Server")]
@@ -213,7 +213,7 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
             tenant,
         } => {
             run_prewarm_many(
-                &socket_path,
+                endpoint,
                 &list_file,
                 jobs.max(1),
                 keep_warm,
@@ -722,11 +722,7 @@ async fn send_recoverable(
     req: &RpcRequest,
     timeout: std::time::Duration,
 ) -> anyhow::Result<RpcResponse> {
-    send_recoverable_with(endpoint, req, timeout, |old| {
-        discovery::wait_for_daemon_exit(old, BRIDGE_LOSS_EXIT_WAIT)?;
-        discovery::discover_socket(None)
-    })
-    .await
+    send_recoverable_with(endpoint, req, timeout, restart_daemon).await
 }
 
 async fn send_recoverable_with(
@@ -742,16 +738,63 @@ async fn send_recoverable_with(
     eprintln!(
         "The ida-cli daemon lost its Nexus bridge before running this request; waiting for it to exit, then retrying once on a fresh daemon..."
     );
-    let old = endpoint.path.clone();
-    let blocking_old = old.clone();
-    match tokio::task::spawn_blocking(move || restart(&blocking_old)).await? {
+    match recover_endpoint(endpoint.path.clone(), restart).await {
         Ok(path) => {
             endpoint.path = path;
             send_request(&endpoint.path, req, timeout).await
         }
-        Err(reason) => {
-            eprintln!("Cannot recover automatically: {reason}");
-            Ok(resp)
+        Err(_) => Ok(resp),
+    }
+}
+
+fn restart_daemon(old: &Path) -> Result<std::path::PathBuf, String> {
+    discovery::wait_for_daemon_exit(old, BRIDGE_LOSS_EXIT_WAIT)?;
+    discovery::discover_socket(None)
+}
+
+async fn recover_endpoint(
+    old: std::path::PathBuf,
+    restart: impl FnOnce(&Path) -> Result<std::path::PathBuf, String> + Send + 'static,
+) -> Result<std::path::PathBuf, String> {
+    let result = match tokio::task::spawn_blocking(move || restart(&old)).await {
+        Ok(result) => result,
+        Err(error) => Err(format!("daemon recovery task failed: {error}")),
+    };
+    if let Err(reason) = &result {
+        eprintln!("Cannot recover automatically: {reason}");
+    }
+    result
+}
+
+/// All items share one recovery, including a failed recovery. Only a typed
+/// entrance refusal permits replay; transport failures never establish that.
+struct BatchEndpoint {
+    initial: Endpoint,
+    recovery: OnceCell<Result<std::path::PathBuf, String>>,
+}
+
+impl BatchEndpoint {
+    async fn send(
+        &self,
+        req: &RpcRequest,
+        timeout: std::time::Duration,
+        restart: impl FnOnce(&Path) -> Result<std::path::PathBuf, String> + Send + 'static,
+    ) -> anyhow::Result<RpcResponse> {
+        if let Some(Ok(path)) = self.recovery.get() {
+            // Already using the replacement daemon: no second recovery/replay.
+            return send_request(path, req, timeout).await;
+        }
+        let response = send_request(&self.initial.path, req, timeout).await?;
+        if self.initial.pinned || !refused_before_dispatch(&response) {
+            return Ok(response);
+        }
+        let recovered = self.recovery.get_or_init(|| async {
+            eprintln!("The ida-cli daemon lost its Nexus bridge before running a batch item; waiting for it to exit, then retrying refused items once on a fresh daemon...");
+            recover_endpoint(self.initial.path.clone(), restart).await
+        }).await;
+        match recovered {
+            Ok(path) => send_request(path, req, timeout).await,
+            Err(_) => Ok(response),
         }
     }
 }
@@ -768,14 +811,8 @@ async fn send_request(
     .await
     {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            eprintln!("Error: Cannot connect to server: {e}");
-            std::process::exit(1);
-        }
-        Err(_) => {
-            eprintln!("Error: Connection timed out");
-            std::process::exit(1);
-        }
+        Ok(Err(e)) => anyhow::bail!("Cannot connect to server: {e}"),
+        Err(_) => anyhow::bail!("Connection timed out"),
     };
 
     let (reader, writer) = stream.into_split();
@@ -792,10 +829,7 @@ async fn send_request(
         Ok(Ok(0)) => anyhow::bail!("Server closed connection"),
         Ok(Ok(_)) => {}
         Ok(Err(e)) => anyhow::bail!("Read error: {e}"),
-        Err(_) => {
-            eprintln!("Error: request timed out after {}s", timeout.as_secs());
-            std::process::exit(1);
-        }
+        Err(_) => anyhow::bail!("request timed out after {}s", timeout.as_secs()),
     }
 
     serde_json::from_str(line.trim()).map_err(|e| anyhow::anyhow!("Invalid response: {e}"))
@@ -806,7 +840,7 @@ async fn send_request(
 // would only add boilerplate.
 #[allow(clippy::too_many_arguments)]
 async fn run_prewarm_many(
-    socket_path: &Path,
+    endpoint: Endpoint,
     list_file: &str,
     jobs: usize,
     keep_warm: bool,
@@ -824,11 +858,15 @@ async fn run_prewarm_many(
         .map(ToOwned::to_owned)
         .collect();
 
+    let endpoint = Arc::new(BatchEndpoint {
+        initial: endpoint,
+        recovery: OnceCell::new(),
+    });
     let semaphore = Arc::new(Semaphore::new(jobs));
     let mut handles = Vec::new();
 
     for (idx, path) in paths.iter().enumerate() {
-        let socket_path = socket_path.to_path_buf();
+        let endpoint = endpoint.clone();
         let path = path.clone();
         let semaphore = semaphore.clone();
         let tenant = tenant.clone();
@@ -845,7 +883,7 @@ async fn run_prewarm_many(
                     "tenant_id": tenant,
                 }),
             );
-            let resp = send_request(&socket_path, &req, timeout).await;
+            let resp = endpoint.send(&req, timeout, restart_daemon).await;
             (path, resp)
         }));
     }
@@ -1118,6 +1156,211 @@ mod bridge_loss_recovery_tests {
     }
 
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn batch_refusals_share_one_recovery_and_retry_each_item_once() {
+        for second_refusal in [false, true] {
+            let dir = case_dir();
+            let old_socket = dir.join("old");
+            let new_socket = dir.join("new");
+            let listener = UnixListener::bind(&old_socket).expect("old batch daemon");
+            let old = tokio::spawn(async move {
+                let mut waiting = Vec::new();
+                for _ in 0..6 {
+                    let (stream, _) = listener.accept().await.expect("batch connection");
+                    let (reader, writer) = stream.into_split();
+                    let mut line = String::new();
+                    BufReader::new(reader)
+                        .read_line(&mut line)
+                        .await
+                        .expect("batch request");
+                    waiting.push(writer);
+                }
+                // All six requests were sent to the old generation before any
+                // refusal is released, so recovery must be shared in flight.
+                for mut writer in waiting {
+                    let response = reply(Some(RPC_BRIDGE_LOST_NOT_DISPATCHED), "entrance refusal");
+                    writer
+                        .write_all(
+                            format!(
+                                "{}\n",
+                                serde_json::to_string(&response).expect("refusal JSON")
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .expect("refusal response");
+                }
+            });
+            let (seen, new) = fake_daemon(
+                &new_socket,
+                reply(
+                    second_refusal.then_some(RPC_BRIDGE_LOST_NOT_DISPATCHED),
+                    "replacement",
+                ),
+            );
+            let endpoint = Arc::new(BatchEndpoint {
+                initial: Endpoint {
+                    path: old_socket,
+                    pinned: false,
+                },
+                recovery: OnceCell::new(),
+            });
+            let restarts = Arc::new(AtomicUsize::new(0));
+            let mut items = Vec::new();
+            for _ in 0..6 {
+                let endpoint = endpoint.clone();
+                let restarts = restarts.clone();
+                let path = new_socket.clone();
+                items.push(tokio::spawn(async move {
+                    endpoint
+                        .send(&request(), TIMEOUT, move |_| {
+                            restarts.fetch_add(1, Ordering::SeqCst);
+                            Ok(path)
+                        })
+                        .await
+                        .expect("batch response")
+                }));
+            }
+            for item in items {
+                let response = item.await.expect("batch item");
+                assert_eq!(refused_before_dispatch(&response), second_refusal);
+            }
+            old.await.expect("all initial requests refused");
+            assert_eq!(
+                seen.load(Ordering::SeqCst),
+                6,
+                "exactly one replay per refusal"
+            );
+            assert_eq!(restarts.load(Ordering::SeqCst), 1, "one shared restart");
+            // A later item uses the recovered endpoint directly, even if that
+            // endpoint refuses too; it must not trigger another recovery.
+            endpoint
+                .send(&request(), TIMEOUT, |_| panic!("second recovery"))
+                .await
+                .expect("later item");
+            assert_eq!(seen.load(Ordering::SeqCst), 7);
+            new.abort();
+            std::fs::remove_dir_all(dir).expect("remove batch fixture");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_does_not_replay_unknown_accepted_or_pinned_items() {
+        for (pinned, response) in [
+            (false, reply(Some(-32000), "UnknownOutcome; never replay")),
+            (
+                false,
+                RpcResponse {
+                    result: Some(serde_json::json!({"status":"queued", "task_id":"accepted"})),
+                    ..reply(None, "")
+                },
+            ),
+            (
+                true,
+                reply(Some(RPC_BRIDGE_LOST_NOT_DISPATCHED), "entrance refusal"),
+            ),
+        ] {
+            let dir = case_dir();
+            let socket = dir.join("only");
+            let (seen, daemon) = fake_daemon(&socket, response.clone());
+            let endpoint = BatchEndpoint {
+                initial: Endpoint {
+                    path: socket,
+                    pinned,
+                },
+                recovery: OnceCell::new(),
+            };
+            let actual = endpoint
+                .send(&request(), TIMEOUT, |_| panic!("unsafe batch replay"))
+                .await
+                .expect("original response");
+            assert_eq!(
+                serde_json::to_value(actual).expect("actual JSON"),
+                serde_json::to_value(response).expect("expected JSON")
+            );
+            assert_eq!(seen.load(Ordering::SeqCst), 1);
+            daemon.abort();
+            std::fs::remove_dir_all(dir).expect("remove batch fixture");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_shares_failed_recovery_and_never_replays_transport_errors() {
+        let dir = case_dir();
+        let socket = dir.join("stuck");
+        let (seen, daemon) = fake_daemon(
+            &socket,
+            reply(Some(RPC_BRIDGE_LOST_NOT_DISPATCHED), "refused"),
+        );
+        let endpoint = BatchEndpoint {
+            initial: Endpoint {
+                path: socket,
+                pinned: false,
+            },
+            recovery: OnceCell::new(),
+        };
+        let restarts = Arc::new(AtomicUsize::new(0));
+        for _ in 0..6 {
+            let restarts = restarts.clone();
+            let response = endpoint
+                .send(&request(), TIMEOUT, move |_| {
+                    restarts.fetch_add(1, Ordering::SeqCst);
+                    Err("old daemon has not exited".into())
+                })
+                .await
+                .expect("original refusal");
+            assert!(refused_before_dispatch(&response));
+        }
+        assert_eq!(seen.load(Ordering::SeqCst), 6);
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        daemon.abort();
+        let missing = BatchEndpoint {
+            initial: Endpoint {
+                path: dir.join("missing"),
+                pinned: false,
+            },
+            recovery: OnceCell::new(),
+        };
+        let error = missing
+            .send(&request(), TIMEOUT, |_| {
+                panic!("connection failure cannot replay")
+            })
+            .await
+            .expect_err("missing socket is an item error");
+        assert!(error.to_string().contains("Cannot connect"));
+        assert!(missing.recovery.get().is_none());
+        std::fs::remove_dir_all(dir).expect("remove recovery fixture");
+    }
+
+    #[tokio::test]
+    async fn batch_transport_timeout_is_an_item_error_without_recovery() {
+        let dir = case_dir();
+        let socket = dir.join("slow");
+        let listener = UnixListener::bind(&socket).expect("slow daemon");
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("connection");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(stream);
+        });
+        let endpoint = BatchEndpoint {
+            initial: Endpoint {
+                path: socket,
+                pinned: false,
+            },
+            recovery: OnceCell::new(),
+        };
+        let error = endpoint
+            .send(&request(), std::time::Duration::from_millis(10), |_| {
+                panic!("timeout does not prove no dispatch")
+            })
+            .await
+            .expect_err("timeout returned to batch");
+        assert!(error.to_string().contains("request timed out"));
+        assert!(endpoint.recovery.get().is_none());
+        daemon.await.expect("slow connection closed");
+        std::fs::remove_dir_all(dir).expect("remove timeout fixture");
+    }
 
     #[tokio::test]
     async fn refused_before_dispatch_waits_for_the_exit_then_retries_exactly_once() {

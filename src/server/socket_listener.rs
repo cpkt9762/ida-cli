@@ -470,7 +470,7 @@ async fn dispatch_cli_request(
 
                 match result {
                     Ok(value) => RpcResponse::ok(&req.id, value),
-                    Err(e) => RpcResponse::err(&req.id, -32000, e.to_string()),
+                    Err(e) => failure_response(router, &req.id, &e),
                 }
             } else {
                 RpcResponse::err(&req.id, -32001, "prewarm requires 'path' parameter")
@@ -570,7 +570,7 @@ pub(crate) async fn test_save_rpc(
 }
 
 #[cfg(all(test, feature = "nexus-test-support"))]
-async fn test_cli_rpc(
+pub(crate) async fn test_cli_rpc(
     router: RouterState,
     method: &str,
     params: serde_json::Value,
