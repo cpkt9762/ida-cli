@@ -11,7 +11,7 @@ Install the Nexus-only ida-cli release (IDA 9.4/9.5, Python >=3.11).
   --tag TAG | --ref REF | --build-from-source
   --bin-dir DIR --install-root DIR --add-path --keep-temp
   --bundle DIR          Install an already extracted release bundle
-  --nexus-source DIR    Read-only pinned Nexus clone for offline preparation
+  --nexus-source DIR    Read-only pristine Nexus tree override
   --wheels DIR          Read-only hashed wheel directory
 IDADIR overrides automatic discovery. Otherwise the newest numeric app version
 is selected and validated, then stored as the launcher's default. Rust needs no SDK.
@@ -111,7 +111,7 @@ cp "$BUNDLE/scripts/prepare_nexus_env.py" "$VERSION_ROOT/scripts/"
 cp "$BUNDLE/scripts/nexus/"*.patch "$BUNDLE/scripts/nexus/"*.json "$BUNDLE/scripts/nexus/requirements.lock" "$VERSION_ROOT/scripts/nexus/"
 chmod 700 "$VERSION_ROOT/ida-cli.real"
 args=(--runtime-only --root "$VERSION_ROOT/nexus" --ida-dir "$IDADIR")
-[[ -z "$SOURCE" ]] || args+=(--source "$SOURCE")
+args+=(--source "${SOURCE:-$BUNDLE/3rd-github/ida-nexus}")
 [[ -z "$WHEELS" ]] || args+=(--wheels "$WHEELS")
 python3 "$VERSION_ROOT/scripts/prepare_nexus_env.py" "${args[@]}"
 # Generate quoted shell assignments without interpolating paths as shell code.

@@ -13,9 +13,13 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 
 REPO = Path(__file__).resolve().parents[1]
 NEXUS_SHA = "d60ff582fde90c59726336c0dbdf3e8286e9df7a"
+NEXUS_TREE = "0726da7f22c9354b12184ae40742c65c091ae581"
+NEXUS_PATCHES = ("loopback-bind", "client-cancel-unknown", "client-close-proof",
+                 "client-acquisition", "launch-authorization")
 CANCEL_HANDLE_SHA256 = "4cd1a9c27e969504eed4ae55d7cbd0e2b4b5a6ba67f0c2529ccb6006a8d67b76"
 PATCHED_HANDLE_SHA256 = "aa5d7ea42caaa922ef494d7d8a1406396537a4ea88d9e833825e08c8d279025e"
 RUNTIME_LOCK = json.loads((REPO / "scripts/nexus/runtime-lock.json").read_text())
@@ -177,6 +181,71 @@ def check_dependencies(root, python, pip, entry):
     run(root, 'pip-check', [str(python), '-I', '-B', '-c', script, exception or '', *pip, 'check'])
 
 
+def prepare_source(root: Path, source_override=None) -> Path:
+    """Snapshot read-only input, validate its Git tree and retain a pristine HEAD."""
+    original = (source_override or REPO / '3rd-github/ida-nexus').resolve(strict=True)
+    if root.resolve().is_relative_to(original):
+        raise ValueError('Nexus input must not contain the preparation root')
+    source = root / 'nexus-source'
+    if source.exists() or source.is_symlink():
+        raise ValueError('Nexus destination already exists')
+    expected = json.loads((REPO / 'scripts/nexus/source-tree.json').read_text())
+    # Exclude inherited Git repository/index/config injection and user hooks.
+    environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    environment.update({'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1',
+                        'GIT_OPTIONAL_LOCKS': '0',
+                        'GIT_AUTHOR_NAME': 'Nexus upstream', 'GIT_AUTHOR_EMAIL': 'nexus@example.invalid',
+                        'GIT_COMMITTER_NAME': 'Nexus upstream', 'GIT_COMMITTER_EMAIL': 'nexus@example.invalid',
+                        'GIT_AUTHOR_DATE': '2000-01-01T00:00:00+0000',
+                        'GIT_COMMITTER_DATE': '2000-01-01T00:00:00+0000'})
+    git = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.autocrlf=false',
+           '-c', 'core.fileMode=true', '-c', 'core.excludesFile=/dev/null',
+           '-c', 'commit.gpgSign=false', '-c', 'core.fsmonitor=false']
+    if (original / '.git').exists():
+        dirty = run(root, 'source-input-status', [*git, 'status', '--porcelain', '--untracked-files=all'],
+                    cwd=original, env=environment)
+        if dirty:
+            raise RuntimeError('Nexus source has local changes: ' + dirty
+                               + '; put DIY changes in scripts/nexus/ patches, then restore the source tree')
+    with tempfile.TemporaryDirectory(prefix='source-check-', dir=root) as temporary:
+        staging = Path(temporary) / 'tree'
+        shutil.copytree(original, staging, symlinks=True,
+                        ignore=lambda directory, names: ['.git'] if Path(directory) == original else [])
+        def invoke(label, *arguments):
+            return run(root, label, [*git, *arguments], cwd=staging, env=environment)
+        invoke('source-init', 'init', '--quiet', '--template=')
+        # Upstream tracked files remain tracked even if an ignore pattern matches.
+        for name in expected:
+            path = staging / name
+            if path.is_file() or path.is_symlink():
+                invoke('source-add-tracked', 'add', '--force', '--', name)
+        invoke('source-add', 'add', '--all', '--', '.')
+        tree = invoke('source-tree', 'write-tree')
+        if tree != NEXUS_TREE:
+            actual = {}
+            for record in invoke('source-index', 'ls-files', '--stage', '-z').split('\0'):
+                if record:
+                    meta, name = record.split('\t', 1)
+                    mode, oid, _ = meta.split()
+                    actual[name] = {'mode': mode, 'oid': oid}
+            changed = sorted(name for name in expected.keys() | actual.keys()
+                             if expected.get(name) != actual.get(name))
+            raise RuntimeError('Nexus source tree mismatch: ' + ', '.join(changed)
+                               + '; put DIY changes in scripts/nexus/ patches, then restore the source tree')
+        # Only the validated index is materialized: ignored build products never escape.
+        source.mkdir()
+        invoke('source-export', 'checkout-index', '--all', '--prefix=' + str(source) + '/')
+        shutil.move(str(staging / '.git'), source / '.git')
+    run(root, 'source-commit', [*git, 'commit', '--quiet', '--no-verify', '-m',
+                               'Pristine Nexus ' + NEXUS_SHA], cwd=source, env=environment)
+    tree = run(root, 'source-head-tree', [*git, 'rev-parse', 'HEAD^{tree}'], cwd=source, env=environment)
+    status = run(root, 'source-clean', [*git, 'status', '--porcelain', '--untracked-files=all', '--ignored'],
+                 cwd=source, env=environment)
+    if tree != NEXUS_TREE or status:
+        raise RuntimeError('Nexus pristine HEAD/worktree verification failed: ' + status)
+    return source
+
+
 def prepare(args: argparse.Namespace) -> None:
     root = args.root.expanduser().resolve()
     installed_runtime = args.runtime_only and root == REPO / 'nexus'
@@ -212,37 +281,31 @@ def prepare(args: argparse.Namespace) -> None:
     run(root, "dependencies", [*pip, "install", "--no-deps", "--require-hashes", "--no-index",
                                "--find-links", str(root / "wheels"), "-r", str(REPO / "scripts/nexus/requirements.lock")])
     run(root, "idapro", [*pip, "install", "--no-deps", "--no-index", str(root / "wheels" / wheel.name)])
-    source = root / "nexus-source"
-    clone = (["--no-hardlinks", "--local", str(args.source.resolve(strict=True))]
-             if args.source else ["--depth", "1", "--branch", "v0.13.4",
-                                  "https://github.com/HexRaysSA/ida-nexus.git"])
-    run(root, "clone", ["git", "clone", "--quiet", *clone, str(source)])
-    sha = run(root, "source-sha", ["git", "rev-parse", "HEAD"], cwd=source)
-    if sha != NEXUS_SHA:
-        raise RuntimeError("Nexus tag no longer matches pinned SHA; refusing patch")
-    patch = REPO / "scripts/nexus/loopback-bind.patch"
+    source = prepare_source(root, args.source)
+    sha = NEXUS_SHA
+    patch = REPO / "scripts/nexus" / (NEXUS_PATCHES[0] + ".patch")
     run(root, "patch-check", ["git", "apply", "--check", str(patch)], cwd=source)
     run(root, "patch", ["git", "apply", str(patch)], cwd=source)
-    cancel_patch = REPO / "scripts/nexus/client-cancel-unknown.patch"
+    cancel_patch = REPO / "scripts/nexus" / (NEXUS_PATCHES[1] + ".patch")
     cancel_applied = not args.without_client_cancel_patch
     if cancel_applied:
         run(root, "cancel-patch-check", ["git", "apply", "--check", str(cancel_patch)], cwd=source)
         run(root, "cancel-patch", ["git", "apply", str(cancel_patch)], cwd=source)
         if digest(source / "ida_nexus/handle.py") != CANCEL_HANDLE_SHA256:
             raise RuntimeError("client cancellation patch output hash mismatch; BLOCKED")
-    close_patch = REPO / "scripts/nexus/client-close-proof.patch"
+    close_patch = REPO / "scripts/nexus" / (NEXUS_PATCHES[2] + ".patch")
     close_applied = cancel_applied and not args.without_client_close_patch
     if close_applied:
         run(root, "close-patch-check", ["git", "apply", "--check", str(close_patch)], cwd=source)
         run(root, "close-patch", ["git", "apply", str(close_patch)], cwd=source)
         if digest(source / "ida_nexus/handle.py") != PATCHED_HANDLE_SHA256:
             raise RuntimeError("client close proof patch output hash mismatch; BLOCKED")
-    sdk_patch = REPO / "scripts/nexus/client-acquisition.patch"
+    sdk_patch = REPO / "scripts/nexus" / (NEXUS_PATCHES[3] + ".patch")
     sdk_applied = close_applied and args.sdk_baseline is None
     if sdk_applied:
         run(root, "sdk-patch-check", ["git", "apply", "--check", str(sdk_patch)], cwd=source)
         run(root, "sdk-patch", ["git", "apply", str(sdk_patch)], cwd=source)
-        authorization_patch = REPO / "scripts/nexus/launch-authorization.patch"
+        authorization_patch = REPO / "scripts/nexus" / (NEXUS_PATCHES[4] + ".patch")
         run(root, "authorization-patch-check", ["git", "apply", "--check", str(authorization_patch)], cwd=source)
         run(root, "authorization-patch", ["git", "apply", str(authorization_patch)], cwd=source)
         for name, expected in SDK_CONTRACT["files"].items():
@@ -289,7 +352,7 @@ def prepare(args: argparse.Namespace) -> None:
         installed_http = Path(installed['handle.py']['path']).with_name('_http.py')
         if digest(installed_http) != RUNTIME_LOCK['installed_files']['_http.py']:
             raise RuntimeError('installed loopback patch hash mismatch')
-    manifest = {"root": str(root), "ida_dir": str(ida), "nexus_sha": sha,
+    manifest = {"root": str(root), "ida_dir": str(ida), "nexus_sha": sha, "nexus_tree": NEXUS_TREE,
                 "runtime_lock": RUNTIME_LOCK, "installed_ida_version": entry["ida_version"], "runtime_only": args.runtime_only,
                 "patch_sha256": digest(patch), "python": sys.version,
                 "client_cancel_patch_applied": cancel_applied,
@@ -304,7 +367,7 @@ def prepare(args: argparse.Namespace) -> None:
                 "experimental_baseline": args.sdk_baseline,
                 "eula_entries_copied": len(eula), "checksums": checksums}
     (root / "environment.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(json.dumps({"status": "PREPARED", "root": str(root), "nexus_sha": sha}))
+    print(json.dumps({"status": "PREPARED", "root": str(root), "nexus_sha": sha, "nexus_tree": NEXUS_TREE}))
 
 
 def main() -> None:
@@ -315,7 +378,7 @@ def main() -> None:
     parser.add_argument("--check-runtime", action="store_true", help="validate the detected runtime before installation")
     parser.add_argument("--runtime-only", action="store_true", help="install dependencies without reading a user profile")
     parser.add_argument("--eula-registry", type=Path, help="existing legally prepared ida.reg")
-    parser.add_argument("--source", type=Path, help="optional local fixed upstream clone (read only)")
+    parser.add_argument("--source", type=Path, help="optional pristine pinned upstream directory (read only)")
     parser.add_argument("--wheels", type=Path, help="optional offline hashed wheel directory (read only)")
     parser.add_argument("--sdk-baseline", choices=("r0",),
                         help="experimental three-patch baseline only; unsupported by production admission")

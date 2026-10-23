@@ -73,3 +73,55 @@ Grant and decision records are retained permanently and never reused. A worker
 without this argument keeps the upstream behavior. Legacy launches without a
 grant remain pending until their normal public owner lifecycle supplies evidence.
 The patched environment must be rebuilt; existing venvs cannot be reused.
+
+### Vendored Nexus source and local patches
+
+`3rd-github/ida-nexus` is the complete, unmodified MIT-licensed tree from
+https://github.com/HexRaysSA/ida-nexus, tag `v0.13.4`, commit
+`d60ff582fde90c59726336c0dbdf3e8286e9df7a`, tree
+`0726da7f22c9354b12184ae40742c65c091ae581` (including upstream dotfiles and LICENSE).
+Preparation defaults to this directory, without a Nexus network clone. Release
+packages include it; bundle, tag and source-build installs use their bundle's tree.
+`--source` (installer: `--nexus-source`) explicitly overrides the input. Both inputs
+must match the pinned tree; changed, missing or extra files fail with paths.
+Upstream-ignored build products are excluded. Inputs are never modified.
+The prepared repository has a deterministic pristine upstream HEAD before the five
+patches are applied; its tree ID and upstream commit are recorded in
+`environment.json` and `PREPARED`. `source-tree.json` supplies path diagnostics.
+
+```bash
+git rev-parse HEAD:3rd-github/ida-nexus
+# Compare with the upstream commit's tree in a separate upstream checkout:
+git -C "$UPSTREAM" rev-parse 'd60ff582fde90c59726336c0dbdf3e8286e9df7a^{tree}'
+```
+
+For DIY, edit the vendor files only while developing the patch, export the diff,
+and restore the original vendor tree. Review the patch before adding it to the
+preparer and `NEXUS_PATCHES` (also used by CI). Never commit a modified vendor tree.
+New files must first be made visible to `git diff` (for example with `git add -N`).
+
+```bash
+git diff --relative=3rd-github/ida-nexus -- 3rd-github/ida-nexus > scripts/nexus/local-change.patch
+git restore --worktree --staged -- 3rd-github/ida-nexus
+# Remove only your own newly created, now-untracked vendor files if applicable.
+```
+
+Integrating a patch requires updating the applicable `CANCEL_HANDLE_SHA256` /
+`PATCHED_HANDLE_SHA256` in `prepare_nexus_env.py`, `client-sdk-contract.json`
+(`files`), and `runtime-lock.json` (`assets`, `installed_files`). A contract change
+also changes its asset hash in `runtime-lock.json`. Keep patch checks, intermediate
+hashes and installed-module checks; rebuild and run the install/N0/release tests.
+`r0_prepare.py` only records the historical three-patch baseline and forwards
+pristine source/wheels inputs. It is not a supported current runtime preparer:
+the current installed-SDK admission requires `_launch_authorization`, absent from
+that baseline, and rejects it explicitly. `r0_sdk_candidate.py --source` instead takes an installed
+package to generate its historical candidate and is not a preparer input.
+
+To upgrade, fetch and verify the new upstream tag in a separate checkout, record
+commit/tree IDs, and import the complete tree as a dedicated vendor-only commit
+(e.g. `git read-tree --prefix=3rd-github/ida-nexus/ -u <tree>` after removing the
+old prefix). Update `NEXUS_SHA`, `NEXUS_TREE`, `source-tree.json`, lock/contract
+provenance and package version requirements. Rebase all five patches in order,
+review their semantics, update all hash gates listed above and rerun the full
+acceptance suite including CI client, offline preparation, package installation
+and smoke tests. Do not fall back to network sources on verification failure.

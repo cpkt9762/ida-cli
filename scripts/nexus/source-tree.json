@@ -1,0 +1,254 @@
+{
+  ".github/CONTRIBUTING.md": {
+    "mode": "100644",
+    "oid": "50f49f877bb632cbd5eb90afae53697516900053"
+  },
+  ".github/workflows/release.yml": {
+    "mode": "100644",
+    "oid": "ed5ddf8343b95e303cf10e329ceda30fb8fad32c"
+  },
+  ".gitignore": {
+    "mode": "100644",
+    "oid": "c38c52b659ba0ce0d45210fcea9ca21f2298977f"
+  },
+  ".python-version": {
+    "mode": "100644",
+    "oid": "2c0733315e415bfb5e5b353f9996ecd964d395b2"
+  },
+  "LICENSE": {
+    "mode": "100644",
+    "oid": "16bb6f9d1d067949d2eed8889bca4f3192e3a31c"
+  },
+  "README.md": {
+    "mode": "100644",
+    "oid": "45b721fd4aea61cf16b0a1c15f2e2cd9fd2eabcb"
+  },
+  "docs/ARCHITECTURE.md": {
+    "mode": "100644",
+    "oid": "30faa2d96588c4d4a838a5d16ff3947a9ec76dbb"
+  },
+  "docs/TESTING.md": {
+    "mode": "100644",
+    "oid": "2f3da72f188dbb08aa64e18eb7ab55fa2783d152"
+  },
+  "ida-plugin.json": {
+    "mode": "100644",
+    "oid": "ee320b5c2dc66c3ca552bf7d24667e1bad65826b"
+  },
+  "ida_nexus/__init__.py": {
+    "mode": "100644",
+    "oid": "f587b32813d47030f7ed8ecc337e490a4e14eeb6"
+  },
+  "ida_nexus/__main__.py": {
+    "mode": "100644",
+    "oid": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08"
+  },
+  "ida_nexus/_http.py": {
+    "mode": "100644",
+    "oid": "c0c46e31eb24d5cb0e3616abb7a9ee711b8c5ed3"
+  },
+  "ida_nexus/_idb_events.py": {
+    "mode": "100644",
+    "oid": "e6f018feeef4b68f955aae02da48b4a3e6899c0e"
+  },
+  "ida_nexus/_registry.py": {
+    "mode": "100644",
+    "oid": "1cb34a3927b459e49545f080aa847f5dddff8e68"
+  },
+  "ida_nexus/_remote.py": {
+    "mode": "100644",
+    "oid": "5c7445c2ccd118d8a3fef74d7abb5145c3a0ab9e"
+  },
+  "ida_nexus/_resolver.py": {
+    "mode": "100644",
+    "oid": "1274e482fe003e07b42edd3e23021ff7931da1ce"
+  },
+  "ida_nexus/_runtime.py": {
+    "mode": "100644",
+    "oid": "fffe7fc62f601a6ba02e015cae72a96a940741d4"
+  },
+  "ida_nexus/_serialization.py": {
+    "mode": "100644",
+    "oid": "3046e68d1732761ffd5cbc23a0d43d9a683ea4b1"
+  },
+  "ida_nexus/_server.py": {
+    "mode": "100644",
+    "oid": "7ddd2b2e3147354fbc1eb825be69cf44ef55131a"
+  },
+  "ida_nexus/cli/__init__.py": {
+    "mode": "100644",
+    "oid": "0eef873f149e70475aaec8fbdfd6d751b7b3b864"
+  },
+  "ida_nexus/cli/__main__.py": {
+    "mode": "100644",
+    "oid": "0476defb05befd2ed18c70fa717d42db88217083"
+  },
+  "ida_nexus/cli/benchmark.py": {
+    "mode": "100644",
+    "oid": "ad12d7aa5c639f69da641d952014bfee12cc4e3f"
+  },
+  "ida_nexus/cli/python.py": {
+    "mode": "100644",
+    "oid": "6f44959a1462bd77201f6417d15fe3688a0b6e8e"
+  },
+  "ida_nexus/cli/worker.py": {
+    "mode": "100644",
+    "oid": "3768fe5f906129375b5cd8a7283098b63438955c"
+  },
+  "ida_nexus/database_state.py": {
+    "mode": "100644",
+    "oid": "cd80eda71c5cb5c5f9dc2afd630dc29bfbb8c7d4"
+  },
+  "ida_nexus/errors.py": {
+    "mode": "100644",
+    "oid": "0d5d631e1b9ad60d9447b4f4764d989cd251d452"
+  },
+  "ida_nexus/handle.py": {
+    "mode": "100644",
+    "oid": "f3a4fcb8f7f6dbf48010128961902251ea4d5b05"
+  },
+  "ida_nexus/instances.py": {
+    "mode": "100644",
+    "oid": "ae9046b04357c637ca1d0b345338bb87e3588eb6"
+  },
+  "ida_nexus/manager.py": {
+    "mode": "100644",
+    "oid": "91cf2655f586b2c143816bf4dff753c510dff815"
+  },
+  "ida_nexus/models.py": {
+    "mode": "100644",
+    "oid": "9d96e41256639905df6a87f804f31f62aa22d06c"
+  },
+  "ida_nexus/options.py": {
+    "mode": "100644",
+    "oid": "f07ef1a35dfb78319ce376d07741ec2a03d3d224"
+  },
+  "ida_nexus/paths.py": {
+    "mode": "100644",
+    "oid": "2a559c899133d20b956f2e034db0b2e8472d4960"
+  },
+  "ida_nexus/plugin.py": {
+    "mode": "100644",
+    "oid": "1c820db5cdf52622da8c989ac73e36df75191d41"
+  },
+  "ida_nexus/py.typed": {
+    "mode": "100644",
+    "oid": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+  },
+  "ida_nexus/reference.py": {
+    "mode": "100644",
+    "oid": "e8ab4d3423a9bc5c8857d67b2867819b512540cd"
+  },
+  "ida_nexus_plugin.py": {
+    "mode": "100644",
+    "oid": "c05755505fb8080d2b507ad91d97127d405785fb"
+  },
+  "pyproject.toml": {
+    "mode": "100644",
+    "oid": "776d96e62c123256b1fd7cbbf7abbea06543d297"
+  },
+  "scripts/bump_version.py": {
+    "mode": "100755",
+    "oid": "3e717afc986b83aeb5ed2241a7f374209da40e9c"
+  },
+  "scripts/check_wheel.py": {
+    "mode": "100755",
+    "oid": "fdb145c1d525684f26ad44dd095c95221d292867"
+  },
+  "scripts/public_api_example.py": {
+    "mode": "100644",
+    "oid": "464ac8188441d461cdebe35d20575129ea8363cd"
+  },
+  "scripts/snippet.py": {
+    "mode": "100644",
+    "oid": "61bce8eff491743911f993388c15ea6b01c3070a"
+  },
+  "scripts/worker_crash_e2e.py": {
+    "mode": "100755",
+    "oid": "ddd1c69dcec8d945121bb8faac46e550f6b1b4ea"
+  },
+  "tests/conftest.py": {
+    "mode": "100644",
+    "oid": "10e39b06e83596ea09dd7fef6b3adaaaa1d7be37"
+  },
+  "tests/crackme03.elf": {
+    "mode": "100755",
+    "oid": "a7a09599b93ef689b6af986f02d79826d2e84e23"
+  },
+  "tests/fixtures/reference_queries.json": {
+    "mode": "100644",
+    "oid": "9e11b8332d815490a73b125b67bd325171863a5a"
+  },
+  "tests/test_bump_version.py": {
+    "mode": "100644",
+    "oid": "dd1b0dc1c5e913ca67bf6ed6136ca2ded614bf07"
+  },
+  "tests/test_database_state.py": {
+    "mode": "100644",
+    "oid": "201cca5b11aea9f451d38f9411f1fa4c3e8c5a9f"
+  },
+  "tests/test_handle_scenarios.py": {
+    "mode": "100644",
+    "oid": "766324b0e444423ac22571f6b6fe8a5c1cfc01e7"
+  },
+  "tests/test_idalib_e2e.py": {
+    "mode": "100644",
+    "oid": "b6fcde5aece5fb9a865e173b73f22b1170ae19a4"
+  },
+  "tests/test_instance_management.py": {
+    "mode": "100644",
+    "oid": "02d3a626f2b0cd6d6b9dc12fd4ccab06a46549b7"
+  },
+  "tests/test_lease_scenarios.py": {
+    "mode": "100644",
+    "oid": "64e9011f0b13cfe7b7fcc0634d3758165b6330d2"
+  },
+  "tests/test_live.py": {
+    "mode": "100755",
+    "oid": "6faf0521dcc56d2f405f16af780ff53b8add2bc5"
+  },
+  "tests/test_manager_scenarios.py": {
+    "mode": "100644",
+    "oid": "990258ee6bc278594708f2360aa5a52a4cd9e15f"
+  },
+  "tests/test_nexus_server.py": {
+    "mode": "100644",
+    "oid": "f89fedfa0259a16068c66eba0cca5a97ffaf8ceb"
+  },
+  "tests/test_public_api.py": {
+    "mode": "100644",
+    "oid": "ec9e01b3fad3b39c086d7a3c2ed3ec50f37b796e"
+  },
+  "tests/test_reference.py": {
+    "mode": "100644",
+    "oid": "d73314da46056c23afc5ad3904ca5b1c1682a027"
+  },
+  "tests/test_registry_scenarios.py": {
+    "mode": "100644",
+    "oid": "32e214e15f31ba9ad5123e043cfd31bf35a2597f"
+  },
+  "tests/test_remote.py": {
+    "mode": "100644",
+    "oid": "efc9656a7c817f6a79fff43348358f7f39fe6544"
+  },
+  "tests/test_resolver_scenarios.py": {
+    "mode": "100644",
+    "oid": "e989b178f8ae20672232ca47196b85f6a89ef168"
+  },
+  "tests/test_runtime.py": {
+    "mode": "100644",
+    "oid": "74f0ff3087cc4dd3ca523ddd38680bbd8303810a"
+  },
+  "tests/test_serialization.py": {
+    "mode": "100644",
+    "oid": "0b9cc8d3ec480ec2f0f91e88ba92ce9cccb0de6b"
+  },
+  "tests/typing/remote_ida.py": {
+    "mode": "100644",
+    "oid": "e27710c76c9517674b3c32e04362aeb7b54bf21f"
+  },
+  "uv.lock": {
+    "mode": "100644",
+    "oid": "89e81a57b0f83083f83c6c05e0ccb3846454698e"
+  }
+}

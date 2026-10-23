@@ -30,14 +30,23 @@ jobs:
         run: |
           timeout 30s python3 -m venv /tmp/nexus-client
           timeout 30s /tmp/nexus-client/bin/python -m pip install --no-deps --require-hashes -r scripts/nexus/requirements.lock
-          timeout 30s git clone --quiet https://github.com/HexRaysSA/ida-nexus.git /tmp/nexus-source
-          git -C /tmp/nexus-source checkout d60ff582fde90c59726336c0dbdf3e8286e9df7a
-          for patch in loopback-bind client-cancel-unknown client-close-proof client-acquisition; do
-            git -C /tmp/nexus-source apply "$GITHUB_WORKSPACE/scripts/nexus/$patch.patch"
-          done
-          timeout 30s /tmp/nexus-client/bin/python -m pip install --no-deps --no-build-isolation /tmp/nexus-source
+          timeout 30s python3 - <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, 'scripts')
+          from prepare_nexus_env import NEXUS_PATCHES, prepare_source, run
+          root = pathlib.Path('/tmp/nexus-ci')
+          root.mkdir(mode=0o700)
+          (root / 'logs').mkdir()
+          source = prepare_source(root)
+          for name in NEXUS_PATCHES:
+              patch = pathlib.Path('scripts/nexus', name + '.patch').resolve()
+              run(root, name + '-check', ['git', 'apply', '--check', str(patch)], cwd=source)
+              run(root, name, ['git', 'apply', str(patch)], cwd=source)
+          PY
+          timeout 30s /tmp/nexus-client/bin/python -m pip install --no-deps --no-build-isolation /tmp/nexus-ci/nexus-source
           echo /tmp/nexus-client/bin >> "$GITHUB_PATH"
           echo IDA_NEXUS_PYTHON=/tmp/nexus-client/bin/python >> "$GITHUB_ENV"
+          echo F1_PYTHON=/tmp/nexus-client/bin/python >> "$GITHUB_ENV"
 
       - name: Validate Rust library tests
         run: |

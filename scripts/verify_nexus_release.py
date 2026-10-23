@@ -414,7 +414,7 @@ def e29(env, binary, case, result):
         variables.pop('IDADIR',None)
     install = command(env, ['bash',str(bundle/'scripts/install.sh'),'--bundle',str(bundle),
         '--bin-dir',str(prefix/'bin'),'--install-root',str(prefix/'lib'),
-        '--nexus-source',str(env.root/'nexus-source'),'--wheels',str(env.root/'wheels')], variables, limit=180)
+        '--wheels',str(env.root/'wheels')], variables, limit=180)
     result['install_output'] = install
     launcher = prefix/'bin/ida-cli'
     roots = list((prefix/'lib').glob('version.*'));assert len(roots)==1

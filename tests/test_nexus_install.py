@@ -221,5 +221,104 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(result.stdout.strip(), str(app / 'Contents/MacOS'))
 
 
+class SourceTreeTests(unittest.TestCase):
+    def setUp(self):
+        import shutil
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        spec = importlib.util.spec_from_file_location('source_preparer', REPO / 'scripts/prepare_nexus_env.py')
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.input = self.root / 'input'
+        shutil.copytree(REPO / '3rd-github/ida-nexus', self.input)
+
+    def prepare(self, name='output'):
+        root = self.root / name
+        (root / 'logs').mkdir(parents=True)
+        return self.module.prepare_source(root, self.input)
+
+    def snapshot(self):
+        import hashlib
+        return {str(path.relative_to(self.input)): (path.stat().st_mode,
+                hashlib.sha256(path.read_bytes()).hexdigest())
+                for path in self.input.rglob('*') if path.is_file()}
+
+    def test_pristine_tree_head_and_source_unchanged(self):
+        before = self.snapshot()
+        source = self.prepare()
+        tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], cwd=source, text=True).strip()
+        self.assertEqual(tree, self.module.NEXUS_TREE)
+        original = subprocess.check_output(['git', 'show', 'HEAD:ida_nexus/_http.py'], cwd=source)
+        self.assertEqual(original, (self.input / 'ida_nexus/_http.py').read_bytes())
+        patch = REPO / 'scripts/nexus/loopback-bind.patch'
+        subprocess.run(['git', 'apply', str(patch)], cwd=source, check=True)
+        self.assertNotEqual(original, (source / 'ida_nexus/_http.py').read_bytes())
+        self.assertEqual(original, subprocess.check_output(['git', 'show', 'HEAD:ida_nexus/_http.py'], cwd=source))
+        self.assertEqual(before, self.snapshot())
+
+    def test_modified_extra_missing_and_mode_changes_rejected_with_paths(self):
+        target = self.input / 'README.md'
+        original = target.read_bytes()
+        for kind in ('modified', 'extra', 'missing', 'mode'):
+            with self.subTest(kind=kind):
+                path = self.input / 'extra.txt' if kind == 'extra' else target
+                if kind == 'modified':path.write_bytes(original + b'changed')
+                if kind == 'extra':path.write_text('unexpected')
+                if kind == 'missing':path.unlink()
+                if kind == 'mode':path.chmod(0o755)
+                before = self.snapshot()
+                with self.assertRaisesRegex(RuntimeError, path.name) as error:
+                    self.prepare(kind)
+                self.assertIn('scripts/nexus/', str(error.exception))
+                self.assertEqual(before, self.snapshot())
+                if kind == 'extra':path.unlink()
+                else:target.write_bytes(original); target.chmod(0o644)
+
+    def test_ignored_products_not_copied_and_commits_deterministic(self):
+        cache = self.input / 'ida_nexus/__pycache__'
+        cache.mkdir()
+        (cache / 'generated.pyc').write_bytes(b'ignored')
+        before = self.snapshot()
+        one, two = self.prepare('one'), self.prepare('two')
+        for source in (one, two):
+            self.assertFalse((source / 'ida_nexus/__pycache__').exists())
+            self.assertEqual(subprocess.check_output(['git', 'status', '--porcelain', '--ignored'], cwd=source), b'')
+        self.assertEqual(subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=one),
+                         subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=two))
+        self.assertEqual(before, self.snapshot())
+
+    def test_package_contains_exact_upstream_tree_and_diagnostics(self):
+        import tarfile
+        binary = self.root / 'binary'
+        binary.write_bytes(b'test executable')
+        archive = self.root / 'bundle.tar.gz'
+        result = subprocess.run([sys.executable, str(REPO / 'scripts/package_release.py'),
+                                 '--binary', str(binary), '--output', str(archive)],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = json.loads((REPO / 'scripts/nexus/source-tree.json').read_text())
+        with tarfile.open(archive) as bundle:
+            prefix = '3rd-github/ida-nexus/'
+            entries = {member.name[len(prefix):]: member for member in bundle.getmembers()
+                       if member.name.startswith(prefix)}
+            self.assertEqual(set(entries), set(expected))
+            self.assertIn('scripts/nexus/source-tree.json', bundle.getnames())
+            for name, member in entries.items():
+                self.assertEqual(bundle.extractfile(member).read(), (self.input / name).read_bytes())
+                self.assertEqual(bool(member.mode & 0o111), expected[name]['mode'] == '100755')
+
+    def test_dirty_clone_is_not_silently_reset(self):
+        import shutil
+        source = self.prepare()
+        shutil.rmtree(self.input)
+        subprocess.run(['git', 'clone', '--quiet', '--no-hardlinks', str(source), str(self.input)], check=True)
+        (self.input / 'README.md').write_text('uncommitted edit')
+        before = self.snapshot()
+        with self.assertRaisesRegex(RuntimeError, 'README.md'):
+            self.prepare('dirty')
+        self.assertEqual(before, self.snapshot())
+
+
 if __name__ == '__main__':
     unittest.main()
