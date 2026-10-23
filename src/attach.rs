@@ -234,7 +234,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after unix epoch")
             .as_nanos();
-        let root = PathBuf::from("/private/tmp")
+        let root = PathBuf::from("/tmp")
             .join(format!("ida-attach-{label}-{}-{nanos}", std::process::id()));
         (
             root.with_extension("mcp.sock"),

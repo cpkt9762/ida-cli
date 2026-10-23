@@ -17,6 +17,9 @@ async fn run_case(fault: &str) {
             .args(["--exact", &name, "--nocapture"])
             .env("N4_F2_CHILD", &name)
             .env("N4_F2_OPEN_FAULT", fault)
+            // The wire fixture never loads IDA. Keep runtime auto-discovery out
+            // of this isolated subprocess even on hosts with no IDA installed.
+            .env("IDADIR", root.join("unused-ida-runtime"))
             .env("IDA_CLI_HOME", &root)
             .env("IDA_NEXUS_STATE_DIR", root.join("state"))
             .env(
