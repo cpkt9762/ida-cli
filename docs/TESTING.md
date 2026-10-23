@@ -2077,7 +2077,11 @@ exits. Concurrent batch items share one recovery (including a failed recovery);
 subsequent items use the replacement endpoint. Dispatched/unknown outcomes,
 transport errors and accepted queue task ids are never replayed. Pinned sockets
 (`--socket` / `$IDA_MCP_SOCKET`) never recover or retry. Deterministic contracts:
-`tests/prewarm_many.rs` and `cli::bridge_loss_recovery_tests::batch_*`. Lib cases: `bridge_loss_tests::daemon_*` (self exit
+`tests/prewarm_many.rs` and `cli::bridge_loss_recovery_tests::batch_*`.
+Queued prewarms immediately schedule eligible waiting items after either success
+or failure releases an active/tenant slot, preserving priority and tenant limits.
+They do not wait for the five-minute maintenance tick. Regression:
+`router::tests::prewarm_completion_drains_queued_work_without_watchdog_or_new_enqueues`. Lib cases: `bridge_loss_tests::daemon_*` (self exit
 in W2a; no early exit while a live orphan owner holds custody; unarmed process
 never tags the retry code) and `cli::bridge_loss_recovery_tests`. Real
 end-to-end evidence is recorded in the H report (W1, W2a, W2b; the first

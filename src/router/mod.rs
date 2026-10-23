@@ -1721,42 +1721,48 @@ impl RouterState {
             };
 
             let Some(task) = task else { break };
-            let state = self.clone();
-            tokio::spawn(async move {
-                let result = state
-                    .prewarm_path_with_options(&task.path, task.keep_warm, &task.tenant_id)
-                    .await;
-                let mut queue = state.prewarm_queue.lock().await;
-                queue.active.remove(&task.task_id);
-                if let Some(count) = queue.tenant_active.get_mut(&task.tenant_id) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        queue.tenant_active.remove(&task.tenant_id);
-                    }
-                }
-                let summary = match result {
-                    Ok(value) => serde_json::json!({
-                        "task_id": task.task_id,
-                        "path": task.path,
-                        "tenant_id": task.tenant_id,
-                        "status": "completed",
-                        "result": value,
-                    }),
-                    Err(err) => serde_json::json!({
-                        "task_id": task.task_id,
-                        "path": task.path,
-                        "tenant_id": task.tenant_id,
-                        "status": "failed",
-                        "error": err.to_string(),
-                    }),
-                };
-                queue.recent.push(summary);
-                if queue.recent.len() > 64 {
-                    let drain = queue.recent.len() - 64;
-                    queue.recent.drain(0..drain);
-                }
-            });
+            self.spawn_prewarm_task(task);
         }
+    }
+
+    fn spawn_prewarm_task(&self, task: QueuedPrewarmTask) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let result = state
+                .prewarm_path_with_options(&task.path, task.keep_warm, &task.tenant_id)
+                .await;
+            let mut queue = state.prewarm_queue.lock().await;
+            queue.active.remove(&task.task_id);
+            if let Some(count) = queue.tenant_active.get_mut(&task.tenant_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    queue.tenant_active.remove(&task.tenant_id);
+                }
+            }
+            let summary = match result {
+                Ok(value) => serde_json::json!({
+                    "task_id": task.task_id,
+                    "path": task.path,
+                    "tenant_id": task.tenant_id,
+                    "status": "completed",
+                    "result": value,
+                }),
+                Err(err) => serde_json::json!({
+                    "task_id": task.task_id,
+                    "path": task.path,
+                    "tenant_id": task.tenant_id,
+                    "status": "failed",
+                    "error": err.to_string(),
+                }),
+            };
+            queue.recent.push(summary);
+            if queue.recent.len() > 64 {
+                let drain = queue.recent.len() - 64;
+                queue.recent.drain(0..drain);
+            }
+            drop(queue);
+            state.drive_prewarm_queue().await;
+        });
     }
 
     async fn drive_route_queue(&self) {
@@ -2132,6 +2138,49 @@ pub fn is_sbpf_elf(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prewarm_completion_drains_queued_work_without_watchdog_or_new_enqueues() {
+        let mut config = RouterConfig::from_env();
+        config.max_active_prewarms = 2;
+        config.max_prewarms_per_tenant = 1;
+        let router = RouterState::with_config(config).expect("batch router");
+        let missing = std::env::temp_dir().join(format!("missing-prewarm-{}", std::process::id()));
+        assert!(
+            !missing.exists(),
+            "fixture must fail before runtime acquisition"
+        );
+        {
+            let mut queue = router.prewarm_queue.lock().await;
+            for i in 0..6 {
+                queue.queued.push(QueuedPrewarmTask {
+                    task_id: format!("batch-{i}"),
+                    path: missing.to_string_lossy().into_owned(),
+                    tenant_id: format!("tenant-{}", i % 2),
+                    priority: 0,
+                    keep_warm: false,
+                    enqueued_at: Instant::now(),
+                });
+            }
+        }
+        router.drive_prewarm_queue().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let queue = router.prewarm_queue.lock().await;
+                if queue.recent.len() == 6 {
+                    assert!(queue.queued.is_empty());
+                    assert!(queue.active.is_empty());
+                    assert!(queue.tenant_active.is_empty(), "tenant slots released");
+                    assert!(queue.recent.iter().all(|item| item["status"] == "failed"));
+                    break;
+                }
+                drop(queue);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion must immediately dispatch queued items");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn queued_dedupe_cancel_removes_all_work_without_overwriting_original() {
