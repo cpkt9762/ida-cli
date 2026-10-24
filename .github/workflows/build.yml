@@ -153,7 +153,8 @@ jobs:
 
           cp scripts/install.sh release/install.sh
           chmod +x release/install.sh
-          sha256sum release/ida-cli-* > release/sha256sums.txt
+          # Bare file names, so `sha256sum -c sha256sums.txt` works in the download directory.
+          (cd release && sha256sum ida-cli-* > sha256sums.txt)
 
       - name: Create release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b  # v2
