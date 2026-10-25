@@ -22,6 +22,11 @@ use tracing::{info, warn};
 /// Back-off after a failed `accept`, so a persistent error (EMFILE) does not spin.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Connection probes for a socket its owner record does not describe. All must
+/// be refused; the spacing lets a transiently full accept queue drain, since
+/// macOS refuses those connections too. Only the rare stale path pays for it.
+const STALE_PROBE_ATTEMPTS: u32 = 5;
+const STALE_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug)]
 pub struct BoundMcpSocket {
@@ -135,7 +140,7 @@ pub fn bind_mcp_socket(path: PathBuf) -> anyhow::Result<BoundMcpSocket> {
         })?;
     }
     let mut owner_lock = McpSocketOwnerLock::acquire(&path)?;
-    remove_stale_socket(&path, owner_lock.recorded_identity(), || {})?;
+    remove_stale_socket(&path, &mut owner_lock, || {})?;
     let listener = UnixListener::bind(&path)
         .map_err(|e| anyhow::anyhow!("cannot bind MCP socket {path:?}: {e}"))?;
     let metadata = std::fs::symlink_metadata(&path)
@@ -164,9 +169,16 @@ pub fn bind_mcp_socket(path: PathBuf) -> anyhow::Result<BoundMcpSocket> {
     })
 }
 
+/// Remove a stale socket at `path`. The caller holds the owner lock, so no
+/// daemon that locked this lock file still runs. The socket is stale when the
+/// owner record matches it, or when the record names another socket and every
+/// connection probe is refused (macOS can renumber a volume's st_dev across a
+/// reboot, and a crash between bind and record_identity leaves the previous
+/// record). A missing record is refused: the lock file may itself be new, so
+/// holding it says nothing about who serves the socket.
 fn remove_stale_socket<F>(
     path: &Path,
-    recorded_identity: Option<SocketIdentity>,
+    owner_lock: &mut McpSocketOwnerLock,
     before_recheck: F,
 ) -> anyhow::Result<()>
 where
@@ -196,20 +208,39 @@ where
         );
     }
     let original_identity = SocketIdentity::from_metadata(&metadata);
-    if !recorded_identity.is_some_and(|recorded| recorded.matches_observed(original_identity)) {
-        anyhow::bail!(
-            "cannot confirm MCP socket {} is stale: owner record does not match its identity",
+    match owner_lock.recorded_identity() {
+        Some(recorded) if recorded.matches_observed(original_identity) => {}
+        Some(recorded) => {
+            if let Some(evidence) = live_listener_evidence(path) {
+                anyhow::bail!(
+                    "cannot confirm MCP socket {} is stale: owner record does not match its identity and {evidence}",
+                    path.display()
+                );
+            }
+            warn!(
+                path = %path.display(),
+                recorded = ?recorded,
+                observed = ?original_identity,
+                "MCP socket owner record does not match; owner lock is free and every connection was refused, treating the socket as stale"
+            );
+        }
+        None => anyhow::bail!(
+            "cannot confirm MCP socket {} is stale: its owner lock holds no record",
             path.display()
-        );
+        ),
     }
 
     before_recheck();
-    let current = std::fs::symlink_metadata(path).map_err(|error| {
-        anyhow::anyhow!(
-            "MCP socket {} changed while checking staleness: {error}",
-            path.display()
-        )
-    })?;
+    let current = match std::fs::symlink_metadata(path) {
+        Ok(current) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "MCP socket {} changed while checking staleness: {error}",
+                path.display()
+            ))
+        }
+    };
     if !current.file_type().is_socket()
         || SocketIdentity::from_metadata(&current) != original_identity
     {
@@ -225,6 +256,94 @@ where
         )
     })?;
     info!("Removed stale MCP socket {:?}", path);
+    Ok(())
+}
+
+/// `None` only when every probe of `path` is refused (nothing listens there);
+/// otherwise why a listener may still be live.
+fn live_listener_evidence(path: &Path) -> Option<String> {
+    for attempt in 0..STALE_PROBE_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(STALE_PROBE_INTERVAL);
+        }
+        match connect_nonblocking(path) {
+            Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {}
+            // Gone: nothing listens; the identity recheck finds it missing.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Ok(()) => return Some("a listener accepted a connection".to_string()),
+            Err(error) => return Some(format!("a connection probe was not refused: {error}")),
+        }
+    }
+    None
+}
+
+/// One non-blocking AF_UNIX connect, so a full accept queue fails fast (EAGAIN
+/// on Linux) instead of blocking the probe.
+fn connect_nonblocking(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: zeroed is a valid sockaddr_un (empty path, family set below).
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= address.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("socket path {} is too long", path.display()),
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+
+    // Linux sets both flags atomically, so a concurrent fork never inherits it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let kind = libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: socket takes no pointers; a non-negative result is a new descriptor.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: raw is a fresh descriptor that nothing else owns or closes.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    let fd = socket.as_raw_fd();
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    set_cloexec_then_nonblocking(fd)?;
+    // SAFETY: address is an initialised sockaddr_un with a NUL-terminated path,
+    // and the length passed is its full size.
+    let connected = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_un).cast(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if connected == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Without SOCK_CLOEXEC, close the inheritance window first, then go non-blocking.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_cloexec_then_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl only updates the descriptor flags of the caller's live fd.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl only reads the status flags of the caller's live fd.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl only updates the status flags of the caller's live fd.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -747,10 +866,9 @@ mod tests {
         let replacement_for_probe = replacement.clone();
         let mut owner_lock =
             McpSocketOwnerLock::acquire(&path).expect("acquire released owner lock");
-        let recorded_identity = owner_lock.recorded_identity();
         let path_for_probe = path.clone();
 
-        let error = remove_stale_socket(&path, recorded_identity, move || {
+        let error = remove_stale_socket(&path, &mut owner_lock, move || {
             std::fs::remove_file(&path_for_probe).expect("remove original stale socket");
             let new_listener =
                 StdUnixListener::bind(&path_for_probe).expect("bind replacement socket");
@@ -767,6 +885,160 @@ mod tests {
             SocketIdentity::from_metadata(&current),
             SocketIdentity::from_metadata(&original)
         );
+        let replacement_listener = replacement
+            .lock()
+            .expect("replacement holder mutex")
+            .take()
+            .expect("replacement listener retained");
+        drop(replacement_listener);
+        std::fs::remove_file(&path).expect("cleanup replacement socket");
+        drop(owner_lock);
+        std::fs::remove_file(test_owner_lock_path(&path)).expect("cleanup owner lock");
+    }
+
+    /// Leave a socket file nothing listens on, as a killed daemon does.
+    fn abandoned_socket(path: &Path) -> std::fs::Metadata {
+        drop(StdUnixListener::bind(path).expect("bind socket to abandon"));
+        std::fs::symlink_metadata(path).expect("abandoned socket metadata")
+    }
+
+    /// An owner record naming the same inode on another device, as after a
+    /// reboot renumbered the volume's st_dev.
+    fn write_renumbered_record(path: &Path, socket: &std::fs::Metadata) {
+        std::fs::write(
+            test_owner_lock_path(path),
+            format!("{}:{}", socket.dev() + 1, socket.ino()),
+        )
+        .expect("write renumbered owner record");
+    }
+
+    #[tokio::test]
+    async fn test_unmatched_owner_record_removes_refused_socket() {
+        let path = temp_socket("renumbered");
+        let abandoned = abandoned_socket(&path);
+        write_renumbered_record(&path, &abandoned);
+        let replacement =
+            bind_mcp_socket(path.clone()).expect("refused socket with a stale record is stale");
+        let record =
+            std::fs::read_to_string(test_owner_lock_path(&path)).expect("new owner record");
+        assert_eq!(
+            SocketIdentity::from_record(&record),
+            Some(replacement.cleanup.identity),
+            "successful bind records the new socket"
+        );
+        drop(replacement);
+        assert!(!path.exists(), "owned socket removed on drop");
+        std::fs::remove_file(test_owner_lock_path(&path)).expect("cleanup owner lock");
+    }
+
+    #[tokio::test]
+    async fn test_missing_owner_record_preserves_refused_socket() {
+        let path = temp_socket("unrecorded");
+        let abandoned = abandoned_socket(&path);
+        let error = bind_mcp_socket(path.clone())
+            .expect_err("a fresh owner lock proves nothing about the socket");
+        assert!(
+            error.to_string().contains("holds no record"),
+            "unexpected error: {error}"
+        );
+        let current = std::fs::symlink_metadata(&path).expect("preserved socket metadata");
+        assert_eq!(
+            SocketIdentity::from_metadata(&current),
+            SocketIdentity::from_metadata(&abandoned)
+        );
+        std::fs::remove_file(&path).expect("cleanup abandoned socket");
+        std::fs::remove_file(test_owner_lock_path(&path)).expect("cleanup owner lock");
+    }
+
+    /// Linux reports a full accept queue as EAGAIN to a non-blocking connect;
+    /// macOS refuses it, which is why the probe repeats over a second.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_unmatched_owner_record_preserves_unlocked_full_queue() {
+        let path = temp_socket("unlocked-full");
+        let unlocked = StdUnixListener::bind(&path).expect("bind unlocked listener");
+        // SAFETY: unlocked owns a valid AF_UNIX listening descriptor; listen only
+        // updates its backlog and does not outlive the descriptor.
+        let listen_result = unsafe { libc::listen(unlocked.as_raw_fd(), 1) };
+        assert_eq!(listen_result, 0, "set queue test backlog");
+        let original = std::fs::symlink_metadata(&path).expect("unlocked socket metadata");
+        write_renumbered_record(&path, &original);
+        // Queued connections stay in the backlog after the client closes.
+        let saturated = (0..64).any(|_| {
+            connect_nonblocking(&path)
+                .is_err_and(|error| error.raw_os_error() == Some(libc::EAGAIN))
+        });
+        assert!(saturated, "accept queue should be saturated for this test");
+
+        let started = Instant::now();
+        let error = bind_mcp_socket(path.clone())
+            .expect_err("a full accept queue must not be treated as stale");
+        assert!(
+            error.to_string().contains("not refused"),
+            "unexpected error: {error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let current = std::fs::symlink_metadata(&path).expect("preserved socket metadata");
+        assert_eq!(
+            SocketIdentity::from_metadata(&current),
+            SocketIdentity::from_metadata(&original)
+        );
+        drop(unlocked);
+        std::fs::remove_file(&path).expect("cleanup unlocked socket");
+        std::fs::remove_file(test_owner_lock_path(&path)).expect("cleanup owner lock");
+    }
+
+    #[tokio::test]
+    async fn test_unmatched_owner_record_preserves_live_listener() {
+        let path = temp_socket("unlocked");
+        // A listener that never took the owner lock: a foreign or pre-lock process.
+        let unlocked = StdUnixListener::bind(&path).expect("bind unlocked listener");
+        let original = std::fs::symlink_metadata(&path).expect("unlocked socket metadata");
+        write_renumbered_record(&path, &original);
+
+        let error = bind_mcp_socket(path.clone())
+            .expect_err("a listener that accepts must not be treated as stale");
+        assert!(
+            error.to_string().contains("accepted a connection"),
+            "unexpected error: {error}"
+        );
+        let current = std::fs::symlink_metadata(&path).expect("preserved socket metadata");
+        assert_eq!(
+            SocketIdentity::from_metadata(&current),
+            SocketIdentity::from_metadata(&original)
+        );
+        drop(unlocked);
+        std::fs::remove_file(&path).expect("cleanup unlocked socket");
+        std::fs::remove_file(test_owner_lock_path(&path)).expect("cleanup owner lock");
+    }
+
+    #[tokio::test]
+    async fn test_unmatched_owner_record_rechecks_identity_after_probe() {
+        let path = temp_socket("probe-race");
+        let abandoned = abandoned_socket(&path);
+        write_renumbered_record(&path, &abandoned);
+        let mut owner_lock = McpSocketOwnerLock::acquire(&path).expect("acquire free owner lock");
+        let replacement = Arc::new(Mutex::new(None));
+        let replacement_for_probe = replacement.clone();
+        let path_for_probe = path.clone();
+
+        let error = remove_stale_socket(&path, &mut owner_lock, move || {
+            std::fs::remove_file(&path_for_probe).expect("remove refused socket");
+            let new_listener =
+                StdUnixListener::bind(&path_for_probe).expect("bind replacement socket");
+            *replacement_for_probe
+                .lock()
+                .expect("replacement holder mutex") = Some(new_listener);
+        })
+        .expect_err("a socket replaced after the probe must be rejected");
+        assert!(
+            error.to_string().contains("changed identity"),
+            "unexpected error: {error}"
+        );
+        assert!(std::fs::symlink_metadata(&path)
+            .expect("replacement socket metadata")
+            .file_type()
+            .is_socket());
         let replacement_listener = replacement
             .lock()
             .expect("replacement holder mutex")
